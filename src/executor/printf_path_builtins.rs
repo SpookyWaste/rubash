@@ -94,9 +94,15 @@ impl Executor {
         // init_noninteractive zeroes interactive while interactive_shell
         // stays 1), so the echo is suppressed in those phases too
         // (rubash#297). `__RUBASH_IN_SOURCE` is the engine's sourcelevel.
+        // The echo is likewise the interactive shell's OWN farewell: an
+        // `exit` inside a `( )` subshell runs in the forked child and
+        // prints nothing (pty-verified GNU 5.3.20: interactive `(exit 3)`
+        // is silent, top-level `exit` echoes; rubash#1254) — the engine's
+        // subshell_depth carries that distinction.
         if self.get_env("__RUBASH_INTERACTIVE").as_deref() == Some("1")
             && self.get_env("__RUBASH_INTERACTIVE_FLAG_OFF").is_none()
             && self.get_env("__RUBASH_IN_SOURCE").is_none()
+            && self.shell_state.subshell_depth.get() == 0
             && cmd.words.get(1).map(String::as_str) != Some("--help")
         {
             let login = self.get_env("__RUBASH_LOGIN_SHELL").as_deref() == Some("1");
