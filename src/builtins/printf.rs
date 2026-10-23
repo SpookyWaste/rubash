@@ -734,7 +734,16 @@ fn render(
         if rendered.stop_output {
             return RenderedPrintf {
                 output,
-                status: EXECUTION_FAILURE,
+                // GNU printf.def: a stop is not itself an error — the %b
+                // \c stop (printstr -> PRETURN) ends output with the status
+                // the conversions earned, which is SUCCESS unless a
+                // conversion error occurred (rubash#1200). The error-class
+                // stops inside render_one_pass already carry FAILURE.
+                status: if conversion_error {
+                    EXECUTION_FAILURE
+                } else {
+                    rendered.status
+                },
                 errors,
                 stop_output: true,
                 conversion_error,
@@ -941,7 +950,15 @@ fn render_one_pass(
                     if stop_output {
                         return RenderedPrintf {
                             output,
-                            status: EXECUTION_FAILURE,
+                            // %b \c (printf.def printstr: the \c ends the
+                            // string AND all further output via PRETURN)
+                            // stops without failing: status follows the
+                            // conversion-error flag only (rubash#1200).
+                            status: if conversion_error {
+                                EXECUTION_FAILURE
+                            } else {
+                                EXECUTION_SUCCESS
+                            },
                             errors,
                             stop_output: true,
                             conversion_error,
