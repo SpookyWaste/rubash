@@ -372,7 +372,7 @@ fn assign_printf_output(
             stderr,
             "{}{}: readonly variable",
             readonly_error_prefix(env_vars),
-            name
+            readonly_name
         )?;
         return Ok(Some(1));
     }
