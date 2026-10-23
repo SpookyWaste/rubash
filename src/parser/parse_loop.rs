@@ -1654,8 +1654,7 @@ fn try_parse_compound_start(tokens: &[Token], i: usize, state: &mut ParseState) 
         return Some(next_i);
     }
 
-    if (command_allows_compound_start(&state.current_cmd)
-        || command_allows_compound_after_assignment_prefix(&state.current_cmd))
+    if command_allows_compound_start(&state.current_cmd)
         && token.kind == TokenKind::Keyword
         && token.value == "("
     {
@@ -1716,39 +1715,21 @@ fn try_parse_compound_start(tokens: &[Token], i: usize, state: &mut ParseState) 
 }
 
 fn command_allows_compound_start(command: &CommandNode) -> bool {
-    command_is_empty(command)
-        || command_is_pending_inversion(command)
-        || command_has_assignment_prefix(command)
+    command_is_empty(command) || command_is_pending_inversion(command)
 }
 
-/// Assignment-prefix + compound: only the SUBSHELL form is currently
-/// admitted (`x=1 (cmd)`), because that is the shape the audit corpus
-/// (#452) shows GNU accepting (`x=plugin::@(disable|enable|load)` —
-/// word breaks at `(`, assignment then subshell). Brace/[[/for prefixes
-/// have no recorded GNU verdict yet and stay rejected until then.
-fn command_allows_compound_after_assignment_prefix(command: &CommandNode) -> bool {
-    command_has_assignment_prefix(command)
-}
-
-/// GNU parse.y: an assignment prefix may precede a compound command
-/// (`x=1 (cmd)`, `x=1 { cmd; }`, `x=1 for i in ...`): the assignments apply
-/// to the compound's environment while it runs. The prefix must be PURE
-/// assignments — a redirection (`x=1 <in (cmd)`) or heredoc keeps GNU's
-/// `syntax error near unexpected token` (the grammar only admits
-/// `assignment_prefix compound_command` with a bare prefix, and the audit
-/// corpus (#452) shows GNU rejecting the redirected spellings too).
-fn command_has_assignment_prefix(command: &CommandNode) -> bool {
-    command.words.is_empty()
-        && (!command.assignments.is_empty()
-            || !command.compound_assignments.is_empty()
-            || !command.array_element_assignments.is_empty())
-        && command.redirect_in.is_none()
-        && command.redirect_out.is_none()
-        && command.heredoc.is_none()
-        && command.heredoc_delimiter.is_none()
-        && command.heredoc_redirects.is_empty()
-        && command.here_string.is_none()
-}
+/// GNU parse.y: an assignment word is a prefix of a SIMPLE command only
+/// (simple_command: cmd_prefix_element* — assignments and redirects —
+/// followed by cmd_name/cmd_word), never of a compound command. After
+/// `A=1`, a following `if`/`for`/`case`/`while`/`((`/`{`/`(` is an
+/// ordinary word or a syntax error, never a compound start: GNU 5.3.20
+/// rejects `A=1 (echo)`, `A=1 if …`, `A=1 for …`, `A=1 case …`,
+/// `A=1 ((…))` and `A=1 { …; }` alike (rc 2, rubash#1354). The extglob
+/// spelling `x=plugin::@(disable|enable|load)` is not a counterexample:
+/// with extglob on, `@(…)` is part of the assignment WORD at lex time
+/// (one token, no subshell); with extglob off it errors like the rest.
+/// (An earlier reading of audit #452 generalized that lexer fact into
+/// a parser admission — that is what this fixes.)
 
 /// Compound-body re-parse that keeps the enclosing parse's diagnostic
 /// context. Body token slices carry absolute script-line positions, and
@@ -2712,24 +2693,15 @@ pub(super) fn command_is_pending_inversion(command: &CommandNode) -> bool {
 }
 
 fn push_compound_command(state: &mut ParseState, mut command: CommandNode) {
-    let mut prefix = std::mem::take(&mut state.current_cmd);
+    let prefix = std::mem::take(&mut state.current_cmd);
     if command_is_pending_inversion(&prefix) {
         command.inverted = !command.inverted;
         command.line = command.line.or(prefix.line);
-    } else if command_has_assignment_prefix(&prefix) {
-        // `x=1 (cmd)`: the prefix assignments apply to the
-        // compound command's environment (GNU make_cmd.c attaches the
-        // assignment prefix to the command that follows it).
-        let mut assignments = std::mem::take(&mut prefix.assignments);
-        command.assignments.append(&mut assignments);
-        let mut compound = std::mem::take(&mut prefix.compound_assignments);
-        command.compound_assignments.append(&mut compound);
-        let mut element = std::mem::take(&mut prefix.array_element_assignments);
-        command.array_element_assignments.append(&mut element);
-        if command.line.is_none() {
-            command.line = prefix.line;
-        }
     }
+    // No assignment-prefix merge: the compound gates
+    // (command_allows_compound_start) admit only an empty or
+    // inversion-pending prefix, because GNU's grammar attaches
+    // assignment prefixes to simple commands only (rubash#1354).
     state.ast.commands.push(command);
     state.current_cmd = CommandNode::new();
 }
