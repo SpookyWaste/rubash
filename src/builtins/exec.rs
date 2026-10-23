@@ -455,6 +455,9 @@ fn external_exec_process(
             Some(command_name),
             operands,
             env_vars,
+            env_vars
+                .get("BASH_ARGV0")
+                .is_some_and(|value| !value.is_empty()),
         );
         command
     };

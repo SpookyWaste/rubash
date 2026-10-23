@@ -1,0 +1,4 @@
+temp: x0=[argv0hi] av=[argv0hi]
+exported: x0=[exported0] av=[exported0]
+plain: x0=[bash] av=[bash]
+done

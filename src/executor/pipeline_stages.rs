@@ -794,6 +794,7 @@ impl Executor {
             Some(&expanded_name),
             &dev_args,
             &self.shell_state.env_vars,
+            self.bash_argv0_env_supplied(&[]),
         );
 
         self.apply_child_environment(&mut process);

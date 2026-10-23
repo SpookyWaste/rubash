@@ -91,6 +91,9 @@ impl Executor {
             Some(&config.command[0]),
             &dev_args,
             &env_vars,
+            env_vars
+                .get("BASH_ARGV0")
+                .is_some_and(|value| !value.is_empty()),
         );
         // GNU env (coreutils) runs the command through execvp under the
         // name as typed, so the child's argv[0] is the bare word, not
@@ -633,6 +636,7 @@ impl Executor {
             Some(&cmd.words[0]),
             &dev_args,
             &self.shell_state.env_vars,
+            self.bash_argv0_env_supplied(&cmd.assignments),
         );
         self.apply_external_environment(cmd, &mut process);
         self.apply_external_redirects(cmd, &mut process)?;
@@ -749,6 +753,31 @@ impl Executor {
         eprintln!("{}{}: No such file or directory", self.error_prefix(), path);
         self.exit_code = 127;
         Ok(true)
+    }
+
+    /// Whether a BASH_ARGV0 value crosses the child boundary for the
+    /// command about to spawn (rubash#1338): a prefix assignment in
+    /// `assignments`, or a bound value carrying the exported mark (the
+    /// tempenv apply marks prefix names exported for the command, so the
+    /// mark test covers both). GNU variables.c:1547-1555 (set_argv0)
+    /// makes such a value the child's dollar_vars[0]; the spawn
+    /// builder's fabricated $0 operand for `sh|bash -c` would outrank
+    /// it in the child, so the builder stands down when this is true.
+    /// A plain unexported binding stays in the parent (GNU
+    /// make_env_array_from_var_list) and does not count.
+    pub(in crate::executor) fn bash_argv0_env_supplied(
+        &self,
+        assignments: &[(String, String)],
+    ) -> bool {
+        assignments
+            .iter()
+            .any(|(name, _)| assignment_name_and_append(name).0 == "BASH_ARGV0")
+            || (is_marked_var(&self.shell_state.env_vars, EXPORTED_VARS, "BASH_ARGV0")
+                && self
+                    .shell_state
+                    .env_vars
+                    .get("BASH_ARGV0")
+                    .is_some_and(|value| !value.is_empty()))
     }
 
     pub(in crate::executor) fn apply_external_environment(

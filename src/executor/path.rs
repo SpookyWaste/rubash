@@ -1024,7 +1024,7 @@ pub fn external_command_for_program(
     args: &[String],
     env_vars: &HashMap<String, String>,
 ) -> (Command, bool) {
-    external_command_for_named_program(program, None, args, env_vars)
+    external_command_for_named_program(program, None, args, env_vars, false)
 }
 
 /// Append already-expanded arguments to a child command line.
@@ -1133,6 +1133,7 @@ pub fn external_command_for_named_program(
     command_name: Option<&str>,
     args: &[String],
     env_vars: &HashMap<String, String>,
+    bash_argv0_supplied: bool,
 ) -> (Command, bool) {
     // Native command processors own slash-prefixed switches such as `/C`.
     // Do not reinterpret those switches as paths under Winuxsh's logical
@@ -1319,11 +1320,23 @@ pub fn external_command_for_named_program(
     // carries the name and the child derives $0 from it; appending the
     // name as an extra operand there would shadow an explicit
     // `exec -a` argv[0] (rubash#1227), so the append is Windows-only.
+    //
+    // The injected word is an explicit $0 operand to the child
+    // (shell.c:523-528), and an explicit operand outranks the child's
+    // set_argv0 import (variables.c:1547-1555): when a BASH_ARGV0 value
+    // actually crosses the boundary — exported, or a prefix assignment
+    // (the tempenv apply marks those exported for the command) — GNU
+    // children adopt it as $0, so the injection must also stand down
+    // where it does happen (Windows) or it clobbers the import with the
+    // command word (rubash#1338: `BASH_ARGV0=hi bash -c 'echo $0
+    // $BASH_ARGV0'` printed the resolved bash path twice). The caller
+    // computes supplied-ness (bash_argv0_env_supplied): the exported
+    // marks live in the VarTable flag sets, not in this map.
     if let Some(name) = command_name {
         let lower = name.replace('\\', "/").to_ascii_lowercase();
         let is_sh =
             lower == "sh" || lower == "bash" || lower.ends_with("/sh") || lower.ends_with("/bash");
-        if !cfg!(unix) && is_sh && native_args.len() == 2 && native_args[0] == "-c" {
+        if !cfg!(unix) && is_sh && native_args.len() == 2 && native_args[0] == "-c" && !bash_argv0_supplied {
             command.arg(name);
         }
     }
@@ -4225,7 +4238,7 @@ mod tests {
         let program = PathBuf::from(r"C:\Windows\System32\cmd.exe");
         let args = vec!["/C".to_string(), "echo child".to_string()];
         let (command, _) =
-            external_command_for_named_program(&program, Some("cmd.exe"), &args, &env_vars);
+            external_command_for_named_program(&program, Some("cmd.exe"), &args, &env_vars, false);
         let actual = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -4589,6 +4602,7 @@ mod tests {
             Some("head"),
             &["-3000".to_string(), "input.txt".to_string()],
             &env_vars,
+            false,
         );
         let args = command
             .get_args()
@@ -4609,6 +4623,7 @@ mod tests {
                 Some(command_name),
                 &["--version".to_string()],
                 &env_vars,
+                false,
             );
             let args = command
                 .get_args()
@@ -5182,6 +5197,7 @@ mod tests {
                 Some("ls"),
                 &[operand.to_string()],
                 &env_vars,
+                false,
             );
             let argv = command
                 .get_args()
@@ -5352,6 +5368,7 @@ mod tests {
                 Some(command),
                 &args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>(),
                 &env_vars,
+                false,
             );
             command
                 .get_args()

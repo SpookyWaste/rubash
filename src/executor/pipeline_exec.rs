@@ -1815,6 +1815,7 @@ impl Executor {
                     Some(expanded_name),
                     args,
                     &self.shell_state.env_vars,
+                    self.bash_argv0_env_supplied(&consumers[index].assignments),
                 )
             };
             self.apply_external_environment(&consumers[index], &mut process);
@@ -2326,6 +2327,7 @@ impl Executor {
                     Some(expanded_name),
                     &dev_args,
                     &self.shell_state.env_vars,
+                    self.bash_argv0_env_supplied(&commands[index].assignments),
                 )
             };
             // Apply the element's `VAR=value` tempenv prefix to the child
@@ -2585,6 +2587,7 @@ impl Executor {
                     Some(expanded_name),
                     args,
                     &self.shell_state.env_vars,
+                    self.bash_argv0_env_supplied(&commands[index].assignments),
                 )
             };
             self.apply_external_environment(commands[index], &mut process);
@@ -2974,6 +2977,7 @@ impl Executor {
                 Some(expanded_name),
                 &args,
                 &self.shell_state.env_vars,
+                self.bash_argv0_env_supplied(&commands[index].assignments),
             );
             // Same tempenv application as the os_pipe path above.
             self.apply_external_environment(&commands[index], &mut process);
