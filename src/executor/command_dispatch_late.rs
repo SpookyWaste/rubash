@@ -42,6 +42,12 @@ impl Executor {
         let mut overrides: Vec<(usize, String)> = Vec::new();
         let mut has_t = false;
         let mut index = 0;
+        // rubash#1202: the -v subscript rewrite's evalerror diagnostic is
+        // a diagnostic OF THIS BUILTIN (GNU test.c via execute_cmd.c
+        // routing), so the command's own `2>file` must capture it. Arm
+        // the capture around the rewrite loop and flush whatever was
+        // collected through the buffered-output path below.
+        crate::executor::arithmetic::arm_operand_subscript_diag_capture();
         while index < args.len() {
             let current = strip(&args[index]);
             if current == "-t" {
@@ -62,13 +68,29 @@ impl Executor {
                         }
                         overrides.push((index + 1, rewritten));
                     }
-                    Err(()) => return Ok(1),
+                    Err(()) => {
+                        let captured =
+                            crate::executor::arithmetic::take_operand_subscript_diag_capture();
+                        if !captured.is_empty() {
+                            let mut bytes = Vec::new();
+                            for line in captured {
+                                bytes.extend_from_slice(line.as_bytes());
+                                bytes.push(b'\n');
+                            }
+                            self.write_buffered_builtin_output(cmd, &[], &bytes)?;
+                        }
+                        return Ok(1);
+                    }
                 }
                 index += 2;
                 continue;
             }
             index += 1;
         }
+        // Disarm (a successful rewrite reports nothing through the
+        // capture; anything collected belongs to this builtin, and the
+        // Err path above already flushed it).
+        let _ = crate::executor::arithmetic::take_operand_subscript_diag_capture();
         // Overrides arrive in increasing index order, so merge with a moving
         // pointer: each side advances once (early-exit when past the index),
         // no per-index linear `find` over the table.

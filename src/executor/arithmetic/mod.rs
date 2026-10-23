@@ -48,6 +48,26 @@ thread_local! {
     /// on a hit-fallback).
     static ARITH_PARSE_CACHE: std::cell::RefCell<ArithParseCache> =
         const { std::cell::RefCell::new(ArithParseCache::EMPTY) };
+
+    /// rubash#1202: when armed, `report_indexed_subscript_error` collects
+    /// its rendered diagnostic lines here instead of writing them to the
+    /// raw process stderr, so a builtin whose output is redirectable
+    /// (`test -v name[sub] 2>file`) can route them through the buffered
+    /// output path like every other builtin diagnostic. Disarmed (None)
+    /// is the historical raw-stderr behavior for expansion-time errors,
+    /// which GNU also leaves unredirected.
+    static OPERAND_SUBSCRIPT_DIAG_CAPTURE: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arm the operand-subscript diagnostic capture (see the thread-local).
+pub(in crate::executor) fn arm_operand_subscript_diag_capture() {
+    OPERAND_SUBSCRIPT_DIAG_CAPTURE.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+}
+
+/// Disarm the capture and return the collected diagnostic lines.
+pub(in crate::executor) fn take_operand_subscript_diag_capture() -> Vec<String> {
+    OPERAND_SUBSCRIPT_DIAG_CAPTURE.with(|slot| slot.borrow_mut().take().unwrap_or_default())
 }
 
 /// Take (and clear) the evalerror record of the last evaluation.
@@ -1019,19 +1039,33 @@ impl Executor {
         self.raise_evalerror_abort();
         // The subscript's nested evalexp recorded the real evalerror state —
         // its frame expression IS the subscript text, with lasttp inside it.
-        if let Some(record) = take_arith_eval_error() {
-            eprintln!("{}{}", self.error_prefix(), record.render());
+        let line = if let Some(record) = take_arith_eval_error() {
+            format!("{}{}", self.error_prefix(), record.render())
         } else {
             let token = indexed_noexpand_error_token(resolved);
-            eprintln!(
+            format!(
                 "{}{}: arithmetic syntax error: operand expected (error token is \"{}\")",
                 self.error_prefix(),
                 resolved,
                 token
-            );
+            )
+        };
+        // rubash#1202: an armed capture (test -v's subscript rewrite)
+        // collects the line for the builtin's buffered, redirectable
+        // stderr; otherwise it goes to the raw process stderr as before.
+        let captured = OPERAND_SUBSCRIPT_DIAG_CAPTURE.with(|slot| {
+            if let Some(lines) = slot.borrow_mut().as_mut() {
+                lines.push(line.clone());
+                true
+            } else {
+                false
+            }
+        });
+        if !captured {
+            eprintln!("{line}");
+            use std::io::Write;
+            let _ = std::io::stderr().flush();
         }
-        use std::io::Write;
-        let _ = std::io::stderr().flush();
     }
 
     /// Evaluate a `$(( ... ))` expansion embedded in a word. This is the
