@@ -882,10 +882,11 @@ fn case_command_source_text(case_command: &CaseCommand) -> String {
 
 fn coproc_command_source_text(coproc_command: &crate::parser::CoprocCommand) -> String {
     let mut text = String::from("coproc");
-    if let Some(name) = &coproc_command.name {
-        text.push(' ');
-        text.push_str(name);
-    }
+    // GNU always renders the coprocess name in command displays (jobs,
+    // BASH_COMMAND): an unnamed coproc runs under the default name COPROC
+    // (execute_cmd.c coproc_setup; print_cmd.c prints the name verbatim).
+    text.push(' ');
+    text.push_str(coproc_command.name.as_deref().unwrap_or("COPROC"));
     text.push(' ');
     if let Some(body) = &coproc_command.body {
         text.push_str("{ ");

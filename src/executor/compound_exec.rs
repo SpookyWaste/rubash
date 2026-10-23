@@ -366,23 +366,41 @@ impl Executor {
         }
     }
 
-    fn allocate_coproc_fd(&mut self, slot: usize) -> u32 {
-        let want = if slot == 0 { 63u32 } else { 60u32 };
-        let free = self.fd_table.entries.get(&want).map_or(true, |e| {
-            e.closed || (e.read.is_none() && e.write.is_none())
-        });
-        if free {
-            want
+    fn allocate_coproc_fds(&mut self) -> (u32, u32) {
+        // GNU sh_openpipe (execute_cmd.c/coproc) moves ALL FOUR pipe ends,
+        // in rpipe[0], rpipe[1], wpipe[0], wpipe[1] order, to the highest
+        // free fds below 64 (move_to_high_fd, general.c, maxfd 64). The
+        // parent keeps rpipe[0] as its read end and wpipe[1] as its write
+        // end; its copies of rpipe[1]/wpipe[0] are closed after the fork,
+        // but they still consume high slots during allocation. So with an
+        // empty table the pair is (63, 60); a second live coproc gets
+        // (62, 58), a third (61, 56): the scan must step over the slots
+        // the child ends of earlier coprocs consumed, not just the two
+        // parent ends. Reserving all four slots against the current
+        // fd_table reproduces that numbering exactly.
+        let mut reserved: Vec<u32> = Vec::with_capacity(4);
+        let mut candidate = 63u32;
+        while reserved.len() < 4 && candidate >= 10 {
+            let free = !reserved.contains(&candidate)
+                && self.fd_table.entries.get(&candidate).map_or(true, |e| {
+                    e.closed || (e.read.is_none() && e.write.is_none())
+                });
+            if free {
+                reserved.push(candidate);
+            }
+            candidate -= 1;
+        }
+        if reserved.len() == 4 {
+            (reserved[0], reserved[3])
         } else {
-            // GNU's fallback for a busy high fd is move_to_high_fd
-            // (general.c:681): it scans downward for a free slot with
-            // fcntl F_GETFD and then dup2()s the descriptor there — a
-            // different mechanism from redir.c:942's fcntl F_DUPFD that
-            // backs {var} allocation. Our fallback instead routes through
-            // the limit-aware low-first allocator, so it is bounded by
-            // the same RLIMIT_NOFILE soft limit (rubash#773) but picks
-            // the lowest free slot rather than GNU's high-side scan.
-            self.allocate_dynamic_fd().unwrap_or(want)
+            // High band exhausted: fall back to the limit-aware low-first
+            // allocator (bounded by RLIMIT_NOFILE, rubash#773). GNU's
+            // move_to_high_fd would keep scanning below 10; the fds there
+            // are the shell's own stdio, so this only diverges when more
+            // than ~13 coprocs/dynamic fds are already live.
+            let read = self.allocate_dynamic_fd().unwrap_or(63);
+            let write = self.allocate_dynamic_fd().unwrap_or(60);
+            (read, write)
         }
     }
 
@@ -3200,7 +3218,7 @@ impl Executor {
                         handle: crate::fd::into_handle(stdout_reader),
                         path: std::path::PathBuf::from(format!("coproc:{pid}:stdout")),
                     });
-                    let coproc_read_fd = self.allocate_coproc_fd(0);
+                    let (coproc_read_fd, coproc_write_fd) = self.allocate_coproc_fds();
                     self.fd_table.open_input(
                         coproc_read_fd,
                         FdReadEndpoint::CoprocStdout {
@@ -3209,7 +3227,6 @@ impl Executor {
                         },
                         true,
                     );
-                    let coproc_write_fd = self.allocate_coproc_fd(1);
                     self.fd_table.open_output(
                         coproc_write_fd,
                         FdWriteEndpoint::CoprocStdin {
