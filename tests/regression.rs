@@ -142,6 +142,9 @@ golden_fixture!(golden_issue1232_tilde_pwd => "issue1232-tilde-pwd", timeout 60,
 golden_fixture!(golden_issue1235_fd_move => "issue1235-fd-move", timeout 60, corpus []);
 golden_fixture!(golden_issue1237_net_redir => "issue1237-net-redir", timeout 60, corpus []);
 golden_fixture!(golden_issue1238_arith_diag => "issue1238-arith-diag", timeout 60, corpus []);
+golden_fixture!(golden_k4_declare_options => "k4-declare-options", timeout 60, corpus []);
+golden_fixture!(golden_k4_getopts_state => "k4-getopts-state", timeout 60, corpus []);
+golden_fixture!(golden_k4_expansion_fixes => "k4-expansion-fixes", timeout 60, corpus []);
 
 /// Upstream suite slices pinned as rubash snapshots (coordinator list,
 /// 2026-09-27): the slices the lanes rely on for parity ledgers.

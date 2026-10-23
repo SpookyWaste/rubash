@@ -1,0 +1,10 @@
+== OPTIND attribute
+declare -i OPTIND="1"
+== readonly OPTIND loop
+got a OPTIND=1
+got b OPTIND=1
+rc=0
+== name is OPTIND, unknown option
+rc=0 OPTIND=[1] OPTARG=[]
+== name is OPTIND, missing argument
+rc=0 OPTIND=[1]
