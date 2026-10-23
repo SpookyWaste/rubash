@@ -117,9 +117,24 @@ fn current_directory(mode: Mode, env_vars: &HashMap<String, String>) -> io::Resu
     // GNU pwd.def (physical mode) prints get_working_directory — one
     // canonical shell-absolute form: the POSIX /<drive>/... spelling
     // (rubash#537), the same form cd's bindpwd and the startup PWD use.
-    Ok(Some(crate::executor::path::shell_pwd_display_path(
-        &shell_display_path(&physical),
-    )))
+    let display = crate::executor::path::shell_pwd_display_path(&shell_display_path(&physical));
+    // GNU canonicalizes the logical spelling rather than echoing raw
+    // getcwd, so an exactly-two-slashes $PWD prefix (POSIX `//`, the UNC
+    // root on Windows) survives even in physical mode while getcwd
+    // collapses it (rubash#1415). Restore it when $PWD names this very
+    // directory.
+    if mode == Mode::Physical && logical_pwd_if_current(&physical, env_vars).is_some() {
+        if let Some(pwd) = env_vars.get("PWD") {
+            if pwd.starts_with("//")
+                && !pwd.starts_with("///")
+                && display.starts_with('/')
+                && !display.starts_with("//")
+            {
+                return Ok(Some(format!("/{display}")));
+            }
+        }
+    }
+    Ok(Some(display))
 }
 
 fn logical_pwd_if_current(physical: &Path, env_vars: &HashMap<String, String>) -> Option<String> {

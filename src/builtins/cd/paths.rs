@@ -38,20 +38,45 @@ pub(super) fn logical_destination(old_pwd: &Path, target: &Path) -> PathBuf {
 }
 
 pub(super) fn logical_destination_display(old_pwd: &Path, target: &Path) -> String {
+    let target_display = path_display_text(target);
+    let old_display = path_display_text(old_pwd);
+    // The raw combined text is the only place the exactly-two-slashes
+    // prefix survives; both Path::components and split('/') erase it.
+    let combined_raw = if target.is_absolute() || target_display.starts_with('/') {
+        target_display.clone()
+    } else {
+        format!("{old_display}/{target_display}")
+    };
     if !cfg!(windows) {
-        return shell_display_path(&logical_destination(old_pwd, target));
+        return preserve_leading_double_slash(
+            &combined_raw,
+            &shell_display_path(&logical_destination(old_pwd, target)),
+        );
     }
 
-    let target_display = path_display_text(target);
-    // Windows absolute paths start with a drive letter (`C:/...`), not `/`;
-    // `Path::is_absolute` covers both native and slash-drive forms.
     let normalized = if target.is_absolute() || target_display.starts_with('/') {
         normalize_logical_display(&target_display)
     } else {
-        let old_display = path_display_text(old_pwd);
-        normalize_logical_display(&format!("{old_display}/{target_display}"))
+        normalize_logical_display(&combined_raw)
     };
-    windows_slash_drive_display_to_native(&normalized).unwrap_or(normalized)
+    let normalized = windows_slash_drive_display_to_native(&normalized).unwrap_or(normalized);
+    preserve_leading_double_slash(&combined_raw, &normalized)
+}
+
+/// POSIX leaves the meaning of exactly two leading slashes
+/// implementation-defined, and GNU bash preserves them through logical
+/// path normalization — `cd //tmp` binds PWD=`//tmp`, and the prefix
+/// behaves like a root of its own (`cd ..` from there yields `//`, not
+/// `/`); three or more slashes collapse to one. On Windows this prefix
+/// is the UNC root (rubash#1415). The component-wise normalizers cannot
+/// represent it, so re-apply it from the raw combined text.
+pub(super) fn preserve_leading_double_slash(raw: &str, normalized: &str) -> String {
+    let exactly_two = raw.starts_with("//") && !raw.starts_with("///");
+    if exactly_two && normalized.starts_with('/') && !normalized.starts_with("//") {
+        format!("/{normalized}")
+    } else {
+        normalized.to_string()
+    }
 }
 
 pub(super) fn shell_var(env_vars: &HashMap<String, String>, name: &str) -> Option<String> {
