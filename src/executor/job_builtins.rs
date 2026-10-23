@@ -2124,7 +2124,7 @@ impl Executor {
         stderr: &mut Vec<u8>,
     ) -> Result<i32, ExecuteError> {
         let job = jobs.first().map(String::as_str);
-        let pid = match self.resolve_requested_background_job(job) {
+        let pid = match self.resolve_fg_bg_operand("fg", job, stderr)? {
             JobOperandResolution::Pid(pid) => pid,
             JobOperandResolution::Ambiguous => {
                 // GNU fg_bg.def:144-152: DUP_JOB skips sh_badjob — the
