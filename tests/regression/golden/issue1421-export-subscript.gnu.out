@@ -1,0 +1,5 @@
+rc=1 i=1
+declare -a a=([0]="x" [1]="y" [2]="z")
+numrc=1
+rorc=1 i=1
+declare -a a=([0]="x" [1]="y" [2]="z")

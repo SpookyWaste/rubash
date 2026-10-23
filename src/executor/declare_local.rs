@@ -557,6 +557,17 @@ impl Executor {
                     if is_compound {
                         return Ok(arg.clone());
                     }
+                    // GNU builtins/setattr.def: export/readonly NEVER
+                    // treat `name[sub]=value` as an element assignment —
+                    // the operand is rejected as not a valid identifier
+                    // with the subscript text verbatim, evaluated never
+                    // (rubash#1421: `export 'a[i+1]=Q'` must not become
+                    // `a[2]=Q`, and `a[i++]` must not increment i).
+                    // Pass the operand through untouched; setattr's own
+                    // identifier validation reports it.
+                    if !declare_family {
+                        return Ok(arg.clone());
+                    }
                     // GNU declare.def:592-600 + tokenize_array_reference
                     // (arrayfunc.c:1288): the operand name's subscript must
                     // be a complete matched pair — `declare 'm[x[y]=a'`
