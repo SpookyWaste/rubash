@@ -488,6 +488,10 @@ impl Executor {
         }
 
         subshell.stderr_capture = Some(Vec::new());
+        // rubash#1342: the pipeline driver already emitted this stage's
+        // xtrace line; mark the clone so its dispatch re-trace is
+        // suppressed once (nested commands still trace normally).
+        subshell.pipeline_stage_pre_traced.set(true);
         // rubash#815 profiler: this stage re-dispatches through
         // execute_command, whose own prepared-command seam confirms the
         // element — cancel the stage-level tentative frame so the element is

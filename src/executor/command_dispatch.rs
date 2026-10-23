@@ -124,7 +124,12 @@ impl Executor {
             }
             applied
         };
-        if self.xtrace_enabled() && cmd.arithmetic_command.is_none() {
+        // rubash#1342: a builtin pipeline element re-dispatched here by
+        // execute_builtin_pipeline_stage was already traced once by the
+        // pipeline driver; consume that mark so the element prints
+        // exactly one line, like GNU's forked execute_simple_command.
+        let stage_pre_traced = self.pipeline_stage_pre_traced.replace(false);
+        if self.xtrace_enabled() && cmd.arithmetic_command.is_none() && !stage_pre_traced {
             // GNU dispatches `(( ))` to execute_arith_command, whose own
             // xtrace (execute_cmd.c:3940) prints the raw between-parens text;
             // the generic simple-command trace (execute_cmd.c:4480) never

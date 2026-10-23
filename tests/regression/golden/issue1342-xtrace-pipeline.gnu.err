@@ -1,0 +1,11 @@
++ set -o
++ cat
++ export
++ head -1
++ umask
++ cat
++ declare
++ head -1
++ echo hi
++ cat
++ set +x

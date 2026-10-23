@@ -955,6 +955,17 @@ pub struct Executor {
     /// walk re-opens `>f` and would truncate the bytes the child already
     /// wrote live through the shared description (niubash#144).
     pipeline_stage_fds_pre_wired: Cell<bool>,
+    /// rubash#1342: set on the throwaway subshell clone in
+    /// execute_builtin_pipeline_stage, whose stage command the pipeline
+    /// driver already traced (execute_pipeline_stage_inner prints every
+    /// element's line once, execute_cmd.c:4649). The clone's re-dispatch
+    /// through execute_command would print the same line a second time
+    /// for every builtin routed there (set/export/declare/umask/...),
+    /// while inline stage arms never re-dispatch and traced once. The
+    /// dispatch trace site consumes the flag (replace(false)) so exactly
+    /// one trace — the driver's — survives; nested commands inside the
+    /// builtin (an eval body, say) trace normally.
+    pipeline_stage_pre_traced: Cell<bool>,
     /// Set by `restricted_command_error` when a sequential pipeline stage is
     /// refused (#804): the driver then skips `route_pipeline_stage_streams`
     /// for the stage, because the routing walk would OPEN the refused
