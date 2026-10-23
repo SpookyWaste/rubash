@@ -2921,3 +2921,319 @@ fn prompt_expansion_failure_contained_like_gnu() {
     assert_eq!(code, Some(0));
     assert_eq!(stdout, "xset:0 [vsetw]");
 }
+
+mod k1_batch2 {
+    use super::*;
+
+    fn run(case: &str, script: &str) -> (String, String, Option<i32>) {
+        let dir = case_scratch(case);
+        std::fs::write(dir.join("fg.sh"), script).expect("write script");
+        let out = run_rubash_in(&dir, &["fg.sh"], Duration::from_secs(60));
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    fn run_interactive(
+        case: &str,
+        input: &str,
+        seed_history: Option<&str>,
+    ) -> (String, String, PathBuf) {
+        let dir = case_scratch(case);
+        if let Some(seed) = seed_history {
+            std::fs::write(dir.join(".bash_history"), seed).expect("seed history");
+        }
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rubash"));
+        cmd.args(["-i"])
+            .current_dir(&dir)
+            .env_clear()
+            .env("PATH", minimal_path())
+            .env("HOME", &dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn rubash");
+        std::io::Write::write_all(child.stdin.as_mut().expect("stdin pipe"), input.as_bytes())
+            .expect("write stdin");
+        drop(child.stdin.take());
+        let out = wait_bounded(&mut child, Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            dir,
+        )
+    }
+
+    /// rubash#1184 finding 1: a word merely STARTING with `2` is an
+    /// ordinary word (parse.y read_token_word) — $'...' decoding and
+    /// backslash folding must run; only a token ENDING right before
+    /// `<`/`>` is an io-number.
+    #[test]
+    fn issue_1184_word_starting_with_two_decodes() {
+        let (stdout, stderr, code) = run(
+            "k1-1184-f1",
+            "echo \"1: $(echo 2$'x')\"\n\
+             echo \"2: $(echo 2\\\\x)\"\n\
+             echo \"3: $(echo 2abc$'\\t' | cat -A)\"\n\
+             for w in 2$'z'; do echo \"4: $w\"; done\n\
+             case 2$'x' in 2x) echo \"5: hit\";; *) echo \"5: miss\";; esac\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "1: 2x\n2: 2\\x\n3: 2abc^I$\n4: 2z\n5: hit\n");
+    }
+
+    /// rubash#1184 findings 2+3: the no-arg export/readonly listings use
+    /// declare -p display quoting ($'...' for control bytes), and
+    /// UID/EUID/PPID carry the integer attribute.
+    #[test]
+    fn issue_1184_listing_quoting_and_uid_attrs() {
+        let (stdout, stderr, code) = run(
+            "k1-1184-f23",
+            "xv=$'x\\ny'\nexport xv\nexport -p | grep '^declare -x xv='\n\
+             ro=$'r\\tq'\nreadonly ro\nreadonly -p | grep '^declare -r ro='\n\
+             declare -p UID\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert!(
+            stdout.contains("declare -x xv=$'x\\ny'\n"),
+            "export listing; stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("declare -r ro=$'r\\tq'\n"),
+            "readonly listing; stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("declare -ir UID="),
+            "UID attrs; stdout:\n{stdout}"
+        );
+    }
+
+    /// rubash#1186 (grouped-driver shape): with history on, a failglob
+    /// error discards the rest of its logical line; the next line runs.
+    #[test]
+    fn issue_1186_grouped_failglob_discards_line() {
+        let (stdout, stderr, code) = run(
+            "k1-1186",
+            "set -o history\nshopt -s failglob\necho case1-start\n\
+             set -- /no/such/*.zzz; echo case1-skipped\necho case2-start\necho END\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "case1-start\ncase2-start\nEND\n");
+        assert_eq!(stderr, "fg.sh: line 4: no match: /no/such/*.zzz\n");
+    }
+
+    /// rubash#1200: printf %b \c stops output without failing.
+    #[test]
+    fn issue_1200_printf_percent_b_backslash_c() {
+        let (stdout, stderr, code) = run(
+            "k1-1200",
+            "printf '%b' 'A\\cB'; echo \"[rc=$?]\"\nprintf '%b' 'p\\c' 'q'; echo \"[rc=$?]\"\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "A[rc=0]\np[rc=0]\n");
+    }
+
+    /// rubash#1201: a nounset fatal inside [[ ]] keeps its status even
+    /// when the predicate itself evaluates to 0 (-z of the empty word).
+    #[test]
+    fn issue_1201_conditional_nounset_status() {
+        let (stdout, _stderr, code) = run(
+            "k1-1201",
+            "(set -u; [[ -z $UNSET_XYZ2 ]]) 2>&1; echo \"rc=$?\"\n\
+             (set -u; [ -z \"$UNSET_XYZ2\" ]) 2>&1; echo \"rc=$?\"\n\
+             (set -u; [[ $UNSET_XYZ2 = x ]]) 2>&1; echo \"rc=$?\"\n",
+        );
+        assert_eq!(code, Some(0));
+        assert_eq!(
+            stdout,
+            "fg.sh: line 1: UNSET_XYZ2: unbound variable\nrc=1\n\
+             fg.sh: line 2: UNSET_XYZ2: unbound variable\nrc=1\n\
+             fg.sh: line 3: UNSET_XYZ2: unbound variable\nrc=1\n"
+        );
+    }
+
+    /// rubash#1202: the `test -v name[sub]` subscript evalerror is the
+    /// builtin's own diagnostic — the command's `2>file` captures it.
+    #[test]
+    fn issue_1202_test_v_subscript_error_redirected() {
+        let (stdout, stderr, code) = run(
+            "k1-1202",
+            "arr1=(a b c)\n[ -v 'arr1[1:2]' ] 2>e4\necho \"e4=[$(cat e4)]\"\necho after\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stderr, "");
+        assert_eq!(
+            stdout,
+            "e4=[fg.sh: line 2: 1:2: arithmetic syntax error in expression \
+             (error token is \":2\")]\nafter\n"
+        );
+    }
+
+    /// rubash#1210: `history -d 0` / `-d -0` are out of range (a bare 0
+    /// names no entry); the entries survive.
+    #[test]
+    fn issue_1210_history_delete_zero() {
+        let (stdout, stderr, code) = run(
+            "k1-1210",
+            "set -o history\nhistory -c\nhistory -s \"cmd one\"\nhistory -s \"cmd two\"\n\
+             history -d 0; echo \"rc=$?\"\nhistory -d -0; echo \"rc=$?\"\nhistory\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(
+            stderr,
+            "fg.sh: line 5: history: 0: history position out of range\n\
+             fg.sh: line 6: history: -0: history position out of range\n"
+        );
+        assert_eq!(
+            stdout,
+            "rc=1\nrc=1\n    1  cmd one\n    2  cmd two\n    3  history -d 0; echo \"rc=$?\"\n    4  history -d -0; echo \"rc=$?\"\n    5  history\n"
+        );
+    }
+
+    /// rubash#1211: the `fc -e` re-execution echo goes to the command's
+    /// redirected stderr, not the raw process stderr.
+    #[test]
+    fn issue_1211_fc_echo_redirected() {
+        let (stdout, stderr, code) = run(
+            "k1-1211",
+            "set -o history\necho SEEDLINE\nfc -e true 2 2>err1211.txt\n\
+             echo \"err-is:[$(cat err1211.txt)]\"\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "SEEDLINE\nSEEDLINE\nerr-is:[echo SEEDLINE]\n");
+    }
+
+    /// rubash#1212: `time` reports real CPU time (getrusage deltas), not
+    /// a hard-coded user/sys of zero.
+    #[test]
+    fn issue_1212_time_reports_cpu() {
+        let (_stdout, stderr, code) = run(
+            "k1-1212",
+            "time ( x=0; while [ $x -lt 60000 ]; do x=$((x+1)); done )\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        let user_line = stderr
+            .lines()
+            .find(|line| line.starts_with("user"))
+            .unwrap_or("");
+        assert!(
+            !user_line.is_empty() && !user_line.ends_with("0m0.000s"),
+            "user time must be measured, got: {user_line:?} in\n{stderr}"
+        );
+    }
+
+    /// rubash#1213: `return` with too many arguments is the no_args
+    /// DISCARD class — message, status 2, rest of the line abandoned,
+    /// in functions, at top level, and for the numeric path's caller.
+    #[test]
+    fn issue_1213_return_too_many_arguments() {
+        let (stdout, stderr, code) = run(
+            "k1-1213",
+            "f() { return 1 2 3; echo \"f-after\"; }\nf; echo rc=$?\n\
+             return 1 2 3; echo \"top rc=$?\"\n\
+             f2() { return abc; echo \"f2-after\"; }\nf2; echo rc2=$?\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "rc2=2\n");
+        assert_eq!(
+            stderr,
+            "fg.sh: line 1: return: too many arguments\n\
+             fg.sh: line 3: return: too many arguments\n\
+             fg.sh: line 4: return: abc: numeric argument required\n"
+        );
+    }
+
+    /// rubash#1215: `hash <builtin>` is a silent no-op (no entry, rc 0);
+    /// external names hash and report normally.
+    #[test]
+    #[cfg(unix)]
+    fn issue_1215_hash_skips_builtins() {
+        let (stdout, stderr, code) = run(
+            "k1-1215",
+            "hash echo; echo \"rc1=$?\"\nhash; echo \"rc2=$?\"\n\
+             hash -t echo; echo \"rc3=$?\"\nhash cd; echo \"rc4=$?\"\n\
+             hash -t cd; echo \"rc5=$?\"\nhash ls; echo \"rc6=$?\"\n\
+             hash -t ls; echo \"rc7=$?\"\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(
+            stdout,
+            "rc1=0\nhash: hash table empty\nrc2=0\nrc3=1\nrc4=0\nrc5=1\nrc6=0\n/usr/bin/ls\nrc7=0\n"
+        );
+        assert_eq!(
+            stderr,
+            "fg.sh: line 3: hash: echo: not found\nfg.sh: line 5: hash: cd: not found\n"
+        );
+    }
+
+    /// rubash#1216: with HISTFILE unset, an interactive shell loads and
+    /// saves the default ~/.bash_history.
+    #[test]
+    fn issue_1216_histfile_default() {
+        let (stdout, stderr, _dir) =
+            run_interactive("k1-1216a", "fc -l\nexit\n", Some("echo OLDHIST1\n"));
+        assert!(
+            stdout.contains("echo OLDHIST1") || stderr.contains("echo OLDHIST1"),
+            "seeded history must load; stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let (_stdout2, _stderr2, dir2) =
+            run_interactive("k1-1216b", "echo NEWCMD1\nexit\n", Some("echo OLDHIST1\n"));
+        let saved2 = std::fs::read_to_string(dir2.join(".bash_history")).unwrap_or_default();
+        assert!(
+            saved2.contains("NEWCMD1"),
+            "session lines must be saved; file: {saved2}"
+        );
+    }
+
+    /// rubash#1214: PS0 is expanded and printed after each interactive
+    /// command is read, before it executes.
+    #[test]
+    fn issue_1214_ps0_printed() {
+        let (_stdout, stderr, _dir) = run_interactive(
+            "k1-1214",
+            "PS0=PS0MARK\\n\nPS1=READY\\n\necho hi\nexit\n",
+            None,
+        );
+        assert_eq!(
+            stderr.matches("PS0MARKn").count(),
+            3,
+            "PS0 before the PS1=, echo and exit lines; stderr:\n{stderr}"
+        );
+    }
+
+    /// rubash#1218: in posix mode `time -p cmd` is NOT the time keyword —
+    /// it dispatches to an external `time` (absent here: 127).
+    #[test]
+    fn issue_1218_posix_time_dash_word() {
+        let (stdout, stderr, code) = run(
+            "k1-1218",
+            "set -o posix\ntime -p true\necho \"rc=$?\"\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "rc=127\n");
+        assert!(
+            stderr.contains("fg.sh: line 2: time: command not found"),
+            "stderr:\n{stderr}"
+        );
+    }
+
+    /// rubash#1222: `wait` for a disowned pid succeeds silently with
+    /// status 0 (repeatedly); a never-owned pid still reports 127.
+    #[test]
+    #[cfg(unix)]
+    fn issue_1222_wait_disowned_pid() {
+        let (stdout, stderr, code) = run(
+            "k1-1222",
+            "sleep 0.2 & p=$!\ndisown $p\nwait $p; echo \"rc=$?\"\n\
+             wait $p; echo \"rc2=$?\"\nwait 999999; echo \"rc3=$?\"\necho done\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "rc=0\nrc2=0\nrc3=127\ndone\n");
+        assert_eq!(
+            stderr,
+            "fg.sh: line 5: wait: pid 999999 is not a child of this shell\n"
+        );
+    }
+}
