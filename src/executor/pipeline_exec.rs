@@ -868,6 +868,9 @@ impl Executor {
 
         let time_prefix = time_pipeline_prefix(first, self.posix_mode_enabled());
         let time_prefix_started = time_prefix.as_ref().map(|_| time_command_started());
+        let mut time_report_routed = false;
+        let mut hoisted_time_inverted = false;
+        let mut deferred_time_report: Option<(std::time::Instant, bool)> = None;
         let mut input = String::new();
         let mut statuses = Vec::new();
         let mut first_stage = 0usize;
@@ -983,6 +986,17 @@ impl Executor {
             // (set-e1.sub:40 `! { false; echo A $?; } | cat` prints `A 1`).
             let pipeline_inverted =
                 first.inverted || time_prefix.as_ref().is_some_and(|prefix| prefix.inverted);
+            // GNU binds a leading `time` (and its `!`) to the WHOLE
+            // pipeline; the compound parse parks the TimeCommand on
+            // element 0, whose stage executor would print the report and
+            // invert at element scope (the report overtook the buffered
+            // pipeline output and the status stayed un-inverted). Defer
+            // both to pipeline scope (rubash#1263).
+            let hoist_stage_time =
+                stage_index == 0 && commands.len() > 1 && command.time_command.is_some();
+            if hoist_stage_time {
+                self.defer_stage_time_report = true;
+            }
             let Some((mut next_input, mut next_stderr, mut next_status)) = (if pipeline_inverted {
                 self.with_errexit_suppressed(|executor| {
                     if last_stage && executor.lastpipe_enabled() {
@@ -1010,6 +1024,7 @@ impl Executor {
                     executor.execute_pipeline_stage(stage, &input, stage0_stdin_inherit)
                 })?
             }) else {
+                self.defer_stage_time_report = false;
                 return Ok(None);
             };
             // GNU: each element's own redirections run inside the element's
@@ -1072,16 +1087,71 @@ impl Executor {
             }
             input = next_input;
             statuses.push(next_status);
+            // GNU runs a timed pipeline element in a subshell whose fd 2
+            // is already bound: when the element dups stderr onto the
+            // pipe (`2>&1` / `|&`), the time report is written into the
+            // pipe right after the element's own output — it reaches the
+            // next stage, it does not trail the whole pipeline on the
+            // shell's stderr (rubash#1263: `time ! { echo hi; } 2>&1 |
+            // cat` printed the timing block BEFORE `hi`).
+            if stage_index == 0 && !time_report_routed {
+                if let (Some(prefix), Some(started)) = (&time_prefix, time_prefix_started) {
+                    if timed_element_merges_stderr(prefix) {
+                        let metrics = TimeCommandMetrics::from_start(started);
+                        if let Some(report) = format_time_report(
+                            &self.shell_state.env_vars,
+                            prefix.posix_format,
+                            metrics,
+                        ) {
+                            input.push_str(&format!("{report}\n"));
+                            time_report_routed = true;
+                        }
+                    }
+                }
+            }
+            if hoist_stage_time {
+                self.defer_stage_time_report = false;
+                hoisted_time_inverted = command
+                    .time_command
+                    .as_ref()
+                    .is_some_and(|timed| timed.inverted);
+                if let Some((started, posix_format)) = self.pending_stage_time_report.take() {
+                    // The element dup'd its stderr onto the pipe (`2>&1`):
+                    // the report is part of the pipe stream, right after
+                    // the element's own contribution. Otherwise it stays
+                    // on the shell's stderr, printed once the pipeline's
+                    // output is out (rubash#1263).
+                    if timed_stage_merges_stderr(command) {
+                        if let Some(report) = format_time_report(
+                            &self.shell_state.env_vars,
+                            posix_format,
+                            TimeCommandMetrics::from_start(started),
+                        ) {
+                            input.push_str(&format!("{report}\n"));
+                        }
+                    } else {
+                        deferred_time_report = Some((started, posix_format));
+                    }
+                }
+            }
         }
 
         let final_command = commands.last().expect("pipeline has at least one stage");
         self.write_pipeline_output(final_command, &input, true)?;
-        if let Some(prefix) = &time_prefix {
-            if let Some(started) = time_prefix_started {
-                self.print_time_shell(prefix.posix_format, started);
+        if !time_report_routed {
+            if let Some(prefix) = &time_prefix {
+                if let Some(started) = time_prefix_started {
+                    self.print_time_shell(prefix.posix_format, started);
+                }
             }
         }
+        if let Some((started, posix_format)) = deferred_time_report {
+            self.print_time_shell(posix_format, started);
+        }
         let mut status = self.pipeline_exit_status(&statuses);
+        if hoisted_time_inverted {
+            status = invert_exit_status(status);
+        }
         if time_prefix.as_ref().is_some_and(|prefix| prefix.inverted) {
             status = invert_exit_status(status);
         }
@@ -3314,6 +3384,13 @@ impl Executor {
             else {
                 return Ok(None);
             };
+            if self.defer_stage_time_report {
+                // Element 0 of a pipeline: GNU's `time`/`!` bind to the
+                // whole pipeline, so neither print nor invert here — the
+                // pipeline executor owns both (rubash#1263).
+                self.pending_stage_time_report = Some((started, time_command.posix_format));
+                return Ok(Some((output, stderr, status)));
+            }
             self.print_time_shell(time_command.posix_format, started);
             let status = if time_command.inverted {
                 invert_exit_status(status)
@@ -4660,6 +4737,38 @@ struct TimePipelinePrefix {
     command: CommandNode,
     inverted: bool,
     posix_format: bool,
+}
+
+/// Whether a command node's fd 2 is dup'd onto its fd 1 — a `2>&1`
+/// redirect (or the `|&` desugar of one): the node's stderr belongs to
+/// its stdout stream (rubash#1263).
+fn node_merges_stderr_into_stdout(node: &CommandNode) -> bool {
+    let is_stdout_dup = |redirect: &crate::parser::Redirect| {
+        redirect.fd == Some(2)
+            && redirect.kind == crate::parser::RedirectKind::DuplicateOutput
+            && redirect.target == "&1"
+    };
+    node.redirects.iter().any(is_stdout_dup)
+        || node.redirect_err.as_ref().is_some_and(is_stdout_dup)
+}
+
+/// Whether the timed pipeline element's fd 2 is dup'd onto the pipe:
+/// the time report then belongs to the pipe stream, right after the
+/// element's own output (rubash#1263).
+fn timed_element_merges_stderr(prefix: &TimePipelinePrefix) -> bool {
+    node_merges_stderr_into_stdout(&prefix.command)
+}
+
+/// Whether a stage carrying a `time_command` payload (the compound
+/// parse of `time <compound> ...`) sends its fd 2 into the pipe — the
+/// dup may sit on the stage node or on the timed command itself
+/// (rubash#1263).
+fn timed_stage_merges_stderr(stage: &CommandNode) -> bool {
+    node_merges_stderr_into_stdout(stage)
+        || stage
+            .time_command
+            .as_ref()
+            .is_some_and(|timed| node_merges_stderr_into_stdout(&timed.command))
 }
 
 fn time_pipeline_prefix(command: &CommandNode, posix_mode: bool) -> Option<TimePipelinePrefix> {
