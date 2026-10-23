@@ -598,7 +598,14 @@ where
         // WITH an assignment -- leaves nothing observable: no value, no
         // attributes, no message (probe: `declare -p a b` afterwards reports
         // "b: not found" and a later `b+=1` builds a plain b).
+        // GNU 5.3 (variables.c bind_variable): the value bound to a cell
+        // carrying BOTH att_integer and att_nameref is arithmetic-evaluated
+        // first, and the numeric result is never a valid nameref target, so
+        // the declare FAILS (status 1) while still creating nothing and
+        // printing nothing (rubash#1243: the skip was right, the status was
+        // left at success).
         if nameref && integer && !value.is_empty() {
+            attr_status = EXECUTION_FAILURE;
             continue;
         }
         // GNU declare.def:554-558 + 966-980: a real compound assignment
