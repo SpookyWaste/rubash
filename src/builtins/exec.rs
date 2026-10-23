@@ -215,6 +215,7 @@ where
         return match child_stdio {
             Some((child_stdout, child_stderr)) => run_external_exec_with_stdio(
                 &program,
+                command,
                 operands,
                 env_vars,
                 clean_env,
@@ -226,6 +227,7 @@ where
             ),
             None => run_external_exec(
                 &program,
+                command,
                 operands,
                 env_vars,
                 clean_env,
@@ -315,6 +317,7 @@ where
 
 fn run_external_exec<W, E>(
     program: &std::path::Path,
+    command_name: &str,
     operands: &[String],
     env_vars: &crate::shell::var_table::VarTable,
     clean_env: bool,
@@ -327,7 +330,8 @@ where
     W: Write,
     E: Write,
 {
-    let mut process = external_exec_process(program, operands, env_vars, clean_env, argv0);
+    let mut process =
+        external_exec_process(program, command_name, operands, env_vars, clean_env, argv0);
     process.stdout(Stdio::piped()).stderr(Stdio::piped());
     // std's Command::output() defaults stdin to Stdio::null() when .stdin()
     // is never called — a capture-path `$(exec cat)` then reads EOF on a
@@ -364,6 +368,7 @@ where
 
 fn run_external_exec_with_stdio<E>(
     program: &std::path::Path,
+    command_name: &str,
     operands: &[String],
     env_vars: &crate::shell::var_table::VarTable,
     clean_env: bool,
@@ -376,7 +381,8 @@ fn run_external_exec_with_stdio<E>(
 where
     E: Write,
 {
-    let mut process = external_exec_process(program, operands, env_vars, clean_env, argv0);
+    let mut process =
+        external_exec_process(program, command_name, operands, env_vars, clean_env, argv0);
     process.stdout(child_stdout).stderr(child_stderr);
     // Explicit for symmetry with run_external_exec: `.status()` would
     // inherit by default, but every spawn site of the exec builtin must
@@ -405,6 +411,7 @@ where
 
 fn external_exec_process(
     program: &std::path::Path,
+    command_name: &str,
     operands: &[String],
     env_vars: &crate::shell::var_table::VarTable,
     clean_env: bool,
@@ -423,9 +430,13 @@ fn external_exec_process(
     ) {
         command
     } else {
+        // Non-script targets get the command word as typed for argv[0]
+        // (shell_execve via external_command_for_named_program), NOT the
+        // resolved program's file stem: `exec /usr/bin/bash -c 'echo $0'`
+        // reports /usr/bin/bash in GNU (rubash#1227).
         let (command, _) = crate::executor::path::external_command_for_named_program(
             program,
-            program.file_stem().and_then(|stem| stem.to_str()),
+            Some(command_name),
             operands,
             env_vars,
         );
