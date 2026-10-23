@@ -2569,9 +2569,18 @@ impl Executor {
                     return Ok(0);
                 }
                 // fc.def:539: echo_input_at_read = 1 before fc_execute_file.
-                // y.tab.c:5071-5075: each input line is echoed to stderr.
+                // y.tab.c:5071-5075: each input line is echoed to stderr —
+                // the COMMAND's stderr, so an `fc ... 2>file` redirect
+                // captures the echo like any builtin diagnostic. The raw
+                // eprintln! here bypassed the redirect entirely
+                // (rubash#1211). The echo is written below, inside the
+                // compound-redirect scope: that scope is what binds fd 2
+                // to the command's redirect target, and writing before it
+                // opens would lose the bytes to its truncation.
+                let mut echo = Vec::new();
                 for line in edited.lines() {
-                    eprintln!("{line}");
+                    use std::io::Write as _;
+                    let _ = writeln!(echo, "{line}");
                 }
                 if let Some(session) = session.as_ref() {
                     let control = self.get_env("HISTCONTROL").unwrap_or_default();
@@ -2597,7 +2606,14 @@ impl Executor {
                     },
                 );
                 self.apply_command_output_redirects(cmd, &mut ast)?;
-                self.with_compound_output_redirects(cmd, |executor| executor.execute_ast(&ast))?;
+                self.with_compound_output_redirects(cmd, |executor| {
+                    // rubash#1211: the fc echo (built above) goes to fd 2
+                    // as bound by this command's redirects, BEFORE the
+                    // re-executed text runs — GNU's echo_input_at_read
+                    // order (fc.def:539).
+                    executor.write_default_stderr(&echo)?;
+                    executor.execute_ast(&ast)
+                })?;
                 Ok(self.exit_code)
             }
             crate::builtins::fc::FcResult::Status(status) => Ok(status),
