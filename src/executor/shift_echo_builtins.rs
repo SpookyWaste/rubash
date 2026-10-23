@@ -128,12 +128,18 @@ impl Executor {
             timed.word_kinds = cmd.word_kinds[index..].to_vec();
         }
         let started = time_command_started();
-        self.execute_command(&timed)?;
+        // GNU execute_cmd.c: the time report (print_time_info) is part of
+        // executing the timed command — it is printed even when the
+        // command fails and errexit then terminates the shell
+        // (rubash#1278: `set -e; time false` prints the real/user/sys
+        // block in GNU). Capture the execution result, print the report,
+        // and only then propagate an errexit/exit unwind.
+        let result = self.execute_command(&timed);
         self.print_time_shell(cmd.words.iter().skip(1).any(|word| word == "-p"), started);
-        if inverted {
+        if result.is_ok() && inverted {
             self.exit_code = invert_exit_status(self.exit_code);
         }
-        Ok(())
+        result
     }
 
     pub(in crate::executor) fn execute_echo(
