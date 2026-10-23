@@ -1047,6 +1047,24 @@ fn valid_brace_array_reference(head: &[u8]) -> bool {
     }
 }
 
+/// If `bytes` begins with a complete ANSI-C quoted literal `$'...'`,
+/// return the index of its closing quote within `bytes` (backslash
+/// escapes the next byte). rubash#1287.
+pub(in crate::executor) fn ansi_c_literal_end(bytes: &[u8]) -> Option<usize> {
+    if bytes.first() != Some(&b'$') || bytes.get(1) != Some(&b'\'') {
+        return None;
+    }
+    let mut index = 2;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'\'' => return Some(index),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
 /// subst.c:7583 `valid_brace_expansion_word` minus its length arm: an array
 /// reference is validated as `identifier[non-empty-subscript]` ending at the
 /// `]` (subst.c:10042-10046 -> arrayfunc.c valid_array_reference), so
@@ -1130,6 +1148,16 @@ fn braced_name_has_empty_substring_operand(name: &str) -> bool {
 ///   `${x(M)}`, `${1a}`, `${x!}`, `${a\b}`, `${${x}}`, `${日本}`.
 pub(in crate::executor) fn braced_name_is_bad_substitution(name: &str) -> bool {
     let bytes = name.as_bytes();
+
+    // rubash#1287: `${#$'...'}` — a complete ANSI-C quoted literal as the
+    // length operand. GNU subst.c parameter_brace_expand accepts it and
+    // expands the length of the (unset) parameter, printing 0; the
+    // sibling forms `${#$v}`, `${#$1}`, `${#$"..."}` and `${#'...'}`
+    // stay bad substitutions in GNU too, so only the $'...' literal is
+    // admitted here.
+    if bytes.first() == Some(&b'#') && ansi_c_literal_end(&bytes[1..]) == Some(bytes.len() - 2) {
+        return false;
+    }
 
     // `${#name}` with an identifier starter: whole-body length form.
     if bytes.first() == Some(&b'#') && bytes.get(1).is_some_and(|b| is_variable_starter(*b)) {

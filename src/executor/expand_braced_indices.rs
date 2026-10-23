@@ -497,6 +497,12 @@ impl Executor {
             // already rejected the empty-word operator forms and the
             // `#`+starter bad-length names.
             let bytes = rest.as_bytes();
+            // rubash#1287: `${#$'...'}` — GNU accepts a complete ANSI-C
+            // quoted literal as the length operand and expands the
+            // length of the unset parameter: 0.
+            if crate::executor::expand_word::ansi_c_literal_end(bytes) == Some(bytes.len() - 1) {
+                return Some("0".to_string());
+            }
             let is_length_operand = bytes.iter().all(|b| b.is_ascii_digit())
                 || is_shell_name(rest)
                 || (rest.len() == 1
