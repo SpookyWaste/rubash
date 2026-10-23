@@ -609,7 +609,15 @@ fn globstar_expand(
     // with its trailing slash preserved (`echo lib/**` starts with `lib/`).
     // A bare `**` (empty prefix) has no depth-0 operand to emit - the base is
     // the cwd and GNU prints no `./` entry.
-    if match_all && !prefix.is_empty() && logical_base_dir != "/" {
+    // The pure `prefix/**/` form (dirs_only with an empty suffix) has the
+    // same zero-depth match — `d/**/` yields `d/` itself before `d/e/` —
+    // but a patterned remainder (`**/foo*/`) does not: the base is only
+    // emitted when it matches the pattern, which the walk handles
+    // (rubash#1323).
+    if (match_all || (dirs_only && suffix.is_empty()))
+        && !prefix.is_empty()
+        && logical_base_dir != "/"
+    {
         let output = if dirs_only || !prefix.is_empty() {
             format!("{}/", logical_base_dir)
         } else {
@@ -629,6 +637,17 @@ fn globstar_expand(
         globskipdots,
         env_vars,
     );
+    // A `./` prefix is part of every result GNU prints (`./**/` yields
+    // `./ ./d/ ./d/e/`): the walk normalizes the base `.` away when
+    // joining, so re-attach the literal prefix to the walked entries.
+    // The zero-depth entry pushed above already carries it (`./`).
+    if prefix == "./" {
+        for entry in &mut matches {
+            if entry != "./" && !entry.starts_with("./") {
+                *entry = format!("./{entry}");
+            }
+        }
+    }
 
     let matches = apply_globignore(matches, env_vars);
     if matches.is_empty() {
