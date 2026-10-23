@@ -737,6 +737,19 @@ impl Executor {
             for name in value.split(':').filter(|name| !name.is_empty()) {
                 if crate::builtins::set::is_shell_option(name) {
                     crate::builtins::set::set_shell_option(env_vars, name, true);
+                } else {
+                    // GNU shell.c initialize_shell_options -> set.def
+                    // parse_shellopts: an unknown inherited name is
+                    // reported once at startup (`<shell>: line 0: <name>:
+                    // invalid option name`) and startup continues
+                    // (rubash#1246). The value is rebuilt sanitized below,
+                    // so re-entered constructors (subshells) never repeat
+                    // the report.
+                    let shell_name = std::env::args()
+                        .next()
+                        .filter(|arg| !arg.is_empty())
+                        .unwrap_or_else(|| "bash".to_string());
+                    eprintln!("{shell_name}: line 0: {name}: invalid option name");
                 }
             }
         }

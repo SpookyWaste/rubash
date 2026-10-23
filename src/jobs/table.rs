@@ -40,6 +40,12 @@ pub struct JobEntry {
     pub stage_commands: Vec<String>,
     pub state: ProcessState,
     pub exit_status: Option<i32>,
+    /// GNU jobs.c: the WSTOPSIG of the process whose stop report made
+    /// the job JSTOPPED — `jobs -l` renders it through
+    /// printable_job_status/j_strsignal (`Stopped (signal)` for
+    /// SIGSTOP, `Stopped (tty input)` for SIGTTIN, ...; rubash#1246).
+    /// Recorded by the kill path, the shell's only stop detector.
+    pub stop_signal: Option<i32>,
     pub background: bool,
     pub foreground: bool,
     pub notified: bool,
@@ -192,6 +198,7 @@ impl JobTable {
             stage_commands,
             state: ProcessState::Running,
             exit_status: None,
+            stop_signal: None,
             background,
             foreground: !background,
             notified: false,
@@ -408,7 +415,7 @@ impl JobTable {
         self.pid_to_job.get(&pid).copied()
     }
 
-    pub fn mark_stopped(&mut self, pid: u32) {
+    pub fn mark_stopped(&mut self, pid: u32, stop_signal: Option<i32>) {
         let Some(job_id) = self.pid_to_job.get(&pid).copied() else {
             return;
         };
@@ -416,6 +423,7 @@ impl JobTable {
             if let Some(process) = job.processes.get_mut(&pid) {
                 process.state = ProcessState::Stopped;
             }
+            job.stop_signal = stop_signal;
             job.notified = false;
         }
         self.recompute_job(job_id);
@@ -432,6 +440,7 @@ impl JobTable {
             if let Some(process) = job.processes.get_mut(&pid) {
                 process.state = ProcessState::Running;
             }
+            job.stop_signal = None;
         }
         // jobs.c start_job/set_job_running: a Running transition does not
         // pick the job as current. Callers decide: fg -> set_current_job,
@@ -708,10 +717,12 @@ mod tests {
     fn stopped_and_continued_processes_update_job_state() {
         let mut table = JobTable::default();
         let job = table.register_process(20, "sleep", true, 20);
-        table.mark_stopped(20);
+        table.mark_stopped(20, Some(19));
         assert_eq!(table.jobs[&job].state, ProcessState::Stopped);
+        assert_eq!(table.jobs[&job].stop_signal, Some(19));
         table.mark_running(20);
         assert_eq!(table.jobs[&job].state, ProcessState::Running);
+        assert_eq!(table.jobs[&job].stop_signal, None);
     }
 
     #[test]

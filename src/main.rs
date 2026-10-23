@@ -1689,7 +1689,16 @@ fn diagnose_bash_env_directory(executor: &mut Executor) {
     };
     let path = executor.resolve_shell_path(&bash_env);
     if std::fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
-        eprintln!("rubash: {bash_env}: Is a directory");
+        // GNU shell.c maybe_execute_env_file reports startup-file
+        // failures with the shell's $0 and the lowercase strerror text
+        // (`<script>: /tmp: is a directory`, rubash#1246) — the capital
+        // "Is a directory" belongs to the script-ARGUMENT open path,
+        // which is a different diagnostic and keeps it.
+        let shell_name = executor
+            .get_env("__RUBASH_SCRIPT_NAME")
+            .filter(|value| !value.is_empty())
+            .unwrap_or("rubash");
+        eprintln!("{shell_name}: {bash_env}: is a directory");
     }
 }
 

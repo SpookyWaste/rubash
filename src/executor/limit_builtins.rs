@@ -197,7 +197,9 @@ impl Executor {
                 if request.signal == 18 {
                     self.shell_state.job_table.mark_running(pid);
                 } else if matches!(request.signal, 19 | 20) {
-                    self.shell_state.job_table.mark_stopped(pid);
+                    self.shell_state
+                        .job_table
+                        .mark_stopped(pid, Some(request.signal));
                 }
             } else if operand.starts_with('%') && self.jobspec_death_is_unreported(request.signal) {
                 // rubash#796: a jobspec kill of a DONT_REPORT signal is the

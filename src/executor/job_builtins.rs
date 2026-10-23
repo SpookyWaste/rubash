@@ -9,6 +9,32 @@ enum WaitPidOutcome {
     NotFound,
     Status(i32),
     Interrupted(i32),
+    /// The job is already known to be stopped. GNU's wait never blocks
+    /// on a stopped job (jobs.c wait_for_background_pids /
+    /// wait_for_job); the caller renders the form-specific warning and
+    /// status (rubash#1246).
+    Stopped {
+        job_id: u32,
+        stop_signal: i32,
+    },
+}
+
+/// GNU jobs.c:1969 printable_job_status -> j_strsignal: the
+/// strsignal(3) description of the recorded stop signal, used only by
+/// the `jobs -l` long format. SIGTSTP's description is plain `Stopped`
+/// (the caller's fallback), so it has no entry here.
+fn stopped_long_text(stop_signal: Option<i32>) -> Option<&'static str> {
+    let _ = stop_signal;
+    #[cfg(unix)]
+    {
+        match stop_signal {
+            Some(sig) if sig == libc::SIGSTOP as i32 => return Some("Stopped (signal)"),
+            Some(sig) if sig == libc::SIGTTIN as i32 => return Some("Stopped (tty input)"),
+            Some(sig) if sig == libc::SIGTTOU as i32 => return Some("Stopped (tty output)"),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `resolve_background_job` with GNU's three-way get_job_spec result
@@ -449,15 +475,29 @@ impl Executor {
                 .filter(|job| job.background)
                 .flat_map(|job| job.pids.iter().copied())
                 .collect::<Vec<_>>();
+            let mut wait_stderr: Vec<u8> = Vec::new();
             for pid in pids {
                 // wait.def:238-245 wait_for_any_job + :328-331: a trapped
                 // signal interrupts the no-operand wait too, returning
                 // 128+sig.
-                if let WaitPidOutcome::Interrupted(interrupt) =
-                    self.wait_for_background_pid(pid, false)?
-                {
-                    self.write_buffered_builtin_output(cmd, &[], &[])?;
-                    return Ok(interrupt);
+                match self.wait_for_background_pid(pid, false)? {
+                    WaitPidOutcome::Interrupted(interrupt) => {
+                        self.write_buffered_builtin_output(cmd, &[], &wait_stderr)?;
+                        return Ok(interrupt);
+                    }
+                    WaitPidOutcome::Stopped { job_id, .. } => {
+                        // GNU jobs.c:2818 wait_for_background_pids: a
+                        // stopped job is reported, never waited for
+                        // (rubash#1246).
+                        writeln!(
+                            wait_stderr,
+                            "{}wait: warning: job {}[{}] stopped",
+                            self.diagnostic_prefix(),
+                            job_id,
+                            pid
+                        )?;
+                    }
+                    _ => {}
                 }
             }
             // rubash#1022: GNU's no-operand wait also reaps finished
@@ -469,7 +509,7 @@ impl Executor {
             // left alone: GNU would block, but an unkillable block here
             // could hang the shell, so they stay signallable instead.
             self.sweep_procsub_placeholders();
-            self.write_buffered_builtin_output(cmd, &[], &[])?;
+            self.write_buffered_builtin_output(cmd, &[], &wait_stderr)?;
             // Bash's no-operand wait reports success after waiting for all
             // current jobs; individual statuses require an explicit operand.
             return Ok(0);
@@ -500,6 +540,21 @@ impl Executor {
                         self.write_buffered_builtin_output(cmd, &[], &[])?;
                         return Ok(status);
                     }
+                    WaitPidOutcome::Stopped {
+                        job_id,
+                        stop_signal,
+                    } => {
+                        // GNU jobs.c wait_for_job (rubash#1246).
+                        let mut stderr = Vec::new();
+                        writeln!(
+                            stderr,
+                            "{}warning: wait_for_job: job {} is stopped",
+                            self.diagnostic_prefix(),
+                            job_id
+                        )?;
+                        self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                        return Ok(128 + stop_signal);
+                    }
                     WaitPidOutcome::NotFound => {}
                 },
                 JobOperandResolution::Ambiguous => {
@@ -529,6 +584,21 @@ impl Executor {
                             | WaitPidOutcome::Interrupted(status) => {
                                 self.write_buffered_builtin_output(cmd, &[], &[])?;
                                 return Ok(status);
+                            }
+                            WaitPidOutcome::Stopped {
+                                job_id,
+                                stop_signal,
+                            } => {
+                                // GNU jobs.c wait_for_job (rubash#1246).
+                                let mut stderr = Vec::new();
+                                writeln!(
+                                    stderr,
+                                    "{}warning: wait_for_job: job {} is stopped",
+                                    self.diagnostic_prefix(),
+                                    job_id
+                                )?;
+                                self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                                return Ok(128 + stop_signal);
                             }
                             WaitPidOutcome::NotFound => {}
                         }
@@ -759,6 +829,23 @@ impl Executor {
                 WaitPidOutcome::Interrupted(interrupt_status) => {
                     self.write_buffered_builtin_output(cmd, &[], &stderr)?;
                     return Ok(interrupt_status);
+                }
+                WaitPidOutcome::Stopped {
+                    job_id,
+                    stop_signal,
+                } => {
+                    // GNU jobs.c wait_for_job: a stopped job is reported
+                    // (`warning: wait_for_job: job %d is stopped`) and
+                    // the wait returns the stop status 128+sig without
+                    // blocking (rubash#1246).
+                    writeln!(
+                        stderr,
+                        "{}warning: wait_for_job: job {} is stopped",
+                        self.diagnostic_prefix(),
+                        job_id
+                    )?;
+                    status = 128 + stop_signal;
+                    last_pid = Some(pid);
                 }
                 WaitPidOutcome::Status(wait_status) => {
                     status = wait_status;
@@ -1301,6 +1388,27 @@ impl Executor {
         if let Some(interrupt) = self.wait_pending_signal_status()? {
             return Ok(WaitPidOutcome::Interrupted(interrupt));
         }
+        // GNU jobs.c wait_for_background_pids (bare wait) and
+        // wait_for_job (explicit wait): a job the shell already knows
+        // is stopped is never blocked on — a stopped child never exits,
+        // so the poll loop below would hang forever (rubash#1246,
+        // verified GNU 5.3.20: bare wait warns and returns 0, an
+        // explicit wait warns and returns 128+stopsig). The caller
+        // renders the form-specific warning.
+        if let Some((job_id, stop_signal)) = self
+            .shell_state
+            .job_table
+            .pid_to_job
+            .get(&pid)
+            .and_then(|job_id| self.shell_state.job_table.jobs.get(job_id))
+            .filter(|job| job.state == crate::jobs::ProcessState::Stopped)
+            .map(|job| (job.id, job.stop_signal.unwrap_or(19)))
+        {
+            return Ok(WaitPidOutcome::Stopped {
+                job_id,
+                stop_signal,
+            });
+        }
         if let Some(status) = self
             .shell_state
             .job_table
@@ -1570,6 +1678,22 @@ impl Executor {
             }
             let state_text = state_text_opt.unwrap_or_else(|| "Unknown".to_string());
 
+            // GNU jobs.c:1969 printable_job_status: in the LONG format a
+            // stopped job renders the stop signal's strsignal text —
+            // SIGSTOP `Stopped (signal)`, SIGTTIN `Stopped (tty input)`,
+            // SIGTTOU `Stopped (tty output)` (SIGTSTP's description is
+            // plain `Stopped`). The short format and the notification
+            // lines always use the plain state text (rubash#1246,
+            // verified against GNU 5.3.20 in a pty).
+            let display_text = if options.long && state_text == "Stopped" {
+                let stop_signal = job_id
+                    .and_then(|id| self.shell_state.job_table.jobs.get(&id))
+                    .and_then(|job| job.stop_signal);
+                stopped_long_text(stop_signal).unwrap_or(&state_text)
+            } else {
+                &state_text
+            };
+
             // GNU jobs.c:2118-2120 pretty_print_pipeline: the trailing ` &`
             // is printed only while the job is RUNNING and not foreground —
             // the stored command text never contains it.
@@ -1605,7 +1729,7 @@ impl Executor {
                 // `[1]+ 17063` (rubash#233: the old `{marker}  {pid}` shape
                 // printed a fixed two spaces with a left-aligned pid).
                 output.push_str(&format!(
-                    "[{job_number}]{marker} {pid:>5} {state_text:<27}{source}{async_suffix}\n"
+                    "[{job_number}]{marker} {pid:>5} {display_text:<27}{source}{async_suffix}\n"
                 ));
             } else {
                 output.push_str(&format!(
