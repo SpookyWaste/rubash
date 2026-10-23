@@ -797,12 +797,26 @@ impl Executor {
     }
 
     pub(in crate::executor) fn xtrace_prefix(&self) -> String {
-        let ps4 = self
-            .shell_state
-            .env_vars
-            .get("PS4")
-            .cloned()
-            .unwrap_or_else(|| "+ ".to_string());
+        // GNU print_cmd.c:455-466 indirection_level_string reads PS4 via
+        // get_string_value: an UNSET PS4 yields NULL and an empty one
+        // yields "" — both render an EMPTY prefix, not the startup
+        // default. The "+ " default only exists because startup binds it
+        // (init.rs); an explicit `unset PS4` must remove the prefix
+        // (rubash#1343).
+        let ps4 = match self.shell_state.env_vars.get("PS4") {
+            Some(value) => value.clone(),
+            None => return String::new(),
+        };
+        if ps4.is_empty() {
+            return String::new();
+        }
+        // GNU print_cmd.c:469: the PS4 text goes through
+        // decode_prompt_string, so prompt escapes (\w, \t, \$, ...) are
+        // decoded before the expansion pass — the same decode-then-expand
+        // composition as the PS1 channel (parse.y prompt decoding). The
+        // old expansion-only pipeline left `\w` literal in the prefix
+        // (rubash#1343).
+        let decoded = self.decode_prompt_string(&ps4);
         // GNU print_cmd.c:462-466 indirection_level_string: `change_flag
         // ('x', FLAG_OFF)` around decode_prompt_string, restored after —
         // the prefix expansion runs untraced. The suspension counter is
@@ -813,8 +827,9 @@ impl Executor {
         // through xtrace_enabled/shell_option_flags, so both routes agree.
         let suspended = self.shell_state.xtrace_suspended.get();
         self.shell_state.xtrace_suspended.set(suspended + 1);
-        let expanded = self.expand_embedded_parameters(&ps4);
+        let expanded = self.expand_embedded_parameters(&decoded);
         self.shell_state.xtrace_suspended.set(suspended);
+        let expanded = strip_prompt_ignore_markers(&expanded);
         // GNU print_cmd.c:445-510 indirection_level_string: expand PS4
         // (decode_prompt_string), then repeat its FIRST CHARACTER once per
         // indirection_level and append the rest of the string. The base
