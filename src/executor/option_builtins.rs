@@ -9,9 +9,15 @@ impl Executor {
         // Bash. This covers `hash -t cat 2>/dev/null` from builtins9.sub.
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let status = crate::builtins::hash::execute_with_io(
+        // GNU hash.def never hashes builtins or functions (rubash#1215);
+        // the pure builtin cannot see either set, so supply their union.
+        let mut unhashable_names: std::collections::HashSet<String> =
+            self.shell_state.functions.keys().cloned().collect();
+        unhashable_names.extend(builtin_names().iter().map(|name| name.to_string()));
+        let status = crate::builtins::hash::execute_with_io_and_functions(
             &cmd.words[1..],
             &mut self.shell_state.env_vars,
+            &unhashable_names,
             &mut stdout,
             &mut stderr,
         )?;

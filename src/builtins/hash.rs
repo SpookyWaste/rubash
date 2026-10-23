@@ -29,6 +29,30 @@ where
     W: Write,
     E: Write,
 {
+    execute_with_io_and_functions(
+        args,
+        env_vars,
+        &std::collections::HashSet::new(),
+        stdout,
+        stderr,
+    )
+}
+
+/// Same as [`execute_with_io`], with the names GNU hash.def never
+/// hashes — shell builtins and shell functions — supplied by the
+/// executor: the bare builtin cannot see either set from the variable
+/// table alone (rubash#1215).
+pub(crate) fn execute_with_io_and_functions<W, E>(
+    args: &[String],
+    env_vars: &mut VarTable,
+    unhashable_names: &std::collections::HashSet<String>,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> io::Result<i32>
+where
+    W: Write,
+    E: Write,
+{
     // GNU builtins/hash.def:86-90: when hashing is disabled (set +h), the
     // entire `hash` builtin refuses with "hash: hashing disabled" and
     // returns failure, before any option parsing.
@@ -308,6 +332,16 @@ where
             // A name containing '/' is never hashed and never reported
             // (rubash#1362); general.c:864 defines it as containing a slash.
             if name.contains('/') {
+                continue;
+            }
+            // GNU builtins/hash.def hash_builtin: a name that resolves to
+            // a shell builtin or a shell function is skipped silently —
+            // builtins and functions are never hashed, so `hash echo`
+            // succeeds with no entry created and `hash -t echo` afterwards
+            // reports not found (rubash#1215). Reserved words are NOT
+            // skipped: GNU reports `hash: if: not found` for them, which
+            // the PATH search below produces naturally.
+            if unhashable_names.contains(name) {
                 continue;
             }
             // Drop any stale remembered location so the PATH scan is
