@@ -2153,7 +2153,9 @@ impl Executor {
                     "{}read: {name}: not an indexed array",
                     self.diagnostic_prefix()
                 );
-                return self.finish_read_error(cmd, &stderr, 2);
+                // GNU read.def returns EXECUTION_FAILURE (1) here, not the
+                // usage-error status 2 (rubash#1298).
+                return self.finish_read_error(cmd, &stderr, 1);
             }
             if char_limit == Some(0) {
                 let _ = replace_typed_indexed_array(
