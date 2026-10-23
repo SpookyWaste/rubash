@@ -521,11 +521,7 @@ where
             continue;
         }
         if value.starts_with('-') && value != "-" && !saw_signal {
-            // GNU kill.def takes the signal spec as the word after
-            // exactly one leading dash, so `--badflag` reports
-            // `-badflag` in the diagnostic (rubash#1259); stripping all
-            // dashes printed the bare `badflag`.
-            let sigspec = value.strip_prefix('-').unwrap_or(value);
+            let sigspec = value.trim_start_matches('-');
             if !sigspec_accepted(sigspec, posix) {
                 writeln!(
                     stderr,
@@ -773,26 +769,6 @@ pub fn process_exists(pid: u32) -> bool {
 /// of killpg over the job's process list.
 pub fn send_signal(pid: u32, signal: i32) -> Result<(), &'static str> {
     signal_process(pid, signal)
-}
-
-/// Record a console `CTRL_C_EVENT` into this process's self-signal queue.
-///
-/// The niubash host owns `SetConsoleCtrlHandler` on Windows and must not
-/// terminate the shell; it calls this so the engine's wait-slice and
-/// command-boundary polls (`observe_signals_while_blocked` /
-/// `run_pending_signal_traps`) observe Ctrl+C the same way they would a
-/// mailbox SIGINT from another process. Without it, an in-process wait
-/// such as `sleep_interruptibly` never sees the console event and the
-/// command runs to completion (niubash D8).
-///
-/// Unix: no-op — the kernel `signal_hook` backend already receives SIGINT
-/// for the process; a second injection would double-dispatch.
-pub fn note_console_ctrl_c() {
-    #[cfg(not(unix))]
-    {
-        // Linux mailbox wire format: SIGINT = 2.
-        queue_self_signal(2);
-    }
 }
 
 /// Install this process's signal-receiving backend.
@@ -2090,6 +2066,87 @@ mod kernel_signals {
         });
     }
 
+    /// RAII guard: SIGPIPE blocked on the current thread while alive.
+    /// The startup reset (rubash#1333) puts SIGPIPE at SIG_DFL for the
+    /// shell process itself — GNU parity for the shell's own writes and
+    /// for signal delivery. But an in-process pipeline member SHARES
+    /// this process, while GNU forks every member
+    /// (execute_cmd.c:2620): a member's write to a closed pipe kills
+    /// only the member there. Blocking SIGPIPE for the duration of a
+    /// member's execution (and on short-lived payload-writer threads)
+    /// makes those writes fail with EPIPE instead, and the stage
+    /// machinery converts the failure into the member's 141 status —
+    /// the model the pre-#1333 process-wide SIG_IGN provided
+    /// implicitly (niubash#345 producers must not take the shell down).
+    pub struct SigpipeBlockGuard {
+        previous: libc::sigset_t,
+    }
+
+    impl SigpipeBlockGuard {
+        fn new() -> Self {
+            let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+            let mut previous: libc::sigset_t = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGPIPE);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut previous);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for SigpipeBlockGuard {
+        fn drop(&mut self) {
+            unsafe {
+                // A write to a broken pipe with SIGPIPE blocked returns
+                // EPIPE but the kernel still leaves the signal PENDING
+                // for this thread; it would deliver the instant the mask
+                // clears and kill the shell for what was only a member's
+                // broken pipe. When the restored mask leaves SIGPIPE
+                // unblocked (outermost guard), consume a pending
+                // SIGPIPE first. Nested guards restore a still-blocked
+                // mask and skip the drain — the outer guard owns it.
+                if libc::sigismember(&self.previous, libc::SIGPIPE) == 0 {
+                    let mut set: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, libc::SIGPIPE);
+                    let timeout = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    };
+                    let _ = libc::sigtimedwait(&set, std::ptr::null_mut(), &timeout);
+                }
+                libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut());
+            }
+        }
+    }
+
+    pub(super) fn sigpipe_block_guard() -> SigpipeBlockGuard {
+        SigpipeBlockGuard::new()
+    }
+
+    /// Block SIGPIPE on the calling thread with no restore (for
+    /// short-lived writer threads that exit after one payload).
+    pub(super) fn block_sigpipe_on_this_thread() {
+        let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGPIPE);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        }
+    }
+
+    /// Unblock SIGPIPE on the calling thread (child pre-exec: the
+    /// pipeline guard's block must not cross an exec).
+    fn block_sigpipe_on_this_thread_unblock() {
+        let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGPIPE);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        }
+    }
+
     pub(super) fn install() -> io::Result<()> {
         capture_entry_and_policy();
         if KERNEL_SIGNALS.get().is_some() {
@@ -2140,6 +2197,14 @@ mod kernel_signals {
     /// SIG_IGN and exit 0 instead of dying with 131. Runs in pre_exec:
     /// sigaction and atomic loads are async-signal-safe.
     pub(super) fn pre_exec_child_dispositions() -> io::Result<()> {
+        // rubash#1333: the pipeline guard blocks SIGPIPE on the
+        // EXECUTING thread; a signal mask survives fork+exec, so a
+        // child spawned mid-pipeline would inherit the block and its
+        // writes would fail EPIPE (a coreutils producer then prints
+        // "standard output: Broken pipe" where GNU's child dies
+        // silently by the signal). Children always start unblocked;
+        // the disposition loop below gives SIGPIPE its entry default.
+        block_sigpipe_on_this_thread_unblock();
         for &sig in MANAGED.iter() {
             let action = if ENTRY_IGNORED.load(Ordering::Relaxed) & bit(sig) != 0 {
                 // Ignored at shell entry: POSIX keeps it ignored for children.
@@ -2290,6 +2355,19 @@ pub fn kernel_handler_installed(signal: i32) -> bool {
 #[cfg(unix)]
 pub fn hold_fg_sigint() {
     kernel_signals::hold_fg_sigint()
+}
+
+/// Block SIGPIPE on the current thread until the returned guard drops
+/// (see kernel_signals::SigpipeBlockGuard for the model).
+#[cfg(unix)]
+pub fn sigpipe_block_guard() -> kernel_signals::SigpipeBlockGuard {
+    kernel_signals::sigpipe_block_guard()
+}
+
+/// Block SIGPIPE on the calling thread permanently (writer threads).
+#[cfg(unix)]
+pub fn block_sigpipe_on_this_thread() {
+    kernel_signals::block_sigpipe_on_this_thread()
 }
 
 /// rubash#1250: release the foreground SIGINT hold (restores Default,
