@@ -1,0 +1,11 @@
+after-badopt rc=2
+cap2:
+issue1230-exec-redirect-undo.sh: line 5: exec: --: invalid option
+exec: usage: exec [-cl] [-a name] [command [argument ...]] [redirection ...]
+after-help rc=2
+cap3 first line:
+exec: exec [-cl] [-a name] [command [argument ...]] [redirection ...]
+cap4 size: 0
+keep:
+kept line
+stdout still mine

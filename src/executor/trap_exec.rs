@@ -2123,10 +2123,18 @@ impl Executor {
             }
         }
 
-        // Bash applies redirections before `exec` parses its options.  This
-        // matters when an expanded option is invalid: the diagnostic is still
-        // emitted, but a stdout redirection remains in effect afterwards.
+        // GNU applies the redirections to a temporary undo scope while
+        // `exec` parses its options (redir.c do_redirections with
+        // REDIRECTIONS_UNDOABLE for a builtin that may fail): the option
+        // diagnostics land in the redirected targets, but when option
+        // parsing fails (EX_BADUSAGE) the redirections are undone and the
+        // shell keeps its original stdout/stderr (rubash#1230). Only a
+        // bare `exec` whose options parse cleanly (the redirects-only
+        // branch above) makes them permanent. Snapshot both persistence
+        // stores and roll back on EX_BADUSAGE.
         if self.exec_has_no_command_operand_after_expansion(cmd) {
+            let saved_env_vars = self.shell_state.env_vars.clone();
+            let saved_fd_table = self.fd_table.clone();
             self.execute_stdio_only_exec_redirect(cmd)?;
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
@@ -2155,7 +2163,14 @@ impl Executor {
                     );
                 }
             }
+            // Route the buffered output while the temporary redirections
+            // are still in effect (the diagnostics belong in the redirect
+            // targets), then undo them if the exec failed.
             self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+            if status == 2 {
+                self.shell_state.env_vars = saved_env_vars;
+                self.fd_table = saved_fd_table;
+            }
             return Ok(status);
         }
 
