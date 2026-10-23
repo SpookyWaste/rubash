@@ -2206,13 +2206,31 @@ pub fn reconcile_kernel_trap_dispositions(env_vars: &std::collections::HashMap<S
             break;
         }
     }
-    if !any_armed && no_reset && kernel_signals::at_default_state() {
+    // An armed EXIT trap also forces the slow path: it routes every
+    // otherwise-untrapped managed signal through the handler
+    // (sig.c:226-229, rubash#1332 — see the disposition loop below).
+    let exit_armed = env_vars
+        .get("__RUBASH_TRAP_EXIT")
+        .is_some_and(|action| !action.is_empty());
+    if !any_armed && !exit_armed && no_reset && kernel_signals::at_default_state() {
         return;
     }
     let reset = env_vars
         .get("__RUBASH_TRAP_RESET")
         .map(|value| value.as_str())
         .unwrap_or("");
+    // GNU sig.c:226-229: an EXIT trap forces
+    // initialize_terminating_signals — `if (signal_is_trapped (EXIT))
+    // set_signal_handler for every terminating signal` — even in a
+    // non-interactive shell. Without it an untrapped SIGTERM kills the
+    // process at the kernel and the EXIT trap never runs; with it the
+    // delivery queues here and the boundary dispatch turns it into the
+    // 128+signal exit, whose top-level path runs the EXIT trap first
+    // (rubash#1332).
+    let exit_armed = env_vars
+        .get("__RUBASH_TRAP_EXIT")
+        .is_some_and(|action| !action.is_empty())
+        && !reset_contains(reset, "EXIT");
     let mut dispositions = [(0i32, Disposition::Default); 7];
     for (slot, &(sig, short, key)) in dispositions.iter_mut().zip(MANAGED_TRAP_KEYS.iter()) {
         let want = match env_vars.get(key) {
@@ -2226,6 +2244,9 @@ pub fn reconcile_kernel_trap_dispositions(env_vars: &std::collections::HashMap<S
             Some(_) if reset_contains(reset, short) => Disposition::Default,
             // trap '' SIG: ignored (trap.def ignore path, kernel SIG_IGN).
             Some(_) => Disposition::Ignore,
+            // No trap of its own: an armed EXIT trap still routes the
+            // signal through the handler (sig.c:226-229 above).
+            None if exit_armed => Disposition::Handler,
             None => Disposition::Default,
         };
         *slot = (sig, want);
