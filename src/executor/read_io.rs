@@ -147,6 +147,42 @@ impl Executor {
         escape_aware: bool,
         raw: bool,
     ) -> Option<String> {
+        // GNU builtins/read.def: NUL bytes in the input are skipped as
+        // the record is read — they never reach the assigned value,
+        // the IFS field splitting, or a -a array (rubash#1419:
+        // `printf 'a\0b\n' | read -r v` binds "ab", not "a\0b"). Every
+        // transport below serves the record with NULs intact, so strip
+        // them at this single funnel. The delimiter itself is excluded
+        // by the readers, and a NUL delimiter stops the record before
+        // any NUL can appear, so `read -d ''` is unaffected.
+        let line = self.read_input_for_command_inner(
+            cmd,
+            read_fd,
+            silent,
+            delimiter,
+            char_limit,
+            exact_char_limit,
+            escape_aware,
+            raw,
+        )?;
+        Some(if line.contains('\0') {
+            line.replace('\0', "")
+        } else {
+            line
+        })
+    }
+
+    fn read_input_for_command_inner(
+        &mut self,
+        cmd: &CommandNode,
+        read_fd: Option<u32>,
+        silent: bool,
+        delimiter: char,
+        char_limit: Option<usize>,
+        exact_char_limit: bool,
+        escape_aware: bool,
+        raw: bool,
+    ) -> Option<String> {
         // rubash#1250: hold untrapped SIGINT at the mailbox handler for
         // the whole acquisition, like the `sleep` fast path: an
         // interactive `read -t 30` (or a plain tty read) otherwise sat

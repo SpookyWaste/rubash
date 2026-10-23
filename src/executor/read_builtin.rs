@@ -2483,6 +2483,15 @@ impl Executor {
                         // record is still assigned and the status becomes
                         // 128+SIGALRM via take_read_timed_out below.
                         self.read_timed_out |= timed_out;
+                        // rubash#1419: this last-resort transport bypasses
+                        // read_input_for_command, so apply its NUL skip
+                        // here too (read.def discards NUL bytes as the
+                        // record is read).
+                        let line = if line.contains('\0') {
+                            line.replace('\0', "")
+                        } else {
+                            line
+                        };
                         self.read_eof_no_delimiter |= stdin_eof;
                         let line = if !raw
                             && delimiter == '\n'
