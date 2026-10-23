@@ -630,6 +630,22 @@ impl Executor {
                 *current = value.clone();
             }
         }
+        if name == "__RUBASH_IS_C" {
+            // GNU: a `-c` command string has no script file, so BASH_SOURCE
+            // starts as a set-but-EMPTY array; only function entry pushes
+            // the $0 operand (via current_bash_source's fallback). The
+            // __RUBASH_SCRIPT_NAME installed for the same invocation
+            // carries that $0 operand and seeded the stack when it was set
+            // (the name is set before IS_C at every startup site —
+            // invocation.rs / main.rs); clear both here (rubash#1306). The
+            // SCRIPT_NAME branch below guards the reverse seeding order.
+            self.shell_state.bash_source_stack.clear();
+            store_indexed_array_state(
+                &mut self.shell_state,
+                "BASH_SOURCE",
+                Vec::<String>::new(),
+            );
+        }
         if name == "__RUBASH_SCRIPT_NAME" {
             let source_value = if self
                 .shell_state
@@ -654,6 +670,17 @@ impl Executor {
             if self.shell_state.env_vars.contains_key("__RUBASH_IN_SOURCE") {
                 let values = self.shell_state.bash_source_stack.clone();
                 store_indexed_array_state(&mut self.shell_state, "BASH_SOURCE", values);
+                return;
+            }
+            if self.shell_state.env_vars.contains_key("__RUBASH_IS_C") {
+                // `-c` invocation (host seeded IS_C before the name):
+                // BASH_SOURCE stays the set-but-empty array (rubash#1306).
+                self.shell_state.bash_source_stack.clear();
+                store_indexed_array_state(
+                    &mut self.shell_state,
+                    "BASH_SOURCE",
+                    Vec::<String>::new(),
+                );
                 return;
             }
             self.shell_state.bash_source_stack = vec![source_value.clone()];
