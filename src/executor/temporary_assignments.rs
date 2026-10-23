@@ -1534,13 +1534,22 @@ impl Executor {
         // stores the value at key "0" via assign_func. Without this, a value
         // like `([a]=1)` is stored raw and later misinterpreted as assoc
         // storage format (assoc.tests:191 T='([a]=1)' -> ${T[@]} is `([a]=1)`,
-        // not `1`).
+        // not `1`). The bind MERGES into the existing entries like the
+        // indexed-array arm above (bind_variable_internal keeps the other
+        // elements): building a fresh `(["0"]=v)` storage here silently
+        // dropped every pre-existing key (rubash#1347).
         if !compound_assignment
             && !append
             && is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base_name)
             && !value.starts_with(STORAGE_WORD_PREFIX)
         {
-            let storage = format!("([\"0\"]={})", quote_assoc_storage_value(&value));
+            let current = self
+                .shell_state
+                .env_vars
+                .get(base_name)
+                .cloned()
+                .unwrap_or_default();
+            let storage = append_assoc_scalar_value(&current, &value);
             // Assoc scalar bind stores at key "0" — keep the structured cell
             // in lockstep from the same render.
             sync_typed_assoc_storage(&mut self.shell_state.variables, base_name, &storage);
