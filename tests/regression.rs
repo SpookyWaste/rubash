@@ -113,6 +113,7 @@ macro_rules! golden_fixture {
 golden_fixture!(golden_andor_continuation => "andor-continuation", timeout 60, corpus []);
 golden_fixture!(golden_declare_integer_nameref => "declare-integer-nameref", timeout 60, corpus []);
 golden_fixture!(golden_let_bare_diagnostic => "let-bare-diagnostic", timeout 60, corpus []);
+golden_fixture!(golden_tilde_dirstack => "tilde-dirstack", timeout 60, corpus []);
 golden_fixture!(golden_umask_comsub => "umask-comsub", timeout 60, corpus []);
 golden_fixture!(golden_at_star_matrix => "at-star-matrix", timeout 60, corpus []);
 golden_fixture!(golden_catfile_comsub => "catfile-comsub", timeout 60, corpus []);

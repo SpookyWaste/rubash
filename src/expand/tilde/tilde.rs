@@ -56,68 +56,85 @@ pub fn expand_word_prefix(word: &str, env_vars: &HashMap<String, String>) -> Opt
         return Some(format!("{}/{}", home_value(env_vars), rest));
     }
 
+    if let Some(expanded) = special_tilde_expansion(word, env_vars) {
+        return expanded;
+    }
+
     match word {
         "~" => Some(home_value(env_vars)),
         "~+" => env_vars.get("PWD").cloned(),
         "~-" => env_vars.get("OLDPWD").cloned(),
-        _ => {
-            // GNU lib/tilde/tilde.c: the `~+`/`~-` prefix family (with an
-            // optional directory-stack index and/or a `/` tail) is resolved
-            // BEFORE the getpwnam user lookup — rubash#1232 left `~+/x`,
-            // `~-/x` and every `~+N` literal because only the bare forms
-            // were matched above.
-            if let Some(expanded) = word
-                .strip_prefix('~')
-                .and_then(|rest| expand_pwd_tilde(rest, env_vars))
-            {
-                return Some(expanded);
-            }
-            expand_user_tilde_word(word, env_vars)
-        }
+        _ => expand_user_tilde_word(word, env_vars),
     }
 }
 
-/// GNU lib/tilde/tilde.c (isolate_tilde_prefix / tilde_expand_word): the
-/// tilde prefix may be `~+` or `~-`, optionally followed by decimal digits
-/// — a directory-stack index. The prefix ends at the first `/` or `:` or at
-/// the end of the word; the tail glues verbatim. Bare `~+` reads $PWD and
-/// bare `~-` reads $OLDPWD (an unset variable expands to nothing, so the
-/// word stays literal); `~+N` is the Nth stack entry counting from the
-/// left (0 = the current directory) and `~-N` the Nth counting from the
-/// right. An out-of-range index is not an expansion (None), matching the
-/// unknown-user failure path.
-fn expand_pwd_tilde(rest: &str, env_vars: &HashMap<String, String>) -> Option<String> {
-    let (from_right, after_sign) = if let Some(tail) = rest.strip_prefix('+') {
-        (false, tail)
-    } else if let Some(tail) = rest.strip_prefix('-') {
-        (true, tail)
-    } else {
-        return None;
+/// GNU general.c:1120 bash_special_tilde_expansions (the tilde
+/// preexpansion hook) + builtins/pushd.def:620 get_dirstack_from_string:
+/// the special tilde prefixes are `+` ($PWD), `-` ($OLDPWD), and a
+/// sign-or-digit-leading ALL-DIGIT prefix resolved against the
+/// directory stack (`+N` and bare `N` count from the top — 0 is the
+/// current directory — and `-N` counts from the bottom, so `-0` is the
+/// oldest entry). The whole prefix up to the first `/` must be the
+/// sign+digits form; an out-of-range index fails the expansion and the
+/// caller keeps the word verbatim (get_dirstack_from_string returns
+/// NULL exactly like a failed getpwnam).
+///
+/// Returns Some(Some(value)) when the prefix resolves, Some(None) when
+/// the prefix is a special form that cannot resolve (keep the word
+/// verbatim), and None when the prefix is not a special form at all
+/// (the caller falls through to the `~user` lookup).
+pub fn special_tilde_expansion(
+    word: &str,
+    env_vars: &HashMap<String, String>,
+) -> Option<Option<String>> {
+    let rest = word.strip_prefix('~')?;
+    // Integration merge (k2 #1232 + k3 #1244): GNU also ends the special
+    // prefix at a ':' and glues the rest verbatim in word position
+    // (`~+1:sub` -> "<stack[1]>:sub", `~2:y` -> "<stack[2]>:y" — verified
+    // against GNU bash 5.3.20). Assignment values reach this function one
+    // ':'-separated segment at a time, so a ':' here is always a word tail.
+    let (head, tail) = match rest.find(['/', ':']) {
+        Some(index) => (&rest[..index], Some(&rest[index..])),
+        None => (rest, None),
     };
-    let digit_len = after_sign
-        .bytes()
-        .take_while(|byte| byte.is_ascii_digit())
-        .count();
-    let (digits, tail) = after_sign.split_at(digit_len);
-    if !tail.is_empty() && !tail.starts_with('/') && !tail.starts_with(':') {
-        return None;
-    }
-    let base = if digits.is_empty() {
-        let variable = if from_right { "OLDPWD" } else { "PWD" };
-        env_vars.get(variable)?.clone()
-    } else {
-        let index: usize = digits.parse().ok()?;
-        let stack = crate::builtins::pushd::load_stack(env_vars);
-        if from_right {
-            if index >= stack.len() {
+    let value = match head {
+        "+" => env_vars.get("PWD").cloned(),
+        "-" => env_vars.get("OLDPWD").cloned(),
+        _ => {
+            let (from_right, digits) = if let Some(digits) = head.strip_prefix('-') {
+                (true, digits)
+            } else if let Some(digits) = head.strip_prefix('+') {
+                (false, digits)
+            } else {
+                (false, head)
+            };
+            if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
                 return None;
             }
-            stack[stack.len() - 1 - index].clone()
-        } else {
-            stack.get(index)?.clone()
+            let count: usize = digits.parse().ok()?;
+            let stack = crate::builtins::pushd::load_stack(env_vars);
+            let index = if from_right {
+                if count < stack.len() {
+                    stack.len() - 1 - count
+                } else {
+                    return Some(None);
+                }
+            } else {
+                count
+            };
+            match stack.get(index) {
+                Some(dir) => Some(dir.clone()),
+                None => return Some(None),
+            }
         }
     };
-    Some(format!("{base}{tail}"))
+    match value {
+        Some(value) => Some(Some(match tail {
+            Some(tail) => format!("{value}{tail}"),
+            None => value,
+        })),
+        None => Some(None),
+    }
 }
 
 /// GNU lib/tilde/tilde.c:361-410: `~user` and `~user/rest` resolve the user
@@ -308,13 +325,12 @@ pub(crate) fn expand_tilde_segment(segment: &str, env_vars: &HashMap<String, Str
         };
     }
 
-    // GNU lib/tilde/tilde.c: a `~+`/`~-` segment (with optional stack
-    // index or `/` tail) resolves against $PWD/$OLDPWD/the directory
-    // stack, never through getpwnam (rubash#1232: `x=~/a:~+/b` kept the
-    // second segment literal).
-    if rest.starts_with('+') || rest.starts_with('-') {
-        return match expand_pwd_tilde(rest, env_vars) {
-            Some(expanded) => expanded,
+    // GNU general.c:1120 bash_special_tilde_expansions: an assignment
+    // segment takes the same special prefixes as a plain word
+    // (`x=~+1`, `PATH=~-0:$PATH`, `v=~+1:~-1`).
+    if let Some(expanded) = special_tilde_expansion(segment, env_vars) {
+        return match expanded {
+            Some(value) => value,
             None => segment.to_string(),
         };
     }
@@ -476,6 +492,73 @@ mod tests {
             "a:~missing/x:b"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// GNU general.c:1120 bash_special_tilde_expansions +
+    /// builtins/pushd.def:620 get_dirstack_from_string (rubash#1244):
+    /// `~+N`/bare `~N` count from the stack top (0 = $PWD), `~-N` from
+    /// the bottom (-0 = oldest), a `/tail` glues on, and out-of-range
+    /// indices keep the word verbatim. Non-numeric prefixes are not
+    /// special (the caller falls through to the `~user` lookup).
+    #[test]
+    fn special_tilde_expansion_resolves_dirstack_forms() {
+        let sep = crate::executor::markers::DIR_STACK_FIELD_SEP;
+        let env_vars = HashMap::from([
+            ("PWD".to_string(), "/c".to_string()),
+            ("OLDPWD".to_string(), "/b".to_string()),
+            (
+                crate::builtins::pushd::DIR_STACK.to_string(),
+                format!("/c{sep}/b{sep}/a"),
+            ),
+        ]);
+
+        // Bare +/- keep their historical meaning ($PWD / $OLDPWD).
+        assert_eq!(
+            special_tilde_expansion("~+", &env_vars),
+            Some(Some("/c".to_string()))
+        );
+        assert_eq!(
+            special_tilde_expansion("~-", &env_vars),
+            Some(Some("/b".to_string()))
+        );
+        // From the top.
+        assert_eq!(
+            special_tilde_expansion("~+0", &env_vars),
+            Some(Some("/c".to_string()))
+        );
+        assert_eq!(
+            special_tilde_expansion("~+1", &env_vars),
+            Some(Some("/b".to_string()))
+        );
+        assert_eq!(
+            special_tilde_expansion("~2", &env_vars),
+            Some(Some("/a".to_string()))
+        );
+        // From the bottom.
+        assert_eq!(
+            special_tilde_expansion("~-0", &env_vars),
+            Some(Some("/a".to_string()))
+        );
+        assert_eq!(
+            special_tilde_expansion("~-2", &env_vars),
+            Some(Some("/c".to_string()))
+        );
+        // Tails glue onto the resolved directory.
+        assert_eq!(
+            special_tilde_expansion("~+1/sub", &env_vars),
+            Some(Some("/b/sub".to_string()))
+        );
+        assert_eq!(
+            special_tilde_expansion("~-0/sub", &env_vars),
+            Some(Some("/a/sub".to_string()))
+        );
+        // Out of range: special form, no resolution (verbatim word).
+        assert_eq!(special_tilde_expansion("~+9", &env_vars), Some(None));
+        assert_eq!(special_tilde_expansion("~-9", &env_vars), Some(None));
+        // Not special at all: user-name territory.
+        assert_eq!(special_tilde_expansion("~1abc", &env_vars), None);
+        assert_eq!(special_tilde_expansion("~root", &env_vars), None);
+        assert_eq!(special_tilde_expansion("~+abc", &env_vars), None);
     }
 
     /// Unix wiring (E9, GNU tilde.c:329 tilde_expand_word -> getpwnam :379):
