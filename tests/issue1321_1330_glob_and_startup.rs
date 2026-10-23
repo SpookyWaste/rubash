@@ -60,6 +60,30 @@ fn globignore_matches_dir_results_by_basename() {
 }
 
 #[test]
+fn globignore_uses_strmatch_pathname_semantics() {
+    // pathexp.c glob_name_is_acceptable(): strmatch(pattern, name,
+    // FNM_PATHNAME) on the FULL collected name — a non-trailing `*`
+    // never crosses `/`, a trailing `*` matches any remainder, and
+    // there is no basename fallback.
+    let dir = fixture_tree();
+    std::fs::create_dir_all(dir.join("d/x")).expect("mkdir d/x");
+    std::fs::File::create(dir.join("d/x/inner"))
+        .unwrap()
+        .write_all(b"x")
+        .unwrap();
+    std::fs::create_dir_all(dir.join("d2")).expect("mkdir d2");
+    std::fs::File::create(dir.join("d2/a.txt"))
+        .unwrap()
+        .write_all(b"x")
+        .unwrap();
+    let (stdout, _, _) = rubash_c(&format!(
+        "cd {}; GLOBIGNORE='*/inner'; echo d/*/inner; GLOBIGNORE='d/*'; echo d/*/inner; GLOBIGNORE='a.txt'; echo d2/*",
+        dir.display()
+    ));
+    assert_eq!(stdout, "d/x/inner\nd/*/inner\nd2/a.txt\n");
+}
+
+#[test]
 fn globstar_trailing_slash_includes_base_and_keeps_dot_prefix() {
     let dir = fixture_tree();
     let (stdout, _, _) = rubash_c(&format!(
