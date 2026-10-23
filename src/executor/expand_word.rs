@@ -775,6 +775,16 @@ impl Executor {
                     format!("{}{}\n", self.error_prefix(), message).as_bytes(),
                 );
             }
+            // The word WAS admitted as a whole-word arithmetic expansion
+            // above, so its failure is final: never fall through to the
+            // `$(` command-substitution arm below, which re-reads
+            // `$((1/0))` as `$(` + `(1/0)` + `)` and executes `1/0` as a
+            // command — rubash#1241's phantom `1/0: No such file or
+            // directory` printed after the real diagnostic in for-loop
+            // and case word lists. GNU decides `$((` vs `$(` at parse
+            // time (parse.y parse_comsub / parse_matched_pair); an
+            // arithmetic word can never become a command substitution.
+            return Some(String::new());
         }
 
         if let Some(source) = word

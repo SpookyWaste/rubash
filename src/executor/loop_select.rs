@@ -63,7 +63,31 @@ impl Executor {
                     .map(|metadata| metadata.raw.as_str());
                 let metadata = for_command.word_metadata.get(index);
                 match self.expand_for_word_values_result(word, raw, metadata) {
-                    Ok(expanded) => values.extend(expanded),
+                    Ok(expanded) => {
+                        // GNU execute_cmd.c execute_for_command expands
+                        // the whole word list (expand_word_list) before
+                        // the first iteration: an arithmetic evalerror in
+                        // ANY word fails the entire expansion (expr.c
+                        // evalerror -> jump_to_top_level DISCARD) — no
+                        // iteration runs, the for returns 1, the rest of
+                        // its source line is discarded and the next line
+                        // runs (rubash#1241). The word expander records
+                        // the failure in the arithmetic error flags and
+                        // returns a hollowed value; convert it here via
+                        // the compound-expansion consumer (which clears
+                        // both flags and yields the class status), or
+                        // the stale flags silently poison the NEXT
+                        // command — its expansion is hollowed out and
+                        // even its diagnostic is suppressed by the
+                        // report-once latch.
+                        if self.shell_state.arithmetic_fatal_error.get()
+                            || self.shell_state.arithmetic_nounset_error.get()
+                        {
+                            self.raise_evalerror_abort();
+                            self.abandon_on_arithmetic_expansion_error()?;
+                        }
+                        values.extend(expanded);
+                    }
                     Err(pattern) => {
                         self.report_failglob(&pattern);
                         // failglob is a fatal word-expansion error (GNU):
