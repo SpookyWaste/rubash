@@ -86,6 +86,44 @@ pub(in crate::executor) fn parse_indirect_pattern_removal(
     None
 }
 
+/// Byte offsets that fall between the two halves of a marker pair:
+/// a raw-byte marker (U+E000 + payload U+E001..=U+E100, or U+E000 +
+/// U+E000 for a literal sentinel) or a literal-char escape (U+E400 +
+/// any char). Both encodings are single units — the pattern matcher
+/// flattens each pair to one byte/char — so a removal boundary inside
+/// a pair would strand a lone marker char in the result (rubash#1261:
+/// `${v#?}` on a lone 0xFF byte left U+E100 behind instead of
+/// stripping to empty). Mirrors the greedy pairing of
+/// shell_text_to_raw_bytes.
+fn marker_pair_split_points(value: &str) -> Vec<usize> {
+    if !value.contains('\u{E000}') && !value.contains('\u{E400}') {
+        return Vec::new();
+    }
+    let mut points = Vec::new();
+    let mut chars = value.char_indices().peekable();
+    while let Some((_, ch)) = chars.next() {
+        let is_escape_lead =
+            (ch as u32) == crate::executor::substitution_metadata::RAW_BYTE_MARKER_ESCAPE;
+        let is_literal_lead = ch == crate::executor::markers::LITERAL_CHAR_ESCAPE;
+        if !is_escape_lead && !is_literal_lead {
+            continue;
+        }
+        let Some(&(next_index, next)) = chars.peek() else {
+            break;
+        };
+        let paired = is_literal_lead
+            || (next as u32) == crate::executor::substitution_metadata::RAW_BYTE_MARKER_ESCAPE
+            || (crate::executor::substitution_metadata::RAW_BYTE_MARKER_FIRST
+                ..=crate::executor::substitution_metadata::RAW_BYTE_MARKER_LAST)
+                .contains(&(next as u32));
+        if paired {
+            points.push(next_index);
+            chars.next();
+        }
+    }
+    points
+}
+
 pub(in crate::executor) fn remove_matching_prefix(
     value: &str,
     pattern: &str,
@@ -100,11 +138,14 @@ pub(in crate::executor) fn remove_matching_prefix(
     // Iterator>` pair was two allocations per removal call, paid once per
     // candidate boundary in the loop below. CharIndices/Chain are
     // DoubleEndedIterators, so the Longest walk is the same reversed
-    // order the collected Vec produced.
+    // order the collected Vec produced. Boundaries that would split a
+    // marker pair are not candidates (marker_pair_split_points).
+    let split_points = marker_pair_split_points(value);
     let mut indices = value
         .char_indices()
         .map(|(index, _)| index)
-        .chain(std::iter::once(value.len()));
+        .chain(std::iter::once(value.len()))
+        .filter(|index| !split_points.contains(index));
     let matched = match length {
         MatchLength::Shortest => indices
             .find(|&end| removal_pattern_matches(pattern, &value[..end], extglob))
@@ -126,11 +167,15 @@ pub(in crate::executor) fn remove_matching_suffix(
     if pattern_has_raw_byte_markers(pattern) {
         return remove_matching_suffix_bytes(value, pattern, length, extglob);
     }
-    // Same allocation-free boundary walk as remove_matching_prefix above.
+    // Same allocation-free boundary walk as remove_matching_prefix above,
+    // with the same marker-pair split exclusion (rubash#1261: the `%`
+    // form stranded the U+E000 sentinel half).
+    let split_points = marker_pair_split_points(value);
     let mut indices = value
         .char_indices()
         .map(|(index, _)| index)
-        .chain(std::iter::once(value.len()));
+        .chain(std::iter::once(value.len()))
+        .filter(|index| !split_points.contains(index));
     let matched = match length {
         MatchLength::Shortest => indices
             .rev()
