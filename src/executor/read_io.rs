@@ -48,7 +48,7 @@ impl Executor {
         while line.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1 {
             line.pop();
             let Some(next) =
-                self.read_input_for_command(cmd, read_fd, silent, '\n', None, false, false)
+                self.read_input_for_command(cmd, read_fd, silent, '\n', None, false, false, false)
             else {
                 // GNU read.def:802-830: the `\<newline>` pair is swallowed
                 // and reading continues; a continuation that hits EOF is
@@ -145,6 +145,7 @@ impl Executor {
         char_limit: Option<usize>,
         exact_char_limit: bool,
         escape_aware: bool,
+        raw: bool,
     ) -> Option<String> {
         // rubash#1250: hold untrapped SIGINT at the mailbox handler for
         // the whole acquisition, like the `sleep` fast path: an
@@ -230,6 +231,7 @@ impl Executor {
                     char_limit,
                     exact_char_limit,
                     escape_aware,
+                    raw,
                 ));
             }
             if let Some(heredoc) = &cmd.heredoc {
@@ -242,6 +244,7 @@ impl Executor {
                     char_limit,
                     exact_char_limit,
                     escape_aware,
+                    raw,
                 ));
             }
         }
@@ -259,11 +262,12 @@ impl Executor {
                 char_limit,
                 exact_char_limit,
                 escape_aware,
+                raw,
             ) {
                 return Some(line);
             }
             if let Some(output) =
-                self.read_coproc_stdout(fd, delimiter, char_limit, exact_char_limit, escape_aware)
+                self.read_coproc_stdout(fd, delimiter, char_limit, exact_char_limit, escape_aware, raw)
             {
                 self.read_eof_no_delimiter |=
                     !record_contains_delimiter(&output, delimiter, escape_aware);
@@ -273,6 +277,7 @@ impl Executor {
                     char_limit,
                     exact_char_limit,
                     escape_aware,
+                    raw,
                 ));
             }
             // A dup of fd 0 (`exec 8<&0; read -u 8`) shares fd 0's open file
@@ -295,6 +300,7 @@ impl Executor {
                     char_limit,
                     exact_char_limit,
                     escape_aware,
+                    raw,
                 );
             }
             return self
@@ -305,6 +311,7 @@ impl Executor {
                     char_limit,
                     exact_char_limit,
                     escape_aware,
+                    raw,
                 )
                 .or_else(|| {
                     self.read_heredoc_fd_input(
@@ -314,6 +321,7 @@ impl Executor {
                         char_limit,
                         exact_char_limit,
                         escape_aware,
+                        raw,
                     )
                 });
         }
@@ -379,6 +387,7 @@ impl Executor {
                         char_limit,
                         exact_char_limit,
                         escape_aware,
+                        raw,
                     ));
                 }
             }
@@ -412,6 +421,7 @@ impl Executor {
                         char_limit,
                         exact_char_limit,
                         escape_aware,
+                        raw,
                     );
                 }
                 if let Some(output) = self.read_coproc_stdout(
@@ -420,6 +430,7 @@ impl Executor {
                     char_limit,
                     exact_char_limit,
                     escape_aware,
+                    raw,
                 ) {
                     return Some(output);
                 }
@@ -430,6 +441,7 @@ impl Executor {
                     char_limit,
                     exact_char_limit,
                     escape_aware,
+                    raw,
                 ) {
                     return Some(line);
                 }
@@ -440,6 +452,7 @@ impl Executor {
                     char_limit,
                     exact_char_limit,
                     escape_aware,
+                    raw,
                 );
             }
 
@@ -480,6 +493,7 @@ impl Executor {
                     char_limit,
                     exact_char_limit,
                     escape_aware,
+                    raw,
                 );
                 match saved {
                     Some(entry) => {
@@ -519,6 +533,7 @@ impl Executor {
                 char_limit,
                 exact_char_limit,
                 escape_aware,
+                raw,
             ));
         }
 
@@ -535,6 +550,7 @@ impl Executor {
                     char_limit,
                     exact_char_limit,
                     escape_aware,
+                    raw,
                 ));
             }
         }
@@ -574,6 +590,7 @@ impl Executor {
                 char_limit,
                 exact_char_limit,
                 escape_aware,
+                raw,
             );
         }
         if fd0_file_is_null
@@ -589,6 +606,7 @@ impl Executor {
                 char_limit,
                 exact_char_limit,
                 escape_aware,
+                raw,
             ) {
                 return Some(line);
             }
@@ -597,7 +615,7 @@ impl Executor {
         // If FUNCTION_STDIN is set (from heredoc or redirect), only read from it.
         // Do NOT fall through to process stdin - that would block on the terminal.
         if self.shell_state.env_vars.contains_key(FUNCTION_STDIN) {
-            return self.read_function_stdin(delimiter, char_limit, exact_char_limit, escape_aware);
+            return self.read_function_stdin(delimiter, char_limit, exact_char_limit, escape_aware, raw);
         }
 
         if let Some(line) = self.read_virtual_fd_stdin(
@@ -607,6 +625,7 @@ impl Executor {
             char_limit,
             exact_char_limit,
             escape_aware,
+            raw,
         ) {
             return Some(line);
         }
@@ -631,7 +650,7 @@ impl Executor {
             return None;
         }
 
-        self.read_function_stdin(delimiter, char_limit, exact_char_limit, escape_aware)
+        self.read_function_stdin(delimiter, char_limit, exact_char_limit, escape_aware, raw)
             .or_else(|| {
                 self.read_inherited_process_stdin(
                     silent,
@@ -639,6 +658,7 @@ impl Executor {
                     char_limit,
                     exact_char_limit,
                     escape_aware,
+                    raw,
                 )
             })
     }
@@ -657,9 +677,10 @@ impl Executor {
         char_limit: Option<usize>,
         exact_char_limit: bool,
         escape_aware: bool,
+        raw: bool,
     ) -> Option<String> {
         if let Some(line) =
-            self.read_function_stdin(delimiter, char_limit, exact_char_limit, escape_aware)
+            self.read_function_stdin(delimiter, char_limit, exact_char_limit, escape_aware, raw)
         {
             return Some(line);
         }
@@ -669,6 +690,7 @@ impl Executor {
             char_limit,
             exact_char_limit,
             escape_aware,
+            raw,
         ) {
             return Some(line);
         }
@@ -680,6 +702,7 @@ impl Executor {
             exact_char_limit,
             self.read_sigint_guard_armed,
             escape_aware,
+            raw,
         ) {
             // rubash#1250: an untrapped SIGINT aborted the raw read —
             // record it so the acquisition cascade stops here.
@@ -713,6 +736,7 @@ impl Executor {
         char_limit: Option<usize>,
         exact_char_limit: bool,
         escape_aware: bool,
+        raw: bool,
     ) -> Option<String> {
         // Bash exposes the coprocess output as COPROC[0] (and NAME[0]).
         // Rubash stores that endpoint as a PipeReader keyed by the child PID.
@@ -737,6 +761,8 @@ impl Executor {
         let mut ended = false;
         // rubash#1300: escaped bytes never terminate the record.
         let mut escapes = crate::executor::fd_table::ReadEscapeTracker::new(escape_aware);
+        // Post-escape counting state for the char limit (rubash#1328).
+        let mut escaped = false;
         // read.def:731-738: a record that is just the delimiter is served
         // (empty line, GNU rc 0) — tracked so the empty check below cannot
         // conflate it with EOF (niubash#275).
@@ -758,15 +784,28 @@ impl Executor {
                 }
                 Ok(buf) => {
                     bytes.push(buf[0]);
+                    let was_escaped = escaped;
+                    if escaped {
+                        if buf[0] != b'\n' {
+                            consumed_chars += 1;
+                        }
+                        escaped = false;
+                    } else if !raw && buf[0] == b'\\' {
+                        escaped = true;
+                    } else {
+                        consumed_chars += 1;
+                    }
                     let suppressed = escapes.suppresses_match(buf[0]);
-                    if !suppressed && delimiter_byte_matches(buf[0], delimiter) && !exact_char_limit
+                    if !suppressed
+                        && !was_escaped
+                        && delimiter_byte_matches(buf[0], delimiter)
+                        && !exact_char_limit
                     {
                         delimiter_found = true;
                         break;
                     }
                     if let Some(limit) = char_limit {
-                        consumed_chars += 1;
-                        if consumed_chars >= limit {
+                        if consumed_chars >= limit && !escaped {
                             break;
                         }
                     }
@@ -816,6 +855,7 @@ impl Executor {
             char_limit,
             exact_char_limit,
             escape_aware,
+            raw,
         ))
     }
 
@@ -914,11 +954,12 @@ impl Executor {
         char_limit: Option<usize>,
         exact_char_limit: bool,
         escape_aware: bool,
+        raw: bool,
     ) -> Option<String> {
         if self.fd_table.is_open_for_read(fd) {
             if let Some(line) =
                 self.fd_table
-                    .read_text(fd, delimiter, char_limit, exact_char_limit, escape_aware)
+                    .read_text(fd, delimiter, char_limit, exact_char_limit, escape_aware, raw)
             {
                 if let Some((_, offset)) = self.fd_table.input_snapshot(fd) {
                     self.shell_state
@@ -931,6 +972,7 @@ impl Executor {
                     char_limit,
                     exact_char_limit,
                     escape_aware,
+                    raw,
                 ));
             }
             if self.fd_table.is_closed(fd) {
@@ -956,6 +998,7 @@ impl Executor {
                 char_limit,
                 exact_char_limit,
                 escape_aware,
+                raw,
             );
         }
         None
@@ -967,6 +1010,7 @@ impl Executor {
         char_limit: Option<usize>,
         exact_char_limit: bool,
         escape_aware: bool,
+        raw: bool,
     ) -> Option<String> {
         self.apply_comsub_stdin_writeback();
         // GNU read builtin: one zread record off the shared fd-0 cursor
@@ -1022,8 +1066,12 @@ impl Executor {
             let chars: Vec<(usize, char)> = slice.char_indices().collect();
             let mut cursor = 0usize;
             let mut units = 0usize;
-            // rubash#1300: an escaped character is never the delimiter
-            // in a non-raw read.
+            // GNU read.def escape state for the -n/-N budget: the budget
+            // is spent on POST-ESCAPE characters (an escape pair counts
+            // once, a backslash-newline continuation counts zero), and an
+            // escaped delimiter is data, not a terminator (rubash#1328);
+            // the escape introducer itself never matches either
+            // (rubash#1300).
             let mut escaped = false;
             while cursor < chars.len() {
                 let (index, ch) = chars[cursor];
@@ -1061,10 +1109,18 @@ impl Executor {
                     output.push(ch);
                     consumed = index + ch.len_utf8();
                     cursor += 1;
-                    escaped = escape_aware && !escaped && ch == '\\';
                 }
                 took_any = true;
-                units += 1;
+                if escaped {
+                    if ch != '\n' {
+                        units += 1;
+                    }
+                    escaped = false;
+                } else if !raw && ch == '\\' && !pair {
+                    escaped = true;
+                } else {
+                    units += 1;
+                }
                 if char_limit.is_some_and(|limit| units >= limit) {
                     limit_reached = true;
                     break;
@@ -1089,6 +1145,7 @@ impl Executor {
             char_limit,
             exact_char_limit,
             escape_aware,
+            raw,
         ))
     }
 
@@ -1099,6 +1156,7 @@ impl Executor {
         char_limit: Option<usize>,
         exact_char_limit: bool,
         escape_aware: bool,
+        raw: bool,
     ) -> Option<String> {
         if self
             .shell_state
@@ -1150,6 +1208,9 @@ impl Executor {
         let mut output = String::new();
         let mut decoder = StdinCharDecoder::new();
         let mut units = 0usize;
+        // GNU read.def escape state for the -n/-N budget (see the counting
+        // below): true when the previous unit was an unquoted backslash.
+        let mut escaped = false;
         let mut eof = false;
         let mut delimiter_found = false;
         // rubash#1300: an escaped unit is never the delimiter.
@@ -1225,16 +1286,28 @@ impl Executor {
                 delimiter_found = true;
                 break;
             }
-            escaped = escape_aware && !escaped && matches!(unit, StdinUnit::Char('\\'));
+            let unit_char = match &unit {
+                StdinUnit::Char(ch) => Some(*ch),
+                StdinUnit::RawByte { .. } => None,
+            };
             match unit {
-                StdinUnit::Char(ch) => {
-                    output.push(ch);
+                StdinUnit::Char(ch) => output.push(ch),
+                StdinUnit::RawByte { text } => output.push_str(&text),
+            }
+            // GNU builtins/read.def processes backslash escapes inline
+            // while counting: an escape pair appends ONE character (the
+            // -n/-N budget is spent on stored characters) and a
+            // backslash-newline continuation appends none (rubash#1328).
+            // -r disables escape processing entirely.
+            if escaped {
+                if unit_char != Some('\n') {
                     units += 1;
                 }
-                StdinUnit::RawByte { text } => {
-                    output.push_str(&text);
-                    units += 1;
-                }
+                escaped = false;
+            } else if !raw && unit_char == Some('\\') {
+                escaped = true;
+            } else {
+                units += 1;
             }
             if char_limit.is_some_and(|limit| units >= limit) {
                 break;
@@ -1263,6 +1336,7 @@ impl Executor {
             char_limit,
             exact_char_limit,
             escape_aware,
+            raw,
         ))
     }
 

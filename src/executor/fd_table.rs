@@ -583,8 +583,9 @@ impl FdTable {
         char_limit: Option<usize>,
         exact: bool,
         escape_aware: bool,
+        raw: bool,
     ) -> Option<String> {
-        self.read_bytes(fd, delimiter, char_limit, exact, escape_aware)
+        self.read_bytes(fd, delimiter, char_limit, exact, escape_aware, raw)
             .map(|bytes| bytes_to_shell_text(&bytes))
     }
 
@@ -595,6 +596,7 @@ impl FdTable {
         char_limit: Option<usize>,
         exact: bool,
         escape_aware: bool,
+        raw: bool,
     ) -> Option<Vec<u8>> {
         let endpoint = self.entries.get(&fd)?.read.clone()?;
         let file = match &endpoint {
@@ -604,7 +606,7 @@ impl FdTable {
             _ => None,
         };
         if let Some(file) = file {
-            return self.read_file_bytes(file, delimiter, char_limit, exact, escape_aware);
+            return self.read_file_bytes(file, delimiter, char_limit, exact, escape_aware, raw);
         }
         let input = match endpoint {
             FdReadEndpoint::Text(input) | FdReadEndpoint::ProcessSubstitution(input) => input,
@@ -625,9 +627,26 @@ impl FdTable {
         let mut delimiter_len = 0usize;
         let mut limit_reached = false;
         let mut escapes = ReadEscapeTracker::new(escape_aware && !exact);
+        // Post-escape counting state (rubash#1328), shared with the other
+        // readers: an unquoted backslash itself is not a stored character;
+        // the character it quotes completes one unit (zero for a newline
+        // continuation), and a delimiter byte ending an escape pair is
+        // data, not a terminator.
+        let mut escaped = false;
         for (index, byte) in slice.iter().copied().enumerate() {
-            if byte & 0xc0 != 0x80 {
-                chars += 1;
+            let lead = byte & 0xc0 != 0x80;
+            let was_escaped = escaped;
+            if lead {
+                if escaped {
+                    if byte != b'\n' {
+                        chars += 1;
+                    }
+                    escaped = false;
+                } else if !raw && byte == b'\\' {
+                    escaped = true;
+                } else {
+                    chars += 1;
+                }
             }
             consumed = index + 1;
             let suppressed = escapes.suppresses_match(byte);
@@ -678,6 +697,7 @@ impl FdTable {
         char_limit: Option<usize>,
         exact: bool,
         escape_aware: bool,
+        raw: bool,
     ) -> Option<Vec<u8>> {
         if char_limit == Some(0) {
             return Some(Vec::new());
@@ -693,13 +713,15 @@ impl FdTable {
         // O(bytes/chunk). Deadline reads stay byte-wise (per-byte
         // wait_readable, read.def check_read_timeout).
         if self.read_deadline.is_none() && crate::fd::is_disk_file(file.handle) {
-            return self.read_file_bytes_buffered(file, delimiter, char_limit, exact, escape_aware);
+            return self.read_file_bytes_buffered(file, delimiter, char_limit, exact, escape_aware, raw);
         }
         let mut result = Vec::new();
         let mut chars = 0usize;
         let mut consumed = false;
         let mut delimiter_found = false;
         let mut limit_reached = false;
+        // Post-escape counting state (rubash#1328), as in read_bytes.
+        let mut escaped = false;
         let seqs = read_delimiter_seqs(delimiter);
         let mut escapes = ReadEscapeTracker::new(escape_aware);
         loop {
@@ -721,8 +743,19 @@ impl FdTable {
                 Err(_) => break,
             };
             consumed = true;
-            if byte & 0xc0 != 0x80 {
-                chars += 1;
+            let lead = byte & 0xc0 != 0x80;
+            let was_escaped = escaped;
+            if lead {
+                if escaped {
+                    if byte != b'\n' {
+                        chars += 1;
+                    }
+                    escaped = false;
+                } else if !raw && byte == b'\\' {
+                    escaped = true;
+                } else {
+                    chars += 1;
+                }
             }
             result.push(byte);
             let suppressed = escapes.suppresses_match(byte);
@@ -770,6 +803,7 @@ impl FdTable {
         char_limit: Option<usize>,
         exact: bool,
         escape_aware: bool,
+        raw: bool,
     ) -> Option<Vec<u8>> {
         let Ok(origin) = crate::fd::file_position(file.handle) else {
             return None;
@@ -783,6 +817,9 @@ impl FdTable {
         let mut delimiter_found = false;
         let mut limit_reached = false;
         let mut rewind: Option<u64> = None;
+        // Post-escape counting state (rubash#1328), as in read_bytes;
+        // persists across chunk boundaries.
+        let mut escaped = false;
         'chunks: loop {
             let scanned_from = buffer.len();
             match crate::fd::read_some(file.handle, 8192) {
@@ -793,8 +830,19 @@ impl FdTable {
             for (index, &byte) in buffer[scanned_from..].iter().enumerate() {
                 let absolute = scanned_from + index;
                 consumed = true;
-                if byte & 0xc0 != 0x80 {
-                    chars += 1;
+                let lead = byte & 0xc0 != 0x80;
+                let was_escaped = escaped;
+                if lead {
+                    if escaped {
+                        if byte != b'\n' {
+                            chars += 1;
+                        }
+                        escaped = false;
+                    } else if !raw && byte == b'\\' {
+                        escaped = true;
+                    } else {
+                        chars += 1;
+                    }
                 }
                 result.push(byte);
                 let suppressed = escapes.suppresses_match(byte);

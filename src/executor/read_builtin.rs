@@ -2193,6 +2193,7 @@ impl Executor {
                 char_limit,
                 exact_char_limit,
                 escape_aware,
+                raw,
             ) {
                 Some(l) if l.is_empty() && initial_text.is_some() => None,
                 Some(l) => Some(l),
@@ -2285,6 +2286,7 @@ impl Executor {
                 char_limit,
                 exact_char_limit,
                 escape_aware,
+                raw,
             ) {
                 // GNU read.def: input is a C string, truncate at first NUL
                 // (rubash#1419). The `-d ''` case stops at NUL (delimiter),
@@ -2446,6 +2448,7 @@ impl Executor {
                     exact_char_limit,
                     poll_sigint,
                     escape_aware,
+                    raw,
                 ) {
                     Ok((_, _, _, _, true)) => {
                         // Interrupted (rubash#1250): assign nothing; the
