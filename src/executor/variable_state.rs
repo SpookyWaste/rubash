@@ -436,6 +436,18 @@ impl Executor {
                 return Some(values.join(&self.ifs_first_char_separator()));
             }
         }
+        // rubash#1282: BASH_ARGC/BASH_ARGV/BASH_LINENO are live views,
+        // not storage — an unsubscripted read is element 0 of the view
+        // (GNU variables.c: scalar array read == element 0). Falling
+        // through to the env store leaked the raw storage repr
+        // ("\x1d()" / "\x1d([0]=\"0\")") parked there by the startup /
+        // materialization writes, while indexed reads (which divert to
+        // the view) were correct.
+        if matches!(name, "BASH_ARGC" | "BASH_ARGV" | "BASH_LINENO") && !attrs.assoc {
+            if let Some(values) = self.dynamic_stack_array_values(name) {
+                return Some(values.into_iter().next().unwrap_or_default());
+            }
+        }
         if let Some(value) = self.array_element_parameter_value(name) {
             return Some(value);
         }
