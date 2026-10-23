@@ -2756,6 +2756,13 @@ impl Executor {
                         continue;
                     }
                     if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
+                        // GNU redir.c: the dup/move apply is guarded by
+                        // `redir_fd != redirector` — a self-dup/self-move
+                        // is a no-op even for a closed fd, and a self-move
+                        // must not close the fd (rubash#1236).
+                        if source_fd == fd {
+                            continue;
+                        }
                         self.copy_exec_output_fd_resolving_ambient(fd, source_fd, &ambient);
                         if move_source {
                             self.close_persistent_output_fd(source_fd)?;
@@ -2814,6 +2821,11 @@ impl Executor {
                         continue;
                     }
                     if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
+                        // Self-dup/self-move: no-op (see the output arm
+                        // above; rubash#1236).
+                        if source_fd == fd {
+                            continue;
+                        }
                         self.copy_exec_output_fd_resolving_ambient(fd, source_fd, &ambient);
                         if move_source {
                             self.close_persistent_output_fd(source_fd)?;
@@ -2855,6 +2867,10 @@ impl Executor {
                         continue;
                     }
                     if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
+                        // Self-dup/self-move: no-op (rubash#1236).
+                        if source_fd == fd {
+                            continue;
+                        }
                         self.copy_persistent_input_fd(fd, source_fd);
                         if move_source {
                             self.close_persistent_input_fd(source_fd);
@@ -2936,6 +2952,12 @@ impl Executor {
                 crate::parser::RedirectKind::DuplicateInput => {
                     let fd = redirect.fd.unwrap_or(0);
                     if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
+                        // Self-dup/self-move: no-op, succeeds even when
+                        // the fd is closed (rubash#1236) — judge it before
+                        // the is_open check below.
+                        if source_fd == fd {
+                            continue;
+                        }
                         if self.fd_table.is_open(source_fd) {
                             self.copy_persistent_input_fd(fd, source_fd);
                             if move_source {

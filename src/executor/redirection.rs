@@ -517,6 +517,17 @@ impl Executor {
                 }
                 // Digit forms `&N` / `&N-` (possibly via expansion).
                 if let Some((fd, move_fd)) = redirect_target_fd_and_move(&target) {
+                    // GNU redir.c do_redirection_internal guards the
+                    // whole dup/move apply with `redir_fd != redirector`:
+                    // a self-dup/self-move never reaches the dup2, so it
+                    // succeeds even when the fd is closed, and a self-move
+                    // does not close anything (rubash#1236). It also
+                    // changes nothing, so the opened bookkeeping is left
+                    // exactly as it was (a closed fd stays closed for a
+                    // later dup in the same list).
+                    if fd == redirector {
+                        continue;
+                    }
                     if !dup_source_fd_open(&self.fd_table, fd, &opened) {
                         return self
                             .reject_with_dup_bad_fd(cmd, index, fd, move_fd, raw_word, redirector)
@@ -552,6 +563,13 @@ impl Executor {
                         .and_then(|value| u32::try_from(value).ok())
                     {
                         Some(fd) => {
+                            // Self-dup/self-move: never rejected and the
+                            // opened state is unchanged (see the digit-form
+                            // branch above; redir.c's
+                            // `redir_fd != redirector` guard).
+                            if fd == redirector {
+                                continue;
+                            }
                             if !dup_source_fd_open(&self.fd_table, fd, &opened) {
                                 return self
                                     .reject_with_dup_bad_fd(
