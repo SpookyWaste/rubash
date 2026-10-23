@@ -161,6 +161,13 @@ impl Executor {
                 index += 1;
                 break;
             }
+            // GNU type.def's getopt table maps --help to CASE_HELPOPT:
+            // long help to stdout, EX_USAGE status (rubash#1229). Only in
+            // option position — after `--` it is a name to describe.
+            if arg == "--help" {
+                crate::builtins::help::print_builtin_help("type", stdout)?;
+                return Ok(2);
+            }
             if !arg.starts_with('-') || arg == "-" {
                 break;
             }

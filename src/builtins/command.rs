@@ -61,6 +61,14 @@ where
             break;
         }
 
+        // GNU command.def's getopt table maps --help to CASE_HELPOPT:
+        // long help to stdout, EX_USAGE status (rubash#1229). Only in
+        // option position — after `--` it is the command name itself.
+        if *arg == "--help" {
+            crate::builtins::help::print_builtin_help("command", stdout)?;
+            return Ok(CommandAction::Complete(EX_USAGE));
+        }
+
         if !arg.starts_with('-') || *arg == "-" {
             break;
         }

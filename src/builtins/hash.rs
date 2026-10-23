@@ -80,6 +80,13 @@ where
             index += 1;
             continue;
         }
+        // GNU hash.def's getopt table maps --help to CASE_HELPOPT: long
+        // help to stdout, EX_USAGE status (rubash#1229). Only while still
+        // parsing options — after `--` it is a name to look up.
+        if parsing_options && arg == "--help" {
+            crate::builtins::help::print_builtin_help("hash", stdout)?;
+            return Ok(EX_USAGE);
+        }
         if parsing_options && arg.starts_with('-') && *arg != "-" {
             let mut chars = arg[1..].char_indices();
             while let Some((offset, option)) = chars.next() {
@@ -442,10 +449,7 @@ fn phash_search_target(path: &str) -> Option<String> {
 /// device+inode identity (hashcmd.c same_file); canonicalized-path
 /// comparison is close enough for the directory-identity test here.
 fn same_file(first: &str, second: &str) -> bool {
-    match (
-        std::fs::canonicalize(first),
-        std::fs::canonicalize(second),
-    ) {
+    match (std::fs::canonicalize(first), std::fs::canonicalize(second)) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
     }

@@ -6,6 +6,18 @@ impl Executor {
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
         let args = &cmd.words[1..];
+        // GNU builtins/builtin.def: internal_getopt maps a leading
+        // --help to CASE_HELPOPT (long help to stdout, EX_USAGE) before
+        // no_options() rejects the other options (rubash#1229). Checked
+        // before the `--` skip below: after a `--`, --help is the name
+        // of the builtin to run, not an option.
+        if args.first().map(String::as_str) == Some("--help") {
+            let mut stdout = Vec::new();
+            crate::builtins::help::print_builtin_help("builtin", &mut stdout)?;
+            self.write_buffered_builtin_output(cmd, &stdout, &[])?;
+            self.exit_code = 2;
+            return Ok(());
+        }
         // GNU builtins/builtin.def: no_options() + `list = loptend`: a bare
         // `--` ends option parsing and is skipped, so `builtin -- CMD` runs
         // CMD (rubash#1376); a lone `--` is a silent success.

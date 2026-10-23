@@ -44,6 +44,7 @@ impl Executor {
             return Ok(());
         };
 
+        let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         // A sourced file is fresh parser input: GNU expands its aliases
         // while reading it (bashhist.c reader -> parse.y), so the driver's
@@ -53,13 +54,14 @@ impl Executor {
             self,
             &expanded.words[0],
             &expanded.words[1..],
+            &mut stdout,
             &mut stderr,
             cmd,
         );
         self.resume_alias_streamed(saved_alias_streamed);
         let had_diagnostic = !stderr.is_empty();
-        if had_diagnostic {
-            self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+        if had_diagnostic || !stdout.is_empty() {
+            self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
         }
         match result {
             Err(ExecuteError::ExitCode(1)) if command_builtin && had_diagnostic => Ok(()),

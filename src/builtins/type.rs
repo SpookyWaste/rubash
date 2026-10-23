@@ -58,6 +58,13 @@ where
             break;
         }
 
+        // GNU type.def's getopt table maps --help to CASE_HELPOPT: long
+        // help to stdout, EX_USAGE status (rubash#1229).
+        if *arg == "--help" {
+            crate::builtins::help::print_builtin_help("type", stdout)?;
+            return Ok(EX_USAGE);
+        }
+
         if !arg.starts_with('-') || *arg == "-" {
             break;
         }

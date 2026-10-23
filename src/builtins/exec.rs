@@ -103,6 +103,7 @@ where
     let mut clean_env = false;
     let mut login = false;
     let mut argv0 = None;
+    let mut help = false;
     let Some(index) = parse_options(
         args,
         stderr,
@@ -110,8 +111,12 @@ where
         &mut clean_env,
         &mut login,
         &mut argv0,
+        &mut help,
     )?
     else {
+        if help {
+            crate::builtins::help::print_builtin_help("exec", stdout)?;
+        }
         return Ok(EX_BADUSAGE);
     };
 
@@ -246,6 +251,7 @@ pub(crate) fn command_operand_index(args: &[String]) -> Option<usize> {
     let mut clean_env = false;
     let mut login = false;
     let mut argv0 = None;
+    let mut help = false;
     parse_options(
         args,
         &mut io::sink(),
@@ -253,6 +259,7 @@ pub(crate) fn command_operand_index(args: &[String]) -> Option<usize> {
         &mut clean_env,
         &mut login,
         &mut argv0,
+        &mut help,
     )
     .ok()
     .flatten()
@@ -266,6 +273,7 @@ fn parse_options<W>(
     clean_env: &mut bool,
     login: &mut bool,
     argv0: &mut Option<String>,
+    help: &mut bool,
 ) -> io::Result<Option<usize>>
 where
     W: Write,
@@ -275,6 +283,14 @@ where
     while let Some(arg) = args.get(index) {
         if arg == "--" {
             return Ok(Some(index + 1));
+        }
+        // GNU exec.def's getopt table maps --help to CASE_HELPOPT: print
+        // the long help to stdout and fail with EX_USAGE (rubash#1229).
+        // Checked only in option position: after `--`, or consumed as
+        // -a's argument, "--help" is data, exactly as under getopt.
+        if arg == "--help" {
+            *help = true;
+            return Ok(None);
         }
         let Some(options) = arg.strip_prefix('-') else {
             break;

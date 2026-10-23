@@ -16,23 +16,39 @@ pub enum EvalAction {
 
 /// Execute `eval` option processing with arguments after the command name.
 pub fn execute(args: &[String], prefix: &str) -> io::Result<EvalAction> {
+    let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
-    execute_with_io(args.iter().map(String::as_str), prefix, &mut stderr)
+    execute_with_io(
+        args.iter().map(String::as_str),
+        prefix,
+        &mut stdout,
+        &mut stderr,
+    )
 }
 
-pub(crate) fn execute_with_io<'a, I, E>(
+pub(crate) fn execute_with_io<'a, I, W, E>(
     args: I,
     prefix: &str,
+    stdout: &mut W,
     stderr: &mut E,
 ) -> io::Result<EvalAction>
 where
     I: IntoIterator<Item = &'a str>,
+    W: Write,
     E: Write,
 {
     let args: Vec<&str> = args.into_iter().collect();
     let mut index = 0;
 
     if let Some(arg) = args.get(index) {
+        // GNU eval.def's option table maps --help to CASE_HELPOPT: long
+        // help to stdout, EX_USAGE status (rubash#1229). Only as the
+        // first word — eval has no other options, and after `--` the
+        // word is data to evaluate.
+        if *arg == "--help" {
+            crate::builtins::help::print_builtin_help("eval", stdout)?;
+            return Ok(EvalAction::Complete(EX_USAGE));
+        }
         if *arg == "--" {
             index += 1;
         } else if arg.starts_with('-') && *arg != "-" {
@@ -55,8 +71,10 @@ mod tests {
     use super::*;
 
     fn run(args: &[&str]) -> (EvalAction, String) {
+        let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let action = execute_with_io(args.iter().copied(), "rubash: ", &mut stderr).unwrap();
+        let action =
+            execute_with_io(args.iter().copied(), "rubash: ", &mut stdout, &mut stderr).unwrap();
 
         (action, String::from_utf8(stderr).unwrap())
     }

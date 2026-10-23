@@ -260,15 +260,17 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let args = cmd.words[1..].to_vec();
         match crate::builtins::eval::execute_with_io(
             args.iter().map(String::as_str),
             &self.diagnostic_prefix(),
+            &mut stdout,
             &mut stderr,
         )? {
             crate::builtins::eval::EvalAction::Complete(status) => {
-                self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
                 self.exit_code = status;
                 Ok(())
             }
