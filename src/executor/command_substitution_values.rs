@@ -421,6 +421,15 @@ impl Executor {
         }
 
         let values = if transform == ParameterTransform::Assignment {
+            // GNU subst.c @A form: with zero positional parameters there
+            // is no `set --` header at all — "${@@A}" expands to zero
+            // words and "${*@A}" to a single empty word (rubash#1269).
+            if self.shell_state.positional_window().is_empty() {
+                if var_name == "*" && quoted {
+                    return Some(vec![String::new()]);
+                }
+                return Some(vec![]);
+            }
             let mut values = vec!["set".to_string(), "--".to_string()];
             values.extend(
                 self.shell_state
