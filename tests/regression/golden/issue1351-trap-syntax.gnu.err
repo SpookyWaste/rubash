@@ -1,0 +1,2 @@
+issue1351-trap-syntax.sh: trap: line 1: syntax error near unexpected token `fi'
+issue1351-trap-syntax.sh: trap: line 1: `fi'

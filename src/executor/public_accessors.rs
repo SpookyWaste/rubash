@@ -1775,6 +1775,16 @@ impl Executor {
     /// `script: eval:2: `, `bash: -c:2: ` under gnu_errfmt).
     pub fn parser_error_prefix_for_line(&self, line: usize) -> String {
         let is_c = self.shell_state.env_vars.contains_key("__RUBASH_IS_C");
+        // GNU trap.c:496: a trap action parses under the input name
+        // "trap" ("interrupt trap" for SIGINT), which parser_error
+        // (error.c:300-316) appends like the eval name below
+        // (rubash#1351).
+        if let Some(context) = self.shell_state.env_vars.get("__RUBASH_TRAP_CONTEXT") {
+            if let Some(script) = self.shell_state.env_vars.get("__RUBASH_SCRIPT_NAME") {
+                return self.gnu_error_line(&format!("{script}: {context}"), line);
+            }
+            return self.gnu_error_line(&format!("bash: {context}"), line);
+        }
         if self
             .shell_state
             .env_vars

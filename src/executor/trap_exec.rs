@@ -1348,11 +1348,34 @@ impl Executor {
                     "BASH_TRAPSIG",
                 );
             }
+            // GNU trap.c:496 runs the action through parse_and_execute
+            // with the input name "trap" ("interrupt trap" for SIGINT):
+            // parser_error's prolog becomes `<script>: trap: line N:`.
+            // Mirror the __RUBASH_EVAL_CONTEXT marker for the duration
+            // of the action.
+            let old_trap_context = self.shell_state.env_vars.insert(
+                "__RUBASH_TRAP_CONTEXT".to_string(),
+                if signal == 2 {
+                    "interrupt trap".to_string()
+                } else {
+                    "trap".to_string()
+                },
+            );
             let tokens = crate::lexer::tokenize(&action);
             let ast = crate::parser::parse(&tokens);
             // trap.c:496 runs the action through parse_and_execute: the
             // xtrace indirection level rises by one for the action.
             let result = self.with_xtrace_indirection(|executor| executor.execute_ast(&ast));
+            match old_trap_context {
+                Some(value) => {
+                    self.shell_state
+                        .env_vars
+                        .insert("__RUBASH_TRAP_CONTEXT".to_string(), value);
+                }
+                None => {
+                    self.shell_state.env_vars.remove("__RUBASH_TRAP_CONTEXT");
+                }
+            }
             if !bash_trapsig_was_exported {
                 unmark_env_name(
                     &mut self.shell_state.env_vars,
@@ -1395,7 +1418,22 @@ impl Executor {
                 }
             }
             self.signal_trap_running = false;
+            // GNU trap.c:496 (parse_and_execute inside _run_trap_internal)
+            // contains a syntax error in the action: the diagnostic
+            // stands, the action yields its failure, and the shell goes
+            // on with the pre-trap $? — the parse error must not unwind
+            // the whole script the way a top-level syntax error does
+            // (rubash#1351). Consume the flag either way so it cannot
+            // leak into the script driver; a parse error that already
+            // exit_shell(2)ed under live errexit (parser_error_errexited)
+            // is a real shell exit and keeps propagating.
+            let parse_error_raised = self.take_parse_error();
+            let parser_error_errexited = self.parser_error_errexited.take();
             match result {
+                Err(ExecuteError::ExitCode(2)) if parse_error_raised && !parser_error_errexited => {
+                    self.take_exit_jump_pending();
+                    self.exit_code = saved_exit;
+                }
                 Ok(()) => self.exit_code = saved_exit,
                 Err(error @ ExecuteError::Return(_)) => return Err(error),
                 Err(error @ ExecuteError::ExitCode(_)) => return Err(error),
