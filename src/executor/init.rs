@@ -591,6 +591,13 @@ impl Executor {
                 }
             }
         }
+        // Whether SHELL/PATH arrived with the environment: the fabricated
+        // fallbacks below are bound WITHOUT att_exported in GNU (a
+        // passwd-derived SHELL and the set_if_not PATH default are plain
+        // shell variables; `env -i` export -p lists neither), so any name
+        // fabricated here must be unmarked again after
+        // mark_initial_exported_vars sweeps the table (rubash#1325).
+        let shell_inherited = env_vars.contains_key("SHELL");
         env_vars
             .entry("SHELL".to_string())
             .or_insert_with(login_shell_value);
@@ -600,6 +607,8 @@ impl Executor {
         // /usr/sbin:/bin:/sbin:." — a shell started with no PATH in its
         // environment (env -i) still resolves the standard utilities; a
         // PATH that is present but empty is imported verbatim (rubash#1129).
+        #[cfg(unix)]
+        let path_inherited = env_vars.contains_key("PATH");
         #[cfg(unix)]
         env_vars.entry("PATH".to_string()).or_insert_with(|| {
             "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:.".to_string()
@@ -657,6 +666,17 @@ impl Executor {
         initialize_shell_level(env_vars);
         mark_initial_exported_vars(env_vars);
         mark_env_name(env_vars, EXPORTED_VARS, "OLDPWD");
+        // Undo the export mark for the SHELL/PATH fallbacks fabricated
+        // above (see the note at the SHELL bind): GNU binds both without
+        // att_exported, so `env -i` shells must not export them
+        // (rubash#1325). Inherited values keep their imported mark.
+        if !shell_inherited {
+            unmark_env_name(env_vars, EXPORTED_VARS, "SHELL");
+        }
+        #[cfg(unix)]
+        if !path_inherited {
+            unmark_env_name(env_vars, EXPORTED_VARS, "PATH");
+        }
         // GNU variables.c initialize_shell_variables only imports TMPDIR from
         // the environment — it never invents a value (WSL probe: `env -i
         // bash -c 'echo ${TMPDIR-UNSET}'` prints UNSET), and a value it never
@@ -731,6 +751,16 @@ impl Executor {
         env_vars
             .entry("COMP_WORDBREAKS".to_string())
             .or_insert_with(|| " \t\n\"'@><=;|&(:".to_string());
+        // GNU binds COMP_WORDBREAKS with att_invisible: the variable
+        // exists (`declare -p COMP_WORDBREAKS` succeeds) but print_var_list
+        // (the `set` listing) skips invisible variables (rubash#1325).
+        mark_env_name(env_vars, INVISIBLE_VARS, "COMP_WORDBREAKS");
+        // GNU shell.c: a shell whose environment carries no TERM binds
+        // TERM="dumb" (plain, unexported) instead of leaving it unset
+        // (rubash#1325).
+        env_vars
+            .entry("TERM".to_string())
+            .or_insert_with(|| "dumb".to_string());
         env_vars.insert(
             SHELL_START_EPOCH.to_string(),
             current_epoch_seconds().to_string(),

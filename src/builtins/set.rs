@@ -98,6 +98,7 @@ pub(super) const UPPERCASE_VARS: &str = "__RUBASH_UPPERCASE_VARS";
 pub(super) const LOWERCASE_VARS: &str = "__RUBASH_LOWERCASE_VARS";
 pub(super) const NAMEREF_VARS: &str = "__RUBASH_NAMEREF_VARS";
 pub(super) const DECLARED_UNSET_VARS: &str = "__RUBASH_DECLARED_UNSET_VARS";
+pub(super) const INVISIBLE_VARS: &str = "__RUBASH_INVISIBLE_VARS";
 
 /// Execute `set` with arguments after the command name.
 pub fn set(args: &[String], env_vars: &mut crate::shell::var_table::VarTable) -> io::Result<i32> {
@@ -374,6 +375,13 @@ where
         // option state) are invisible in listings, like GNU's invisible_p
         // vars in print_var_list (variables.c).
         if name.starts_with("__RUBASH_") {
+            continue;
+        }
+        // GNU att_invisible (variables.c print_var_list skips
+        // invisible_p): COMP_WORDBREAKS is bound invisible at startup, so
+        // `set` never lists it even though the variable exists
+        // (rubash#1325).
+        if unset::is_marked_variable(env_vars, INVISIBLE_VARS, name) {
             continue;
         }
         // GNU variables.c:511-526 (initialize_shell_variables): environment

@@ -52,6 +52,10 @@ pub const FD_PROCESS_STDIN_TARGET: &str = "__RUBASH_FD_PROCESS_STDIN";
 pub const INHERIT_PROCESS_STDIN: &str = "__RUBASH_INHERIT_PROCESS_STDIN";
 pub const LOCAL_EXPORT_ENV: &str = "__RUBASH_LOCAL_EXPORT_ENV";
 pub const DECLARED_UNSET_VARS: &str = "__RUBASH_DECLARED_UNSET_VARS";
+/// GNU att_invisible (variables.c): variables bound invisible at startup
+/// (COMP_WORDBREAKS, bashline.c) exist and answer `declare -p NAME`, but
+/// print_var_list — the `set` listing — skips them (rubash#1325).
+pub const INVISIBLE_VARS: &str = "__RUBASH_INVISIBLE_VARS";
 // GNU builtins/set.def:928 + variables.c:3839 unbind_variable: `unset -v`
 // on a dynamic variable (BASHPID, RANDOM, BASH_SUBSHELL, ...) removes it
 // like an ordinary one — the name stays unbound and does not
