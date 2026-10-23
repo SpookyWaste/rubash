@@ -974,6 +974,42 @@ impl Executor {
         self.evalerror_pending.set(true);
     }
 
+    /// rubash#1318: arm the reader-level DISCARD for a standalone
+    /// assignment failure (GNU subst.c bash_variable_assignment_error ->
+    /// exp_jump_to_top_level(DISCARD): the rest of the current list is
+    /// abandoned, the script resumes at the next line). The
+    /// Err(ExpansionFailure) the caller returns is absorbed into a plain
+    /// status by the brace-group and function-frame boundaries it
+    /// crosses, which used to let the enclosing list continue on the
+    /// SAME line (`{ z=1; }; echo after` printed `after`); the armed
+    /// pending makes every enclosing list loop skip the rest of the
+    /// failing logical line through the standard abandon check. The
+    /// boundary line is pinned here rather than left to the lazy
+    /// reader_command_line capture so the abandon check does not
+    /// rewrite the status the failure already chose (1 for a bind
+    /// failure, EX_BADUSAGE 2 for the ${:=} readonly class, rubash#402).
+    /// The pinned line is the READER's current list line: a failing
+    /// assignment inside a function body carries the body's own
+    /// re-based line number, but GNU abandons the caller's list — the
+    /// line the depth-1 loop is executing (the call site). The node
+    /// line is only the fallback for contexts with no reader line yet.
+    pub(in crate::executor) fn raise_assignment_discard(&self, line: Option<usize>) {
+        // Sourced files and eval strings carry their own top_level catch
+        // (evalstring.c): the Err propagation alone already reproduces
+        // GNU there (the sourced reader resumes at its next line and the
+        // caller keeps the status), and this executor's reader line
+        // still points at the CALLER's list, so arming would corrupt
+        // both readers' boundaries.
+        if self.in_source_context() || self.eval_list_depth.get().is_some() {
+            return;
+        }
+        self.evalerror_pending.set(true);
+        let boundary = self.reader_command_line.get().or(line);
+        if let Some(line) = boundary.filter(|line| *line != 0) {
+            self.evalerror_line.set(Some(line));
+        }
+    }
+
     /// rubash#753: absorb a pending failglob-class discard at a containment
     /// boundary (the `eval` and `source` builtins — GNU evalstring.c:365,
     /// 422-442 installs a local top_level catch for the text they run, so

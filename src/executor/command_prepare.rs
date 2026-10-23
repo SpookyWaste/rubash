@@ -438,6 +438,9 @@ impl Executor {
             }
             // rubash#439: expansion error, not a failed command — no ERR trap.
             self.command_expansion_failed.set(true);
+            // rubash#1318: the DISCARD must survive the group/function
+            // boundaries the Err crosses on its way to the reader.
+            self.raise_assignment_discard(cmd.logical_line.or(cmd.line));
             return Err(ExecuteError::ExpansionFailure(status));
         }
         // Bash 5.3 (parser.h FUNSUB_CHAR) executes whitespace-led
@@ -692,6 +695,9 @@ impl Executor {
                     self.exit_code = code;
                     return Err(ExecuteError::ExitCode(code));
                 }
+                // rubash#1318: the DISCARD must survive the group/function
+                // boundaries the Err crosses on its way to the reader.
+                self.raise_assignment_discard(cmd.logical_line.or(cmd.line));
                 return Err(ExecuteError::ExpansionFailure(1));
             }
             // GNU variables.c make_variable_value: an integer-attribute
@@ -800,6 +806,9 @@ impl Executor {
             }
             // rubash#439: expansion error, not a failed command — no ERR trap.
             self.command_expansion_failed.set(true);
+            // rubash#1318: the DISCARD must survive the group/function
+            // boundaries the Err crosses on its way to the reader.
+            self.raise_assignment_discard(cmd.logical_line.or(cmd.line));
             return Err(ExecuteError::ExpansionFailure(status));
         }
         // Bash 5.3 (parser.h FUNSUB_CHAR) executes whitespace-led
