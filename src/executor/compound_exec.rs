@@ -1666,6 +1666,38 @@ impl Executor {
         &mut self,
         time_command: &TimeCommand,
     ) -> Result<(), ExecuteError> {
+        // rubash#1218: the parser folds `time` prefixes without knowing
+        // the posix-mode grammar rule — in posix mode a dash word right
+        // after `time` means `time` was never a keyword (GNU parse.y),
+        // so the reconstructed command (`time`, the prefix words, then
+        // the inner command's words) dispatches as an ordinary command
+        // named `time` (PATH-resolved; 127 when absent). Only the simple
+        // inner shape is rebuilt; pipeline/compound inners keep the
+        // timed path.
+        if self.posix_mode_enabled()
+            && time_command
+                .prefix_words
+                .first()
+                .is_some_and(|word| word.len() > 1 && word.starts_with('-'))
+            && time_command.command.pipeline_command.is_none()
+            && !time_command.command.words.is_empty()
+        {
+            let inner = &time_command.command;
+            let mut plain = CommandNode::new();
+            plain.line = inner.line;
+            plain.logical_line = inner.logical_line;
+            let mut words = vec![time_command.keyword.clone()];
+            words.extend(time_command.prefix_words.iter().cloned());
+            words.extend(inner.words.iter().cloned());
+            plain.words = words;
+            plain.redirects = inner.redirects.clone();
+            plain.redirect_in = inner.redirect_in.clone();
+            plain.redirect_out = inner.redirect_out.clone();
+            plain.append = inner.append.clone();
+            plain.redirect_err = inner.redirect_err.clone();
+            plain.redirect_err_append = inner.redirect_err_append.clone();
+            return self.execute_command(&plain);
+        }
         let started = time_command_started();
         if let Some(coproc_cmd) = &time_command.command.coproc_command {
             self.execute_coproc_command(&time_command.command, coproc_cmd)?;
@@ -1740,7 +1772,7 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
-        let inverted = time_prefix_parts(&cmd.words)
+        let inverted = time_prefix_parts(&cmd.words, self.posix_mode_enabled())
             .map(|parts| parts.inverted)
             .unwrap_or(false);
         let started = time_command_started();
@@ -1764,7 +1796,8 @@ impl Executor {
             Ok(())
         };
         self.print_time_shell(
-            time_prefix_parts(&cmd.words).is_some_and(|parts| parts.posix_format),
+            time_prefix_parts(&cmd.words, self.posix_mode_enabled())
+                .is_some_and(|parts| parts.posix_format),
             started,
         );
         result?;
@@ -1787,7 +1820,7 @@ impl Executor {
         let Some(command) = commands.get(index) else {
             return Ok(None);
         };
-        let Some(prefix) = time_prefix_parts(&command.words) else {
+        let Some(prefix) = time_prefix_parts(&command.words, self.posix_mode_enabled()) else {
             return Ok(None);
         };
         if !matches!(
@@ -3809,8 +3842,14 @@ impl Executor {
     }
 }
 
-pub(in crate::executor) fn command_is_time_prefixed_compound(cmd: &CommandNode) -> bool {
-    cmd.words.first().map(String::as_str) == Some("time")
+pub(in crate::executor) fn command_is_time_prefixed_compound(
+    cmd: &CommandNode,
+    posix_mode: bool,
+) -> bool {
+    // rubash#1218: the posix dash-word rule applies to compounds too —
+    // `time -p ( ... )` in posix mode is not the time keyword.
+    !posix_time_dash_word(&cmd.words, posix_mode)
+        && cmd.words.first().map(String::as_str) == Some("time")
         && (cmd.for_command.is_some()
             || cmd.if_command.is_some()
             || cmd.loop_command.is_some()
@@ -4063,8 +4102,25 @@ struct TimePrefixParts {
     posix_format: bool,
 }
 
-fn time_prefix_parts(words: &[String]) -> Option<TimePrefixParts> {
+/// GNU parse.y, posix mode (rubash#1218): `time` is a reserved word
+/// only when the word after it does not begin with `-`. With a dash
+/// word (`time -p cmd`, `time -- cmd`, `time -x cmd`) the command is an
+/// ordinary external command named `time`, resolved through PATH —
+/// oracle-verified against GNU 5.3 (a fake `time` in PATH runs with
+/// those arguments; without one the report is `time: command not
+/// found`, status 127).
+pub(in crate::executor) fn posix_time_dash_word(words: &[String], posix_mode: bool) -> bool {
+    posix_mode
+        && words
+            .get(1)
+            .is_some_and(|word| word.len() > 1 && word.starts_with('-'))
+}
+
+fn time_prefix_parts(words: &[String], posix_mode: bool) -> Option<TimePrefixParts> {
     if words.first().map(String::as_str) != Some("time") {
+        return None;
+    }
+    if posix_time_dash_word(words, posix_mode) {
         return None;
     }
 

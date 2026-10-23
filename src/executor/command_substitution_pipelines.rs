@@ -527,6 +527,11 @@ impl Executor {
         if words.first().map(String::as_str) != Some("time") {
             return None;
         }
+        // rubash#1218: posix mode + dash word — not the time keyword;
+        // decline the shortcut so the body runs as an ordinary command.
+        if posix_time_dash_word(words, self.posix_mode_enabled()) {
+            return None;
+        }
 
         let mut index = 1;
         let mut inverted = false;

@@ -732,7 +732,7 @@ impl Executor {
                 || command.time_command.is_some()
                 || command.coproc_command.is_some()
                 || command.background_command.is_some()
-                || command_is_time_prefixed_compound(command);
+                || command_is_time_prefixed_compound(command, self.posix_mode_enabled());
             let debug_trap_active = crate::builtins::trap::has_active_trap_action(
                 &self.shell_state.env_vars,
                 "DEBUG",
@@ -1124,7 +1124,7 @@ impl Executor {
                 continue;
             }
 
-            if command_is_time_prefixed_compound(command) {
+            if command_is_time_prefixed_compound(command, self.posix_mode_enabled()) {
                 let execution_result = self.execute_time_prefixed_compound_command(command);
                 match execution_result {
                     Ok(()) => {}

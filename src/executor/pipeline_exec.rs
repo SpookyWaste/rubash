@@ -867,7 +867,7 @@ impl Executor {
             return Ok(Some(end + 1));
         }
 
-        let time_prefix = time_pipeline_prefix(first);
+        let time_prefix = time_pipeline_prefix(first, self.posix_mode_enabled());
         let time_prefix_started = time_prefix.as_ref().map(|_| time_command_started());
         let mut input = String::new();
         let mut statuses = Vec::new();
@@ -4663,8 +4663,13 @@ struct TimePipelinePrefix {
     posix_format: bool,
 }
 
-fn time_pipeline_prefix(command: &CommandNode) -> Option<TimePipelinePrefix> {
+fn time_pipeline_prefix(command: &CommandNode, posix_mode: bool) -> Option<TimePipelinePrefix> {
     if command.words.first().map(String::as_str) != Some("time") {
+        return None;
+    }
+    // rubash#1218: posix mode + dash word — not the time keyword; the
+    // pipeline runs an ordinary command named `time`.
+    if posix_time_dash_word(&command.words, posix_mode) {
         return None;
     }
 

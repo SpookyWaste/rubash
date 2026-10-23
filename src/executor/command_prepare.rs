@@ -202,7 +202,7 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Option<Result<(), ExecuteError>> {
-        if command_is_time_prefixed_compound(cmd) {
+        if command_is_time_prefixed_compound(cmd, self.posix_mode_enabled()) {
             return Some(self.execute_time_prefixed_compound_command(cmd));
         }
         // GNU execute_cmd.c:485 (shell_control_structure) counts cm_arith,

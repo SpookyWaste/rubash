@@ -96,6 +96,13 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        // rubash#1218: in posix mode a dash word after `time` ends its
+        // reserved-word status (GNU parse.y) — the whole command is an
+        // ordinary external command named `time` (PATH-resolved, 127
+        // when absent), never the timing keyword.
+        if posix_time_dash_word(&cmd.words, self.posix_mode_enabled()) {
+            return self.execute_external(cmd);
+        }
         let mut index = 1;
         let mut inverted = false;
         while let Some(word) = cmd.words.get(index).map(String::as_str) {

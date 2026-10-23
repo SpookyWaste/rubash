@@ -219,7 +219,7 @@ pub(in crate::executor) fn command_sets_own_line(cmd: &CommandNode) -> bool {
         && cmd.background_command.is_none()
         && cmd.inverted_command.is_none()
         && cmd.time_command.is_none()
-        && !command_is_time_prefixed_compound(cmd)
+        && !command_is_time_prefixed_compound(cmd, false)
 }
 
 /// GNU `Simple->line` for a plain simple command is `simplecmd_lineno`
