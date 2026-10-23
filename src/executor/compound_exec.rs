@@ -3766,9 +3766,55 @@ impl Executor {
             return std::borrow::Cow::Owned(strip_surrounding_quotes(&restored));
         }
 
-        std::borrow::Cow::Owned(quote_aware_case_pattern(&pattern.raw_text, |word| {
-            self.expand_word_mut(word)
-        }))
+        let array_at = self.case_pattern_array_at_map(&pattern.raw_text);
+        std::borrow::Cow::Owned(quote_aware_case_pattern(
+            &pattern.raw_text,
+            |word| self.expand_word_mut(word),
+            &array_at,
+        ))
+    }
+
+    /// First element + element count for every `${name[@]}` unit in a
+    /// case pattern's raw text, in the engine's own `[@]` enumeration
+    /// order (hash-slot order for associative arrays, index order for
+    /// indexed ones — the order join_array_parameter_values joins in).
+    /// Precomputed because quote_aware_case_pattern walks the pattern
+    /// with only an expansion callback (rubash#1393).
+    fn case_pattern_array_at_map(
+        &self,
+        raw: &str,
+    ) -> std::collections::HashMap<String, (String, usize)> {
+        let mut map = std::collections::HashMap::new();
+        let mut rest = raw;
+        while let Some((_, end, name)) = find_case_pattern_array_at(rest) {
+            if !map.contains_key(&name) {
+                let entry = self.case_pattern_array_at_first(&name);
+                map.insert(name, entry);
+            }
+            rest = &rest[end..];
+        }
+        map
+    }
+
+    fn case_pattern_array_at_first(&self, name: &str) -> (String, usize) {
+        let Some(value) = self.shell_state.env_vars.get(name) else {
+            return (String::new(), 0);
+        };
+        if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, name) {
+            let values = super::assignment_helpers::assoc_hash_ordered_values(
+                value,
+                super::assignment_helpers::assoc_nbuckets(&self.shell_state.env_vars, name),
+            );
+            let count = values.len();
+            (values.into_iter().next().unwrap_or_default(), count)
+        } else {
+            let entries = super::indexed_array_entries_cached(value);
+            let count = entries.len();
+            (
+                entries.values().next().cloned().unwrap_or_default(),
+                count,
+            )
+        }
     }
 
     pub(in crate::executor) fn execute_case_command_with_redirects(
@@ -4443,7 +4489,103 @@ fn quote_aware_case_word(raw: &str, mut expand_word: impl FnMut(&str) -> String)
     output
 }
 
-fn quote_aware_case_pattern(raw: &str, mut expand_word: impl FnMut(&str) -> String) -> String {
+/// The first `${name[@]}` unit in `text`: (byte offset of the `$`, byte
+/// offset just past the closing `}`, array name). Braced and
+/// parenthesized units that are not exactly `${name[@]}` are skipped
+/// whole, so a `[@]` nested inside another expansion is not mistaken
+/// for a top-level one.
+fn find_case_pattern_array_at(text: &str) -> Option<(usize, usize, String)> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let plain: Vec<char> = chars.iter().map(|(_, c)| *c).collect();
+    let mut index = 0usize;
+    while index < plain.len() {
+        if plain[index] == '$' && plain.get(index + 1) == Some(&'(') {
+            if let Some(close) =
+                crate::lexer::skip_parenthesized_unit_corrected(&plain, index + 1)
+            {
+                index = close.min(plain.len());
+                continue;
+            }
+        }
+        if plain[index] == '$' && plain.get(index + 1) == Some(&'{') {
+            if let Some(close) = skip_braced_case_pattern_unit(&plain, index + 1) {
+                let unit: String = plain[index..=close].iter().collect();
+                let name = unit
+                    .strip_prefix("${")
+                    .and_then(|unit| unit.strip_suffix("[@]}"))
+                    .filter(|name| {
+                        !name.is_empty()
+                            && name
+                                .chars()
+                                .next()
+                                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    });
+                if let Some(name) = name {
+                    let start = chars[index].0;
+                    let end = if close + 1 < chars.len() {
+                        chars[close + 1].0
+                    } else {
+                        text.len()
+                    };
+                    return Some((start, end, name.to_string()));
+                }
+                index = close + 1;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+enum CasePatternSegment {
+    /// The segment's literal contribution; later segments still glue
+    /// onto the same pattern word.
+    Continues(String),
+    /// The pattern word is complete: a multi-element `${name[@]}`
+    /// produced a second field, so everything after it (the rest of
+    /// this segment and all later segments) is discarded.
+    Finished(String),
+}
+
+/// Expand one double-quoted case-pattern segment under GNU's field rule
+/// (rubash#1393): the pattern is a single word, but a quoted
+/// `"${name[@]}"` expands to a field LIST and only the first field
+/// belongs to the pattern — text before the expansion glues onto that
+/// field, text after it belongs to later fields. A one-element
+/// expansion glues whole; an empty one contributes nothing.
+fn case_pattern_quoted_segment(
+    body: &str,
+    expand_word: &mut impl FnMut(&str) -> String,
+    array_at: &std::collections::HashMap<String, (String, usize)>,
+) -> CasePatternSegment {
+    let mut literal = String::new();
+    let mut rest = body;
+    loop {
+        let Some((start, end, name)) = find_case_pattern_array_at(rest) else {
+            literal.push_str(&expand_word(rest));
+            return CasePatternSegment::Continues(literal);
+        };
+        let (first, count) = array_at.get(&name).cloned().unwrap_or_default();
+        literal.push_str(&expand_word(&rest[..start]));
+        if count == 0 {
+            rest = &rest[end..];
+            continue;
+        }
+        literal.push_str(&first);
+        if count >= 2 {
+            return CasePatternSegment::Finished(literal);
+        }
+        rest = &rest[end..];
+    }
+}
+
+fn quote_aware_case_pattern(
+    raw: &str,
+    mut expand_word: impl FnMut(&str) -> String,
+    array_at: &std::collections::HashMap<String, (String, usize)>,
+) -> String {
     let chars = raw.chars().collect::<Vec<_>>();
     let mut output = String::new();
     let mut index = 0usize;
@@ -4453,11 +4595,20 @@ fn quote_aware_case_pattern(raw: &str, mut expand_word: impl FnMut(&str) -> Stri
             let quote = chars[index + 1];
             if let Some(end) = quoted_case_pattern_end(&chars, index + 2, quote, quote == '\'') {
                 let body = chars[index + 2..end].iter().collect::<String>();
-                let literal = if quote == '\'' {
-                    decode_ansi_c_escapes(&body)
-                } else {
-                    expand_word(&body)
-                };
+                if quote == '"' {
+                    match case_pattern_quoted_segment(&body, &mut expand_word, array_at) {
+                        CasePatternSegment::Continues(literal) => {
+                            output.push_str(&escape_case_pattern_literal(&literal));
+                            index = end + 1;
+                            continue;
+                        }
+                        CasePatternSegment::Finished(literal) => {
+                            output.push_str(&escape_case_pattern_literal(&literal));
+                            return output;
+                        }
+                    }
+                }
+                let literal = decode_ansi_c_escapes(&body);
                 output.push_str(&escape_case_pattern_literal(&literal));
                 index = end + 1;
                 continue;
@@ -4474,9 +4625,7 @@ fn quote_aware_case_pattern(raw: &str, mut expand_word: impl FnMut(&str) -> Stri
             let quote = chars[index];
             if let Some(end) = quoted_case_pattern_end(&chars, index + 1, quote, false) {
                 let body = chars[index + 1..end].iter().collect::<String>();
-                let literal = if quote == '\'' {
-                    body
-                } else {
+                if quote == '"' {
                     // parse.y read_token_word's double-quote scanner never
                     // opens single-quote state: a `'` inside the body is
                     // literal data (GNU case patterns keep it, so
@@ -4488,10 +4637,21 @@ fn quote_aware_case_pattern(raw: &str, mut expand_word: impl FnMut(&str) -> Stri
                     // Quotes inside a `${...}`/`$(...)`/backtick unit stay
                     // raw (parse.y:3877 parse_matched_pair owns them;
                     // rubash#258 BUG_PSUBSQUOT).
-                    let body = crate::lexer::quotes::mark_data_squotes_around_substitutions(&body);
-                    expand_word(&body)
-                };
-                output.push_str(&escape_case_pattern_literal(&literal));
+                    let body =
+                        crate::lexer::quotes::mark_data_squotes_around_substitutions(&body);
+                    match case_pattern_quoted_segment(&body, &mut expand_word, array_at) {
+                        CasePatternSegment::Continues(literal) => {
+                            output.push_str(&escape_case_pattern_literal(&literal));
+                            index = end + 1;
+                            continue;
+                        }
+                        CasePatternSegment::Finished(literal) => {
+                            output.push_str(&escape_case_pattern_literal(&literal));
+                            return output;
+                        }
+                    }
+                }
+                output.push_str(&escape_case_pattern_literal(&body));
                 index = end + 1;
                 continue;
             } else {
