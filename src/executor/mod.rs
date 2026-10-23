@@ -688,6 +688,24 @@ pub struct Executor {
     /// position relative to the bind error.
     buffer_assignment_diagnostics: bool,
     pending_assignment_diagnostics: Vec<u8>,
+    /// GNU getopts.def dogetopts: binding the option character into an
+    /// integer-attributed OPTIND (name == "OPTIND") whose value is not
+    /// arithmetic (`?`/`:`) raises an evalexp error that abandons the
+    /// rest of the call — the trailing OPTARG bind/unbind never runs —
+    /// while the script continues with status 1 (rubash#1270). The name
+    /// bind latches the fatality here; execute_getopts reads and clears
+    /// it at the affected call sites.
+    getopts_optind_arith_fatal: bool,
+    /// GNU parse.y builds `time` [`!`] pipeline — the timing and the
+    /// inversion bind to the WHOLE pipeline (execute_cmd.c
+    /// execute_pipeline under CMD_TIMED). Rubash's compound parse parks
+    /// the TimeCommand on pipeline element 0 instead; while the pipeline
+    /// executor runs that element it raises this flag so the stage
+    /// executor defers both effects to pipeline scope (rubash#1263).
+    defer_stage_time_report: bool,
+    /// A deferred time report's (start, posix_format), stashed by the
+    /// stage executor for the pipeline executor (rubash#1263).
+    pending_stage_time_report: Option<(std::time::Instant, bool)>,
     /// GNU subst.c: an assignment performed by `${var:=word}`/`${var=word}`
     /// that fails (invalid nameref target value, readonly, ...) is a word
     /// expansion error — expand_word_error -> exp_jump_to_top_level(DISCARD)

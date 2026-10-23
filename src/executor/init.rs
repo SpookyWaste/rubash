@@ -412,6 +412,9 @@ impl Executor {
             arithmetic_last_eval_input: std::cell::RefCell::new(String::new()),
             assignment_command_name: None,
             buffer_assignment_diagnostics: false,
+            getopts_optind_arith_fatal: false,
+            defer_stage_time_report: false,
+            pending_stage_time_report: None,
             pending_assignment_diagnostics: Vec::new(),
             parameter_assignment_failure: Cell::new(false),
             tempenv_names: Vec::new(),
@@ -770,6 +773,10 @@ impl Executor {
         mark_env_name(env_vars, READONLY_VARS, "BASHOPTS");
         mark_env_name(env_vars, ARRAY_VARS, "PIPESTATUS");
         env_vars.insert("OPTIND".to_string(), "1".to_string());
+        // GNU variables.c creates OPTIND with att_integer (it prints as
+        // `declare -i OPTIND="1"`), which is also why a getopts name bind
+        // into OPTIND arith-evaluates (rubash#1270).
+        mark_env_name(env_vars, INTEGER_VARS, "OPTIND");
         env_vars.remove("OPTARG");
         env_vars.remove("__RUBASH_GETOPTS_OFFSET");
         env_vars

@@ -762,6 +762,21 @@ impl Executor {
                 );
             }
         }
+        // GNU variables.c:5817 { "OPTIND", sv_optind }: a bind of
+        // OPTIND resets the getopt scan state from the variable's
+        // current value — POSIX's `OPTIND=1` restart, a reseek for
+        // values > 1. The hook fires for ANY bind attempt, including
+        // one refused as readonly (the value is unchanged, so the scan
+        // restarts from the frozen value). Rubash carries the live scan
+        // position in shadow keys while OPTIND is readonly
+        // (rubash#1268); dropping them makes the next getopts call
+        // re-derive its start from the variable itself, and dropping
+        // the char offset mirrors getopts_reset clearing nextchar
+        // (rubash#1270).
+        if base == "OPTIND" {
+            self.shell_state.env_vars.remove("__RUBASH_GETOPTS_OPTIND");
+            self.shell_state.env_vars.remove("__RUBASH_GETOPTS_OFFSET");
+        }
         // GNU variables.c:5760 { "BASH_COMPAT", sv_shcompat }: assigning
         // BASH_COMPAT re-syncs the compatNN shopt flags (and resets the
         // level to default on an unparseable/out-of-range value, keeping
