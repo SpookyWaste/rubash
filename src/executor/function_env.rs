@@ -5,14 +5,20 @@ pub(in crate::executor) fn import_exported_functions_from_env(
 ) -> (
     HashMap<String, FunctionBody>,
     HashMap<String, crate::executor::FunctionDefInfo>,
+    Vec<String>,
 ) {
     let mut functions = HashMap::new();
     let mut def_infos = HashMap::new();
+    let mut failed = Vec::new();
     for (env_name, value) in env_vars {
         let Some(name) = imported_function_name(env_name) else {
             continue;
         };
         let Some((body, def_redirects)) = parse_exported_function_body(value) else {
+            // GNU variables.c refuses the definition (ShellShock guard)
+            // and reports it at startup; the caller owns the diagnostic
+            // (rubash#1276).
+            failed.push(name.to_string());
             continue;
         };
         functions.insert(name.to_string(), Rc::new(Ast { commands: body }));
@@ -28,7 +34,7 @@ pub(in crate::executor) fn import_exported_functions_from_env(
             },
         );
     }
-    (functions, def_infos)
+    (functions, def_infos, failed)
 }
 
 pub(in crate::executor) fn imported_function_name(env_name: &str) -> Option<&str> {

@@ -157,8 +157,26 @@ impl Executor {
             }
         }
 
-        let (imported_functions, imported_function_def_infos) =
+        let (imported_functions, imported_function_def_infos, failed_function_imports) =
             import_exported_functions_from_env(&env_vars);
+        // GNU variables.c: an imported function keeps att_exported — it
+        // shows as `declare -fx` and re-exports to grandchildren
+        // (rubash#1275). The import stripped the BASH_FUNC_* env entry
+        // but never recorded the attribute.
+        for name in imported_functions.keys() {
+            mark_env_name(&mut env_vars, EXPORTED_FUNCTIONS, name);
+        }
+        // GNU variables.c import refusal (the ShellShock guard) reports
+        // both lines under the shell's invocation name (rubash#1276).
+        if !failed_function_imports.is_empty() {
+            let shell_name = std::env::args()
+                .next()
+                .unwrap_or_else(|| "rubash".to_string());
+            for name in &failed_function_imports {
+                eprintln!("{shell_name}: warning: {name}: ignoring function definition attempt");
+                eprintln!("{shell_name}: error importing function definition for `{name}'");
+            }
+        }
         // GNU variables.c:397-446 (initialize_shell_variables,
         // FUNCTION_IMPORT): a successfully imported exported function
         // becomes a shell function, NOT a variable — the BASH_FUNC_name%%
