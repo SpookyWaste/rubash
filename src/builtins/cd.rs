@@ -266,7 +266,20 @@ where
                 .unwrap_or_else(|| shell_pwd_display_path(&new_pwd_display));
             writeln!(stdout, "{verbatim}")?
         }
-        PrintPath::CdPath => writeln!(stdout, "{}", shell_pwd_display_path(&new_pwd_display))?,
+        // GNU builtins/cd.def: the CDPATH announcement prints the path
+        // that was FOUND (the CDPATH-joined pathname), even under -P —
+        // only $PWD becomes the physical directory. new_pwd_display is
+        // the resolved physical path in Mode::Physical, which leaked
+        // into the announcement (rubash#1329); the logical destination
+        // built from the target display is the found path in both modes.
+        PrintPath::CdPath => writeln!(
+            stdout,
+            "{}",
+            shell_pwd_display_path(&logical_destination_display(
+                &old_pwd,
+                target.display.as_deref().unwrap_or(&target.path)
+            ))
+        )?,
         _ => {}
     }
 
