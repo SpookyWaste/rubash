@@ -1249,9 +1249,18 @@ fn apply_globignore(
             let base = name.rsplit('/').next().unwrap_or(name);
             base != "."
                 && base != ".."
-                && !patterns
-                    .iter()
-                    .any(|pattern| ignore_pattern_matches(pattern, base, extglob, nocase))
+                && !patterns.iter().any(|pattern| {
+                    // GNU glob.c ignorable(): an ignore pattern that
+                    // contains a `/` is matched against the full pathname;
+                    // only slashless patterns match the basename. Matching
+                    // every pattern against the basename made `sub1/*`
+                    // unmatchable (rubash#1321).
+                    if pattern.contains('/') {
+                        ignore_pattern_matches(pattern, name, extglob, nocase)
+                    } else {
+                        ignore_pattern_matches(pattern, base, extglob, nocase)
+                    }
+                })
         })
         .collect()
 }
