@@ -827,7 +827,21 @@ impl Executor {
                 self.set_current_line_value(line);
             }
         }
-        let trap_return_status = self.run_function_return_trap()?;
+        // GNU: `exit` inside a function body longjmps to the top level
+        // (builtins/exit.def -> jump_to_top_level) — the function never
+        // RETURNS, so the RETURN trap does not fire (rubash#1283). The
+        // body result carries the exit as Err(ExitCode) (or LastpipeExit
+        // for a lastpipe-stage exit); skip the trap for exactly those
+        // unwinds. `return N` (Err(Return)) and normal completion still
+        // fire it.
+        let trap_return_status = if matches!(
+            result,
+            Err(ExecuteError::ExitCode(_)) | Err(ExecuteError::LastpipeExit(_))
+        ) {
+            None
+        } else {
+            self.run_function_return_trap()?
+        };
         // GNU execute_cmd.c run_unwind_frame ("function_calling") AFTER the
         // run_return_trap fires: uw_maybe_set_return_trap restores the saved
         // action only when the body left the trap untrapped
