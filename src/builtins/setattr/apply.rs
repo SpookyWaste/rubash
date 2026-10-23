@@ -119,6 +119,41 @@ where
             mark_exported(env_vars, name);
         }
         ExportMode::Unset => {
+            // GNU setattr.def set_or_show_attributes: an assignment
+            // operand is bound FIRST (bind_variable) and only then is
+            // att_exported removed, so `export -n name=value` keeps the
+            // new value as a plain shell variable (rubash#1330). Dropping
+            // the operand entirely lost the value.
+            if let Some(assigned) = value {
+                if env_vars.is_marked(READONLY_VARS, name) {
+                    writeln!(
+                        stderr,
+                        "{}{}: readonly variable",
+                        readonly_error_prefix(env_vars),
+                        name
+                    )?;
+                    return Ok(EXECUTION_FAILURE);
+                }
+                let converted = env_vars.contains_key(name);
+                let (new_value, bound_array) = array_attribute_assignment_value(
+                    assigned,
+                    array,
+                    assoc,
+                    append,
+                    env_vars,
+                    name,
+                    oob_word,
+                );
+                env_vars.insert(name.to_string(), new_value);
+                if assoc {
+                    mark_assoc(env_vars, name, converted);
+                } else if array || bound_array {
+                    mark_array(env_vars, name);
+                }
+                if oob_word.is_some() {
+                    return Ok(EXECUTION_FAILURE);
+                }
+            }
             // Existence-gated process-env removal (#916/#917): the name
             // gate only applies to writes; an inherited copy must be
             // dropped so table-miss fallbacks do not resurrect it.
