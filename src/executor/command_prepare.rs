@@ -341,6 +341,7 @@ impl Executor {
         // FORCE_EOF class (or the interactive DISCARD class).
         let conditional_fatal = self.conditional_expansion_fatal.replace(false);
         let conditional_fatal_status = self.conditional_fatal_status.replace(None);
+        let conditional_error = self.conditional_expansion_error_status.take();
         if conditional_fatal {
             // rubash#1201: execute_conditional_command just overwrote
             // exit_code with the predicate's own status (e.g. -z of the
@@ -377,6 +378,13 @@ impl Executor {
                     self.fd_table.entries.remove(&fd);
                 }
             }
+        }
+        // rubash#1422: a non-fatal expansion error in a [[ ]] operand
+        // (recorded by expand_conditional_word) abandons the current
+        // command list with the recorded status — DISCARD, so the next
+        // list still runs — after the command's redirects are restored.
+        if let Some(status) = conditional_error {
+            return Err(ExecuteError::ExpansionFailure(status));
         }
         // rubash#1177: a nounset fatal latched while expanding a `=~`
         // operand inside the conditional converts to the FORCE_EOF exit

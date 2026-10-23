@@ -798,6 +798,14 @@ pub struct Executor {
     /// -z of the empty substitution to 0, and GNU's FORCE_EOF unwind keeps
     /// the fatal status (1) instead of the predicate result.
     pub(crate) conditional_fatal_status: Cell<Option<i32>>,
+    /// rubash#1422: a [[ ]] operand word hit a NON-fatal expansion
+    /// error (substring expression < 0 / bad substitution, status 1)
+    /// during cond_expand_word; the diagnostic and exit_code are
+    /// already in place and execute_conditional_command_with_redirects
+    /// converts the recorded status into the DISCARD unwind
+    /// (ExpansionFailure), mirroring the simple-command handling of
+    /// the same error class.
+    pub(crate) conditional_expansion_error_status: Cell<Option<i32>>,
     /// rubash#637: marks a pending evalerror abort as bad-subscript class.
     /// The eval boundary absorbs exactly this class (eval returns failure,
     /// the caller continues — GNU evalstring.c:365,422-442 swallowing

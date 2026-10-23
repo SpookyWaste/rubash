@@ -446,6 +446,7 @@ impl Executor {
             nounset_force_eof: Cell::new(false),
             conditional_expansion_fatal: Cell::new(false),
             conditional_fatal_status: Cell::new(None),
+            conditional_expansion_error_status: Cell::new(None),
             evalerror_subscript_pending: Cell::new(false),
             evalerror_failglob_pending: Cell::new(false),
             evalerror_exit_toomany_pending: Cell::new(false),

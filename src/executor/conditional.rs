@@ -250,6 +250,12 @@ impl Executor {
     /// dequote (subst.c:4795+); no [[ ]] context consumes the field-
     /// splitting semantics it encodes.
     fn expand_conditional_word(&mut self, word: &str) -> String {
+        // rubash#1422: an earlier operand already hit the DISCARD-class
+        // error below; GNU abandons the conditional at the first bad
+        // word, so later operands are never expanded at all.
+        if self.conditional_expansion_error_status.get().is_some() {
+            return String::new();
+        }
         // GNU cond.c cond_expand_word -> expand_word: a nounset unbound
         // variable (or another FATAL expansion error) in a [[ ]]
         // operand raises FORCE_EOF, exactly as in a simple command's
@@ -259,6 +265,24 @@ impl Executor {
         // execute_conditional_command_with_redirects to unwind.
         if !self.conditional_expansion_fatal.get() {
             if let Some((name, message, status)) = self.parameter_expansion_error_in_word(word) {
+                if status == 1 {
+                    // GNU subst.c: a non-fatal word-expansion error
+                    // (substring expression < 0, bad substitution) is
+                    // an expand_wdesc_error -> DISCARD inside [[ ]]
+                    // too: print the diagnostic, fail the conditional,
+                    // and abandon the rest of the current command
+                    // list, exactly as the simple-command path does
+                    // (rubash#1422). Record the status; the unwind
+                    // happens in
+                    // execute_conditional_command_with_redirects.
+                    let line = format!("{}{}: {}\n", self.diagnostic_prefix(), name, message);
+                    let _ = self.write_diagnostic_fd2(line.as_bytes());
+                    self.exit_code = status;
+                    // rubash#439: expansion error, not a failed command.
+                    self.command_expansion_failed.set(true);
+                    self.conditional_expansion_error_status.set(Some(status));
+                    return String::new();
+                }
                 if status == Self::FATAL_PARAMETER_EXPANSION_STATUS {
                     let line = format!("{}{}: {}\n", self.diagnostic_prefix(), name, message);
                     let _ = self.write_diagnostic_fd2(line.as_bytes());
@@ -789,10 +813,11 @@ impl Executor {
         // (variables.c: bind_variable), emits "BASH_REMATCH: readonly
         // variable" on stderr, and keeps the stale value. The match itself
         // still succeeds.
-        if self.shell_state.env_vars.is_marked(
-            crate::executor::READONLY_VARS,
-            "BASH_REMATCH",
-        ) {
+        if self
+            .shell_state
+            .env_vars
+            .is_marked(crate::executor::READONLY_VARS, "BASH_REMATCH")
+        {
             eprintln!("{}BASH_REMATCH: readonly variable", self.error_prefix());
             return;
         }
