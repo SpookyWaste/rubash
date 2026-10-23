@@ -854,6 +854,25 @@ impl Executor {
         let value = value
             .strip_prefix(COMPOUND_ASSIGNMENT_MARKER)
             .unwrap_or(value);
+        // GNU subst.c expand_word_internal: tilde expansion runs on the
+        // RAW word before parameter expansion, so a glued `~$u` is judged
+        // as the literal user name "$u" — the passwd lookup fails and the
+        // segment stays verbatim while `$u` still expands into it
+        // (rubash#1417: `u=/x; v=~$u` is `~/x`, never `$HOME/x`; a tilde
+        // produced BY a parameter is likewise never re-expanded). Apply
+        // the pass up front here and suppress the post-expansion pass at
+        // the bottom of this function, which operated on expanded text.
+        let tilde_first = !quoted
+            && !compound_assignment
+            && !value.contains('=')
+            && tilde_expand::assignment_value_needs_tilde_expansion(value, true);
+        let tilde_resolved;
+        let value = if tilde_first {
+            tilde_resolved = self.expand_assignment_tilde(value);
+            &tilde_resolved
+        } else {
+            value
+        };
         // GNU subst.c:11358-11381 (expand_word_internal cases '<'/'>'):
         // process substitution is recognized only while the word walker is
         // scanning the ORIGINAL word text; results of parameter expansion
@@ -1336,7 +1355,8 @@ impl Executor {
         // where the value is "~" must stay literal). GNU expands `~` at the
         // start of the RHS and after every `:` in an assignment value
         // (subst.c:11410-11460 internal_tilde + assignoff tracking).
-        if !expanded.contains('=')
+        if !tilde_first
+            && !expanded.contains('=')
             && tilde_expand::assignment_value_needs_tilde_expansion(value, true)
         {
             self.expand_assignment_tilde(&expanded)

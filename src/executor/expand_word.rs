@@ -642,8 +642,34 @@ impl Executor {
         // raw parenthesized text first; the preserve variant keeps element
         // quote syntax so the storage tokenizer sees GNU's raw words
         // (assoc11.sub quote elements, d=(x $(echo 'y z') w) assoc glue).
+        // GNU subst.c: expand_word_internal applies tilde expansion to the
+        // RAW word BEFORE parameter expansion. A tilde that comes from
+        // ${param} expansion is never re-expanded (unicode1.sub: EChar=${Array[0x7e]}
+        // where the value is "~" must stay literal), and a glued `~$u` is
+        // judged on its raw text: the would-be user name `$u` fails the
+        // passwd lookup, so the segment stays literal and the parameter is
+        // expanded afterwards into the unexpanded text (rubash#1417:
+        // `u=/x; v=~$u` is `~/x`, not `$HOME/x`). GNU expands `~` at the
+        // start of the RHS and after every `:` in an assignment value
+        // (subst.c:11410-11460 internal_tilde + assignoff tracking).
+        // A compound `( ... )` RHS already took its per-element tilde pass
+        // (assign_assoc_from_kvlist key/value split, arrayfunc.c:630) — a
+        // whole-text `:`-tilde would wrongly expand `~` inside key-position
+        // elements like `p:~/r` that GNU leaves literal.
+        let tilde_first = !quoted
+            && !compound_assignment
+            && tilde_expand::assignment_value_needs_tilde_expansion(value, true)
+            && (self
+                .shell_state
+                .env_vars
+                .get("__RUBASH_POSIX_MODE")
+                .map(String::as_str)
+                != Some("1")
+                || value.starts_with("~/"));
         let expanded = if compound_assignment {
             self.expand_embedded_parameters_compound(value)
+        } else if tilde_first {
+            self.expand_embedded_parameters(&self.expand_assignment_tilde(value))
         } else {
             self.expand_embedded_parameters(value)
         };
@@ -652,30 +678,6 @@ impl Executor {
         } else {
             expanded
         };
-        // GNU subst.c: expand_word_internal applies tilde expansion to the
-        // RAW word before parameter expansion. A tilde that comes from
-        // ${param} expansion is never re-expanded (unicode1.sub: EChar=${Array[0x7e]}
-        // where the value is "~" must stay literal). GNU expands `~` at the
-        // start of the RHS and after every `:` in an assignment value
-        // (subst.c:11410-11460 internal_tilde + assignoff tracking).
-        // A compound `( ... )` RHS already took its per-element tilde pass
-        // (assign_assoc_from_kvlist key/value split, arrayfunc.c:630) — a
-        // whole-text `:`-tilde would wrongly expand `~` inside key-position
-        // elements like `p:~/r` that GNU leaves literal.
-        if !quoted
-            && !compound_assignment
-            && !expanded.contains('=')
-            && tilde_expand::assignment_value_needs_tilde_expansion(value, true)
-            && (self
-                .shell_state
-                .env_vars
-                .get("__RUBASH_POSIX_MODE")
-                .map(String::as_str)
-                != Some("1")
-                || expanded.starts_with("~/"))
-        {
-            return format!("{name}={}", self.expand_assignment_tilde(&expanded));
-        }
 
         format!("{name}={expanded}")
     }
