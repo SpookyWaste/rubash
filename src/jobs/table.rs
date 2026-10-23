@@ -82,6 +82,15 @@ pub struct JobTable {
     /// wait consumes them. Synthetic fallback pids (non-unix / fork
     /// failure) never enter.
     pub procsub_placeholders: HashSet<u32>,
+    /// rubash#1222: pids removed from the job table by `disown`. GNU
+    /// keeps no job for them, yet an explicit `wait <pid>` for a disowned
+    /// child still succeeds silently with status 0 — bgpids remembers
+    /// every background pid the shell created (jobs.c bgpids, a
+    /// pid->status list wait consults before declaring "not a child");
+    /// disowned pids stay in that list with their status discarded.
+    /// Membership here must therefore never be removed by `wait` (repeat
+    /// waits also return 0), only by shell exit.
+    pub disowned_pids: HashSet<u32>,
     current_job: Option<JobId>,
     previous_job: Option<JobId>,
 }

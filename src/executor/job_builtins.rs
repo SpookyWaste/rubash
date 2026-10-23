@@ -518,6 +518,12 @@ impl Executor {
                 }
                 JobOperandResolution::NoMatch => {
                     if let Ok(pid) = cmd.words[1].parse::<u32>() {
+                        // rubash#1222: a disowned pid waits silently with
+                        // status 0 (GNU bgpids), before any child lookup.
+                        if self.shell_state.job_table.disowned_pids.contains(&pid) {
+                            self.write_buffered_builtin_output(cmd, &[], &[])?;
+                            return Ok(0);
+                        }
                         match self.wait_for_background_pid(pid, true)? {
                             WaitPidOutcome::Status(status)
                             | WaitPidOutcome::Interrupted(status) => {
@@ -562,6 +568,29 @@ impl Executor {
                 }
                 self.write_buffered_builtin_output(cmd, &[], &stderr)?;
                 return Ok(status);
+            }
+        }
+
+        // rubash#1222: when NO operand resolved through the job table but
+        // every operand is a pid disowned earlier in this shell, GNU's
+        // bgpids-backed wait still succeeds silently with status 0
+        // (multi-operand and `wait -p var` forms land here).
+        if let Some(operands) = wait_background_operands(&cmd.words[1..]) {
+            if !operands.is_empty()
+                && operands.iter().all(|operand| {
+                    operand
+                        .parse::<u32>()
+                        .is_ok_and(|pid| self.shell_state.job_table.disowned_pids.contains(&pid))
+                })
+            {
+                if let Some((wait_var, _)) = wait_assign_var(&cmd.words[1..]) {
+                    if let Some(last) = operands.last() {
+                        let arrayref = self.wait_var_arrayref();
+                        self.bind_wait_variable(&wait_var, last.clone(), arrayref);
+                    }
+                }
+                self.write_buffered_builtin_output(cmd, &[], &[])?;
+                return Ok(0);
             }
         }
 
@@ -705,6 +734,17 @@ impl Executor {
                     continue;
                 }
                 JobOperandResolution::NoMatch => {
+                    // rubash#1222: a pid disowned earlier in this shell
+                    // stays wait-able — GNU's bgpids list keeps it after
+                    // disown and the wait succeeds silently with status 0
+                    // (the child's real exit status is discarded).
+                    if let Ok(pid) = operand.parse::<u32>() {
+                        if self.shell_state.job_table.disowned_pids.contains(&pid) {
+                            status = 0;
+                            last_pid = Some(pid);
+                            continue;
+                        }
+                    }
                     status = write_wait_operand_error(
                         &operand,
                         &self.diagnostic_prefix(),
@@ -1613,9 +1653,12 @@ impl Executor {
                         .chain(self.background_children.keys().copied())
                         .collect();
                     self.background_children.clear();
-                    for pid in pids {
-                        self.close_coproc_endpoints(pid);
-                        self.fd_table.close(pid);
+                    for pid in &pids {
+                        // rubash#1222: disowned pids stay wait-able with
+                        // status 0 (GNU bgpids survives disown_all_jobs).
+                        self.shell_state.job_table.disowned_pids.insert(*pid);
+                        self.close_coproc_endpoints(*pid);
+                        self.fd_table.close(*pid);
                     }
                     self.shell_state.job_table.clear_jobs();
                     0
@@ -1697,6 +1740,9 @@ impl Executor {
                                 self.background_children.remove(&pid);
                                 self.close_coproc_endpoints(pid);
                                 self.fd_table.close(pid);
+                                // rubash#1222: record before removal —
+                                // `wait <pid>` must still succeed with 0.
+                                self.shell_state.job_table.disowned_pids.insert(pid);
                                 self.shell_state.job_table.remove_job_by_pid(pid);
                             }
                         }
@@ -1738,6 +1784,8 @@ impl Executor {
         self.background_children.remove(&pid);
         self.close_coproc_endpoints(pid);
         self.fd_table.close(pid);
+        // rubash#1222: see the Jobs arm — disowned pids stay wait-able.
+        self.shell_state.job_table.disowned_pids.insert(pid);
         self.shell_state.job_table.remove_job_by_pid(pid);
         true
     }
