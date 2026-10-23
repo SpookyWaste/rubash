@@ -274,8 +274,27 @@ fn run_script_grouped_at_line_offset(
     if install_session {
         executor.set_session_history(Some(session.clone()));
     }
+    // rubash#1186 companion: a fresh grouped read starts with no discard
+    // armed — the failglob pending belongs to the read that produced it
+    // (execute_ast clears the same state at its entry for the same
+    // reason), so a previous script's trailing failglob cannot eat this
+    // read's first group.
+    executor.evalerror_failglob_pending.set(false);
     let raw_lines: Vec<&str> = contents.split_inclusive('\n').collect();
     let mut index = 0usize;
+    // rubash#1186: the failglob DISCARD span, as the last line of the
+    // group whose execution armed it. GNU expr.c evalerror ->
+    // jump_to_top_level (DISCARD) abandons the rest of the failing
+    // command's LOGICAL line. The whole-file reader sees that inside one
+    // execute_ast_inner walk, but this grouped reader re-enters
+    // execute_ast per group (whose entry clears the pendings), and the
+    // gatherer may split one logical line into several groups (a
+    // compound command followed by `; cmd`), so a same-line discard was
+    // lost across the group boundary: `{ set -- /no/such/*.zzz; echo
+    // in; }; echo rc` printed `rc` in grouped mode only. Track the span
+    // here: groups starting on or before it are not executed (the
+    // first group starting past it clears the span and runs).
+    let mut failglob_discard_until: Option<usize> = None;
     while index < raw_lines.len() {
         // One gather implementation for every grouped reader (the `source`
         // builtin shares it via read_next_source_group). The gather loop
@@ -293,6 +312,17 @@ fn run_script_grouped_at_line_offset(
         else {
             break;
         };
+        if let Some(until) = failglob_discard_until {
+            if start_line <= until {
+                // Same logical line as the failglob failure: GNU's
+                // DISCARD abandons it. (The group is also not recorded;
+                // GNU records read lines before executing them, but the
+                // recording here is fused with execution.)
+                continue;
+            }
+            failglob_discard_until = None;
+        }
+        let group_last_line = start_line + group.len().saturating_sub(1);
         let status = run_history_group(
             executor,
             &session,
@@ -302,6 +332,9 @@ fn run_script_grouped_at_line_offset(
             false,
             feeder_tokens.take(),
         );
+        if executor.evalerror_failglob_pending.get() {
+            failglob_discard_until = Some(group_last_line);
+        }
         let parse_error = executor.take_parse_error();
         // A group that ended by unwinding (exit builtin, errexit, POSIX
         // special-builtin failure) stops the reader unconditionally — GNU's
@@ -1187,6 +1220,9 @@ fn run_history_group(
     if exec_text.trim().is_empty() {
         return executor.last_exit_code();
     }
+    // rubash#1186: the failglob DISCARD is handled by the grouped
+    // reader loop (run_script_grouped_at_line_offset), which knows the
+    // line span of every group; see failglob_discard_until there.
     // The group's words are final: executor-level alias expansion would
     // expand them a second time. Inner re-parses (eval, command
     // substitution, source, traps) suspend the marker and expand their own
@@ -3241,6 +3277,18 @@ pub fn initialize_interactive_history(executor: &mut Executor) {
     if executor.get_env("HISTFILESIZE").is_none() {
         if let Some(histsize) = executor.get_env("HISTSIZE").map(String::from) {
             executor.set_env("HISTFILESIZE", &histsize);
+        }
+    }
+    // GNU variables.c/bind_variable defaults: HISTFILE falls back to
+    // ~/.bash_history when unset (bashhist.c reads and appends that
+    // file). Without the default, an unset HISTFILE silently disabled
+    // both the startup load below and the exit save in finish_shell,
+    // losing the whole interactive history (rubash#1216).
+    if executor.get_env("HISTFILE").is_none() {
+        if let Some(home) = executor.get_env("HOME") {
+            if !home.is_empty() {
+                executor.set_env("HISTFILE", &format!("{home}/.bash_history"));
+            }
         }
     }
     let Some(session) = executor.get_session_history() else {
