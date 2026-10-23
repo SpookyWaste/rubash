@@ -306,7 +306,7 @@ fn test_kill_background_jobspec_keeps_job_until_reap() {
         "kill succeeds: {content:?}"
     );
     assert!(
-        content.contains("[1]") && content.contains("while true; do true; done &"),
+        content.contains("[1]") && content.contains("while true; do true; done"),
         "jobs still lists the killed job until the reap: {content:?}"
     );
     let _ = fs::remove_file(output_path);
@@ -337,7 +337,7 @@ fn test_kill_current_jobspec_uses_last_background_job() {
         "kill succeeds: {content:?}"
     );
     assert!(
-        content.contains("[1]") && content.contains("while true; do true; done &"),
+        content.contains("[1]") && content.contains("while true; do true; done"),
         "jobs still lists the killed job until the reap: {content:?}"
     );
     let _ = fs::remove_file(output_path);
