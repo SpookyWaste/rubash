@@ -468,6 +468,8 @@ impl Executor {
             fd_var_external_undo: Vec::new(),
             read_deadline: None,
             read_timed_out: false,
+            read_interrupted_signal: None,
+            read_sigint_guard_armed: false,
             read_eof_no_delimiter: false,
             stdout_capture: None,
             stderr_capture: None,

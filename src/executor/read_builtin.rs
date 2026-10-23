@@ -2182,6 +2182,15 @@ impl Executor {
                 None => None,
             };
             let read_timed_out = self.take_read_timed_out();
+            // rubash#1250: an untrapped SIGINT aborted the acquisition —
+            // GNU assigns nothing and the builtin returns 128+SIGINT.
+            if let Some(signal) = self.take_read_interrupted_signal() {
+                return if invalid_name {
+                    self.finish_read_error(cmd, &stderr, 1)
+                } else {
+                    128 + signal
+                };
+            }
             let read_eof = self.take_read_eof_no_delimiter();
             let final_line = match (&line, &initial_text) {
                 (Some(line), _) => line.clone(),
@@ -2298,6 +2307,14 @@ impl Executor {
                 } else {
                     0
                 }
+            } else if self.read_interrupted_signal.is_some() {
+                // rubash#1250: an untrapped SIGINT aborted the
+                // acquisition — GNU assigns NOTHING and returns
+                // 128+SIGINT; the final status mapping below produces
+                // it from the flag. Do not fall through to the EOF /
+                // timeout / fallback arms (the fallback would block
+                // on a second raw read).
+                130
             } else if command_closes_stdin(cmd) || self.fd_table.is_closed(0) {
                 let assign_status = self.assign_read_scalar_names(
                     &scalar_names,
@@ -2388,14 +2405,43 @@ impl Executor {
                     0
                 }
             } else {
+                // rubash#1250: hold the foreground SIGINT guard across
+                // the raw fallback read as well (see read_input_for_
+                // command); its loops poll for the abort in slices.
+                #[cfg(unix)]
+                let _sigint_guard = super::external_inner::ForegroundBuiltinSigintGuard::hold_if_interactive_untrapped(self);
+                let poll_sigint = {
+                    #[cfg(unix)]
+                    {
+                        _sigint_guard.is_armed()
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        false
+                    }
+                };
                 match read_stdin_until(
                     self.read_deadline,
                     silent,
                     delimiter,
                     char_limit,
                     exact_char_limit,
+                    poll_sigint,
                 ) {
-                    Ok((0, _, false, false)) => {
+                    Ok((_, _, _, _, true)) => {
+                        // Interrupted (rubash#1250): assign nothing; the
+                        // final status mapping produces 128+SIGINT.
+                        #[cfg(unix)]
+                        {
+                            self.read_interrupted_signal = Some(libc::SIGINT);
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            self.read_interrupted_signal = Some(2);
+                        }
+                        130
+                    }
+                    Ok((0, _, false, false, _)) => {
                         let assign_status = self.assign_read_scalar_names(
                             &scalar_names,
                             initial_text.as_deref().unwrap_or(""),
@@ -2410,7 +2456,7 @@ impl Executor {
                             0
                         }
                     }
-                    Ok((_, line, stdin_eof, timed_out)) => {
+                    Ok((_, line, stdin_eof, timed_out, _)) => {
                         // read.def:553: the deadline expired — the partial
                         // record is still assigned and the status becomes
                         // 128+SIGALRM via take_read_timed_out below.
@@ -2441,9 +2487,13 @@ impl Executor {
                     Err(_) => 1,
                 }
             };
-            // GNU read.def:539-562: on timeout the vars keep the partial
-            // assignment above and the builtin returns 128+SIGALRM=142.
-            let status = if self.take_read_timed_out() {
+            // GNU read.def: an interrupted read returns 128+SIGINT and
+            // assigns nothing (rubash#1250); on timeout the vars keep
+            // the partial assignment above and the builtin returns
+            // 128+SIGALRM=142 (read.def:539-562).
+            let status = if let Some(signal) = self.take_read_interrupted_signal() {
+                128 + signal
+            } else if self.take_read_timed_out() {
                 142
             } else {
                 status
@@ -2627,8 +2677,18 @@ impl Executor {
             .map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s));
         self.read_deadline = deadline;
         self.read_timed_out = false;
+        self.read_interrupted_signal = None;
+        self.read_sigint_guard_armed = false;
         self.fd_table.read_deadline = deadline;
         self.fd_table.read_timed_out = false;
+    }
+
+    /// Merge and clear the rubash#1250 interrupt flag: an untrapped
+    /// SIGINT consumed by a blocking read's slice poll. The caller maps
+    /// it to 128+signal and assigns nothing (GNU read.def interrupted
+    /// read: no `goto assign_vars`).
+    fn take_read_interrupted_signal(&mut self) -> Option<i32> {
+        self.read_interrupted_signal.take()
     }
 
     /// Merge the fd-table timeout flag, clear the armed deadline, and report

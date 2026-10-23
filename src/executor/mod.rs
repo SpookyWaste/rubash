@@ -1098,6 +1098,17 @@ pub struct Executor {
     /// A bounded read expired mid-line: GNU assigns the partial input and
     /// returns 128+SIGALRM=142 (read.def:539-562 `goto assign_vars`).
     pub(crate) read_timed_out: bool,
+    /// rubash#1250: an untrapped SIGINT aborted a blocking `read` — the
+    /// ForegroundBuiltinSigintGuard routed it to the pending-signal
+    /// mailbox and the read loop's slice poll consumed it. GNU read.def:
+    /// the interrupted read assigns NOTHING and returns 128+SIGINT.
+    /// Reset by arm_read_deadline at every `read` entry.
+    pub(crate) read_interrupted_signal: Option<i32>,
+    /// True while a `read` input acquisition holds the foreground
+    /// SIGINT guard (external_inner::ForegroundBuiltinSigintGuard), so
+    /// the blocking read loops know their slice polls may consume an
+    /// untrapped SIGINT from the mailbox.
+    pub(crate) read_sigint_guard_armed: bool,
     /// GNU read.def:949 `retval = eof ? EXECUTION_FAILURE : SUCCESS`: the
     /// record read exhausted its input before the delimiter (`read -d ''`
     /// over a NUL-free stream, `read v` without a trailing newline). The

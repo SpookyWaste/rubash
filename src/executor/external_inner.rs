@@ -1486,6 +1486,10 @@ impl ForegroundBuiltinSigintGuard {
         Self { armed: true }
     }
 
+    pub(in crate::executor) fn is_armed(&self) -> bool {
+        self.armed
+    }
+
     /// Consume a pending untrapped SIGINT for this wait (true = caller aborts
     /// with 128+SIGINT). Gated on armed: a TRAPPED SIGINT must flow through
     /// observe_signals_while_blocked so its action runs — stealing it here

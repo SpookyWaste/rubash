@@ -476,15 +476,46 @@ pub(in crate::executor) fn stdin_unit_is_delimiter(unit: &StdinUnit, delimiter: 
     delimiter_byte_matches(byte, delimiter)
 }
 
+/// rubash#1250: poll the pending-signal mailbox for an untrapped
+/// SIGINT held by the foreground guard (the caller's `poll_sigint_abort`
+/// is the guard's armed state). Consumes the SIGINT, re-queues any
+/// other signal for its own boundary handling. Mirrors
+/// ForegroundBuiltinSigintGuard::take_sigint_abort for this free
+/// function's loops.
+fn take_untrapped_sigint() -> bool {
+    #[cfg(unix)]
+    {
+        let pending =
+            crate::builtins::kill::take_pending_signals_now(std::process::id()).unwrap_or_default();
+        if pending.is_empty() {
+            return false;
+        }
+        let mut rest = Vec::new();
+        let mut interrupted = false;
+        for signal in pending {
+            if signal == libc::SIGINT && crate::builtins::kill::kernel_handler_installed(signal) {
+                interrupted = true;
+            } else {
+                rest.push(signal);
+            }
+        }
+        crate::builtins::kill::requeue_pending_signals(rest);
+        return interrupted;
+    }
+    #[cfg(not(unix))]
+    false
+}
+
 pub(in crate::executor) fn read_stdin_until(
     deadline: Option<std::time::Instant>,
     silent: bool,
     delimiter: char,
     char_limit: Option<usize>,
     exact_char_limit: bool,
-) -> std::io::Result<(usize, String, bool, bool)> {
+    poll_sigint_abort: bool,
+) -> std::io::Result<(usize, String, bool, bool, bool)> {
     if char_limit == Some(0) {
-        return Ok((0, String::new(), false, false));
+        return Ok((0, String::new(), false, false, false));
     }
 
     // GNU builtins/read.def reads fd 0 through zread (lib/sh/zread.c) — one
@@ -553,18 +584,53 @@ pub(in crate::executor) fn read_stdin_until(
     let mut units = 0usize;
     let mut eof = false;
     let mut timed_out = false;
+    let mut interrupted = false;
     loop {
         if !decoder.has_queued() {
             // read.def check_read_timeout (read.def:659) runs at the top of
             // every read-loop iteration: wait out the remaining deadline for
             // the handle to become readable before the blocking read.
+            // rubash#1250: the wait runs in slices polling for an
+            // untrapped SIGINT, and with no deadline an armed guard
+            // gates the blocking read on sliced readability (a canonical
+            // tty reports readable only with a complete line buffered,
+            // so the record shape is unchanged).
             if let Some(deadline) = deadline {
-                let now = std::time::Instant::now();
-                if now >= deadline
-                    || crate::fd::wait_readable(stdin_handle, deadline - now)
-                        == crate::fd::ReadWait::Timeout
-                {
-                    timed_out = true;
+                let mut ready = false;
+                loop {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        timed_out = true;
+                        break;
+                    }
+                    if poll_sigint_abort && take_untrapped_sigint() {
+                        interrupted = true;
+                        break;
+                    }
+                    let slice = (deadline - now).min(std::time::Duration::from_millis(50));
+                    if crate::fd::wait_readable(stdin_handle, slice) != crate::fd::ReadWait::Timeout
+                    {
+                        ready = true;
+                        break;
+                    }
+                }
+                if timed_out || interrupted {
+                    break;
+                }
+                let _ = ready;
+            } else if poll_sigint_abort && crate::fd::is_console_handle(stdin_handle) {
+                loop {
+                    if take_untrapped_sigint() {
+                        interrupted = true;
+                        break;
+                    }
+                    if crate::fd::wait_readable(stdin_handle, std::time::Duration::from_millis(50))
+                        != crate::fd::ReadWait::Timeout
+                    {
+                        break;
+                    }
+                }
+                if interrupted {
                     break;
                 }
             }
@@ -626,12 +692,15 @@ pub(in crate::executor) fn read_stdin_until(
     // Third element: read.def:949 eof — the handle closed before the
     // delimiter (a char-limit break or timeout is not EOF). Fourth element:
     // read.def:553 — the deadline expired; the caller maps it to
-    // 128+SIGALRM while still assigning the partial record.
+    // 128+SIGALRM while still assigning the partial record. Fifth element
+    // (rubash#1250): an untrapped SIGINT aborted the read; the caller
+    // assigns NOTHING and returns 128+SIGINT.
     Ok((
         read,
         trim_read_input(output, delimiter, char_limit, exact_char_limit),
         eof,
         timed_out,
+        interrupted,
     ))
 }
 

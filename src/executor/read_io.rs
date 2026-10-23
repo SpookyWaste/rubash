@@ -68,12 +68,66 @@ impl Executor {
         let Some(deadline) = self.read_deadline else {
             return false;
         };
-        let now = std::time::Instant::now();
-        if now >= deadline
-            || crate::fd::wait_readable(handle, deadline - now) == crate::fd::ReadWait::Timeout
+        // rubash#1250: wait in slices and poll for an untrapped SIGINT
+        // between them — a single full-deadline poll (EINTR-retried in
+        // fd::wait_readable) made `read -t 30` ride out the whole timeout
+        // after Ctrl-C instead of returning 128+SIGINT at once.
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                self.read_timed_out = true;
+                return true;
+            }
+            if self.take_read_sigint_abort() {
+                return true;
+            }
+            let remaining = deadline - now;
+            let slice = remaining.min(std::time::Duration::from_millis(50));
+            if crate::fd::wait_readable(handle, slice) == crate::fd::ReadWait::Timeout {
+                if slice >= remaining {
+                    self.read_timed_out = true;
+                    return true;
+                }
+                continue;
+            }
+            return false;
+        }
+    }
+
+    /// rubash#1250: consume an untrapped SIGINT routed to the pending
+    /// mailbox by the foreground guard held across this read (the same
+    /// partition ForegroundBuiltinSigintGuard::take_sigint_abort
+    /// performs for the `sleep` fast path): the SIGINT is consumed, any
+    /// other pending signal is re-queued for its own boundary handling.
+    /// On success the caller abandons the read WITHOUT assigning (GNU
+    /// read.def: an interrupted read returns 128+SIGINT and the
+    /// variables keep their previous values).
+    fn take_read_sigint_abort(&mut self) -> bool {
+        if !self.read_sigint_guard_armed || self.read_interrupted_signal.is_some() {
+            return self.read_interrupted_signal.is_some();
+        }
+        #[cfg(unix)]
         {
-            self.read_timed_out = true;
-            return true;
+            let pending = crate::builtins::kill::take_pending_signals_now(std::process::id())
+                .unwrap_or_default();
+            if pending.is_empty() {
+                return false;
+            }
+            let mut rest = Vec::new();
+            let mut interrupted = false;
+            for signal in pending {
+                if signal == libc::SIGINT && crate::builtins::kill::kernel_handler_installed(signal)
+                {
+                    interrupted = true;
+                } else {
+                    rest.push(signal);
+                }
+            }
+            crate::builtins::kill::requeue_pending_signals(rest);
+            if interrupted {
+                self.read_interrupted_signal = Some(libc::SIGINT);
+                return true;
+            }
         }
         false
     }
@@ -87,6 +141,27 @@ impl Executor {
         char_limit: Option<usize>,
         exact_char_limit: bool,
     ) -> Option<String> {
+        // rubash#1250: hold untrapped SIGINT at the mailbox handler for
+        // the whole acquisition, like the `sleep` fast path: an
+        // interactive `read -t 30` (or a plain tty read) otherwise sat
+        // in its blocking read while Ctrl-C waited for a command
+        // boundary that could never arrive. The blocking loops below
+        // poll take_read_sigint_abort in slices and abandon the read
+        // with status 128+SIGINT, assigning nothing.
+        #[cfg(unix)]
+        let _sigint_guard =
+            super::external_inner::ForegroundBuiltinSigintGuard::hold_if_interactive_untrapped(
+                self,
+            );
+        #[cfg(unix)]
+        {
+            self.read_sigint_guard_armed = _sigint_guard.is_armed();
+        }
+        // An interrupt consumed by an earlier transport in this same
+        // acquisition ends it: no second transport may block again.
+        if self.read_interrupted_signal.is_some() {
+            return None;
+        }
         // read.def:949 eof bookkeeping: each fresh record read starts with
         // the delimiter unsatisfied; the leaf readers below set the flag
         // when they exhaust their input before finding it.
@@ -500,11 +575,25 @@ impl Executor {
             delimiter,
             char_limit,
             exact_char_limit,
+            self.read_sigint_guard_armed,
         ) {
+            // rubash#1250: an untrapped SIGINT aborted the raw read —
+            // record it so the acquisition cascade stops here.
+            Ok((_, _, _, _, true)) => {
+                #[cfg(unix)]
+                {
+                    self.read_interrupted_signal = Some(libc::SIGINT);
+                }
+                #[cfg(not(unix))]
+                {
+                    self.read_interrupted_signal = Some(2);
+                }
+                None
+            }
             // EOF with nothing consumed: no record to serve — the caller's
             // EOF handling (read.def:762-768) decides the status.
-            Ok((0, _, false, false)) => None,
-            Ok((_, line, stdin_eof, timed_out)) => {
+            Ok((0, _, false, false, false)) => None,
+            Ok((_, line, stdin_eof, timed_out, _)) => {
                 self.read_eof_no_delimiter |= stdin_eof;
                 self.read_timed_out |= timed_out;
                 Some(line)
@@ -886,6 +975,11 @@ impl Executor {
         {
             return None;
         }
+        // rubash#1250: an interrupt already consumed for this `read`
+        // ends every transport instantly (no re-blocking).
+        if self.read_interrupted_signal.is_some() {
+            return None;
+        }
         if char_limit == Some(0) {
             return Some(String::new());
         }
@@ -927,7 +1021,39 @@ impl Executor {
         loop {
             if !decoder.has_queued() {
                 if self.read_wait_timed_out(stdin_handle) {
+                    // rubash#1250: timeout breaks with the partial
+                    // record; an interrupt abandons the read outright
+                    // (no assignment, status 128+SIGINT upstream).
+                    if self.read_interrupted_signal.is_some() {
+                        return None;
+                    }
                     break;
+                }
+                // rubash#1250: with no deadline, a console read blocks
+                // inside read_some (canonical mode holds bytes until a
+                // full line lands, and read_some retries EINTR), so a
+                // Ctrl-C could never surface. While the SIGINT guard is
+                // armed, gate the read on sliced readability instead —
+                // poll() on a canonical tty reports readable only when
+                // a complete line is buffered, so the record shape is
+                // unchanged.
+                if self.read_deadline.is_none() && self.read_sigint_guard_armed {
+                    if crate::fd::is_console_handle(stdin_handle) {
+                        loop {
+                            if self.take_read_sigint_abort() {
+                                return None;
+                            }
+                            if crate::fd::wait_readable(
+                                stdin_handle,
+                                std::time::Duration::from_millis(50),
+                            ) != crate::fd::ReadWait::Timeout
+                            {
+                                break;
+                            }
+                        }
+                    } else if self.take_read_sigint_abort() {
+                        return None;
+                    }
                 }
                 let buf = crate::fd::read_some(stdin_handle, 1).ok()?;
                 if buf.is_empty() {
