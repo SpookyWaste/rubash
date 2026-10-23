@@ -794,8 +794,16 @@ impl<'a> Lexer<'a> {
                 } else if self.peek() == Some('<') {
                     Some(self.finish_prefixed_input_redirect(start))
                 } else {
-                    self.skip_word_at(start);
-                    Some(Token::new(TokenKind::Word, self.slice(start), start))
+                    // GNU parse.y read_token_word: `2` is an ordinary word
+                    // character; the io-number reading (parse.y's
+                    // read_token exit) engages only when the finished token
+                    // ENDS immediately before a `<`/`>` at token position.
+                    // A word merely STARTING with `2` (`2$x`, `2\y`, `2>f`
+                    // mid-word) must go through the normal word finish so
+                    // $'...' decoding and backslash folding run — the raw
+                    // slice shortcut left `2$'x'` undecoded (rubash#1184
+                    // finding 1).
+                    Some(self.finish_word_token(start, false))
                 }
             }
             '#' => {

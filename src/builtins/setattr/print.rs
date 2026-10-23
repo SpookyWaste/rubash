@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use std::io::{self, Write};
 
 use super::marks::marked_vars;
-use super::value::{format_array_value, is_array_value, quote_export_value, valid_identifier};
+use super::value::{
+    format_array_value, is_array_value, quote_export_value, quote_listing_value, valid_identifier,
+};
 use super::{
     ARRAY_VARS, ASSOC_VARS, EXPORTED_VARS, INTEGER_VARS, LOWERCASE_VARS, READONLY_VARS,
     UPPERCASE_VARS,
@@ -109,8 +111,8 @@ where
                 );
                 writeln!(
                     stdout,
-                    "declare {attrs} {name}=\"{}\"",
-                    quote_export_value(value)
+                    "declare {attrs} {name}={}",
+                    quote_listing_value(value)
                 )?;
             }
         } else if posix_mode && is_array {
@@ -211,9 +213,9 @@ where
                 );
                 writeln!(
                     stdout,
-                    "declare {attrs} {}=\"{}\"",
+                    "declare {attrs} {}={}",
                     name,
-                    quote_export_value(value)
+                    quote_listing_value(value)
                 )?;
             }
         } else {

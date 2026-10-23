@@ -796,5 +796,11 @@ impl Executor {
         mark_env_name(env_vars, READONLY_VARS, "UID");
         mark_env_name(env_vars, READONLY_VARS, "EUID");
         mark_env_name(env_vars, READONLY_VARS, "PPID");
+        // GNU variables.c create_variable_tables/initialize_shell_variables:
+        // UID/EUID/PPID are created with V_INTEGER|V_READONLY, so
+        // `declare -p UID` reports -ir, not just -r (rubash#1184 finding 3).
+        mark_env_name(env_vars, INTEGER_VARS, "UID");
+        mark_env_name(env_vars, INTEGER_VARS, "EUID");
+        mark_env_name(env_vars, INTEGER_VARS, "PPID");
     }
 }
