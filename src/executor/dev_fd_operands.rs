@@ -329,6 +329,11 @@ impl Executor {
                 // reader that only exists after exec. An early child exit
                 // surfaces as EPIPE in the thread and is ignored.
                 std::thread::spawn(move || {
+                    // EPIPE must stay a plain error in this thread (see
+                    // the spawn comment); SIGPIPE is SIG_DFL process-wide
+                    // since rubash#1333, so block it here.
+                    #[cfg(unix)]
+                    crate::builtins::kill::block_sigpipe_on_this_thread();
                     let _ = crate::fd::write_all(write_end, &buffered);
                     crate::fd::close_handle(write_end);
                 });

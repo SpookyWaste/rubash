@@ -1016,6 +1016,11 @@ impl Executor {
             // bytes the child already consumed (niubash#383 follow-up).
             self.pipeline_stdin_consumed.set(Some(input.len()));
             std::thread::spawn(move || {
+                // The payload write must survive a broken pipe as a plain
+                // EPIPE (see the spawn comment): SIGPIPE is SIG_DFL for
+                // the shell process since rubash#1333, so block it here.
+                #[cfg(unix)]
+                crate::builtins::kill::block_sigpipe_on_this_thread();
                 let _ = stdin.write_all(&payload);
             })
         });

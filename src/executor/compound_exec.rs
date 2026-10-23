@@ -264,6 +264,11 @@ fn forward_coproc_stderr(
     mut stderr: std::process::ChildStderr,
     mut target: CoprocStderrForwardTarget,
 ) -> Result<(), std::io::Error> {
+    // Forwarding into a closed stdout/stderr pipe must end this thread
+    // with an io error, not kill the shell (SIGPIPE is SIG_DFL
+    // process-wide since rubash#1333).
+    #[cfg(unix)]
+    crate::builtins::kill::block_sigpipe_on_this_thread();
     let mut buffer = [0_u8; 8192];
     loop {
         let count = stderr.read(&mut buffer)?;

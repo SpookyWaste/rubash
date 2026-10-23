@@ -390,6 +390,12 @@ impl Executor {
         &mut self,
         pipeline_command: &PipelineCommand,
     ) -> Result<(), ExecuteError> {
+        // rubash#1333/niubash#345: the whole pipeline execution is
+        // member territory (see execute_pipeline_stage's guard): stage
+        // bodies, captured-output flushes and teardown writes all run
+        // on this thread while members die on EPIPE individually.
+        #[cfg(unix)]
+        let _sigpipe_block = crate::builtins::kill::sigpipe_block_guard();
         // Expand aliases in pipeline stages before running them, like Bash
         // does during parsing. Without this, `alias pipehi='echo pipehi';
         // pipehi | cat` fails with "pipeline command could not execute".
@@ -3230,6 +3236,15 @@ impl Executor {
         input: &str,
         stdin_inherit: bool,
     ) -> Result<Option<(String, String, i32)>, ExecuteError> {
+        // rubash#1333/niubash#345: SIGPIPE is SIG_DFL for the shell
+        // process (GNU parity), but a pipeline member executed in
+        // process shares that disposition — GNU forks members, so a
+        // member's write to a closed pipe may only kill the MEMBER.
+        // Block SIGPIPE for the stage's duration: member writes fail
+        // with EPIPE and the stage machinery reports 141 for the member
+        // while the shell survives.
+        #[cfg(unix)]
+        let _sigpipe_block = crate::builtins::kill::sigpipe_block_guard();
         // `|&` → trailing `2>&1` (parse.y:1470-1487; normalize_pipeerr_stage).
         // execute_simple_pipeline already normalized every gathered stage;
         // this idempotent pass covers the recursion entry points that bypass
