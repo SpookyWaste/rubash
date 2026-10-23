@@ -229,11 +229,12 @@ impl Executor {
             return Ok(());
         }
         let status = if let Some(value) = args.first() {
-            // GNU get_exitstat parses as int64; out-of-range rejected
-            // (rubash#1403).
-            match value.parse::<i64>() {
-                Ok(value) => crate::builtins::exit::normalize_status(value),
-                Err(_) => {
+            // GNU get_exitstat parses via general.c:248 valid_number
+            // (intmax_t): whitespace-padded numerics are legal
+            // (rubash#1339); out-of-range rejected (rubash#1403).
+            match crate::builtins::exit::gnu_valid_number(value) {
+                Some(value) => crate::builtins::exit::normalize_status(value),
+                None => {
                     writeln!(
                         &mut stderr,
                         "{}return: {value}: numeric argument required",

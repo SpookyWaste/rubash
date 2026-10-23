@@ -113,11 +113,52 @@ where
     writeln!(stdout, "    is that of the last command executed.")
 }
 
+/// GNU general.c:248 valid_number — the strtoimax acceptance rule behind
+/// get_exitstat and get_numeric_arg (builtins/common.c:488): strtoimax
+/// skips leading isspace and an optional sign, consumes one or more
+/// digits, and the caller then skips trailing isspace; the string is a
+/// number only if it ends there, and strtoimax overflow/underflow
+/// (errno) is invalid. This is why `"1 "`, `" 1"`, `"1\t"`, `"+1 "` and
+/// `"01 "` are legal operands for exit/return/shift/break/continue while
+/// `"1 2"`, `"1x"`, `"0x10 "` and `""` are "numeric argument required"
+/// (rubash#1339).
+pub(crate) fn gnu_valid_number(arg: &str) -> Option<i64> {
+    fn is_space(byte: u8) -> bool {
+        // C isspace in the "C" locale: the set strtoimax skips.
+        matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    }
+    let bytes = arg.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() && is_space(bytes[index]) {
+        index += 1;
+    }
+    let span_start = index;
+    if index < bytes.len() && (bytes[index] == b'+' || bytes[index] == b'-') {
+        index += 1;
+    }
+    let digits_start = index;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    if index == digits_start {
+        return None;
+    }
+    // Rust's parser rejects overflow exactly where strtoimax sets errno.
+    let value: i64 = arg[span_start..index].parse().ok()?;
+    while index < bytes.len() && is_space(bytes[index]) {
+        index += 1;
+    }
+    if index != bytes.len() {
+        return None;
+    }
+    Some(value)
+}
+
 fn parse_exit_status(arg: &str) -> Option<i32> {
     // GNU builtins/common.c get_exitstat parses as intmax_t (int64);
     // out-of-range values are rejected with "numeric argument required"
     // (rubash#1403), not silently wrapped.
-    let value = arg.parse::<i64>().ok()?;
+    let value = gnu_valid_number(arg)?;
     Some(normalize_status(value))
 }
 

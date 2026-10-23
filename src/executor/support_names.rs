@@ -415,15 +415,15 @@ pub(in crate::executor) fn loop_control_level(args: &[String]) -> Result<usize, 
     if args.next().is_some() {
         return Err(LoopControlError::TooManyArguments);
     }
-    if value.starts_with('-') {
-        return Err(LoopControlError::OutOfRange(value.to_string()));
-    }
-
-    let number = value.strip_prefix('+').unwrap_or(value);
-    match number.parse::<usize>() {
-        Ok(level) if level > 0 => Ok(level),
-        Ok(_) => Err(LoopControlError::OutOfRange(value.to_string())),
-        Err(_) => Err(LoopControlError::NotNumeric(value.to_string())),
+    // GNU break.def/continue.def read the count through get_numeric_arg
+    // (builtins/common.c:488), whose acceptance rule is general.c:248
+    // valid_number: whitespace-padded numerics are legal (rubash#1339),
+    // non-numeric text is NotNumeric, and a parsed count below 1 is
+    // OutOfRange.
+    match crate::builtins::exit::gnu_valid_number(value) {
+        Some(level) if level > 0 => Ok(level as usize),
+        Some(_) => Err(LoopControlError::OutOfRange(value.to_string())),
+        None => Err(LoopControlError::NotNumeric(value.to_string())),
     }
 }
 
