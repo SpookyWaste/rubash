@@ -7,24 +7,71 @@ pub(in crate::executor) struct TimeCommandMetrics {
     sys: std::time::Duration,
 }
 
+/// Start snapshot for a `time` measurement: wall clock plus the process
+/// CPU counters. GNU execute_cmd.c print_time_info reports the deltas of
+/// getrusage(RUSAGE_SELF) + getrusage(RUSAGE_CHILDREN) between the start
+/// and end of the timed command; rubash used to leave user/sys at zero
+/// unconditionally (rubash#1212).
+#[derive(Clone, Copy, Debug)]
+pub(in crate::executor) struct TimeCommandStart {
+    instant: std::time::Instant,
+    rusage: RusageCounters,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::executor) struct RusageCounters {
+    user: std::time::Duration,
+    sys: std::time::Duration,
+}
+
+#[cfg(unix)]
+fn read_rusage(who: libc::c_int) -> (std::time::Duration, std::time::Duration) {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(who, &mut usage) } != 0 {
+        return (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    }
+    let to_duration =
+        |tv: libc::timeval| std::time::Duration::new(tv.tv_sec as u64, (tv.tv_usec as u32) * 1_000);
+    (to_duration(usage.ru_utime), to_duration(usage.ru_stime))
+}
+
+#[cfg(unix)]
+fn rusage_counters() -> RusageCounters {
+    let (self_user, self_sys) = read_rusage(libc::RUSAGE_SELF);
+    let (child_user, child_sys) = read_rusage(libc::RUSAGE_CHILDREN);
+    RusageCounters {
+        user: self_user + child_user,
+        sys: self_sys + child_sys,
+    }
+}
+
+#[cfg(not(unix))]
+fn rusage_counters() -> RusageCounters {
+    RusageCounters::default()
+}
+
 impl TimeCommandMetrics {
-    pub(in crate::executor) fn from_start(started: std::time::Instant) -> Self {
+    pub(in crate::executor) fn from_start(started: TimeCommandStart) -> Self {
+        let now = rusage_counters();
         Self {
-            real: started.elapsed(),
-            user: std::time::Duration::ZERO,
-            sys: std::time::Duration::ZERO,
+            real: started.instant.elapsed(),
+            user: now.user.saturating_sub(started.rusage.user),
+            sys: now.sys.saturating_sub(started.rusage.sys),
         }
     }
 }
 
-pub(in crate::executor) fn time_command_started() -> std::time::Instant {
-    std::time::Instant::now()
+pub(in crate::executor) fn time_command_started() -> TimeCommandStart {
+    TimeCommandStart {
+        instant: std::time::Instant::now(),
+        rusage: rusage_counters(),
+    }
 }
 
 pub(in crate::executor) fn print_time(
     env_vars: &HashMap<String, String>,
     posix_format: bool,
-    started: std::time::Instant,
+    started: TimeCommandStart,
 ) {
     let metrics = TimeCommandMetrics::from_start(started);
     if let Some(report) = format_time_report(env_vars, posix_format, metrics) {

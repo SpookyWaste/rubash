@@ -83,7 +83,7 @@ impl Executor {
     pub(in crate::executor) fn print_time_shell(
         &mut self,
         posix_format: bool,
-        started: std::time::Instant,
+        started: TimeCommandStart,
     ) {
         let metrics = TimeCommandMetrics::from_start(started);
         if let Some(report) = format_time_report(&self.shell_state.env_vars, posix_format, metrics)
