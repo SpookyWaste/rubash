@@ -679,8 +679,17 @@ impl Executor {
         if self.buffer_assignment_diagnostics {
             self.pending_assignment_diagnostics
                 .extend_from_slice(line.as_bytes());
-        } else {
+        } else if !self.fd_table.is_closed(2) && self.fd_table.output_endpoint(2).is_none() {
+            // No fd-2 binding in the table: the process stderr is the
+            // destination, as with the raw write this replaces.
             let _ = std::io::stderr().write_all(line.as_bytes());
+        } else {
+            // GNU error.c report_error family: assignment diagnostics go
+            // to fd 2 AS BOUND by enclosing redirections — `( UID=5 )
+            // 2>err` must land in err and `{ UID=5; } 2>/dev/null` must
+            // stay silent. The raw process-stderr write bypassed every
+            // compound binding (rubash#1317; same class as rubash#167).
+            self.write_diagnostic_fd2(line.as_bytes());
         }
     }
 
