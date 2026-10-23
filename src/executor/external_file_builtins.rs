@@ -1570,10 +1570,11 @@ impl Executor {
                         Some(read) => output.extend(read.bytes),
                         None => {
                             let mut stderr = Vec::new();
+                            // GNU cat.c reports its own errors bare, with
+                            // no shell diagnostic prefix (rubash#1309).
                             writeln!(
                                 &mut stderr,
-                                "{}cat: {}: No such file or directory",
-                                self.diagnostic_prefix(),
+                                "cat: {}: No such file or directory",
                                 target
                             )?;
                             self.write_buffered_builtin_output(cmd, &[], &stderr)?;
@@ -1606,13 +1607,19 @@ impl Executor {
                 };
                 match read {
                     Ok(bytes) => output.extend(bytes),
-                    Err(_) => {
+                    Err(error) => {
                         let mut stderr = Vec::new();
+                        // GNU cat.c: cat reports its own operand errors
+                        // bare — `cat: <file>: <strerror>` with the REAL
+                        // strerror and no shell diagnostic prefix. The
+                        // discarded error flattened EACCES/EISDIR to a
+                        // blanket ENOENT text behind the script prefix
+                        // (rubash#1309).
                         writeln!(
                             &mut stderr,
-                            "{}cat: {}: No such file or directory",
-                            self.diagnostic_prefix(),
-                            target
+                            "cat: {}: {}",
+                            target,
+                            crate::posix_errors::message(&error)
                         )?;
                         self.write_buffered_builtin_output(cmd, &[], &stderr)?;
                         status = 1;
