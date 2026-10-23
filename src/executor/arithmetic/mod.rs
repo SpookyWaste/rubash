@@ -1975,6 +1975,22 @@ pub(super) fn arithmetic_unbound_variable(
             chars.next();
             skip_subscript_chars(&mut chars);
             previous = Some(']');
+            // rubash#1239: GNU treats an associative array with no
+            // elements as UNSET for nounset purposes (variables.c: the
+            // variable has no value until an element exists), so a
+            // subscripted READ (`h[k]`, `h[k]++`, `h[k]+=1`) traps
+            // `h: unbound variable`, while a pure `h[k]=value`
+            // assignment is a write and stays legal.
+            if !arithmetic_subscript_is_pure_assignment(&chars)
+                && env_vars
+                    .get(&name)
+                    .map(|value| {
+                        crate::executor::assignment_helpers::assoc_entries(value).is_empty()
+                    })
+                    .unwrap_or(true)
+            {
+                return Some(name);
+            }
             continue;
         }
         // An identifier that is the left-hand side of an assignment
@@ -2084,6 +2100,18 @@ fn arithmetic_identifier_is_assignment_lhs(
         chars.next();
     }
     true
+}
+
+/// True when the text following a consumed array subscript is a pure
+/// `= value` assignment (blanks allowed). `==` is a comparison, and the
+/// op-assignments (`+=`, ...) read the old element, so neither counts —
+/// only the plain `=` form is write-only (rubash#1239).
+fn arithmetic_subscript_is_pure_assignment(chars: &std::iter::Peekable<std::str::Chars>) -> bool {
+    let mut clone = chars.clone();
+    while clone.peek().is_some_and(|next| matches!(next, ' ' | '\t')) {
+        clone.next();
+    }
+    clone.next() == Some('=') && clone.peek() != Some(&'=')
 }
 
 fn rest_assignment_operator_len(chars: &std::iter::Peekable<std::str::Chars>) -> usize {
