@@ -677,6 +677,12 @@ impl Executor {
                 .cloned()
                 .unwrap_or_default();
             if is_shell_name(&cell) {
+                // The resolved target may itself be a dynamic variable
+                // (SECONDS/RANDOM/...): the read runs its get hook, so
+                // the length is the dynamic value's (rubash#1352).
+                if let Some(dynamic) = self.dynamic_parameter_value(&cell) {
+                    return parameter_char_length(&dynamic).to_string();
+                }
                 if let Some(target_value) = self.shell_state.env_vars.get(&cell) {
                     if self.parameter_is_array_variable(&cell) {
                         let element_zero = if self.is_assoc_parameter_array(&cell) {

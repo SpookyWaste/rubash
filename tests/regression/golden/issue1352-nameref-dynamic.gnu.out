@@ -1,0 +1,6 @@
+random-set=yes len-nonzero=yes
+seconds-set=yes
+bashpid-set=yes
+chain-set=yes
+unset-target=empty-ok
+done
