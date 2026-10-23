@@ -198,6 +198,13 @@ impl Executor {
             self.arith_diag(&format!("{}((: {}\n", self.error_prefix(), rendered));
             return;
         }
+        // A fatal NESTED expansion error (`((i<$((1/0))))`) already
+        // printed its own diagnostic during expand_arith_string and the
+        // evaluation was abandoned before parsing (evalerror); do not
+        // synthesize a second message from the raw text.
+        if self.shell_state.arithmetic_fatal_error.get() {
+            return;
+        }
         let display = raw_display.trim_start_matches([' ', '\t']);
         if let Some(message) =
             crate::executor::arithmetic::arithmetic_command_error_message(display, false)

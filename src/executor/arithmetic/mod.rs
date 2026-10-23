@@ -630,6 +630,16 @@ impl Executor {
             };
             std::borrow::Cow::Owned(normalize_arithmetic_quotes(&expanded).into_owned())
         };
+        // GNU expr.c: a fatal error inside a NESTED expansion of the
+        // expression (`((i<$((1/0))))`, an arith-for header) raises
+        // evalerror while expand_arith_string runs — the evaluation is
+        // abandoned before the mangled remainder (`i<`) is ever parsed.
+        // The nested expansion already printed its diagnostic; parsing
+        // on would synthesize a second, bogus one (`((: i<: arithmetic
+        // syntax error: operand expected`) from the hollowed text.
+        if self.shell_state.arithmetic_fatal_error.get() {
+            return None;
+        }
         // GNU expr.c's expr_string/lasttp only matter once evalerror
         // records a diagnostic — success paths never consult them, so the
         // diagnostic input slot is written lazily: the unbound-variable

@@ -912,15 +912,17 @@ impl Executor {
             }
         }
         match result {
-            // GNU Bash 5.2 (probes f3/f4, 2026-08-24): a word-expansion
-            // failure ends only this function invocation; the caller sees
-            // the failure status and keeps its own remaining list running.
-            Err(ExecuteError::ExpansionFailure(status))
-                if !self.inside_compound_condition.get() =>
-            {
-                self.exit_code = trap_return_status.unwrap_or(status);
-                Ok(())
-            }
+            // A fatal word-expansion failure inside the body is NOT
+            // absorbed here: GNU's evalerror / bad-substitution path
+            // (expr.c evalerror, subst.c) raises jump_to_top_level
+            // (DISCARD), which unwinds every frame and discards the
+            // caller's current list too (GNU 5.3.20, rubash#1240:
+            // `f() { x=$((1/0)); }; f; echo after` never prints
+            // `after`; same for `echo ${:}`). ExpansionFailure therefore
+            // falls through to `other` and keeps unwinding; the
+            // reader-level loop applies the discard. (An earlier absorb
+            // here rested on 5.2-era probes claiming the caller keeps
+            // running; 5.3.20 contradicts them for this error class.)
             Err(ExecuteError::Return(status)) => {
                 // A `return N` absorbed from the RETURN trap action ran
                 // after the body completed, so it wins over the body's own

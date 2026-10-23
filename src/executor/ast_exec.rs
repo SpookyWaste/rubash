@@ -1,6 +1,18 @@
 use super::*;
 
 impl Executor {
+    /// rubash#1240: is the list currently executing a DISCARD boundary —
+    /// the reader's top list, or an eval'd string's own top list
+    /// (evalstring.c installs a local top_level catch, so the discard
+    /// ends that string's list and no more)? GNU's jump_to_top_level
+    /// (DISCARD) unwinds every frame in between: brace-group bodies,
+    /// &&/|| element lists, loop bodies and function bodies are the
+    /// SAME list as their enclosing line for this purpose.
+    pub(in crate::executor) fn at_discard_boundary(&self) -> bool {
+        self.evalerror_exec_depth.get() <= 1
+            || self.eval_list_depth.get() == Some(self.evalerror_exec_depth.get())
+    }
+
     pub fn execute_ast(&mut self, ast: &Ast) -> Result<(), ExecuteError> {
         if EXECUTION_LOCK_DEPTH.with(|depth| depth.get() > 0) {
             return self.execute_ast_inner(&ast.commands);
@@ -1322,6 +1334,31 @@ impl Executor {
                     }
                     Err(ExecuteError::ExpansionFailure(code)) => {
                         self.exit_code = code;
+                        // GNU expr.c evalerror -> jump_to_top_level
+                        // (DISCARD): a fatal expansion failure inside an
+                        // &&/|| chain discards the rest of the current
+                        // list, not just the chain (rubash#1240). In a
+                        // nested list the error keeps unwinding to the
+                        // discard boundary; only there is the remainder
+                        // of the line skipped (mirroring the
+                        // plain-command DISCARD skip below).
+                        if !self.at_discard_boundary() {
+                            return Err(ExecuteError::ExpansionFailure(code));
+                        }
+                        let failed_line = command
+                            .logical_line
+                            .or(command.line)
+                            .filter(|line| *line != 0);
+                        if failed_line.is_some() {
+                            while let Some(next) = commands.get(index + 1) {
+                                let next_logical = next.logical_line.or(next.line);
+                                if next_logical == failed_line && !next.subshell_end {
+                                    index += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
                     }
                     Err(ExecuteError::IoError(error)) => {
                         // rubash#440: a closed output (SIGPIPE analogue) is a
@@ -1392,6 +1429,30 @@ impl Executor {
                 }
                 Err(ExecuteError::ExpansionFailure(code)) => {
                     self.exit_code = code;
+                    // GNU expr.c evalerror -> jump_to_top_level
+                    // (DISCARD): a fatal expansion failure inside a brace
+                    // group discards the rest of the current list, not
+                    // just the group (rubash#1240). In a nested list the
+                    // error keeps unwinding to the discard boundary; only
+                    // there is the remainder of the line skipped
+                    // (mirroring the plain-command DISCARD skip below).
+                    if !self.at_discard_boundary() {
+                        return Err(ExecuteError::ExpansionFailure(code));
+                    }
+                    let failed_line = command
+                        .logical_line
+                        .or(command.line)
+                        .filter(|line| *line != 0);
+                    if failed_line.is_some() {
+                        while let Some(next) = commands.get(index + 1) {
+                            let next_logical = next.logical_line.or(next.line);
+                            if next_logical == failed_line && !next.subshell_end {
+                                index += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
                 }
                 Err(ExecuteError::IoError(error)) => {
                     // rubash#440: a closed output (SIGPIPE analogue) is this
@@ -1501,11 +1562,21 @@ impl Executor {
                 // skipped and the next line runs (GNU probe 2026-09-01:
                 // `echo $((1/0)); echo same-line` never prints "same-line",
                 // the next line does).
+                // rubash#1240: the absorption must happen only in a
+                // DISCARD-boundary list — the reader top, or an eval'd
+                // string's own top list (eval_list_depth). A brace-group
+                // body or an &&/|| element list is the SAME flat list in
+                // GNU (execute_connection / cm_group walk one LIST), so
+                // absorbing there — as this arm used to — let the
+                // enclosing line's remaining commands run
+                // (`{ x=$((1/0)); }; echo after` printed `after`).
+                // Nested lists now fall to the catch-all and unwind.
                 Err(ExecuteError::ExpansionFailure(code))
                     if self.shell_state.loop_depth == 0
                         && self.shell_state.function_depth == 0
                         && subshell_state.is_none()
-                        && !self.inside_compound_condition.get() =>
+                        && !self.inside_compound_condition.get()
+                        && self.at_discard_boundary() =>
                 {
                     self.exit_code = code;
                     // GNU 5.2: under `set -e` a fatal word-expansion

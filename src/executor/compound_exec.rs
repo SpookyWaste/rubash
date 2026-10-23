@@ -2922,9 +2922,11 @@ impl Executor {
     }
 
     fn execute_if_command(&mut self, if_command: &IfCommand) -> Result<(), ExecuteError> {
-        // GNU Bash 5.2 (probe f4, 2026-08-24): a word-expansion failure in
-        // an if/elif condition abandons the whole compound command instead
-        // of selecting the else branch.
+        // GNU 5.3.20 (rubash#1240/#1253): a word-expansion failure in
+        // an if/elif condition abandons the whole enclosing list
+        // (neither branch runs, and the commands after the `fi` on the
+        // same line are discarded) — if_condition_matches propagates
+        // the failure instead of selecting the else branch.
         let matched = match self.if_condition_matches(&if_command.condition)? {
             Some(matched) => matched,
             None => return Ok(()),
@@ -2972,8 +2974,11 @@ impl Executor {
         self.execute_ast_inner(body)
     }
 
-    /// Returns `None` when a word-expansion failure abandoned the whole
-    /// enclosing if command; `Some(true)` when the condition held.
+    /// Returns `Some(true)` when the condition held, `Some(false)` when
+    /// it did not. A fatal word-expansion failure in the condition is
+    /// NOT absorbed into a branch decision: it propagates as
+    /// ExecuteError::ExpansionFailure so the enclosing list is discarded
+    /// (GNU jump_to_top_level (DISCARD); rubash#1240/#1253).
     fn if_condition_matches(
         &mut self,
         condition: &[CommandNode],
@@ -3006,7 +3011,14 @@ impl Executor {
         match result {
             Err(ExecuteError::ExpansionFailure(code)) => {
                 self.exit_code = code;
-                Ok(None)
+                // GNU expr.c evalerror -> shell.c jump_to_top_level
+                // (DISCARD): a fatal expansion failure in a condition
+                // discards the whole enclosing list, not just the if
+                // command (rubash#1240/#1253, GNU 5.3.20: `if [ $((1/0))
+                // -eq 1 ]; then ...; fi; echo after` prints neither
+                // branch and never reaches `after`). Keep the error
+                // unwinding; the reader-level loop applies the discard.
+                Err(ExecuteError::ExpansionFailure(code))
             }
             other => {
                 other?;

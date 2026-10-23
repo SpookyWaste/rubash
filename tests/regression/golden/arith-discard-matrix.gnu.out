@@ -1,0 +1,15 @@
+case-fn
+in-f
+case-if
+case-list
+next rc=1
+case-group
+in-grp
+case-and
+case-comsub
+comsub rc=1 y=[inner]
+case-assign
+after-assign rc=1
+case-while
+case-for-arith
+done

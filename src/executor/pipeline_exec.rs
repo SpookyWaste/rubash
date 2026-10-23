@@ -539,16 +539,15 @@ impl Executor {
                     executor.execute_ast_inner(body)
                 })
             });
-            // GNU Bash 5.2 (probes y1/y3, 2026-08-24): a word-expansion failure
-            // inside a brace group ends only the group tail. The command
-            // following the group still runs with the carried status.
-            let result = match result {
-                Err(ExecuteError::ExpansionFailure(code)) => {
-                    self.exit_code = code;
-                    Ok(())
-                }
-                other => other,
-            };
+            // A fatal word-expansion failure inside the group is NOT
+            // absorbed here: GNU's evalerror raises jump_to_top_level
+            // (DISCARD), discarding the rest of the enclosing list as
+            // well as the group tail (GNU 5.3.20, rubash#1240:
+            // `{ x=$((1/0)); }; echo after` never prints `after`). The
+            // Err propagates to the list loop, whose brace arm applies
+            // the discard. (An earlier absorb rested on 5.2-era probes
+            // claiming the following command still runs; 5.3.20
+            // contradicts them for this error class.)
             let finish_result = self.finish_compound_output_process_substitutions(group_outputs);
             result?;
             finish_result?;
