@@ -2256,7 +2256,7 @@ impl Executor {
 
         let mut status = 0;
         for job in requested {
-            match self.resolve_requested_background_job(job) {
+            match self.resolve_fg_bg_operand("bg", job, stderr)? {
                 JobOperandResolution::Pid(pid) => {
                     if !self.shell_state.job_table.job_control_for_pid(pid) {
                         let job_id = self.shell_state.job_table.job_id_for_pid(pid).unwrap_or(0);
@@ -2362,6 +2362,35 @@ impl Executor {
                 .current_background_pid()
                 .map_or(JobOperandResolution::NoMatch, JobOperandResolution::Pid),
         }
+    }
+
+    /// GNU fg_bg.def / jobs.c get_job_from_arg: an fg/bg operand that does
+    /// not start with `%` is NOT read as a pid. Bash warns
+    /// `job specification requires leading '%'` and then resolves the
+    /// operand as a jobspec anyway — `bg 1` selects job 1, `bg sleep`
+    /// matches by name, and a bare pid like 4788 matches nothing because
+    /// no jobspec spells it. wait/disown/kill keep the pid reading of bare
+    /// numbers; only fg and bg warn and reinterpret (rubash#1408,
+    /// rubash#1409). The caller has already applied the no-job-control
+    /// gate, which GNU reports before any operand processing.
+    fn resolve_fg_bg_operand(
+        &self,
+        builtin: &str,
+        job: Option<&str>,
+        stderr: &mut Vec<u8>,
+    ) -> Result<JobOperandResolution, ExecuteError> {
+        let Some(job) = job else {
+            return Ok(self.resolve_requested_background_job(None));
+        };
+        if job.starts_with('%') {
+            return Ok(self.resolve_background_job_operand(job));
+        }
+        writeln!(
+            stderr,
+            "{}{builtin}: warning: {job}: job specification requires leading `%'",
+            self.diagnostic_prefix()
+        )?;
+        Ok(self.resolve_background_job_operand(&format!("%{job}")))
     }
 
     fn current_background_pid(&self) -> Option<u32> {
