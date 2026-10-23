@@ -9,6 +9,7 @@ impl Executor {
         delimiter: char,
         char_limit: Option<usize>,
         exact_char_limit: bool,
+        escape_aware: bool,
     ) -> Option<String> {
         // GNU redir.c applies the command's own redirections before the
         // builtin runs, so `read -u 3 x 3< file` reads the file. rubash
@@ -43,6 +44,7 @@ impl Executor {
                 delimiter,
                 char_limit,
                 exact_char_limit,
+                escape_aware,
             ));
         }
 
@@ -75,6 +77,7 @@ impl Executor {
             delimiter,
             char_limit,
             exact_char_limit,
+            escape_aware,
         ))
     }
 
@@ -85,6 +88,7 @@ impl Executor {
         delimiter: char,
         char_limit: Option<usize>,
         exact_char_limit: bool,
+        escape_aware: bool,
     ) -> Option<String> {
         let redirect = cmd
             .heredoc_redirects
@@ -101,6 +105,7 @@ impl Executor {
                     delimiter,
                     char_limit,
                     exact_char_limit,
+                    escape_aware,
                 ));
             }
         }
@@ -113,6 +118,7 @@ impl Executor {
                 delimiter,
                 char_limit,
                 exact_char_limit,
+                escape_aware,
             ));
         }
         let input = if let Some(pre) = preexpanded_stdin_body(body) {
@@ -125,6 +131,7 @@ impl Executor {
             delimiter,
             char_limit,
             exact_char_limit,
+            escape_aware,
         ))
     }
 }

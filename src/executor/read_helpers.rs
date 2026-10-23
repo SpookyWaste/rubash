@@ -398,8 +398,17 @@ pub(in crate::executor) fn read_delimiter_needle(delimiter: char) -> String {
 /// marker pair (normalized records), the single-byte marker form a
 /// byte-locale delimiter takes (the delimiter char then stands for one
 /// raw byte), or the literal char (raw mirror texts such as
-/// FUNCTION_STDIN, which stores raw pipe bytes).
-pub(in crate::executor) fn record_contains_delimiter(text: &str, delimiter: char) -> bool {
+/// FUNCTION_STDIN, which stores raw pipe bytes). With `escape_aware`
+/// (a non-raw read with a non-newline delimiter), an occurrence whose
+/// character is backslash-escaped does not count (rubash#1300).
+pub(in crate::executor) fn record_contains_delimiter(
+    text: &str,
+    delimiter: char,
+    escape_aware: bool,
+) -> bool {
+    if escape_aware {
+        return unescaped_delimiter_index(text, delimiter).is_some();
+    }
     if text.contains(delimiter) || text.contains(&read_delimiter_needle(delimiter)) {
         return true;
     }
@@ -409,6 +418,39 @@ pub(in crate::executor) fn record_contains_delimiter(text: &str, delimiter: char
         return text.contains(&single);
     }
     false
+}
+
+/// Byte index of the first UNESCAPED delimiter occurrence in `text`,
+/// for non-raw reads (GNU builtins/read.def: a backslash consumes the
+/// following character as an escaped literal, and an escaped character
+/// can never be the delimiter — rubash#1300). Matches the same forms
+/// as record_contains_delimiter: the marker needle, the literal char,
+/// and the single-byte marker form of a U+0080..=U+00FF delimiter.
+pub(in crate::executor) fn unescaped_delimiter_index(text: &str, delimiter: char) -> Option<usize> {
+    let needle = read_delimiter_needle(delimiter);
+    let code = delimiter as u32;
+    let single = (0x80..=0xFF)
+        .contains(&code)
+        .then(|| substitution_metadata::bytes_to_shell_text(&[code as u8]));
+    let mut escaped = false;
+    for (index, ch) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        let rest = &text[index..];
+        if rest.starts_with(&needle)
+            || rest.starts_with(delimiter)
+            || single.as_deref().is_some_and(|form| rest.starts_with(form))
+        {
+            return Some(index);
+        }
+    }
+    None
 }
 
 /// Normalize a served `read` record into the shell's storage domain: every
@@ -513,6 +555,7 @@ pub(in crate::executor) fn read_stdin_until(
     char_limit: Option<usize>,
     exact_char_limit: bool,
     poll_sigint_abort: bool,
+    escape_aware: bool,
 ) -> std::io::Result<(usize, String, bool, bool, bool)> {
     if char_limit == Some(0) {
         return Ok((0, String::new(), false, false, false));
@@ -585,6 +628,9 @@ pub(in crate::executor) fn read_stdin_until(
     let mut eof = false;
     let mut timed_out = false;
     let mut interrupted = false;
+    // rubash#1300: in a non-raw read an escaped unit is literal data,
+    // never the delimiter (read.def zread escape consumption).
+    let mut escaped = false;
     loop {
         if !decoder.has_queued() {
             // read.def check_read_timeout (read.def:659) runs at the top of
@@ -669,9 +715,20 @@ pub(in crate::executor) fn read_stdin_until(
         if manual_echo {
             echo_unit(&unit);
         }
-        if !exact_char_limit && stdin_unit_is_delimiter(&unit, delimiter) {
+        let was_escaped = escape_aware && escaped;
+        // rubash#1300: the escape introducer itself is consumed as an
+        // escape, never as the delimiter — with `-d '\'` a non-raw read
+        // can therefore never match (GNU read.def/zread consumes the
+        // backslash first), it reads to EOF and fails.
+        let is_introducer = escape_aware && matches!(unit, StdinUnit::Char('\\'));
+        if !exact_char_limit
+            && !was_escaped
+            && !is_introducer
+            && stdin_unit_is_delimiter(&unit, delimiter)
+        {
             break;
         }
+        escaped = escape_aware && !was_escaped && matches!(unit, StdinUnit::Char('\\'));
         match unit {
             StdinUnit::Char(ch) => {
                 output.push(ch);
@@ -697,7 +754,13 @@ pub(in crate::executor) fn read_stdin_until(
     // assigns NOTHING and returns 128+SIGINT.
     Ok((
         read,
-        trim_read_input(output, delimiter, char_limit, exact_char_limit),
+        trim_read_input(
+            output,
+            delimiter,
+            char_limit,
+            exact_char_limit,
+            escape_aware,
+        ),
         eof,
         timed_out,
         interrupted,
@@ -709,11 +772,13 @@ pub(in crate::executor) fn trim_read_input(
     delimiter: char,
     char_limit: Option<usize>,
     exact_char_limit: bool,
+    escape_aware: bool,
 ) -> String {
     // Trimming and limit math below run on the literal-char form (the
     // delimiter needle handles both transports); the storage-domain tagging
     // is the last step so every served record leaves this fn normalized.
-    let trimmed = trim_read_input_literal(input, delimiter, char_limit, exact_char_limit);
+    let trimmed =
+        trim_read_input_literal(input, delimiter, char_limit, exact_char_limit, escape_aware);
     tag_read_carrier_text(&trimmed)
 }
 
@@ -722,6 +787,7 @@ fn trim_read_input_literal(
     delimiter: char,
     char_limit: Option<usize>,
     exact_char_limit: bool,
+    escape_aware: bool,
 ) -> String {
     if !exact_char_limit {
         // GNU builtins/read.def read_builtin: only the delimiter itself is
@@ -731,15 +797,22 @@ fn trim_read_input_literal(
         // emit CRLF); on unix it would eat legal filename bytes.
         // The needle covers the raw-byte transport form; a multibyte
         // delimiter character (rubash#1062) travels as the literal char,
-        // so fall back to it when the needle form is absent.
-        if let Some((before, _)) = input
-            .split_once(&read_delimiter_needle(delimiter))
-            .or_else(|| input.split_once(delimiter))
-        {
+        // so fall back to it when the needle form is absent. With
+        // escape_aware the split point is the first UNESCAPED delimiter:
+        // an escaped one is record data (rubash#1300).
+        let split_at = if escape_aware {
+            unescaped_delimiter_index(&input, delimiter)
+        } else {
+            input
+                .split_once(&read_delimiter_needle(delimiter))
+                .or_else(|| input.split_once(delimiter))
+                .map(|(before, _)| before.len())
+        };
+        if let Some(at) = split_at {
             input = if cfg!(windows) {
-                before.trim_end_matches('\r').to_string()
+                input[..at].trim_end_matches('\r').to_string()
             } else {
-                before.to_string()
+                input[..at].to_string()
             };
         } else if delimiter == '\n' {
             // NOTE (Windows): this also drops a lone trailing '\r' that is

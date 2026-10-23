@@ -355,7 +355,7 @@ impl Executor {
         // tail.
         if self.fd_table.fd0_bound_away_from_process_stdin() {
             self.fd_table.read_eof_no_delimiter = false;
-            return match self.fd_table.read_text(0, '\n', None, false) {
+            return match self.fd_table.read_text(0, '\n', None, false, false) {
                 Some(line) => Some((line, self.fd_table.read_eof_no_delimiter)),
                 None => None,
             };

@@ -1994,6 +1994,13 @@ impl Executor {
             return self.finish_read_error(cmd, &stderr, 1);
         }
 
+        // rubash#1300: without -r and with a non-newline delimiter, a
+        // backslash-escaped delimiter is record data, not the record
+        // terminator (GNU read.def zread escape consumption). The
+        // newline delimiter is exempt: \<newline> is the continuation
+        // case continue_read_line_after_backslash owns.
+        let escape_aware = !raw && delimiter != '\n';
+
         // GNU read.def:331-336: `-i text` only fills the readline edit
         // buffer — `itext = list_optarg` is consumed exclusively by the
         // edit path (-e/-E set `edit`, read.def:316-327), which itself only
@@ -2185,6 +2192,7 @@ impl Executor {
                 delimiter,
                 char_limit,
                 exact_char_limit,
+                escape_aware,
             ) {
                 Some(l) if l.is_empty() && initial_text.is_some() => None,
                 Some(l) => Some(l),
@@ -2276,6 +2284,7 @@ impl Executor {
                 delimiter,
                 char_limit,
                 exact_char_limit,
+                escape_aware,
             ) {
                 // GNU read.def: input is a C string, truncate at first NUL
                 // (rubash#1419). The `-d ''` case stops at NUL (delimiter),
@@ -2436,6 +2445,7 @@ impl Executor {
                     char_limit,
                     exact_char_limit,
                     poll_sigint,
+                    escape_aware,
                 ) {
                     Ok((_, _, _, _, true)) => {
                         // Interrupted (rubash#1250): assign nothing; the

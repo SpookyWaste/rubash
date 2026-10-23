@@ -42,9 +42,13 @@ impl Executor {
         silent: bool,
         mut line: String,
     ) -> String {
-        while line.ends_with('\\') {
+        // GNU read.def:802-830: only an UNESCAPED trailing backslash is a
+        // line continuation — an odd trailing run. An even run is `\\`
+        // pairs (literal backslash data) and ends the record (rubash#1300).
+        while line.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1 {
             line.pop();
-            let Some(next) = self.read_input_for_command(cmd, read_fd, silent, '\n', None, false)
+            let Some(next) =
+                self.read_input_for_command(cmd, read_fd, silent, '\n', None, false, false)
             else {
                 // GNU read.def:802-830: the `\<newline>` pair is swallowed
                 // and reading continues; a continuation that hits EOF is
@@ -140,6 +144,7 @@ impl Executor {
         delimiter: char,
         char_limit: Option<usize>,
         exact_char_limit: bool,
+        escape_aware: bool,
     ) -> Option<String> {
         // rubash#1250: hold untrapped SIGINT at the mailbox handler for
         // the whole acquisition, like the `sleep` fast path: an
@@ -217,22 +222,26 @@ impl Executor {
         if read_fd.is_none() {
             if cmd.heredoc_body.is_some() {
                 let input = self.expand_heredoc_body_mut_from_carrier(&cmd.heredoc_body);
-                self.read_eof_no_delimiter |= !record_contains_delimiter(&input, delimiter);
+                self.read_eof_no_delimiter |=
+                    !record_contains_delimiter(&input, delimiter, escape_aware);
                 return Some(trim_read_input(
                     input,
                     delimiter,
                     char_limit,
                     exact_char_limit,
+                    escape_aware,
                 ));
             }
             if let Some(heredoc) = &cmd.heredoc {
                 let input = self.expand_heredoc_body_mut(heredoc);
-                self.read_eof_no_delimiter |= !record_contains_delimiter(&input, delimiter);
+                self.read_eof_no_delimiter |=
+                    !record_contains_delimiter(&input, delimiter, escape_aware);
                 return Some(trim_read_input(
                     input,
                     delimiter,
                     char_limit,
                     exact_char_limit,
+                    escape_aware,
                 ));
             }
         }
@@ -243,20 +252,27 @@ impl Executor {
         // report EOF where a pipeline stage parks its input on the
         // FUNCTION_STDIN mirror (rubash#938).
         if let Some(fd) = read_fd.filter(|fd| *fd != 0) {
-            if let Some(line) =
-                self.read_redirected_fd(cmd, fd, delimiter, char_limit, exact_char_limit)
-            {
+            if let Some(line) = self.read_redirected_fd(
+                cmd,
+                fd,
+                delimiter,
+                char_limit,
+                exact_char_limit,
+                escape_aware,
+            ) {
                 return Some(line);
             }
             if let Some(output) =
-                self.read_coproc_stdout(fd, delimiter, char_limit, exact_char_limit)
+                self.read_coproc_stdout(fd, delimiter, char_limit, exact_char_limit, escape_aware)
             {
-                self.read_eof_no_delimiter |= !record_contains_delimiter(&output, delimiter);
+                self.read_eof_no_delimiter |=
+                    !record_contains_delimiter(&output, delimiter, escape_aware);
                 return Some(trim_read_input(
                     output,
                     delimiter,
                     char_limit,
                     exact_char_limit,
+                    escape_aware,
                 ));
             }
             // A dup of fd 0 (`exec 8<&0; read -u 8`) shares fd 0's open file
@@ -273,12 +289,32 @@ impl Executor {
                     Some(FdReadEndpoint::InheritedProcessStdin)
                 )
             {
-                return self.read_dup_of_stdin(silent, delimiter, char_limit, exact_char_limit);
+                return self.read_dup_of_stdin(
+                    silent,
+                    delimiter,
+                    char_limit,
+                    exact_char_limit,
+                    escape_aware,
+                );
             }
             return self
-                .read_virtual_fd_stdin(fd, silent, delimiter, char_limit, exact_char_limit)
+                .read_virtual_fd_stdin(
+                    fd,
+                    silent,
+                    delimiter,
+                    char_limit,
+                    exact_char_limit,
+                    escape_aware,
+                )
                 .or_else(|| {
-                    self.read_heredoc_fd_input(cmd, fd, delimiter, char_limit, exact_char_limit)
+                    self.read_heredoc_fd_input(
+                        cmd,
+                        fd,
+                        delimiter,
+                        char_limit,
+                        exact_char_limit,
+                        escape_aware,
+                    )
                 });
         }
 
@@ -294,17 +330,22 @@ impl Executor {
         // GNU redir.c: last fd-0 redirect wins (rubash#1391). If the last
         // stdin redirect is a herestring, the file-redirect path below must
         // be skipped even when cmd.redirect_in is set.
-        let last_stdin_is_herestring = cmd.redirects.iter().rev().find(|r| {
-            r.fd.unwrap_or(0) == 0
-                && matches!(
-                    r.kind,
-                    crate::parser::RedirectKind::Input
-                        | crate::parser::RedirectKind::HereDoc
-                        | crate::parser::RedirectKind::HereString
-                        | crate::parser::RedirectKind::DuplicateInput
-                        | crate::parser::RedirectKind::CloseInput
-                )
-        }).is_some_and(|r| matches!(r.kind, crate::parser::RedirectKind::HereString));
+        let last_stdin_is_herestring = cmd
+            .redirects
+            .iter()
+            .rev()
+            .find(|r| {
+                r.fd.unwrap_or(0) == 0
+                    && matches!(
+                        r.kind,
+                        crate::parser::RedirectKind::Input
+                            | crate::parser::RedirectKind::HereDoc
+                            | crate::parser::RedirectKind::HereString
+                            | crate::parser::RedirectKind::DuplicateInput
+                            | crate::parser::RedirectKind::CloseInput
+                    )
+            })
+            .is_some_and(|r| matches!(r.kind, crate::parser::RedirectKind::HereString));
         let fd0_self_dup = cmd.redirect_in.as_ref().is_some_and(|redirect| {
             redirect.fd_var.is_none()
                 && redirect.fd.unwrap_or(0) == 0
@@ -313,7 +354,11 @@ impl Executor {
                     Some((0, _))
                 )
         });
-        if let Some(redirect) = cmd.redirect_in.as_ref().filter(|_| !fd0_self_dup && !last_stdin_is_herestring) {
+        if let Some(redirect) = cmd
+            .redirect_in
+            .as_ref()
+            .filter(|_| !fd0_self_dup && !last_stdin_is_herestring)
+        {
             if redirect.fd.unwrap_or(0) != 0 {
                 return None;
             }
@@ -326,12 +371,14 @@ impl Executor {
                 .and_then(|target| target.strip_suffix(')'))
             {
                 if let Some(output) = self.process_substitution_output(source) {
-                    self.read_eof_no_delimiter |= !record_contains_delimiter(&output, delimiter);
+                    self.read_eof_no_delimiter |=
+                        !record_contains_delimiter(&output, delimiter, escape_aware);
                     return Some(trim_read_input(
                         output,
                         delimiter,
                         char_limit,
                         exact_char_limit,
+                        escape_aware,
                     ));
                 }
             }
@@ -359,16 +406,31 @@ impl Executor {
                         Some(FdReadEndpoint::InheritedProcessStdin)
                     )
                 {
-                    return self.read_dup_of_stdin(silent, delimiter, char_limit, exact_char_limit);
+                    return self.read_dup_of_stdin(
+                        silent,
+                        delimiter,
+                        char_limit,
+                        exact_char_limit,
+                        escape_aware,
+                    );
                 }
-                if let Some(output) =
-                    self.read_coproc_stdout(fd, delimiter, char_limit, exact_char_limit)
-                {
+                if let Some(output) = self.read_coproc_stdout(
+                    fd,
+                    delimiter,
+                    char_limit,
+                    exact_char_limit,
+                    escape_aware,
+                ) {
                     return Some(output);
                 }
-                if let Some(line) =
-                    self.read_virtual_fd_stdin(fd, silent, delimiter, char_limit, exact_char_limit)
-                {
+                if let Some(line) = self.read_virtual_fd_stdin(
+                    fd,
+                    silent,
+                    delimiter,
+                    char_limit,
+                    exact_char_limit,
+                    escape_aware,
+                ) {
                     return Some(line);
                 }
                 return self.read_heredoc_fd_input(
@@ -377,6 +439,7 @@ impl Executor {
                     delimiter,
                     char_limit,
                     exact_char_limit,
+                    escape_aware,
                 );
             }
 
@@ -410,8 +473,14 @@ impl Executor {
                 let saved = self.fd_table.entries.get(&0).cloned();
                 self.fd_table
                     .open_input(0, FdReadEndpoint::File(file), false);
-                let line =
-                    self.read_virtual_fd_stdin(0, silent, delimiter, char_limit, exact_char_limit);
+                let line = self.read_virtual_fd_stdin(
+                    0,
+                    silent,
+                    delimiter,
+                    char_limit,
+                    exact_char_limit,
+                    escape_aware,
+                );
                 match saved {
                     Some(entry) => {
                         self.fd_table.entries.insert(0, entry);
@@ -442,12 +511,14 @@ impl Executor {
             if input.is_empty() {
                 return None;
             }
-            self.read_eof_no_delimiter |= !record_contains_delimiter(&input, delimiter);
+            self.read_eof_no_delimiter |=
+                !record_contains_delimiter(&input, delimiter, escape_aware);
             return Some(trim_read_input(
                 input,
                 delimiter,
                 char_limit,
                 exact_char_limit,
+                escape_aware,
             ));
         }
 
@@ -456,12 +527,14 @@ impl Executor {
         // does not advance the shared fd cursor.
         if cmd.here_string.is_some() {
             if let Some(line) = self.stdin_string_for_command_mut(cmd) {
-                self.read_eof_no_delimiter |= !record_contains_delimiter(&line, delimiter);
+                self.read_eof_no_delimiter |=
+                    !record_contains_delimiter(&line, delimiter, escape_aware);
                 return Some(trim_read_input(
                     line,
                     delimiter,
                     char_limit,
                     exact_char_limit,
+                    escape_aware,
                 ));
             }
         }
@@ -494,7 +567,14 @@ impl Executor {
                 Some(FdReadEndpoint::File(_))
             )
         {
-            return self.read_virtual_fd_stdin(0, silent, delimiter, char_limit, exact_char_limit);
+            return self.read_virtual_fd_stdin(
+                0,
+                silent,
+                delimiter,
+                char_limit,
+                exact_char_limit,
+                escape_aware,
+            );
         }
         if fd0_file_is_null
             || matches!(
@@ -502,9 +582,14 @@ impl Executor {
                 Some(FdReadEndpoint::Text(_) | FdReadEndpoint::ProcessSubstitution(_))
             )
         {
-            if let Some(line) =
-                self.read_virtual_fd_stdin(0, silent, delimiter, char_limit, exact_char_limit)
-            {
+            if let Some(line) = self.read_virtual_fd_stdin(
+                0,
+                silent,
+                delimiter,
+                char_limit,
+                exact_char_limit,
+                escape_aware,
+            ) {
                 return Some(line);
             }
         }
@@ -512,12 +597,17 @@ impl Executor {
         // If FUNCTION_STDIN is set (from heredoc or redirect), only read from it.
         // Do NOT fall through to process stdin - that would block on the terminal.
         if self.shell_state.env_vars.contains_key(FUNCTION_STDIN) {
-            return self.read_function_stdin(delimiter, char_limit, exact_char_limit);
+            return self.read_function_stdin(delimiter, char_limit, exact_char_limit, escape_aware);
         }
 
-        if let Some(line) =
-            self.read_virtual_fd_stdin(0, silent, delimiter, char_limit, exact_char_limit)
-        {
+        if let Some(line) = self.read_virtual_fd_stdin(
+            0,
+            silent,
+            delimiter,
+            char_limit,
+            exact_char_limit,
+            escape_aware,
+        ) {
             return Some(line);
         }
 
@@ -541,9 +631,15 @@ impl Executor {
             return None;
         }
 
-        self.read_function_stdin(delimiter, char_limit, exact_char_limit)
+        self.read_function_stdin(delimiter, char_limit, exact_char_limit, escape_aware)
             .or_else(|| {
-                self.read_inherited_process_stdin(silent, delimiter, char_limit, exact_char_limit)
+                self.read_inherited_process_stdin(
+                    silent,
+                    delimiter,
+                    char_limit,
+                    exact_char_limit,
+                    escape_aware,
+                )
             })
     }
 
@@ -560,13 +656,20 @@ impl Executor {
         delimiter: char,
         char_limit: Option<usize>,
         exact_char_limit: bool,
+        escape_aware: bool,
     ) -> Option<String> {
-        if let Some(line) = self.read_function_stdin(delimiter, char_limit, exact_char_limit) {
+        if let Some(line) =
+            self.read_function_stdin(delimiter, char_limit, exact_char_limit, escape_aware)
+        {
             return Some(line);
         }
-        if let Some(line) =
-            self.read_inherited_process_stdin(silent, delimiter, char_limit, exact_char_limit)
-        {
+        if let Some(line) = self.read_inherited_process_stdin(
+            silent,
+            delimiter,
+            char_limit,
+            exact_char_limit,
+            escape_aware,
+        ) {
             return Some(line);
         }
         match read_stdin_until(
@@ -576,6 +679,7 @@ impl Executor {
             char_limit,
             exact_char_limit,
             self.read_sigint_guard_armed,
+            escape_aware,
         ) {
             // rubash#1250: an untrapped SIGINT aborted the raw read —
             // record it so the acquisition cascade stops here.
@@ -608,6 +712,7 @@ impl Executor {
         delimiter: char,
         char_limit: Option<usize>,
         exact_char_limit: bool,
+        escape_aware: bool,
     ) -> Option<String> {
         // Bash exposes the coprocess output as COPROC[0] (and NAME[0]).
         // Rubash stores that endpoint as a PipeReader keyed by the child PID.
@@ -630,6 +735,8 @@ impl Executor {
         let mut bytes = Vec::new();
         let mut consumed_chars = 0usize;
         let mut ended = false;
+        // rubash#1300: escaped bytes never terminate the record.
+        let mut escapes = crate::executor::fd_table::ReadEscapeTracker::new(escape_aware);
         // read.def:731-738: a record that is just the delimiter is served
         // (empty line, GNU rc 0) — tracked so the empty check below cannot
         // conflate it with EOF (niubash#275).
@@ -651,7 +758,9 @@ impl Executor {
                 }
                 Ok(buf) => {
                     bytes.push(buf[0]);
-                    if delimiter_byte_matches(buf[0], delimiter) && !exact_char_limit {
+                    let suppressed = escapes.suppresses_match(buf[0]);
+                    if !suppressed && delimiter_byte_matches(buf[0], delimiter) && !exact_char_limit
+                    {
                         delimiter_found = true;
                         break;
                     }
@@ -672,9 +781,19 @@ impl Executor {
         // read.def:949 eof: the pipe drained (or errored) before the
         // delimiter arrived; a timeout break is not EOF.
         if ended && !self.read_timed_out && !bytes.is_empty() {
-            self.read_eof_no_delimiter = !bytes
-                .iter()
-                .any(|byte| delimiter_byte_matches(*byte, delimiter));
+            self.read_eof_no_delimiter = if escape_aware {
+                // Replay the escape state: an escaped delimiter byte is
+                // record data, not a found delimiter (rubash#1300).
+                let mut replay = crate::executor::fd_table::ReadEscapeTracker::new(true);
+                !bytes.iter().any(|byte| {
+                    let suppressed = replay.suppresses_match(*byte);
+                    !suppressed && delimiter_byte_matches(*byte, delimiter)
+                })
+            } else {
+                !bytes
+                    .iter()
+                    .any(|byte| delimiter_byte_matches(*byte, delimiter))
+            };
         }
         if ended
             && matches!(
@@ -696,6 +815,7 @@ impl Executor {
             delimiter,
             char_limit,
             exact_char_limit,
+            escape_aware,
         ))
     }
 
@@ -793,11 +913,12 @@ impl Executor {
         delimiter: char,
         char_limit: Option<usize>,
         exact_char_limit: bool,
+        escape_aware: bool,
     ) -> Option<String> {
         if self.fd_table.is_open_for_read(fd) {
-            if let Some(line) = self
-                .fd_table
-                .read_text(fd, delimiter, char_limit, exact_char_limit)
+            if let Some(line) =
+                self.fd_table
+                    .read_text(fd, delimiter, char_limit, exact_char_limit, escape_aware)
             {
                 if let Some((_, offset)) = self.fd_table.input_snapshot(fd) {
                     self.shell_state
@@ -809,6 +930,7 @@ impl Executor {
                     delimiter,
                     char_limit,
                     exact_char_limit,
+                    escape_aware,
                 ));
             }
             if self.fd_table.is_closed(fd) {
@@ -833,6 +955,7 @@ impl Executor {
                 delimiter,
                 char_limit,
                 exact_char_limit,
+                escape_aware,
             );
         }
         None
@@ -843,6 +966,7 @@ impl Executor {
         delimiter: char,
         char_limit: Option<usize>,
         exact_char_limit: bool,
+        escape_aware: bool,
     ) -> Option<String> {
         self.apply_comsub_stdin_writeback();
         // GNU read builtin: one zread record off the shared fd-0 cursor
@@ -898,9 +1022,12 @@ impl Executor {
             let chars: Vec<(usize, char)> = slice.char_indices().collect();
             let mut cursor = 0usize;
             let mut units = 0usize;
+            // rubash#1300: an escaped character is never the delimiter
+            // in a non-raw read.
+            let mut escaped = false;
             while cursor < chars.len() {
                 let (index, ch) = chars[cursor];
-                if !exact_char_limit {
+                if !exact_char_limit && !escaped && !(escape_aware && ch == '\\') {
                     if slice[index..].starts_with(&delimiter_needle) {
                         consumed = index + delimiter_needle.len();
                         took_any = true;
@@ -926,10 +1053,15 @@ impl Executor {
                     output.push(payload);
                     consumed = payload_index + payload.len_utf8();
                     cursor += 2;
+                    // A marker pair is one raw byte: consumed as a
+                    // whole, it is the escaped character when an escape
+                    // was pending and never an escape introducer itself.
+                    escaped = false;
                 } else {
                     output.push(ch);
                     consumed = index + ch.len_utf8();
                     cursor += 1;
+                    escaped = escape_aware && !escaped && ch == '\\';
                 }
                 took_any = true;
                 units += 1;
@@ -956,6 +1088,7 @@ impl Executor {
             delimiter,
             char_limit,
             exact_char_limit,
+            escape_aware,
         ))
     }
 
@@ -965,6 +1098,7 @@ impl Executor {
         delimiter: char,
         char_limit: Option<usize>,
         exact_char_limit: bool,
+        escape_aware: bool,
     ) -> Option<String> {
         if self
             .shell_state
@@ -1018,6 +1152,8 @@ impl Executor {
         let mut units = 0usize;
         let mut eof = false;
         let mut delimiter_found = false;
+        // rubash#1300: an escaped unit is never the delimiter.
+        let mut escaped = false;
         loop {
             if !decoder.has_queued() {
                 if self.read_wait_timed_out(stdin_handle) {
@@ -1081,10 +1217,15 @@ impl Executor {
             if manual_echo {
                 echo_stdin_unit(&onechar, &unit);
             }
-            if !exact_char_limit && stdin_unit_is_delimiter(&unit, delimiter) {
+            if !exact_char_limit
+                && !escaped
+                && !(escape_aware && matches!(unit, StdinUnit::Char('\\')))
+                && stdin_unit_is_delimiter(&unit, delimiter)
+            {
                 delimiter_found = true;
                 break;
             }
+            escaped = escape_aware && !escaped && matches!(unit, StdinUnit::Char('\\'));
             match unit {
                 StdinUnit::Char(ch) => {
                     output.push(ch);
@@ -1121,6 +1262,7 @@ impl Executor {
             delimiter,
             char_limit,
             exact_char_limit,
+            escape_aware,
         ))
     }
 

@@ -246,6 +246,66 @@ pub(crate) fn delimiter_seq_ending_at(
     None
 }
 
+/// Escape state for non-raw `read` delimiter matching (GNU
+/// builtins/read.def: without -r, a backslash consumes the next
+/// character as an escaped literal — zread/read_mbchar — and an escaped
+/// character can never terminate the record; that includes the
+/// delimiter `\` itself, which only -r makes matchable). Byte-oriented
+/// readers feed each byte through `suppresses_match` before testing
+/// the delimiter: the backslash byte itself and every byte of the
+/// escaped character report "suppressed" (rubash#1300).
+pub(crate) struct ReadEscapeTracker {
+    enabled: bool,
+    escaped_char_bytes_left: usize,
+    escape_pending: bool,
+}
+
+impl ReadEscapeTracker {
+    pub(crate) fn new(enabled: bool) -> Self {
+        ReadEscapeTracker {
+            enabled,
+            escaped_char_bytes_left: 0,
+            escape_pending: false,
+        }
+    }
+
+    /// True when a delimiter match ending at `byte` must be ignored
+    /// because the byte is an escape introducer or part of an escaped
+    /// character. The byte is consumed either way.
+    pub(crate) fn suppresses_match(&mut self, byte: u8) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if self.escaped_char_bytes_left > 0 {
+            self.escaped_char_bytes_left -= 1;
+            return true;
+        }
+        if self.escape_pending {
+            self.escape_pending = false;
+            self.escaped_char_bytes_left = utf8_first_byte_len(byte).saturating_sub(1);
+            return true;
+        }
+        if byte == b'\\' {
+            self.escape_pending = true;
+            return true;
+        }
+        false
+    }
+}
+
+/// Byte length of the UTF-8 character a leading byte introduces
+/// (invalid leading bytes count as one byte, matching the
+/// non-continuation-byte character accounting the readers use).
+fn utf8_first_byte_len(byte: u8) -> usize {
+    match byte {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
+    }
+}
+
 impl FdTable {
     pub(crate) fn new() -> Self {
         let mut table = Self {
@@ -522,8 +582,9 @@ impl FdTable {
         delimiter: char,
         char_limit: Option<usize>,
         exact: bool,
+        escape_aware: bool,
     ) -> Option<String> {
-        self.read_bytes(fd, delimiter, char_limit, exact)
+        self.read_bytes(fd, delimiter, char_limit, exact, escape_aware)
             .map(|bytes| bytes_to_shell_text(&bytes))
     }
 
@@ -533,6 +594,7 @@ impl FdTable {
         delimiter: char,
         char_limit: Option<usize>,
         exact: bool,
+        escape_aware: bool,
     ) -> Option<Vec<u8>> {
         let endpoint = self.entries.get(&fd)?.read.clone()?;
         let file = match &endpoint {
@@ -542,7 +604,7 @@ impl FdTable {
             _ => None,
         };
         if let Some(file) = file {
-            return self.read_file_bytes(file, delimiter, char_limit, exact);
+            return self.read_file_bytes(file, delimiter, char_limit, exact, escape_aware);
         }
         let input = match endpoint {
             FdReadEndpoint::Text(input) | FdReadEndpoint::ProcessSubstitution(input) => input,
@@ -562,12 +624,14 @@ impl FdTable {
         let mut delimiter_found = false;
         let mut delimiter_len = 0usize;
         let mut limit_reached = false;
+        let mut escapes = ReadEscapeTracker::new(escape_aware && !exact);
         for (index, byte) in slice.iter().copied().enumerate() {
             if byte & 0xc0 != 0x80 {
                 chars += 1;
             }
             consumed = index + 1;
-            if !exact {
+            let suppressed = escapes.suppresses_match(byte);
+            if !exact && !suppressed {
                 if let Some(len) = delimiter_seq_ending_at(&seqs, slice, consumed) {
                     delimiter_found = true;
                     delimiter_len = len;
@@ -613,6 +677,7 @@ impl FdTable {
         delimiter: char,
         char_limit: Option<usize>,
         exact: bool,
+        escape_aware: bool,
     ) -> Option<Vec<u8>> {
         if char_limit == Some(0) {
             return Some(Vec::new());
@@ -628,7 +693,7 @@ impl FdTable {
         // O(bytes/chunk). Deadline reads stay byte-wise (per-byte
         // wait_readable, read.def check_read_timeout).
         if self.read_deadline.is_none() && crate::fd::is_disk_file(file.handle) {
-            return self.read_file_bytes_buffered(file, delimiter, char_limit, exact);
+            return self.read_file_bytes_buffered(file, delimiter, char_limit, exact, escape_aware);
         }
         let mut result = Vec::new();
         let mut chars = 0usize;
@@ -636,6 +701,7 @@ impl FdTable {
         let mut delimiter_found = false;
         let mut limit_reached = false;
         let seqs = read_delimiter_seqs(delimiter);
+        let mut escapes = ReadEscapeTracker::new(escape_aware);
         loop {
             // read.def check_read_timeout + shtimer_select: each byte read
             // is bounded by the remaining deadline.
@@ -659,7 +725,8 @@ impl FdTable {
                 chars += 1;
             }
             result.push(byte);
-            if !exact {
+            let suppressed = escapes.suppresses_match(byte);
+            if !exact && !suppressed {
                 // The delimiter is consumed but not returned: when the
                 // accumulated bytes end with one of its sequences, drop
                 // the sequence back off the record (rubash#1062).
@@ -702,11 +769,13 @@ impl FdTable {
         delimiter: char,
         char_limit: Option<usize>,
         exact: bool,
+        escape_aware: bool,
     ) -> Option<Vec<u8>> {
         let Ok(origin) = crate::fd::file_position(file.handle) else {
             return None;
         };
         let seqs = read_delimiter_seqs(delimiter);
+        let mut escapes = ReadEscapeTracker::new(escape_aware);
         let mut buffer: Vec<u8> = Vec::new();
         let mut result: Vec<u8> = Vec::new();
         let mut chars = 0usize;
@@ -728,7 +797,8 @@ impl FdTable {
                     chars += 1;
                 }
                 result.push(byte);
-                if !exact {
+                let suppressed = escapes.suppresses_match(byte);
+                if !exact && !suppressed {
                     if let Some(len) = delimiter_seq_ending_at(&seqs, &result, result.len()) {
                         // Delimiter consumed but not returned; everything
                         // after its end position is prefetched data to
@@ -1034,13 +1104,13 @@ mod tests {
         let mut table = FdTable::new();
         table.open_input(10, FdReadEndpoint::text("one\ntwo\n"), true);
         assert_eq!(
-            table.read_text(10, '\n', None, false).as_deref(),
+            table.read_text(10, '\n', None, false, false).as_deref(),
             Some("one")
         );
         table.move_input(11, 10).unwrap();
         assert!(table.is_closed(10));
         assert_eq!(
-            table.read_text(11, '\n', None, false).as_deref(),
+            table.read_text(11, '\n', None, false, false).as_deref(),
             Some("two")
         );
     }

@@ -1572,11 +1572,7 @@ impl Executor {
                             let mut stderr = Vec::new();
                             // GNU cat.c reports its own errors bare, with
                             // no shell diagnostic prefix (rubash#1309).
-                            writeln!(
-                                &mut stderr,
-                                "cat: {}: No such file or directory",
-                                target
-                            )?;
+                            writeln!(&mut stderr, "cat: {}: No such file or directory", target)?;
                             self.write_buffered_builtin_output(cmd, &[], &stderr)?;
                             status = 1;
                         }
@@ -1652,7 +1648,7 @@ impl Executor {
         // No operands: plain stdin shapes (the operand loop above already
         // returned). This block keeps the original cascade order.
         {
-            if let Some(input) = self.read_function_stdin('\0', None, false) {
+            if let Some(input) = self.read_function_stdin('\0', None, false, false) {
                 self.write_cat_output(
                     cmd,
                     &filter(
@@ -1851,7 +1847,7 @@ impl Executor {
         }
         let Some(input) = self
             .stdin_string_for_command_mut(cmd)
-            .or_else(|| self.read_function_stdin('\0', None, false))
+            .or_else(|| self.read_function_stdin('\0', None, false, false))
             .or_else(|| self.read_inherited_process_stdin_to_string())
         else {
             return Ok(false);
