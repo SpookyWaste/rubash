@@ -326,7 +326,7 @@ fn test_kill_current_jobspec_uses_last_background_job() {
 /// the wait. The signal status stays resolvable through the completed
 /// status (pinning that contract is the pid-operand test below).
 #[test]
-fn test_kill_jobspec_leaves_no_completion_notice() {
+fn test_kill_jobspec_keeps_job_listed_until_reap() {
     let _cwd_guard = CwdGuard::take();
     let output_path = "target/rubash-kill-no-notice-output.txt";
     let _ = fs::remove_file(output_path);
@@ -341,16 +341,34 @@ fn test_kill_jobspec_leaves_no_completion_notice() {
 
     assert!(result.is_ok());
     assert_eq!(executor.last_exit_code(), 0);
-    assert_eq!(
-        fs::read_to_string(output_path).unwrap(),
-        "kill:0\nafter:0\n",
-        "no job-completion notice and no jobs listing for a jobspec kill"
+    // GNU 5.3.20 on this exact script: the jobspec kill delivers SIGTERM
+    // and leaves the entry in the table — `jobs` still lists the job (as
+    // Running) until the reap boundary, no completion notice is printed,
+    // and the bare `wait` returns 0 (rubash#1411; the pre-fix expectation
+    // of an empty listing came from the synchronous removal the engine
+    // used to perform for DONT_REPORT signals).
+    let content = fs::read_to_string(output_path).unwrap();
+    assert!(
+        content.starts_with("kill:0\n"),
+        "kill succeeds: {content:?}"
+    );
+    assert!(
+        content.contains("[1]"),
+        "jobs still lists the killed job until the reap: {content:?}"
+    );
+    assert!(
+        !content.contains("Terminated"),
+        "no completion notice for a DONT_REPORT death: {content:?}"
+    );
+    assert!(
+        content.ends_with("after:0\n"),
+        "bare wait returns 0: {content:?}"
     );
     let _ = fs::remove_file(output_path);
 }
 
-/// The kill builtin stashes the signal status before dropping the table
-/// entry, so the #737 contract survives the #796 notice fix: a pid-shaped
+/// The reap boundary records the job's real signal status, so the #737
+/// contract survives the #1411 listing fix: a pid-shaped
 /// wait after the kill still resolves the signal status (GNU 5.3.0:
 /// `kill $!; wait $!` reports 143).
 #[test]
