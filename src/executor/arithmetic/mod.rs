@@ -1165,6 +1165,10 @@ impl Executor {
         else {
             return;
         };
+        // rubash#1238: remember the diagnostic was printed so the
+        // (( ))/let reporters don't add a synthesized syntax error after
+        // it (GNU's bind failure produces exactly one diagnostic line).
+        self.shell_state.arithmetic_readonly_error.set(true);
         if !self.shell_state.arithmetic_expansion_error.replace(true) {
             eprintln!("{}{}: readonly variable", self.error_prefix(), name);
             use std::io::Write;
@@ -3014,6 +3018,16 @@ fn eval_mutable_arith_result(
                 tok_start: tok,
                 display_end: normalized.len(),
             });
+        } else if value.is_none()
+            && parser
+                .env_vars
+                .get("__RUBASH_ARITH_READONLY_ERROR")
+                .is_some()
+        {
+            // rubash#1238: the parse failed on a readonly bind; the
+            // Executor layer prints the `readonly variable` diagnostic
+            // from the marker. GNU raises no evalerror here, so record
+            // none — synthesizing "operand expected" would double-report.
         } else if value.is_none() {
             // The parser returned no value without recording a cause —
             // GNU exp0's operand-expected (expr.c:1120) with lasttp at the

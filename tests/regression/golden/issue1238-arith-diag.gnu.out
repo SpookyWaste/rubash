@@ -1,0 +1,7 @@
+postinc rc=1
+val=5
+sum=6
+let rc=1
+empty-assoc-read rc=1
+pure-assign ok v=5
+nonempty-missing rc=1

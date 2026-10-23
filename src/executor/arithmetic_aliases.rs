@@ -180,6 +180,12 @@ impl Executor {
         if self.shell_state.arithmetic_nounset_error.get() {
             return;
         }
+        // rubash#1238: a readonly bind failure already printed its one
+        // diagnostic (`name: readonly variable`); GNU emits no evalerror
+        // after it, so suppress the synthesized syntax error.
+        if self.shell_state.arithmetic_readonly_error.get() {
+            return;
+        }
         if self.report_subscript_eval_failure() {
             return;
         }
@@ -217,6 +223,10 @@ impl Executor {
         // reported the unbound variable and jumped out — no evalerror
         // follows (rubash#1150, `let u++` double-reported).
         if self.shell_state.arithmetic_nounset_error.get() {
+            return;
+        }
+        // rubash#1238: same single-diagnostic rule for readonly binds.
+        if self.shell_state.arithmetic_readonly_error.get() {
             return;
         }
         // GNU expr.c: a failed array SUBSCRIPT eval (nested evalexp inside
@@ -323,6 +333,7 @@ impl Executor {
             }
             return 1;
         }
+        self.shell_state.arithmetic_readonly_error.set(false);
         let eval_result = self.eval_arithmetic_command_value(raw_expression.unwrap_or(expression));
         // An invalid nameref-cell assignment inside `((` fails the command
         // with status 1 even though the expression itself evaluated.
@@ -499,6 +510,7 @@ impl Executor {
     }
 
     pub(in crate::executor) fn execute_let(&mut self, expressions: &[String]) -> i32 {
+        self.shell_state.arithmetic_readonly_error.set(false);
         // GNU let.def:85: a leading `--` argument is skipped (ISOPTION),
         // so `let -- 'expr'` evaluates expr, not `--` as an operand.
         let expressions = if expressions.first().map(String::as_str) == Some("--") {
