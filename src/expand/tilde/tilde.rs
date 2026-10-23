@@ -60,8 +60,64 @@ pub fn expand_word_prefix(word: &str, env_vars: &HashMap<String, String>) -> Opt
         "~" => Some(home_value(env_vars)),
         "~+" => env_vars.get("PWD").cloned(),
         "~-" => env_vars.get("OLDPWD").cloned(),
-        _ => expand_user_tilde_word(word, env_vars),
+        _ => {
+            // GNU lib/tilde/tilde.c: the `~+`/`~-` prefix family (with an
+            // optional directory-stack index and/or a `/` tail) is resolved
+            // BEFORE the getpwnam user lookup — rubash#1232 left `~+/x`,
+            // `~-/x` and every `~+N` literal because only the bare forms
+            // were matched above.
+            if let Some(expanded) = word
+                .strip_prefix('~')
+                .and_then(|rest| expand_pwd_tilde(rest, env_vars))
+            {
+                return Some(expanded);
+            }
+            expand_user_tilde_word(word, env_vars)
+        }
     }
+}
+
+/// GNU lib/tilde/tilde.c (isolate_tilde_prefix / tilde_expand_word): the
+/// tilde prefix may be `~+` or `~-`, optionally followed by decimal digits
+/// — a directory-stack index. The prefix ends at the first `/` or `:` or at
+/// the end of the word; the tail glues verbatim. Bare `~+` reads $PWD and
+/// bare `~-` reads $OLDPWD (an unset variable expands to nothing, so the
+/// word stays literal); `~+N` is the Nth stack entry counting from the
+/// left (0 = the current directory) and `~-N` the Nth counting from the
+/// right. An out-of-range index is not an expansion (None), matching the
+/// unknown-user failure path.
+fn expand_pwd_tilde(rest: &str, env_vars: &HashMap<String, String>) -> Option<String> {
+    let (from_right, after_sign) = if let Some(tail) = rest.strip_prefix('+') {
+        (false, tail)
+    } else if let Some(tail) = rest.strip_prefix('-') {
+        (true, tail)
+    } else {
+        return None;
+    };
+    let digit_len = after_sign
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    let (digits, tail) = after_sign.split_at(digit_len);
+    if !tail.is_empty() && !tail.starts_with('/') && !tail.starts_with(':') {
+        return None;
+    }
+    let base = if digits.is_empty() {
+        let variable = if from_right { "OLDPWD" } else { "PWD" };
+        env_vars.get(variable)?.clone()
+    } else {
+        let index: usize = digits.parse().ok()?;
+        let stack = crate::builtins::pushd::load_stack(env_vars);
+        if from_right {
+            if index >= stack.len() {
+                return None;
+            }
+            stack[stack.len() - 1 - index].clone()
+        } else {
+            stack.get(index)?.clone()
+        }
+    };
+    Some(format!("{base}{tail}"))
 }
 
 /// GNU lib/tilde/tilde.c:361-410: `~user` and `~user/rest` resolve the user
@@ -248,6 +304,17 @@ pub(crate) fn expand_tilde_segment(segment: &str, env_vars: &HashMap<String, Str
         // no passwd stand-in) leaves the segment verbatim.
         return match tilde_home(env_vars) {
             Some(home) => format!("{home}{rest}"),
+            None => segment.to_string(),
+        };
+    }
+
+    // GNU lib/tilde/tilde.c: a `~+`/`~-` segment (with optional stack
+    // index or `/` tail) resolves against $PWD/$OLDPWD/the directory
+    // stack, never through getpwnam (rubash#1232: `x=~/a:~+/b` kept the
+    // second segment literal).
+    if rest.starts_with('+') || rest.starts_with('-') {
+        return match expand_pwd_tilde(rest, env_vars) {
+            Some(expanded) => expanded,
             None => segment.to_string(),
         };
     }

@@ -1,0 +1,12 @@
+ok plus
+ok minus
+ok plus0
+ok minus0
+ok plus1-literal
+ok plus-slash
+ok home-slash
+ok stack-plus1
+BAD stack-minus1: [/bin] != [/usr]
+BAD stack-minus0: [/usr] != [/]
+ok colon-tail
+ok minus-unset-literal
