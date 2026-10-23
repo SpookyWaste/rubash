@@ -3459,6 +3459,19 @@ pub fn run_interactive_stdin(executor: &mut Executor) -> i32 {
             let stdin_posix = executor.get_env("__RUBASH_POSIX_MODE").as_deref() == Some("1");
             if pending_heredocs.is_empty() && !stdin_source_needs_more_posix(&pending, stdin_posix)
             {
+                // rubash#1214: PS0 (bashline.c/readline display of
+                // *ps0_prompt, decode_prompt_string) is expanded and
+                // written to stderr after a complete command has been
+                // READ and before it executes — every accepted command,
+                // including `exit`; an empty command line prints nothing.
+                if !pending.trim().is_empty() {
+                    if let Some(ps0) = executor.get_env("PS0") {
+                        if !ps0.is_empty() {
+                            let rendered = executor.expand_prompt_string(&ps0);
+                            eprint!("{rendered}");
+                        }
+                    }
+                }
                 // bashhist.c pre_process_line + bash_add_history: each
                 // complete command runs history expansion first (set -H
                 // defaults on for interactive shells), then records, then
