@@ -1,7 +1,7 @@
 use super::classification::{
     assignment_rhs_is_fully_single_quoted, assignment_rhs_opens_compound,
-    assignment_value_is_quoted, is_assignment, is_keyword, mark_quoted_assignment_value,
-    protect_fully_single_quoted_assignment, quoted_literal_tilde,
+    assignment_value_has_escaped_tilde, assignment_value_is_quoted, is_assignment, is_keyword,
+    mark_quoted_assignment_value, protect_fully_single_quoted_assignment, quoted_literal_tilde,
 };
 use super::quotes::{
     remove_shell_quotes_assignment, remove_shell_quotes_outside_backticks,
@@ -125,13 +125,18 @@ pub(crate) fn word_value_from_raw(
             "{}{value}",
             crate::executor::markers::QUOTED_WORD_PREFIX_STR
         )
-    } else if kind == TokenKind::Assignment && assignment_value_is_quoted(raw) {
+    } else if kind == TokenKind::Assignment
+        && (assignment_value_is_quoted(raw) || assignment_value_has_escaped_tilde(raw))
+    {
         // TODO(parse.y/subst.c): Replace this narrow quoted-RHS marker
         // with WORD_DESC quote flags. It lets assignment tilde expansion
         // distinguish `a=~/x` from `a="~/x"` without leaking syntax to
         // builtins.
         mark_quoted_assignment_value(raw, &value)
-    } else if kind == TokenKind::Word && is_assignment(&value) && assignment_value_is_quoted(raw) {
+    } else if kind == TokenKind::Word
+        && is_assignment(&value)
+        && (assignment_value_is_quoted(raw) || assignment_value_has_escaped_tilde(raw))
+    {
         // A fully quoted assignment-looking argument, such as
         // `"SHELL=~/bash"`, remains a normal word but its RHS quote state
         // still suppresses the assignment-word tilde pass.
@@ -309,7 +314,9 @@ impl<'a> Lexer<'a> {
                 "{}{value}",
                 crate::executor::markers::QUOTED_WORD_PREFIX_STR
             )
-        } else if kind == TokenKind::Assignment && assignment_value_is_quoted(raw) {
+        } else if kind == TokenKind::Assignment
+            && (assignment_value_is_quoted(raw) || assignment_value_has_escaped_tilde(raw))
+        {
             // TODO(parse.y/subst.c): Replace this narrow quoted-RHS marker
             // with WORD_DESC quote flags. It lets assignment tilde expansion
             // distinguish `a=~/x` from `a="~/x"` without leaking syntax to
@@ -317,7 +324,7 @@ impl<'a> Lexer<'a> {
             mark_quoted_assignment_value(raw, &value)
         } else if kind == TokenKind::Word
             && is_assignment(&value)
-            && assignment_value_is_quoted(raw)
+            && (assignment_value_is_quoted(raw) || assignment_value_has_escaped_tilde(raw))
         {
             // A fully quoted assignment-looking argument, such as
             // `"SHELL=~/bash"`, remains a normal word but its RHS quote state

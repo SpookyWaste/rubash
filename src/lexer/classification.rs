@@ -256,5 +256,22 @@ pub(super) fn mark_quoted_assignment_value(raw: &str, value: &str) -> String {
 pub(super) fn quoted_literal_tilde(raw: &str, value: &str) -> bool {
     value.starts_with('~')
         && ((raw.starts_with('\'') && raw.ends_with('\''))
-            || (raw.starts_with('"') && raw.ends_with('"')))
+            || (raw.starts_with('"') && raw.ends_with('"'))
+            // A backslash-quoted tilde is quoted exactly like '~'/"~":
+            // GNU parse.y keeps the escaped `~` CTLESC-protected, so no
+            // tilde pass may touch it (rubash#1416: `echo \~/x` printed
+            // $HOME/x because dequoting erased the only evidence).
+            || raw.starts_with("\\~"))
+}
+
+/// True when an assignment's raw RHS begins with a backslash-quoted tilde
+/// (at the value start or right after a `:` segment boundary). Such an RHS
+/// takes the quoted-value marker so the assignment tilde pass leaves it
+/// literal, mirroring `assignment_value_is_quoted` for quote characters
+/// (rubash#1416: `v=\~/x` must stay `\~/x` -> `~/x`).
+pub(super) fn assignment_value_has_escaped_tilde(raw: &str) -> bool {
+    let Some((_, value)) = raw.split_once('=') else {
+        return false;
+    };
+    !value.starts_with('(') && (value.starts_with("\\~") || value.contains(":\\~"))
 }
