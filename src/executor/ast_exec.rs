@@ -1092,6 +1092,25 @@ impl Executor {
                         return Err(error);
                     }
                 }
+                // GNU execute_cmd.c: the ERR trap and the errexit jump run
+                // for a completed `time` command exactly as for a pipeline
+                // (the branch below) — this branch used to skip both, so
+                // `set -e; time f` with f failing, and a pipefail-failing
+                // pipeline under `time`, never exited (rubash#1277). The
+                // timed command's own `!` (time_command.inverted, already
+                // folded into exit_code by execute_time_ast_command)
+                // exempts the command like an outer inversion.
+                self.maybe_run_error_trap(command)?;
+                if self.errexit_enabled()
+                    && self.errexit_is_active()
+                    && self.suppress_errexit == 0
+                    && self.exit_code != 0
+                    && !command.inverted
+                    && !time_command.inverted
+                    && command.and_or().is_none()
+                {
+                    return Err(ExecuteError::ExitCode(self.exit_code));
+                }
                 if let Some(next_index) = self.skip_and_or_rhs(commands, index) {
                     index = next_index;
                 } else {
