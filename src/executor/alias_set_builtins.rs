@@ -120,11 +120,13 @@ impl Executor {
             &mut stdout,
             &mut stderr,
         )?;
-        if cmd.words.len() == 1 {
+        if cmd.words.len() == 1 && !self.posix_mode_enabled() {
             // GNU set.def set_builtin with no arguments calls
             // print_var_list over ALL variables — shell functions are
             // variables in GNU's table and print after the scalars, in
             // name order, through print_function_def (rubash#1056).
+            // POSIX mode suppresses the function half: bare `set` writes
+            // only the shell variables (rubash#1260).
             let mut names: Vec<&String> = self.shell_state.functions.keys().collect();
             names.sort();
             for name in names {
