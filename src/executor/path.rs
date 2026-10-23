@@ -1298,17 +1298,32 @@ pub fn external_command_for_named_program(
             }
         }
     }
+    // GNU shell_execve (execute_cmd.c) hands execve the command word
+    // exactly as typed for argv[0]; std::process::Command would otherwise
+    // substitute the resolved program path. That leaks the full path into
+    // the child's $0 for `bash -c`/`sh -c` (overriding even an explicit
+    // `exec -a name`, rubash#1227) and into hashed commands invoked by a
+    // short name (`hash -p /bin/dash mydash; mydash` -> $0=/bin/dash,
+    // rubash#1231). Set argv[0] to the typed word on unix.
+    #[cfg(unix)]
+    if let Some(name) = command_name {
+        use std::os::unix::process::CommandExt;
+        command.arg0(name);
+    }
     push_external_args(&mut command, &native_args);
     // For `sh -c '...'` without an explicit $0, Bash sets $0 to the shell
     // name (e.g. "/bin/sh" for `/bin/sh -c 'echo $0'`). WinuxCmd's sh.exe
     // defaults to "niu" in that case, so inject the logical name as $0
     // (histexp.tests: `!2` expands to `/bin/sh -c 'echo this is $0'` and
-    // expects "this is /bin/sh").
+    // expects "this is /bin/sh"). On unix the argv[0] set above already
+    // carries the name and the child derives $0 from it; appending the
+    // name as an extra operand there would shadow an explicit
+    // `exec -a` argv[0] (rubash#1227), so the append is Windows-only.
     if let Some(name) = command_name {
         let lower = name.replace('\\', "/").to_ascii_lowercase();
         let is_sh =
             lower == "sh" || lower == "bash" || lower.ends_with("/sh") || lower.ends_with("/bash");
-        if is_sh && native_args.len() == 2 && native_args[0] == "-c" {
+        if !cfg!(unix) && is_sh && native_args.len() == 2 && native_args[0] == "-c" {
             command.arg(name);
         }
     }
