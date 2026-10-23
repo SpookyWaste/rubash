@@ -101,7 +101,14 @@ impl Executor {
             .filter(|arg| !arg.starts_with('-') && !arg.starts_with('+'))
             .map(String::as_str)
             .collect();
-        let print_not_found = args.iter().any(|arg| arg == "-p");
+        // GNU declare.def: the -p flag may arrive inside a cluster
+        // (`declare -pf NAME`), so test for a `p` in any `-` option word,
+        // exactly like the `print` scan below — an exact "-p" match left
+        // `declare -pf NOPE` silent (rubash#1327). Bare `-f`/`-F` without
+        // -p stays silent on both shells.
+        let print_not_found = args
+            .iter()
+            .any(|arg| arg.starts_with('-') && arg.contains('p'));
         let function_names_only = args
             .iter()
             .any(|arg| arg.starts_with('-') && arg.contains('F'));
