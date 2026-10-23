@@ -2578,8 +2578,21 @@ impl Executor {
         {
             return true;
         }
-        cmd.redirect_in.as_ref().is_some_and(|redirect| {
+        if cmd.redirect_in.as_ref().is_some_and(|redirect| {
             redirect.fd == Some(fd)
+                && !is_closed_redirect_target(&self.expand_redirect_target(redirect))
+        }) {
+            return true;
+        }
+        // rubash#1296: a numbered input redirect attached to the read
+        // command itself (`read -u 3 x 3< file`) lives in cmd.redirects,
+        // not redirect_in — the same dual-store lookup mapfile performs.
+        cmd.redirects.iter().rev().any(|redirect| {
+            redirect.fd == Some(fd)
+                && matches!(
+                    redirect.kind,
+                    crate::parser::RedirectKind::Input | crate::parser::RedirectKind::ReadWrite
+                )
                 && !is_closed_redirect_target(&self.expand_redirect_target(redirect))
         })
     }
@@ -2606,6 +2619,19 @@ impl Executor {
             }
             if cmd.redirect_in.as_ref().is_some_and(|redirect| {
                 redirect.fd == Some(fd)
+                    && !is_closed_redirect_target(&self.expand_redirect_target(redirect))
+            }) {
+                return 0;
+            }
+            // rubash#1296: same cmd.redirects fallback as
+            // read_fd_is_available for command-attached numbered fds.
+            if cmd.redirects.iter().rev().any(|redirect| {
+                redirect.fd == Some(fd)
+                    && matches!(
+                        redirect.kind,
+                        crate::parser::RedirectKind::Input
+                            | crate::parser::RedirectKind::ReadWrite
+                    )
                     && !is_closed_redirect_target(&self.expand_redirect_target(redirect))
             }) {
                 return 0;
