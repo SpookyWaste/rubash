@@ -8,7 +8,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Write};
 
-use crate::executor::path::{shell_directory_entries, shell_path_entries};
+use crate::executor::path::{is_executable_file, shell_directory_entries, shell_path_entries};
 
 use crate::builtins::alias::Alias;
 
@@ -1555,7 +1555,13 @@ fn path_command_completion_candidates(env_vars: &HashMap<String, String>) -> Vec
             continue;
         };
         for entry in entries {
-            if entry.is_file {
+            // GNU compgen -c walks PATH with findcmd's file_status: a
+            // member qualifies when it is executable — symlinks are
+            // followed (access(2) semantics), while plain non-executable
+            // files and directories are excluded (rubash#1265). The old
+            // `entry.is_file` test inverted both halves: it dropped
+            // symlink commands and listed non-executables.
+            if is_executable_file(&entry.path) && !entry.path.is_dir() {
                 candidates.push(entry.name);
             }
         }
