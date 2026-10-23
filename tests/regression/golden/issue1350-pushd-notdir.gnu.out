@@ -1,0 +1,5 @@
+file rc=1
+missing rc=1
+dir rc=0 now=realdir
+popd rc=0
+done
