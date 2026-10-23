@@ -692,11 +692,28 @@ impl Executor {
         // pairs for carrier/raw bytes). readback takes raw capture bytes, so
         // decode the markers once — into_bytes() would re-encode them as
         // literal PUA glyphs at the next bytes_to_shell_text boundary.
-        SubstitutionOutput::readback(
+        let readback = SubstitutionOutput::readback(
             crate::executor::substitution_metadata::shell_text_to_raw_bytes(&output),
             status,
             context,
-        )
+        );
+        if readback.dropped_nul_bytes {
+            self.warn_comsub_nul_bytes();
+        }
+        readback
+    }
+
+    /// GNU subst.c read_comsub: discarding a NUL byte from a command
+    /// substitution's captured output warns once per substitution
+    /// (rubash#1280).
+    pub(in crate::executor) fn warn_comsub_nul_bytes(&self) {
+        self.write_diagnostic_fd2(
+            format!(
+                "{}warning: command substitution: ignored null byte in input\n",
+                self.diagnostic_prefix()
+            )
+            .as_bytes(),
+        );
     }
 
     pub(in crate::executor) fn expand_command_substitution_inner(
@@ -1512,6 +1529,9 @@ impl Executor {
         }
 
         let readback = SubstitutionOutput::readback(output, status, context);
+        if readback.dropped_nul_bytes {
+            self.warn_comsub_nul_bytes();
+        }
         self.last_command_substitution_status
             .set(Some(readback.status));
         Some(readback)
