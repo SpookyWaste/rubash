@@ -1273,7 +1273,17 @@ impl Executor {
                         state.saw_output_redirect = true;
                         continue;
                     }
-                    if let Some(source_fd) = redirect_target_fd(&target) {
+                    // The dup shortcut below is for the `>&N` SPELLING
+                    // and for virtual source bindings (pipes, captures,
+                    // pipeline staging). A /dev/fd/N (or /dev/std*,
+                    // /proc/self/fd/N) target naming a DISK FILE source
+                    // is a FILENAME open in GNU (r_output_direction),
+                    // never a dup — it must reach
+                    // open_command_output_target, which owns the reopen
+                    // semantics (rubash#1373).
+                    if let Some(source_fd) = redirect_target_fd(&target)
+                        .filter(|_| !self.dev_stdio_target_reopens_disk(&target, state))
+                    {
                         let Some(source_target) = state.fd_target(source_fd).cloned() else {
                             self.write_bad_fd_redirect_diagnostic(
                                 state,
@@ -1452,6 +1462,41 @@ impl Executor {
         Ok(state.saw_output_redirect)
     }
 
+    /// rubash#1373 gate for the ordered output walk: a dev-stdio target
+    /// (`/dev/fd/N`, `/dev/stdout`, `/proc/self/fd/N`) reopens only when
+    /// its source fd is bound to a regular disk file in the fd table.
+    /// Pipeline staging (deferred writes) and virtual bindings (pipes,
+    /// captures) keep the dup semantics GNU gets from opening a pipe's
+    /// /proc/self/fd entry.
+    fn dev_stdio_target_reopens_disk(
+        &self,
+        target: &str,
+        state: &OutputFdState,
+    ) -> bool {
+        if state.defer_stdout_writes {
+            return false;
+        }
+        let Some(source_fd) =
+            crate::executor::execution_misc::dev_stdio_redirect_fd(target)
+        else {
+            return false;
+        };
+        match self.fd_table.output_endpoint(source_fd) {
+            Some(FdWriteEndpoint::File(file)) => std::fs::metadata(&file.path)
+                .map(|meta| meta.is_file())
+                .unwrap_or(false),
+            Some(FdWriteEndpoint::Stdout) => {
+                crate::fd::disk_file_path(crate::fd::process_std_handle(1))
+                    .is_some()
+            }
+            Some(FdWriteEndpoint::Stderr) => {
+                crate::fd::disk_file_path(crate::fd::process_std_handle(2))
+                    .is_some()
+            }
+            _ => false,
+        }
+    }
+
     fn open_command_output_target(
         &mut self,
         state: &mut OutputFdState,
@@ -1477,6 +1522,33 @@ impl Executor {
             // handle. An fd with no write side is GNU's ENOENT
             // ("No such file or directory", see
             // write_bad_fd_redirect_diagnostic).
+            // rubash#1373: when the source fd's write endpoint is a regular
+            // disk file, GNU's open("/dev/fd/N") is a FRESH open of the
+            // underlying file — a new open-file description with its own
+            // offset (truncated at open unless the redirect appends) —
+            // not a dup of the source descriptor. Model it as a newly
+            // opened FileFd, whose writes go through its own OS handle,
+            // instead of the source's shared handle. Pipe/capture/procsub
+            // endpoints keep the shared-description match below (the
+            // cases that already agreed with GNU).
+            let reopened = match self.fd_table.output_endpoint(source_fd) {
+                Some(FdWriteEndpoint::File(file_fd)) => Some(file_fd.path.clone()),
+                Some(FdWriteEndpoint::Stdout) => {
+                    crate::fd::disk_file_path(crate::fd::process_std_handle(1))
+                }
+                Some(FdWriteEndpoint::Stderr) => {
+                    crate::fd::disk_file_path(crate::fd::process_std_handle(2))
+                }
+                _ => None,
+            }
+            .and_then(|path| {
+                crate::executor::fd_table::FileFd::open_write(path, redirect.append, false).ok()
+            });
+            if let Some(file_fd) = reopened {
+                state.fds.insert(fd, OutputTarget::SharedFile(file_fd));
+                state.saw_output_redirect = true;
+                return Ok(());
+            }
             match self.fd_table.output_endpoint(source_fd) {
                 Some(FdWriteEndpoint::ProcessSubstitution { path, .. }) => {
                     state.fds.insert(
