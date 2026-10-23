@@ -209,6 +209,40 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<i32, ExecuteError> {
+        // GNU jobs.c wait_for: a job reaped BY the wait itself has its
+        // signal-death notice pretty-printed while wait still owns the
+        // command's descriptors — `wait $p 2>/dev/null` silences the
+        // "Killed" notice. Notices queued BEFORE this wait (reaped at
+        // an earlier boundary) keep the boundary route: the raw-stderr
+        // flush in report_pending_signal_notices. So: snapshot the
+        // queue length, run the wait, then drain only the notices this
+        // wait produced and route them through the wait command's own
+        // fd-2 binding instead of leaving them for the raw flush
+        // (rubash#1303).
+        let notice_mark = self.pending_signal_notices.borrow().len();
+        let result = self.execute_wait_inner(cmd);
+        let drained: Vec<(u32, i32, String, bool)> = {
+            let mut queue = self.pending_signal_notices.borrow_mut();
+            let mark = notice_mark.min(queue.len());
+            queue.drain(mark..).collect()
+        };
+        if !drained.is_empty() {
+            let text = self.format_signal_notices(drained);
+            if !text.is_empty() {
+                if result.is_ok() {
+                    self.write_buffered_builtin_output(cmd, &[], text.as_bytes())?;
+                } else {
+                    let _ = self.write_buffered_builtin_output(cmd, &[], text.as_bytes());
+                }
+            }
+        }
+        result
+    }
+
+    fn execute_wait_inner(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<i32, ExecuteError> {
         self.refresh_background_jobs()?;
         // GNU wait.def wait_builtin() internal_getopt "fnp:": a dangling
         // `-p` (no joined text, no next word) is a getopt error, reported
@@ -1045,15 +1079,25 @@ impl Executor {
     ///   a foreground TERM death lands);
     /// - background TERM/INT/PIPE or trapped deaths: silent.
     pub(crate) fn report_pending_signal_notices(&mut self) -> Result<(), ExecuteError> {
+        let notices = std::mem::take(&mut *self.pending_signal_notices.borrow_mut());
+        let out = self.format_signal_notices(notices);
+        if !out.is_empty() {
+            crate::executor::shell_options::write_stderr_bytes(out.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Format queued signal-death notices exactly as
+    /// report_pending_signal_notices prints them at the command
+    /// boundary. Split out so execute_wait can route the notices ITS
+    /// reap produced through the wait command's own fd-2 binding
+    /// (rubash#1303).
+    fn format_signal_notices(&self, notices: Vec<(u32, i32, String, bool)>) -> String {
         // Signal numbers are the invariant Linux/MSVC values (libc is a
         // unix-only dependency, and job_builtins.rs compiles on both).
         const SIGINT: i32 = 2;
         const SIGPIPE: i32 = 13;
         const SIGTERM: i32 = 15;
-        let notices = std::mem::take(&mut *self.pending_signal_notices.borrow_mut());
-        if notices.is_empty() {
-            return Ok(());
-        }
         let mut out = String::new();
         for (pid, signal, command, foreground) in notices {
             // jobs.c:4628-4638: INT is never reported; PIPE via
@@ -1086,10 +1130,7 @@ impl Executor {
             }
             // Background TERM/trapped deaths print nothing.
         }
-        if !out.is_empty() {
-            crate::executor::shell_options::write_stderr_bytes(out.as_bytes())?;
-        }
-        Ok(())
+        out
     }
 
     /// Per-command boundary reap of background children (GNU's
