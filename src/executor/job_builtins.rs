@@ -1442,9 +1442,21 @@ impl Executor {
         let status = loop {
             // Signal queue first (see trap.c:604-611 note above): a trap
             // delivered before the child exited must win the race.
-            if let Some(interrupt) = self.wait_pending_signal_status()? {
-                self.background_children.insert(pid, child);
-                return Ok(WaitPidOutcome::Interrupted(interrupt));
+            match self.wait_pending_signal_status() {
+                Ok(Some(interrupt)) => {
+                    self.background_children.insert(pid, child);
+                    return Ok(WaitPidOutcome::Interrupted(interrupt));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    // An untrapped signal aborts the wait with
+                    // ExitCode(128+sig): put the handle back before
+                    // propagating, like the trapped branch above, so
+                    // the job remains waitable and reportable — the
+                    // child may still be alive.
+                    self.background_children.insert(pid, child);
+                    return Err(error);
+                }
             }
             if let Some(done) = child.try_wait()? {
                 // rubash#229: queue the signal-death notice (the job entry
@@ -2152,8 +2164,32 @@ impl Executor {
             entry.foreground = true;
             entry.background = false;
         }
-        match self.wait_for_background_pid(pid, false)? {
+        // rubash#1252: GNU jobs.c:3064 wait_for blocks with the shell's
+        // own signal handling installed — the terminal's ^C is aimed at
+        // the foreground JOB, and the shell survives it, returning
+        // 128+SIGINT as fg's status. The emulated wait must therefore
+        // hold the same foreground SIGINT guard as an external-child
+        // wait; without it the shell process takes SIGINT at SIG_DFL
+        // while fg blocks and dies outright (pty-verified). The wait's
+        // untrapped-signal ExitCode(128+sig) is fg's ordinary status,
+        // not a shell exit, so convert it back here.
+        #[cfg(unix)]
+        let _sigint_guard =
+            super::external_inner::ForegroundBuiltinSigintGuard::hold_if_interactive_untrapped(
+                self,
+            );
+        let wait_outcome = match self.wait_for_background_pid(pid, false) {
+            Ok(outcome) => Ok(outcome),
+            Err(ExecuteError::ExitCode(code)) if code > 128 => {
+                Ok(WaitPidOutcome::Interrupted(code))
+            }
+            Err(error) => Err(error),
+        };
+        match wait_outcome? {
             WaitPidOutcome::Status(status) | WaitPidOutcome::Interrupted(status) => Ok(status),
+            // Unreachable in practice: fg SIGCONTs and marks the job
+            // running above, before the wait. Mapped for exhaustiveness.
+            WaitPidOutcome::Stopped { stop_signal, .. } => Ok(128 + stop_signal),
             WaitPidOutcome::NotFound => {
                 self.write_job_not_found("fg", job, stderr)?;
                 Ok(1)
