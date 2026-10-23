@@ -309,10 +309,22 @@ impl Executor {
             .or_else(|| cmd.words.get(1).map(String::as_str))
             .unwrap_or_default();
         // GNU execute_cmd.c:3940-3945: if `set -x` is on, print `(( expr ))`
-        // before evaluating the arithmetic command.  Use the raw expression to
-        // preserve original whitespace.
-        let xtrace_expr = raw_expression.unwrap_or(expression);
-        self.xtrace_print_arith_cmd(xtrace_expr);
+        // before evaluating the arithmetic command. print_cmd.c:986
+        // xtrace_print_arith_cmd renders the EXPANDED expression
+        // (expand_arith_string output) with its whitespace verbatim,
+        // wrapped as `(( <text> ))` — `(( 1 + 1 ))` traces
+        // `+ ((  1 + 1  ))`, `((1+1))` traces `+ (( 1+1 ))`. The old call
+        // used the arith-for renderer, whose leading-blank trim fits the
+        // for-loop sections (their word lists drop the blanks) but eats
+        // a plain (( )) body's leading blanks (rubash#1344).
+        // arith_display_expand applies the parameter part of
+        // expand_arith_string to the raw capture; a command substitution
+        // in the body still renders literally here (residual).
+        if self.xtrace_enabled() {
+            let raw = raw_expression.unwrap_or(expression);
+            let display = self.arith_display_expand(raw);
+            self.xtrace_print_arith_cmd_raw(&display);
+        }
         // GNU parse.y parse_arith_cmd captures the text between `((` and `))`
         // verbatim (whitespace included) and execute_arith_command hands it to
         // evalexp after expand_arith_string. The parser's joined `expression`
