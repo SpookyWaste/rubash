@@ -689,9 +689,15 @@ impl Executor {
                 shell_pwd_display(&safe_temp_dir_string().replace('\\', "/"))
             });
         }
-        env_vars
-            .entry("IFS".to_string())
-            .or_insert_with(|| " \t\n".to_string());
+        // GNU variables.c initialize_shell_variables: IFS is never
+        // imported from the environment — a fresh shell always binds it
+        // to the default " \t\n", discarding any inherited value (even an
+        // empty one, which would disable field splitting entirely). This
+        // initializer runs exactly at fresh-shell starts (process start
+        // and the in-process child path), never for state-cloned
+        // subshells, so an unconditional bind is the GNU shape
+        // (rubash#1334).
+        env_vars.insert("IFS".to_string(), " \t\n".to_string());
         // GNU variables.c initialize_shell_variables binds these defaults
         // for every fresh shell (an inherited value wins): OPTERR=1
         // (getopts diagnostic default), PS4="+ " (xtrace prefix), and the
