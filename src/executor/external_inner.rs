@@ -92,6 +92,17 @@ impl Executor {
             &dev_args,
             &env_vars,
         );
+        // GNU env (coreutils) runs the command through execvp under the
+        // name as typed, so the child's argv[0] is the bare word, not
+        // the PATH-resolved path Command::new carries (rubash#1276:
+        // a GNU grandchild's diagnostics were prefixed with the full
+        // resolved path when the parent shell was niu). Shell-wrapped
+        // children pick their own argv[0] (the script name).
+        #[cfg(unix)]
+        if !used_shell {
+            use std::os::unix::process::CommandExt;
+            process.arg0(&config.command[0]);
+        }
         apply_env_command_environment(&mut process, &env_vars, !config.ignore_environment);
         if let Some(chdir) = &config.chdir {
             let directory = shell_path_to_windows(chdir, &env_vars);
