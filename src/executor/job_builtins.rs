@@ -2395,12 +2395,24 @@ impl Executor {
         cmd: &CommandNode,
     ) -> Result<i32, ExecuteError> {
         let mut stderr = Vec::new();
-        let status = crate::builtins::suspend::execute_with_io(
+        let (status, too_many_arguments) = crate::builtins::suspend::execute_with_io(
             &cmd.words[1..],
             &self.diagnostic_prefix(),
             &mut stderr,
         )?;
         self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+        if too_many_arguments {
+            // GNU builtins/common.c no_args (the `exit 1 2` class,
+            // rubash#705): the diagnostic is out, $? is EX_BADUSAGE (2),
+            // and a DISCARD jump abandons the rest of the current list —
+            // script readers resume at the next line, a `-c` string is
+            // abandoned whole and the shell exits 1 (shell.c:1477). An
+            // `||` cannot rescue it (rubash#1331).
+            self.exit_code = 2;
+            self.raise_evalerror_abort();
+            self.evalerror_exit_toomany_pending.set(true);
+            return Ok(2);
+        }
         Ok(status)
     }
 
