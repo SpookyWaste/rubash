@@ -1,0 +1,7 @@
+issue1237-net-redir.sh: line 12: nodir34/file: No such file or directory
+issue1237-net-redir.sh: connect: Connection refused
+issue1237-net-redir.sh: line 13: /dev/tcp/127.0.0.1/1: Connection refused
+issue1237-net-redir.sh: line 14: notaport: Servname not supported for ai_socktype
+issue1237-net-redir.sh: line 14: /dev/tcp/127.0.0.1/notaport: Invalid argument
+issue1237-net-redir.sh: connect: Connection refused
+issue1237-net-redir.sh: line 15: /dev/tcp/127.0.0.1/http: Connection refused

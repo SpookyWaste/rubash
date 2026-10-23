@@ -717,10 +717,14 @@ impl Executor {
             {
                 let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
                 if let Err(error) = FileFd::open_readwrite_pair(path) {
+                    // posix_errors::path_error already renders the
+                    // `{target}: {errno text}` shape — pass it through
+                    // like the Input probe below instead of prefixing the
+                    // target a second time (rubash#1237).
                     let message = crate::posix_errors::path_error(&target, error);
                     let text = crate::posix_errors::message(&message);
                     return self
-                        .reject_redirect_at(cmd, index, &format!("{target}: {text}"))
+                        .reject_redirect_at(cmd, index, &text)
                         .map(|_| Some(RedirectRejection::Command));
                 }
             }
