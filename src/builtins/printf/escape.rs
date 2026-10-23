@@ -11,6 +11,33 @@ pub(super) fn expand_format_escape<I>(
 where
     I: Iterator<Item = char>,
 {
+    // GNU printf.def tescape: an unrecognized escape letter is NOT
+    // consumed — the backslash is emitted and the letter is reprocessed
+    // as ordinary format text, so `\%` leaves the `%` conversion live
+    // (rubash#1262: `printf '<\%s>\n' 'a b'` printed `<\%s>` literally).
+    // Only the recognized starters below consume their letter.
+    match chars.peek().copied() {
+        Some(
+            'a'
+            | 'b'
+            | 'e'
+            | 'E'
+            | 'f'
+            | 'n'
+            | 'r'
+            | 't'
+            | 'v'
+            | '\\'
+            | '\''
+            | '"'
+            | '?'
+            | 'x'
+            | 'u'
+            | 'U'
+            | '0'..='7',
+        ) => {}
+        _ => return ("\\".to_string(), None),
+    }
     match chars.next() {
         Some('a') => ("\x07".to_string(), None),
         Some('b') => ("\x08".to_string(), None),
