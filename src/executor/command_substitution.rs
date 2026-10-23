@@ -1037,12 +1037,38 @@ impl Executor {
         }
 
         if words.first().map(String::as_str) == Some("umask") {
-            return self
-                .shell_state
-                .env_vars
-                .get("__RUBASH_UMASK")
-                .cloned()
-                .unwrap_or_else(|| "0022".to_string());
+            // Run the real builtin like the ulimit branch below (rubash#1251:
+            // the old canned lookup ignored the arguments entirely, so
+            // `$(umask -S)` printed the octal mask and `$(umask 077)` set
+            // nothing). A comsub is a fork: the env map is cloned, and on
+            // unix the builtin also applies the PROCESS umask, so snapshot
+            // and restore the process mask around the call or a set inside
+            // the substitution would leak into the parent shell.
+            let mut comsub_env = self.shell_state.env_vars.clone();
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            #[cfg(unix)]
+            let saved_mask = unsafe {
+                let mask = libc::umask(0);
+                libc::umask(mask);
+                mask
+            };
+            let status = crate::builtins::umask::execute_with_io(
+                &words[1..],
+                &mut comsub_env,
+                &mut out,
+                &mut err,
+            )
+            .unwrap_or_else(|_| 1); // Vec<u8> writes are infallible
+            #[cfg(unix)]
+            unsafe {
+                libc::umask(saved_mask);
+            }
+            let _ = std::io::stderr().write_all(&err);
+            self.last_command_substitution_status.set(Some(status));
+            return String::from_utf8_lossy(&out)
+                .trim_capture_terminator()
+                .to_string();
         }
 
         if words.first().map(String::as_str) == Some("ulimit") {
