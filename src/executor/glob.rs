@@ -1246,7 +1246,14 @@ fn apply_globignore(
     matches
         .into_iter()
         .filter(|name| {
-            let base = name.rsplit('/').next().unwrap_or(name);
+            // Directory matches in the collected list carry a trailing
+            // `/` (`sub1/`); the basename GNU matches against is taken
+            // after trimming it — `rsplit('/')` on the raw name yields
+            // the empty string, which no slashless pattern but `*` could
+            // match, so `sub*/` and `*/` results escaped filtering
+            // entirely (rubash#1322).
+            let trimmed = name.strip_suffix('/').unwrap_or(name);
+            let base = trimmed.rsplit('/').next().unwrap_or(trimmed);
             base != "."
                 && base != ".."
                 && !patterns.iter().any(|pattern| {
