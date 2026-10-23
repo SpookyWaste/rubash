@@ -522,8 +522,11 @@ impl Executor {
             // GNU execute_cmd.c: the diagnostic goes to the shell's
             // CURRENTLY BOUND fd 2 (redir.c) — an enclosing
             // `exec 2>/dev/null` contains it (rubash#218/#222-era leak).
+            // builtins/let.def: the message is a full line — the trailing
+            // newline is part of it (rubash#1242: the missing '\n' glued
+            // the next prompt/diagnostic onto the same line).
             let _ = self.write_default_stderr(
-                format!("{}let: expression expected", self.diagnostic_prefix()).as_bytes(),
+                format!("{}let: expression expected\n", self.diagnostic_prefix()).as_bytes(),
             );
             return 1;
         }
