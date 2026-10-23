@@ -128,6 +128,7 @@ golden_fixture!(golden_rustup_check_help => "rustup-check-help", timeout 60, cor
 golden_fixture!(golden_trap_signal_matrix => "trap-signal-matrix", timeout 180, corpus []);
 golden_fixture!(golden_xtrace_decl_compound => "xtrace-decl-compound", timeout 60, corpus []);
 golden_fixture!(golden_issue1224_coproc_fds => "issue1224-coproc-fds", timeout 60, corpus []);
+golden_fixture!(golden_issue1225_declare_convert => "issue1225-declare-convert", timeout 60, corpus []);
 
 /// Upstream suite slices pinned as rubash snapshots (coordinator list,
 /// 2026-09-27): the slices the lanes rely on for parity ledgers.

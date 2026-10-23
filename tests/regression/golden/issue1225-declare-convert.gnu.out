@@ -1,0 +1,8 @@
+declare -A v=([0]="" )
+declare -a w=([0]="")
+declare -a s=([0]="scalar")
+declare -A t=([0]="scalar" )
+declare -A fresh=([0]="" )
+declare -a fresh2=([0]="")
+declare -A nocell
+declare -a a=([0]="x" [1]="y")
