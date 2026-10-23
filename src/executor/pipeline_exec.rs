@@ -3266,6 +3266,23 @@ impl Executor {
         // current shell and keeps the parent sequence.)
         let saved_random = self.shell_state.random_state.clone_state();
         self.shell_state.random_state.reseed_fresh();
+        // rubash#1349: GNU forks every pipeline element, and
+        // execute_cmd.c's execute_subshell_builtin_or_function calls
+        // without_job_control() (jobs.c: delete_all_jobs) in the child —
+        // a pipeline element starts from an EMPTY job table, so
+        // `compgen -A job | cat` lists nothing even when the parent shell
+        // has live jobs. The one exception is the jobs builtin itself
+        // (execute_cmd.c's jobs_hack keeps the table for it). Stages run
+        // in place on the shared executor here, so swap the table out
+        // for the stage's duration and restore it below. (The lastpipe
+        // last element runs through execute_lastpipe_stage instead — it
+        // IS the current shell and keeps its jobs.)
+        let stage_is_jobs = command.words.first().map(String::as_str) == Some("jobs");
+        let saved_job_table = if stage_is_jobs {
+            None
+        } else {
+            Some(std::mem::take(&mut self.shell_state.job_table))
+        };
         // A pipeline element runs in its own subshell: an expansion error
         // raised while expanding the element's words on the shared executor
         // (notably `set -u` unbound in `$(( ))`) terminates only that
@@ -3357,6 +3374,10 @@ impl Executor {
         } else {
             self.execute_pipeline_stage_inner(command, input, stdin_inherit, streaming_stdin)
         };
+        // Restore the parent's job table (rubash#1349 swap above).
+        if let Some(saved) = saved_job_table {
+            self.shell_state.job_table = saved;
+        }
         // Inline stage arms that ran on `self` consumed FUNCTION_STDIN
         // directly; subshell/child stages report through the cell. Whichever
         // is missing falls back to the cursor visible here.
