@@ -237,6 +237,11 @@ impl Executor {
             (Ok(()), Ok(trap_status)) => trap_status,
             (Err(ExecuteError::ExitCode(code)), Ok(_)) => code,
             (Err(ExecuteError::ExpansionFailure(code)), Ok(_)) => code,
+            // rubash#1423: a pipeline element runs in a subshell, so a
+            // `return` raised by the element body ends the ELEMENT with
+            // that status — it must not unwind the enclosing function
+            // (GNU: `{ return 3; } | cat` inside f leaves f running).
+            (Err(ExecuteError::Return(code)), Ok(_)) => code,
             // niubash#345: the stage's fd-1 write hit a broken pipe (the
             // downstream consumer exited): the element is SIGPIPE-killed, so
             // report 141 rather than unwinding the whole pipeline.
@@ -376,6 +381,10 @@ impl Executor {
             (Ok(()), Ok(trap_status)) => trap_status,
             (Err(ExecuteError::ExitCode(code)), Ok(_))
             | (Err(ExecuteError::ExpansionFailure(code)), Ok(_)) => code,
+            // rubash#1423: the element runs in a subshell — a `return`
+            // raised by the element body ends the element with that
+            // status instead of unwinding the enclosing function.
+            (Err(ExecuteError::Return(code)), Ok(_)) => code,
             // niubash#345: a function pipeline element writing past the
             // consumer's exit is SIGPIPE-killed (status 141).
             (Err(ExecuteError::BrokenPipe), Ok(_)) => 141,
@@ -513,6 +522,10 @@ impl Executor {
             (Ok(()), Ok(trap_status)) => trap_status,
             (Err(ExecuteError::ExitCode(code)), Ok(_))
             | (Err(ExecuteError::ExpansionFailure(code)), Ok(_)) => code,
+            // rubash#1423: the element runs in a subshell — a `return`
+            // raised by the element body ends the element with that
+            // status instead of unwinding the enclosing function.
+            (Err(ExecuteError::Return(code)), Ok(_)) => code,
             // niubash#345: a builtin pipeline element writing past the
             // consumer's exit is SIGPIPE-killed (status 141).
             (Err(ExecuteError::BrokenPipe), Ok(_)) => 141,
