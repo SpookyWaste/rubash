@@ -78,6 +78,10 @@ impl Executor {
         let mut scalar_names = Vec::new();
         let mut scalar_field_count = 0usize;
         let mut invalid_name = false;
+        // rubash#1301: an invalid -a argument is recorded here, not
+        // reported inline — GNU read.def validates the plain names
+        // first and the -a argument only after all of them pass.
+        let mut invalid_array_name: Option<String> = None;
         let mut stop_scalar_names = false;
         let mut prompt: Option<String> = None;
         let mut initial_text: Option<String> = None;
@@ -139,14 +143,13 @@ impl Executor {
                                 .1
                                 .to_string(),
                         );
+                        invalid_array_name = None;
                     } else {
-                        report_read_invalid_identifier(
-                            &mut stderr,
-                            &self.diagnostic_prefix(),
-                            name,
-                        );
-                        invalid_name = true;
-                        scalar_field_count += 1;
+                        // rubash#1301: deferred — reported after the
+                        // plain names, only if they all pass (see the
+                        // post-parse validation below).
+                        invalid_array_name = Some(name.to_string());
+                        array_name = None;
                     }
                     index += 2;
                 }
@@ -168,14 +171,13 @@ impl Executor {
                                 .1
                                 .to_string(),
                         );
+                        invalid_array_name = None;
                     } else {
-                        report_read_invalid_identifier(
-                            &mut stderr,
-                            &self.diagnostic_prefix(),
-                            name,
-                        );
-                        invalid_name = true;
-                        scalar_field_count += 1;
+                        // rubash#1301: deferred — reported after the
+                        // plain names, only if they all pass (see the
+                        // post-parse validation below).
+                        invalid_array_name = Some(name.to_string());
+                        array_name = None;
                     }
                     index += 2;
                 }
@@ -188,14 +190,13 @@ impl Executor {
                                 .1
                                 .to_string(),
                         );
+                        invalid_array_name = None;
                     } else {
-                        report_read_invalid_identifier(
-                            &mut stderr,
-                            &self.diagnostic_prefix(),
-                            name,
-                        );
-                        invalid_name = true;
-                        stop_scalar_names = true;
+                        // rubash#1301: deferred — reported after the
+                        // plain names, only if they all pass (see the
+                        // post-parse validation below).
+                        invalid_array_name = Some(name.to_string());
+                        array_name = None;
                     }
                     index += 1;
                 }
@@ -217,14 +218,13 @@ impl Executor {
                                 .1
                                 .to_string(),
                         );
+                        invalid_array_name = None;
                     } else {
-                        report_read_invalid_identifier(
-                            &mut stderr,
-                            &self.diagnostic_prefix(),
-                            name,
-                        );
-                        invalid_name = true;
-                        scalar_field_count += 1;
+                        // rubash#1301: deferred — reported after the
+                        // plain names, only if they all pass (see the
+                        // post-parse validation below).
+                        invalid_array_name = Some(name.to_string());
+                        array_name = None;
                     }
                     index += 2;
                 }
@@ -239,14 +239,13 @@ impl Executor {
                                 .1
                                 .to_string(),
                         );
+                        invalid_array_name = None;
                     } else {
-                        report_read_invalid_identifier(
-                            &mut stderr,
-                            &self.diagnostic_prefix(),
-                            name,
-                        );
-                        invalid_name = true;
-                        stop_scalar_names = true;
+                        // rubash#1301: deferred — reported after the
+                        // plain names, only if they all pass (see the
+                        // post-parse validation below).
+                        invalid_array_name = Some(name.to_string());
+                        array_name = None;
                     }
                     index += 1;
                 }
@@ -268,14 +267,13 @@ impl Executor {
                                 .1
                                 .to_string(),
                         );
+                        invalid_array_name = None;
                     } else {
-                        report_read_invalid_identifier(
-                            &mut stderr,
-                            &self.diagnostic_prefix(),
-                            name,
-                        );
-                        invalid_name = true;
-                        scalar_field_count += 1;
+                        // rubash#1301: deferred — reported after the
+                        // plain names, only if they all pass (see the
+                        // post-parse validation below).
+                        invalid_array_name = Some(name.to_string());
+                        array_name = None;
                     }
                     index += 2;
                 }
@@ -295,14 +293,13 @@ impl Executor {
                                 .1
                                 .to_string(),
                         );
+                        invalid_array_name = None;
                     } else {
-                        report_read_invalid_identifier(
-                            &mut stderr,
-                            &self.diagnostic_prefix(),
-                            name,
-                        );
-                        invalid_name = true;
-                        stop_scalar_names = true;
+                        // rubash#1301: deferred — reported after the
+                        // plain names, only if they all pass (see the
+                        // post-parse validation below).
+                        invalid_array_name = Some(name.to_string());
+                        array_name = None;
                     }
                     index += 1;
                 }
@@ -322,14 +319,13 @@ impl Executor {
                                 .1
                                 .to_string(),
                         );
+                        invalid_array_name = None;
                     } else {
-                        report_read_invalid_identifier(
-                            &mut stderr,
-                            &self.diagnostic_prefix(),
-                            name,
-                        );
-                        invalid_name = true;
-                        scalar_field_count += 1;
+                        // rubash#1301: deferred — reported after the
+                        // plain names, only if they all pass (see the
+                        // post-parse validation below).
+                        invalid_array_name = Some(name.to_string());
+                        array_name = None;
                     }
                     index += 2;
                 }
@@ -341,14 +337,13 @@ impl Executor {
                                 .1
                                 .to_string(),
                         );
+                        invalid_array_name = None;
                     } else {
-                        report_read_invalid_identifier(
-                            &mut stderr,
-                            &self.diagnostic_prefix(),
-                            name,
-                        );
-                        invalid_name = true;
-                        stop_scalar_names = true;
+                        // rubash#1301: deferred — reported after the
+                        // plain names, only if they all pass (see the
+                        // post-parse validation below).
+                        invalid_array_name = Some(name.to_string());
+                        array_name = None;
                     }
                     index += 1;
                 }
@@ -368,14 +363,13 @@ impl Executor {
                                 .1
                                 .to_string(),
                         );
+                        invalid_array_name = None;
                     } else {
-                        report_read_invalid_identifier(
-                            &mut stderr,
-                            &self.diagnostic_prefix(),
-                            name,
-                        );
-                        invalid_name = true;
-                        scalar_field_count += 1;
+                        // rubash#1301: deferred — reported after the
+                        // plain names, only if they all pass (see the
+                        // post-parse validation below).
+                        invalid_array_name = Some(name.to_string());
+                        array_name = None;
                     }
                     index += 2;
                 }
@@ -387,14 +381,13 @@ impl Executor {
                                 .1
                                 .to_string(),
                         );
+                        invalid_array_name = None;
                     } else {
-                        report_read_invalid_identifier(
-                            &mut stderr,
-                            &self.diagnostic_prefix(),
-                            name,
-                        );
-                        invalid_name = true;
-                        stop_scalar_names = true;
+                        // rubash#1301: deferred — reported after the
+                        // plain names, only if they all pass (see the
+                        // post-parse validation below).
+                        invalid_array_name = Some(name.to_string());
+                        array_name = None;
                     }
                     index += 1;
                 }
@@ -416,14 +409,13 @@ impl Executor {
                                 .1
                                 .to_string(),
                         );
+                        invalid_array_name = None;
                     } else {
-                        report_read_invalid_identifier(
-                            &mut stderr,
-                            &self.diagnostic_prefix(),
-                            name,
-                        );
-                        invalid_name = true;
-                        scalar_field_count += 1;
+                        // rubash#1301: deferred — reported after the
+                        // plain names, only if they all pass (see the
+                        // post-parse validation below).
+                        invalid_array_name = Some(name.to_string());
+                        array_name = None;
                     }
                     index += 2;
                 }
@@ -438,14 +430,13 @@ impl Executor {
                                 .1
                                 .to_string(),
                         );
+                        invalid_array_name = None;
                     } else {
-                        report_read_invalid_identifier(
-                            &mut stderr,
-                            &self.diagnostic_prefix(),
-                            name,
-                        );
-                        invalid_name = true;
-                        stop_scalar_names = true;
+                        // rubash#1301: deferred — reported after the
+                        // plain names, only if they all pass (see the
+                        // post-parse validation below).
+                        invalid_array_name = Some(name.to_string());
+                        array_name = None;
                     }
                     index += 1;
                 }
@@ -457,14 +448,13 @@ impl Executor {
                                 .1
                                 .to_string(),
                         );
+                        invalid_array_name = None;
                     } else {
-                        report_read_invalid_identifier(
-                            &mut stderr,
-                            &self.diagnostic_prefix(),
-                            name,
-                        );
-                        invalid_name = true;
-                        stop_scalar_names = true;
+                        // rubash#1301: deferred — reported after the
+                        // plain names, only if they all pass (see the
+                        // post-parse validation below).
+                        invalid_array_name = Some(name.to_string());
+                        array_name = None;
                     }
                     index += 1;
                 }
@@ -1985,6 +1975,23 @@ impl Executor {
                     index += 1;
                 }
             }
+        }
+
+        // GNU read.def: every name is validated BEFORE any input is
+        // read or anything is assigned — the plain names first (the
+        // scan above reported the first bad one), then the -a
+        // argument. One failure aborts the builtin with
+        // EXECUTION_FAILURE: the input line stays unread and no
+        // variable is touched. Rubash used to report an invalid -a
+        // argument inline (a spurious second diagnostic when a plain
+        // name was also invalid — rubash#1301) and to read/assign
+        // despite an invalid name.
+        if invalid_name {
+            return self.finish_read_error(cmd, &stderr, 1);
+        }
+        if let Some(bad) = &invalid_array_name {
+            report_read_invalid_identifier(&mut stderr, &self.diagnostic_prefix(), bad);
+            return self.finish_read_error(cmd, &stderr, 1);
         }
 
         // GNU read.def:331-336: `-i text` only fills the readline edit
