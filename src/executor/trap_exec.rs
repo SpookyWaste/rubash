@@ -3061,6 +3061,23 @@ impl Executor {
             }
         }
 
+        if cmd.here_string.is_some() || cmd.here_string_carrier.is_some() {
+            // `exec <<<word`: a plain here-string lives in the command's
+            // stdin mirror fields, not in heredoc_redirects
+            // (parser/redirections.rs assign_here_string_redirect_raw), so
+            // the heredoc path below never sees it. Materialize it exactly
+            // like a command's staged stdin (command_input_redirect) and
+            // bind it persistently to fd 0 (rubash#1413).
+            let mut input = if cmd.here_string_carrier.is_some() {
+                self.expand_here_string_mut_from_carrier(&cmd.here_string_carrier)
+            } else {
+                self.expand_here_string_mut(cmd.here_string.as_deref().unwrap_or_default())
+            };
+            input.push('\n');
+            self.set_fd_input_text(0, input, false);
+            return Ok(Some(0));
+        }
+
         if let Some((fd, input)) = self.exec_heredoc_fd_input(cmd) {
             self.set_fd_input_text(fd, input, fd != 0);
             return Ok(Some(0));
@@ -3080,8 +3097,15 @@ impl Executor {
             .heredoc_redirects
             .iter()
             .rev()
-            .find(|redirect| redirect.fd.is_some() && redirect.body.is_some())?;
-        let fd = redirect.fd?;
+            // `{var}` heredocs are bound by the fd_var loop above; every
+            // other heredoc/here-string with a body belongs to its explicit
+            // fd, or to fd 0 when the redirect names no fd. The old
+            // `fd.is_some()` gate silently dropped `exec <<EOF` and
+            // `exec <<<word`, whose persistence is the whole point of the
+            // no-operand exec form (GNU redir.c: a redirect-only exec makes
+            // the redirection permanent; rubash#1413).
+            .find(|redirect| redirect.fd_var.is_none() && redirect.body.is_some())?;
+        let fd = redirect.fd.unwrap_or(0);
         let body = redirect.body.as_deref()?;
         let input = if let Some(carrier) = &redirect.body_carrier {
             if let crate::parser::StdinBody::Preexpanded(text) = carrier {
