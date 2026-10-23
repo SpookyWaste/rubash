@@ -11,6 +11,22 @@ use super::value::{
 use super::{ExportMode, EXECUTION_FAILURE, EXECUTION_SUCCESS, READONLY_VARS};
 use crate::executor::local_helpers::sync_shell_assignment_process_env;
 
+/// The subject GNU's sh_invalidid names for a bad assignment operand
+/// (rubash#1348): when the name portion parses as an array-element
+/// reference — a valid identifier base followed by a `[...]` subscript —
+/// the subject is that name portion (`a[0]` for `a[0]=x`); otherwise the
+/// whole operand word is named (`9bad=v`, `9x[0]=v`, `a-b=v`).
+fn invalid_id_subject<'a>(arg: &'a str, name: &'a str) -> &'a str {
+    if name.ends_with(']') {
+        if let Some((base, _)) = name.split_once('[') {
+            if valid_identifier(base) {
+                return name;
+            }
+        }
+    }
+    arg
+}
+
 pub(super) fn apply_export_arg<W>(
     arg: &str,
     mode: ExportMode,
@@ -32,10 +48,15 @@ where
     let written_name = name.to_string();
     let rhs_text = value.map(str::to_string);
     if !valid_identifier(name) {
+        // GNU sh_invalidid's subject: for a word that parses as an
+        // array-element assignment (valid identifier base + `[...]`),
+        // the name-with-subscript is reported (`a[0]=x' complains about
+        // `a[0]'); anything else reports the whole operand word
+        // (`9bad=v', `9x[0]=v', `a-b=v') — rubash#1348.
         let diagnostic = format!(
             "{}export: `{}': not a valid identifier\n",
             diagnostic_prefix(),
-            arg
+            invalid_id_subject(arg, name)
         );
         stderr.write_all(diagnostic.as_bytes())?;
         return Ok(EXECUTION_FAILURE);
@@ -199,23 +220,13 @@ where
     let written_name = name.to_string();
     let rhs_text = value.map(str::to_string);
     if !valid_identifier(name) {
-        if name.ends_with(']') {
-            if let Some((base, _)) = name.split_once('[') {
-                if valid_identifier(base) {
-                    let diagnostic = format!(
-                        "{}readonly: `{}': not a valid identifier\n",
-                        diagnostic_prefix(),
-                        arg
-                    );
-                    stderr.write_all(diagnostic.as_bytes())?;
-                    return Ok(EXECUTION_FAILURE);
-                }
-            }
-        }
+        // Same sh_invalidid subject rule as apply_export_arg
+        // (rubash#1348): name-with-subscript for a valid-base element
+        // form, the whole operand word otherwise.
         let diagnostic = format!(
             "{}readonly: `{}': not a valid identifier\n",
             diagnostic_prefix(),
-            arg
+            invalid_id_subject(arg, name)
         );
         stderr.write_all(diagnostic.as_bytes())?;
         return Ok(EXECUTION_FAILURE);
