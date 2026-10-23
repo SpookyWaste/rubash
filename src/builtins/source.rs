@@ -260,8 +260,11 @@ where
             // goes through file_error with the REAL strerror — an
             // unreadable file is `Permission denied`, not the blanket
             // `No such file or directory` this arm used to print for any
-            // error (rubash#1160).
-            if source_path.is_dir() {
+            // error (rubash#1160). An EACCES failure takes the file_error
+            // arm even when the target is a directory: the open itself
+            // was refused, so GNU prints `<file>: Permission denied`
+            // with no builtin-name segment (rubash#1307).
+            if error.kind() != std::io::ErrorKind::PermissionDenied && source_path.is_dir() {
                 writeln!(
                     stderr,
                     "{}{command_name}: {filename}: is a directory",
