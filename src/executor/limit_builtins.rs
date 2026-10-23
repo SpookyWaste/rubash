@@ -185,10 +185,20 @@ impl Executor {
                 // signal delivery).
                 continue;
             }
-            if request.signal == 18 {
-                self.shell_state.job_table.mark_running(pid);
-            } else if matches!(request.signal, 19 | 20) {
-                self.shell_state.job_table.mark_stopped(pid);
+            // GNU: the shell learns that a background job stopped from
+            // waitchld's WUNTRACED report, which only exists under job
+            // control — a non-monitor shell never notices, so `jobs` keeps
+            // reporting the job as Running even after the shell's OWN kill
+            // sent SIGSTOP (nojobs.c; rubash#1247). Rubash has no WUNTRACED
+            // poller, so the kill path's marking is its only stop detector;
+            // gate it on monitor mode or a `set +m` shell would report its
+            // jobs Stopped where GNU reports Running.
+            if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "monitor") {
+                if request.signal == 18 {
+                    self.shell_state.job_table.mark_running(pid);
+                } else if matches!(request.signal, 19 | 20) {
+                    self.shell_state.job_table.mark_stopped(pid);
+                }
             } else if operand.starts_with('%') && self.jobspec_death_is_unreported(request.signal) {
                 // rubash#796: a jobspec kill of a DONT_REPORT signal is the
                 // kill builtin's own doing, and GNU's non-interactive reader
