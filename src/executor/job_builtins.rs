@@ -1147,12 +1147,19 @@ impl Executor {
                 finished.push((
                     *pid,
                     crate::executor::wait_status::process_exit_status(&status),
+                    crate::executor::wait_status::exit_status_signal(&status),
                 ));
             }
         }
 
-        for (pid, status) in finished {
+        for (pid, status, term_signal) in finished {
             self.background_children.remove(&pid);
+            // The raw wait status knows whether the child died by a
+            // signal; the flattened status does not. Record it so the
+            // jobs listing prints the signal description (rubash#1256).
+            if let Some(signal) = term_signal {
+                self.shell_state.job_table.note_term_signal(pid, signal);
+            }
             // rubash#229: a background child killed by a signal gets the
             // jobs.c:4625 notify_of_job_status notice at the reader
             // boundary; the command text must be read before the job entry
@@ -1662,9 +1669,16 @@ impl Executor {
                 .map(|job| match job.state {
                     crate::jobs::ProcessState::Running => "Running".to_string(),
                     crate::jobs::ProcessState::Stopped => "Stopped".to_string(),
-                    crate::jobs::ProcessState::Completed => match job.exit_status.unwrap_or(1) {
-                        0 => "Done".to_string(),
-                        status => format!("Exit {status}"),
+                    // GNU jobs.c pretty_print_job: a job killed by a
+                    // signal lists the signal description (Terminated,
+                    // Killed, ...), not the flattened 128+signal status
+                    // (rubash#1256).
+                    crate::jobs::ProcessState::Completed => match job.term_signal {
+                        Some(signal) => crate::builtins::kill::signal_death_description(signal),
+                        None => match job.exit_status.unwrap_or(1) {
+                            0 => "Done".to_string(),
+                            status => format!("Exit {status}"),
+                        },
                     },
                 });
             // Apply state-based filters
