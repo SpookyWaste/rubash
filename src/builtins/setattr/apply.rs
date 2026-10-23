@@ -19,11 +19,18 @@ pub(super) fn apply_export_arg<W>(
     env_vars: &mut crate::shell::var_table::VarTable,
     stderr: &mut W,
     oob_word: &mut Option<String>,
+    traced: Option<&mut Vec<(String, bool, String)>>,
 ) -> io::Result<i32>
 where
     W: Write,
 {
     let (name, append, value) = split_assignment(arg);
+    // The operand as written: GNU's per-assignment xtrace line
+    // (subst.c:3580 xtrace_print_assignment via setattr.def's
+    // do_assignment_no_expand) names the written name, even when the
+    // bind lands on a nameref's resolved cell (rubash#1340).
+    let written_name = name.to_string();
+    let rhs_text = value.map(str::to_string);
     if !valid_identifier(name) {
         let diagnostic = format!(
             "{}export: `{}': not a valid identifier\n",
@@ -107,6 +114,14 @@ where
             if oob_word.is_some() {
                 return Ok(EXECUTION_FAILURE);
             }
+            // The bind happened: record it for the caller's xtrace line
+            // (subst.c:3580 — one line per performed assignment operand,
+            // export/readonly only; declare/typeset/local do not trace
+            // theirs). Compound operands are skipped by the emitter: the
+            // declaration expansion phase already traced them (rubash#1340).
+            if let (Some(traced), Some(rhs)) = (traced, rhs_text) {
+                traced.push((written_name, append, rhs));
+            }
             // GNU variables.c make_env_array_from_var_list: array and
             // associative variables never cross the child env boundary
             // (ARRAY_EXPORT off), so `export A` / `export -a A=(x y)` on an
@@ -173,11 +188,16 @@ pub(super) fn apply_readonly_arg<W>(
     stderr: &mut W,
     context_name: Option<&str>,
     oob_word: &mut Option<String>,
+    traced: Option<&mut Vec<(String, bool, String)>>,
 ) -> io::Result<i32>
 where
     W: Write,
 {
     let (name, append, value) = split_assignment(arg);
+    // Written operand name + RHS for the xtrace record (rubash#1340, see
+    // apply_export_arg).
+    let written_name = name.to_string();
+    let rhs_text = value.map(str::to_string);
     if !valid_identifier(name) {
         if name.ends_with(']') {
             if let Some((base, _)) = name.split_once('[') {
@@ -272,6 +292,11 @@ where
     // fail here, diagnostic + DISCARD abort at the Executor layer.
     if oob_word.is_some() {
         return Ok(EXECUTION_FAILURE);
+    }
+    // The bind happened: record it for the caller's xtrace line
+    // (subst.c:3580, rubash#1340 — see apply_export_arg).
+    if let (Some(traced), Some(rhs)) = (traced, rhs_text) {
+        traced.push((written_name, append, rhs));
     }
     // Same array-export contract as apply_export_arg above (GNU variables.c
     // make_env_array_from_var_list, rubash#534): a readonly array keeps the

@@ -954,6 +954,37 @@ impl Executor {
         format!("{name}={rendered}")
     }
 
+    /// GNU setattr.def:275: export/readonly perform each assignment
+    /// operand through do_assignment_no_expand, and subst.c:3580 traces
+    /// the performed bind (xtrace_print_assignment) — one
+    /// `{prefix}name=value` line per operand, after the command's own
+    /// trace line and in operand order. declare/typeset/local perform
+    /// the same do_assignment but GNU emits no such lines for them, so
+    /// only the export/readonly executors call this (rubash#1340). The
+    /// records are (written name, append flag, RHS text) collected by
+    /// builtins/setattr/apply.rs. Compound operands are skipped: the
+    /// declaration expansion phase already traced them before the
+    /// command line, exactly as GNU orders it.
+    pub(in crate::executor) fn xtrace_setattr_assignments(
+        &mut self,
+        traced: &[(String, bool, String)],
+    ) {
+        if !self.xtrace_enabled() {
+            return;
+        }
+        for (name, append, rhs) in traced {
+            if rhs.starts_with('(') && rhs.ends_with(')') {
+                continue;
+            }
+            let mut line = self.xtrace_assignment_line_from_expanded(name, rhs, rhs, true);
+            if *append {
+                line = line.replacen('=', "+=", 1);
+            }
+            let text = format!("{}{}\n", self.xtrace_prefix(), line);
+            self.xtrace_write(text.as_bytes());
+        }
+    }
+
     pub(in crate::executor) fn xtrace_assignment_text(
         &mut self,
         cmd: &CommandNode,

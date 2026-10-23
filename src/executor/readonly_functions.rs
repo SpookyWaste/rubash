@@ -53,6 +53,7 @@ impl Executor {
             .first()
             .map(String::as_str);
         let mut oob_word = None;
+        let mut traced_assignments = Vec::new();
         let status = crate::builtins::setattr::readonly_with_io(
             args.iter().map(String::as_str),
             &mut self.shell_state.env_vars,
@@ -60,7 +61,11 @@ impl Executor {
             &mut stderr,
             context_name,
             &mut oob_word,
+            Some(&mut traced_assignments),
         )?;
+        // GNU subst.c:3580: per-assignment xtrace lines, as in
+        // execute_export (rubash#1340).
+        self.xtrace_setattr_assignments(&traced_assignments);
         // rubash#616 (1a): `readonly -a name=(...)` rewrites the array mirror
         // inside the pure builtin — refresh the structured cell for
         // assignment operands (same mark-aware rule as export above, so the
