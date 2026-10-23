@@ -698,12 +698,42 @@ fn mark_parse_time_extglob_errors(ast: &mut Ast, tokens: &[Token]) {
 }
 
 fn is_unquoted_extglob_word(token: &Token) -> bool {
-    token.raw == token.value
-        && token
-            .value
-            .chars()
-            .any(|operator| matches!(operator, '@' | '!' | '+' | '?' | '*'))
-        && token.value.contains("(")
+    if token.raw != token.value {
+        return false;
+    }
+    // Only an extglob operator at the TOP level of the word gates the
+    // parse: a `+(`/`@(`/... group inside a `${...}` expansion is
+    // pattern text whose extglob validity GNU decides at expansion
+    // time, never at read time — `shopt -s extglob; echo ${v%%+(b)*}`
+    // on one line is legal in GNU even though the same-line `echo @(x)`
+    // and case-pattern forms are read-time errors (rubash#1281). Scan
+    // with ${ } nesting depth (backslash escapes the next byte); `$(`
+    // does not open the brace depth, so a plain word inside a command
+    // substitution still counts, as GNU's own parse of the body would.
+    let bytes = token.value.as_bytes();
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'$' if bytes.get(index + 1) == Some(&b'{') => {
+                depth += 1;
+                index += 2;
+            }
+            b'}' if depth > 0 => {
+                depth -= 1;
+                index += 1;
+            }
+            b'@' | b'!' | b'+' | b'?' | b'*' if depth == 0 => {
+                if bytes.get(index + 1) == Some(&b'(') {
+                    return true;
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    false
 }
 
 fn fold_inverted_commands(commands: Vec<CommandNode>) -> Vec<CommandNode> {
