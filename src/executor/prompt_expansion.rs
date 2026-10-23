@@ -844,10 +844,10 @@ impl Executor {
     /// increments indirection_level around its reader loop; trap.c:496/1071
     /// route every trap action through it) with the xtrace indirection
     /// level raised by one, restoring the previous level on the way out.
-    pub(in crate::executor) fn with_xtrace_indirection<R>(
-        &mut self,
-        body: impl FnOnce(&mut Self) -> R,
-    ) -> R {
+    // Shared by the eval/source execution paths (GNU evalstring.c:348
+    // parse_and_execute bumps indirection_level around the nested list),
+    // so this is pub(crate), not executor-private (rubash#1341).
+    pub(crate) fn with_xtrace_indirection<R>(&mut self, body: impl FnOnce(&mut Self) -> R) -> R {
         let saved = self.shell_state.xtrace_indirection_level.get();
         self.shell_state.xtrace_indirection_level.set(saved + 1);
         let result = body(self);

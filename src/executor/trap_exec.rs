@@ -708,8 +708,13 @@ impl Executor {
         let saved_eval_list_depth = self
             .eval_list_depth
             .replace(Some(self.evalerror_exec_depth.get() + 1));
-        let result =
-            self.with_compound_output_redirects(cmd, |executor| executor.execute_ast(&ast));
+        // GNU builtins/evalstring.c:348: parse_and_execute raises
+        // indirection_level around the eval'd list, so under `set -x`
+        // the body's traces render one PS4 level deeper than the eval
+        // line itself (`++ echo ...`) — rubash#1341.
+        let result = self.with_compound_output_redirects(cmd, |executor| {
+            executor.with_xtrace_indirection(|executor| executor.execute_ast(&ast))
+        });
         self.eval_list_depth.set(saved_eval_list_depth);
 
         self.resume_alias_streamed(saved_alias_streamed);
