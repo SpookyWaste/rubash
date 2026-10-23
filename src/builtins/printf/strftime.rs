@@ -18,6 +18,45 @@ pub(super) fn strftime_subset(format: &str, time: &LocalTimeParts) -> String {
             'A' => output.push_str(WEEKDAYS_FULL[time.weekday as usize]),
             'b' | 'h' => output.push_str(MONTHS_ABBR[time.month as usize - 1]),
             'B' => output.push_str(MONTHS_FULL[time.month as usize - 1]),
+            // glibc strftime batch verified against GNU bash 5.3.20
+            // (rubash#1284): %c locale datetime, %C century, %D = %m/%d/%y,
+            // %g ISO year mod 100, %j day of year, %n/%t literal controls,
+            // %P lowercase am/pm, %R = %H:%M, %U/%W Sunday/Monday week
+            // numbers, %w weekday digit (Sunday = 0).
+            'c' => output.push_str(&format!(
+                "{} {} {:2} {:02}:{:02}:{:02} {}",
+                WEEKDAYS_ABBR[time.weekday as usize],
+                MONTHS_ABBR[time.month as usize - 1],
+                time.day,
+                time.hour,
+                time.minute,
+                time.second,
+                time.year
+            )),
+            'C' => output.push_str(&format!("{:02}", time.year.div_euclid(100))),
+            'D' => output.push_str(&format!(
+                "{:02}/{:02}/{:02}",
+                time.month,
+                time.day,
+                time.year.rem_euclid(100)
+            )),
+            'g' => output.push_str(&format!(
+                "{:02}",
+                iso_week_year(time.year, time.month, time.day)
+                    .0
+                    .rem_euclid(100)
+            )),
+            'j' => output.push_str(&format!(
+                "{:03}",
+                day_of_year(time.year, time.month, time.day)
+            )),
+            'n' => output.push('\n'),
+            'P' => output.push_str(if time.hour < 12 { "am" } else { "pm" }),
+            'R' => output.push_str(&format!("{:02}:{:02}", time.hour, time.minute)),
+            't' => output.push('\t'),
+            'U' => output.push_str(&format!("{:02}", week_of_year(time, false))),
+            'W' => output.push_str(&format!("{:02}", week_of_year(time, true))),
+            'w' => output.push_str(&time.weekday.to_string()),
             'd' => output.push_str(&format!("{:02}", time.day)),
             'e' => output.push_str(&format!("{:2}", time.day)),
             'H' => output.push_str(&format!("{:02}", time.hour)),
@@ -132,6 +171,26 @@ fn day_of_year(year: i32, month: u8, day: u8) -> i32 {
     const CUMULATIVE: [i32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
     let leap = month > 2 && is_leap(year);
     CUMULATIVE[(month - 1) as usize] + i32::from(day) + leap as i32
+}
+
+/// glibc strftime %U (Sunday-first) / %W (Monday-first) week number:
+/// days before the year's first week-start day are week 0; the first
+/// week-start day opens week 1.
+fn week_of_year(time: &LocalTimeParts, monday_first: bool) -> i32 {
+    let doy = day_of_year(time.year, time.month, time.day);
+    // Weekday of this date in the week's own numbering (first day = 0).
+    let weekday = if monday_first {
+        (i32::from(time.weekday) + 6) % 7
+    } else {
+        i32::from(time.weekday)
+    };
+    let jan1_weekday = (weekday - (doy - 1)).rem_euclid(7);
+    let first_start_doy = (7 - jan1_weekday) % 7 + 1;
+    if doy < first_start_doy {
+        0
+    } else {
+        1 + (doy - first_start_doy) / 7
+    }
 }
 
 fn days_in_iso_year(year: i32) -> i32 {
