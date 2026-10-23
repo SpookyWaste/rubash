@@ -1776,16 +1776,22 @@ mod kernel_signals {
 
     static KERNEL_SIGNALS: OnceLock<Mutex<Signals>> = OnceLock::new();
 
-    /// The six signals the backend manages dispositions for (the
+    /// The seven signals the backend manages dispositions for (the
     /// signal_hook-catchable subset of GNU's terminating set that a trap can
-    /// name and the executor can dispatch).
-    const MANAGED: [i32; 6] = [
+    /// name and the executor can dispatch). SIGPIPE joined the set with
+    /// rubash#1333: it used to be deliberately excluded because the Rust
+    /// runtime pre-ignores it (see capture_entry_and_policy, which resets
+    /// it to SIG_DFL), but GNU leaves SIGPIPE at SIG_DFL in a script shell,
+    /// so an untrapped delivery must kill the shell (exit 141) and a PIPE
+    /// trap must fire.
+    const MANAGED: [i32; 7] = [
         libc::SIGHUP as i32,
         libc::SIGINT as i32,
         libc::SIGQUIT as i32,
         libc::SIGTERM as i32,
         libc::SIGUSR1 as i32,
         libc::SIGUSR2 as i32,
+        libc::SIGPIPE as i32,
     ];
 
     /// Bitmask (1 << index into MANAGED) of signals currently routed to the
@@ -1797,7 +1803,7 @@ mod kernel_signals {
     /// no sigaction traffic on the steady-state command path.
     static DISPOSITION_STATE: AtomicU64 = AtomicU64::new(0);
 
-    /// The six managed signals occupy state bits 0..=11 (two bits each, in
+    /// The managed signals occupy state bits 0..=13 (two bits each, in
     /// MANAGED order). All-zero means every one is at Default.
     const MANAGED_STATE_MASK: u64 = (1u64 << (2 * MANAGED.len())) - 1;
 
@@ -1853,9 +1859,10 @@ mod kernel_signals {
             // runtime's, never the invoking environment's — attributing
             // it to the parent would list `trap -- '' SIGPIPE` in shells
             // whose parent left it at SIG_DFL (GNU lists nothing there).
-            // The shell also depends on the ignore for its EPIPE write
-            // error model (rubash#440), so the entry state is
-            // deliberately not reconstructed.
+            // The DISPOSITION itself is separately reset to SIG_DFL in
+            // capture_entry_and_policy (rubash#1333); only the entry
+            // attribution stays unreconstructed, since a parent that
+            // genuinely ignored SIGPIPE is indistinguishable here.
             mask &= !(1u64 << (libc::SIGPIPE as u64 - 1));
             mask
         })
@@ -2052,6 +2059,22 @@ mod kernel_signals {
             // signals ignored on entry must stay ignored (POSIX 2.11,
             // GNU sig.c:273).
             for sig in MANAGED {
+                if sig == libc::SIGPIPE as i32 {
+                    // rubash#1333: SIGPIPE's entry disposition is
+                    // unobservable — the Rust runtime sets SIG_IGN before
+                    // main() on every process, whatever the parent did.
+                    // GNU's script shell runs with SIGPIPE at SIG_DFL
+                    // (sig.c initialize_signals never ignores it), so
+                    // reset it: an untrapped delivery (self `kill -PIPE`,
+                    // EPIPE on a closed pipe) must kill the shell with
+                    // 141 and a PIPE trap must be installable. This
+                    // supersedes the rubash#440 rationale for keeping the
+                    // runtime ignore: write errors now surface as the
+                    // signal, exactly as under GNU.
+                    set_kernel_handler(sig, libc::SIG_DFL);
+                    store_state(sig, 0);
+                    continue;
+                }
                 if current_disposition_is_ignored(sig) {
                     ENTRY_IGNORED.fetch_or(bit(sig), Ordering::SeqCst);
                 }
@@ -2140,20 +2163,21 @@ mod kernel_signals {
     }
 }
 
-/// The six signals `kernel_signals` manages, paired with their trap-table
+/// The seven signals `kernel_signals` manages, paired with their trap-table
 /// short name and the literal `__RUBASH_TRAP_SIG*` env key. Static so the
 /// per-command-boundary reconcile never allocates a key string (rubash#437:
 /// the boundary poll runs once or more per loop iteration, and the old
 /// `format!("__RUBASH_TRAP_SIG{short}")` built six throwaway Strings each
 /// call — tens of thousands of allocations in a short arithmetic loop).
 #[cfg(unix)]
-const MANAGED_TRAP_KEYS: [(i32, &str, &str); 6] = [
+const MANAGED_TRAP_KEYS: [(i32, &str, &str); 7] = [
     (libc::SIGHUP as i32, "HUP", "__RUBASH_TRAP_SIGHUP"),
     (libc::SIGINT as i32, "INT", "__RUBASH_TRAP_SIGINT"),
     (libc::SIGQUIT as i32, "QUIT", "__RUBASH_TRAP_SIGQUIT"),
     (libc::SIGTERM as i32, "TERM", "__RUBASH_TRAP_SIGTERM"),
     (libc::SIGUSR1 as i32, "USR1", "__RUBASH_TRAP_SIGUSR1"),
     (libc::SIGUSR2 as i32, "USR2", "__RUBASH_TRAP_SIGUSR2"),
+    (libc::SIGPIPE as i32, "PIPE", "__RUBASH_TRAP_SIGPIPE"),
 ];
 
 /// Map the executor's trap table onto the kernel dispositions (unix arm of
@@ -2189,7 +2213,7 @@ pub fn reconcile_kernel_trap_dispositions(env_vars: &std::collections::HashMap<S
         .get("__RUBASH_TRAP_RESET")
         .map(|value| value.as_str())
         .unwrap_or("");
-    let mut dispositions = [(0i32, Disposition::Default); 6];
+    let mut dispositions = [(0i32, Disposition::Default); 7];
     for (slot, &(sig, short, key)) in dispositions.iter_mut().zip(MANAGED_TRAP_KEYS.iter()) {
         let want = match env_vars.get(key) {
             // A real action and not reset-listed -> handler (trap.c
