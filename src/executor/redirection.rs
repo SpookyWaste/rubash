@@ -73,6 +73,15 @@ struct OutputFdState {
     /// stream instead of escaping to real stdout.
     defer_stdout_writes: bool,
     deferred_stdout: std::cell::RefCell<Vec<u8>>,
+    /// True only for the buffered-builtin route (a builtin running in
+    /// THIS shell): GNU redir.c add_undo_redirect registers a move's
+    /// source close for undo only when the target fd was open at apply
+    /// time; when the target was closed the close is NOT undone, so
+    /// `echo x 5>&3-` with fd 5 closed leaves fd 3 closed after the
+    /// builtin (rubash#1235). Probe/diagnostic walks and pipeline-stage
+    /// routing leave this false — their state is discarded or belongs to
+    /// a child shell, so nothing may persist from them.
+    persist_move_closes: bool,
 }
 
 impl Executor {
@@ -966,6 +975,10 @@ impl Executor {
     ) -> Result<bool, ExecuteError> {
         self.last_builtin_write_failed.set(false);
         let mut state = self.command_output_fd_state();
+        // This route serves builtins executing in the current shell, so a
+        // move-close whose target was closed persists past the command
+        // (GNU redir.c add_undo_redirect; rubash#1235).
+        state.persist_move_closes = true;
         if !self.apply_ordered_output_redirects(cmd, &mut state)? {
             // A persistent `exec >&N-` closes the shell fd without adding a
             // redirect to the current command. Buffered builtins still need
@@ -1106,6 +1119,7 @@ impl Executor {
             redirect_failed: false,
             defer_stdout_writes: false,
             deferred_stdout: std::cell::RefCell::new(Vec::new()),
+            persist_move_closes: false,
         };
         state.fds.insert(1, OutputTarget::Stdout);
         state.fds.insert(2, OutputTarget::Stderr);
@@ -1297,12 +1311,18 @@ impl Executor {
                     }
                     // `>&N` and the move form `>&N-` (make_cmd.c:704-718 →
                     // redir.c r_move_output) both resolve fd N's write
-                    // target into the redirector. This state map is
-                    // per-command transient and GNU's move close is undone
-                    // when the command ends (RX_UNDOABLE), so a plain copy
-                    // matches the command's observable writes (`exec 5>&1;
-                    // echo x >&5-` writes stdout, fd 5 still open after).
-                    if let Some((source_fd, _move_source)) = redirect_target_fd_and_move(&target) {
+                    // target into the redirector.
+                    if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
+                        // GNU redir.c do_redirection_internal: the whole
+                        // r_duplicating/r_move apply is guarded by
+                        // `redir_fd != redirector`, so a self-dup or
+                        // self-move is a total no-op — it succeeds even
+                        // when the fd is closed (`echo hi 99>&99`), and a
+                        // self-move leaves the fd open (rubash#1236).
+                        if source_fd == target_fd {
+                            state.saw_output_redirect = true;
+                            continue;
+                        }
                         let Some(source_target) = state.fd_target(source_fd).cloned() else {
                             self.write_bad_fd_redirect_diagnostic(
                                 state,
@@ -1332,8 +1352,26 @@ impl Executor {
                             } else {
                                 source_target
                             };
+                        // GNU add_undo_redirect (redir.c) for r_move: the
+                        // source fd is saved for undo ONLY when the target
+                        // was open at apply time (fcntl(redirector) != -1);
+                        // a closed target means the move's close survives
+                        // the command. Judge openness from the state as it
+                        // stands BEFORE this redirect binds the target.
+                        let target_was_open = state
+                            .fd_target(target_fd)
+                            .is_some_and(|target| *target != OutputTarget::Closed);
                         state.fds.insert(target_fd, source_target);
                         state.saw_output_redirect = true;
+                        if move_source {
+                            state.fds.insert(source_fd, OutputTarget::Closed);
+                            if state.persist_move_closes && !target_was_open {
+                                self.close_persistent_output_fd(source_fd)?;
+                                self.shell_state
+                                    .env_vars
+                                    .insert(fd_closed_key(source_fd), "1".to_string());
+                            }
+                        }
                         continue;
                     }
 

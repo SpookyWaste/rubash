@@ -3319,7 +3319,10 @@ impl Executor {
         Ok(true)
     }
 
-    fn close_persistent_output_fd(&mut self, fd: u32) -> Result<(), ExecuteError> {
+    pub(in crate::executor) fn close_persistent_output_fd(
+        &mut self,
+        fd: u32,
+    ) -> Result<(), ExecuteError> {
         let coproc_pid = self
             .fd_table
             .entries

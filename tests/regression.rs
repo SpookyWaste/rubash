@@ -133,6 +133,7 @@ golden_fixture!(golden_issue1227_argv0 => "issue1227-argv0", timeout 60, corpus 
 golden_fixture!(golden_issue1229_builtin_help => "issue1229-builtin-help", timeout 60, corpus []);
 golden_fixture!(golden_issue1230_exec_redirect_undo => "issue1230-exec-redirect-undo", timeout 60, corpus []);
 golden_fixture!(golden_issue1232_tilde_pwd => "issue1232-tilde-pwd", timeout 60, corpus []);
+golden_fixture!(golden_issue1235_fd_move => "issue1235-fd-move", timeout 60, corpus []);
 
 /// Upstream suite slices pinned as rubash snapshots (coordinator list,
 /// 2026-09-27): the slices the lanes rely on for parity ledgers.
