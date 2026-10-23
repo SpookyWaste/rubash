@@ -205,6 +205,29 @@ impl Executor {
             Some("--") => &args[1..],
             _ => args,
         };
+        // GNU return.def: more than one operand is `return: too many
+        // arguments` — the no_args class (builtins/common.c), exactly
+        // like `exit 1 2`: set_exit_status(EX_BADUSAGE) then
+        // jump_to_top_level(DISCARD). Oracle-verified against GNU 5.3:
+        // the function/source unwinds AND the rest of the current
+        // command list is abandoned (the caller's same-line commands
+        // never run; an `if` whose condition dies this way takes the
+        // whole line with it), while the NEXT line runs with $?=2. At
+        // top level it reports this message — not the can-only-`return'
+        // one. Ride the same evalerror vehicle as exit-too-many
+        // (rubash#705 machinery, rubash#1213).
+        if args.len() > 1 {
+            writeln!(
+                &mut stderr,
+                "{}return: too many arguments",
+                self.diagnostic_prefix()
+            )?;
+            self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+            self.exit_code = 2;
+            self.raise_evalerror_abort();
+            self.evalerror_exit_toomany_pending.set(true);
+            return Ok(());
+        }
         let status = if let Some(value) = args.first() {
             // GNU get_exitstat parses as int64; out-of-range rejected
             // (rubash#1403).
