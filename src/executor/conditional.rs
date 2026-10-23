@@ -267,6 +267,11 @@ impl Executor {
                     } else {
                         self.expansion_fatal_status()
                     };
+                    // rubash#1201: park the fatal status — the conditional
+                    // wrapper overwrites exit_code with the predicate result
+                    // (0 for `-z` of the failed expansion) before it reads
+                    // the fatal flag, which lost the status entirely.
+                    self.conditional_fatal_status.set(Some(self.exit_code));
                     // rubash#439: expansion error, not a failed command.
                     self.command_expansion_failed.set(true);
                     self.conditional_expansion_fatal.set(true);

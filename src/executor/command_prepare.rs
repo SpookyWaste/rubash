@@ -340,7 +340,15 @@ impl Executor {
         // in place from expand_conditional_word; unwind with the
         // FORCE_EOF class (or the interactive DISCARD class).
         let conditional_fatal = self.conditional_expansion_fatal.replace(false);
+        let conditional_fatal_status = self.conditional_fatal_status.replace(None);
         if conditional_fatal {
+            // rubash#1201: execute_conditional_command just overwrote
+            // exit_code with the predicate's own status (e.g. -z of the
+            // empty failed expansion -> 0); the FORCE_EOF unwind keeps
+            // the fatal expansion status expand_conditional_word parked.
+            if let Some(status) = conditional_fatal_status {
+                self.exit_code = status;
+            }
             self.finish_conditional_output_procsubs()?;
             self.close_command_scoped_procsub_input_fds_from(procsub_fd_base);
             for (fd, saved) in [(1u32, saved_stdout), (2, saved_stderr)] {

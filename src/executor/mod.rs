@@ -765,6 +765,13 @@ pub struct Executor {
     /// into the FORCE_EOF/DISCARD unwind, since the conditional
     /// evaluator itself only returns an i32 status.
     pub(crate) conditional_expansion_fatal: Cell<bool>,
+    /// rubash#1201: the exit status expand_conditional_word computed for
+    /// the fatal above. The wrapper must restore THIS status after
+    /// execute_conditional_command overwrites exit_code with the
+    /// conditional's own result: `[[ -z $UNSET ]]` under `set -u` evaluates
+    /// -z of the empty substitution to 0, and GNU's FORCE_EOF unwind keeps
+    /// the fatal status (1) instead of the predicate result.
+    pub(crate) conditional_fatal_status: Cell<Option<i32>>,
     /// rubash#637: marks a pending evalerror abort as bad-subscript class.
     /// The eval boundary absorbs exactly this class (eval returns failure,
     /// the caller continues — GNU evalstring.c:365,422-442 swallowing
