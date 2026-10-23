@@ -400,6 +400,7 @@ pub(in crate::executor) fn execute_history_session(
         HistoryMode::Append | HistoryMode::Write | HistoryMode::Read | HistoryMode::ReadNew => {
             // history.def:159,273: filename is the first non-option argument
             // (loptend); fall back to $HISTFILE when none is given.
+            let from_histfile = operands.is_empty();
             let Some(path) = operands
                 .first()
                 .cloned()
@@ -412,6 +413,16 @@ pub(in crate::executor) fn execute_history_session(
                 );
                 return Ok(2);
             };
+            // GNU history.def: a null $HISTFILE is its own diagnostic
+            // (rubash#1289 B3), for both -w and -a.
+            if from_histfile && path.is_empty() {
+                let _ = writeln!(
+                    stderr,
+                    "{}history: HISTFILE: parameter null or not set",
+                    executor.diagnostic_prefix()
+                );
+                return Ok(1);
+            }
             // Translate Git-Bash/POSIX spellings (/c/..., /dev/null) to the
             // Windows forms the file APIs need; children see the same file.
             let path =
@@ -433,11 +444,33 @@ pub(in crate::executor) fn execute_history_session(
                 _ => Ok(0),
             };
             if let Err(err) = outcome {
-                let _ = writeln!(
-                    stderr,
-                    "{}history: {path}: cannot open: {err}",
-                    executor.diagnostic_prefix()
-                );
+                // GNU's diagnostic surface for -w/-a file errors is
+                // narrow (rubash#1289, verified on GNU bash 5.3.20):
+                // -w failures are silent; -a prints exactly one
+                // `cannot create' line and only when the open fails
+                // with ENOENT (missing parent) — a directory target
+                // (EISDIR) stays silent there too. Read modes keep the
+                // existing `cannot open' report.
+                match mode {
+                    HistoryMode::Write => {}
+                    HistoryMode::Append => {
+                        if err.raw_os_error() == Some(2) {
+                            let _ = writeln!(
+                                stderr,
+                                "{}history: {path}: cannot create: {}",
+                                executor.diagnostic_prefix(),
+                                crate::posix_errors::message(&err)
+                            );
+                        }
+                    }
+                    _ => {
+                        let _ = writeln!(
+                            stderr,
+                            "{}history: {path}: cannot open: {err}",
+                            executor.diagnostic_prefix()
+                        );
+                    }
+                }
                 return Ok(1);
             }
         }
