@@ -2161,7 +2161,7 @@ impl Executor {
         cmd: &CommandNode,
     ) -> Result<i32, ExecuteError> {
         if exec_has_only_redirects(cmd) {
-            if let Some(status) = self.execute_stdio_only_exec_redirect(cmd)? {
+            if let Some(status) = self.execute_stdio_only_exec_redirect_scoped(cmd)? {
                 return Ok(status);
             }
         }
@@ -2178,7 +2178,7 @@ impl Executor {
         if self.exec_has_no_command_operand_after_expansion(cmd) {
             let saved_env_vars = self.shell_state.env_vars.clone();
             let saved_fd_table = self.fd_table.clone();
-            self.execute_stdio_only_exec_redirect(cmd)?;
+            self.execute_stdio_only_exec_redirect_scoped(cmd)?;
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             let status = crate::builtins::exec::execute_with_io(
@@ -2705,6 +2705,69 @@ impl Executor {
             }
             Err(_) => false,
         }
+    }
+
+    /// The no-operand exec forms (redirects only, or operands that expand
+    /// to nothing) with the `builtin`-wrapper scoping of rubash#1412:
+    /// plain `exec >f` persists its redirections, but `builtin exec >f`
+    /// applies them for that command only — the target file is still
+    /// created/truncated, yet the shell's fd state afterwards is the
+    /// pre-command one (GNU: `builtin exec >f; echo x` writes x to the
+    /// original stdout and f stays empty). Snapshot the fd table plus
+    /// the env-side fd records (the closed-fd keys and any `{var}`
+    /// bindings) and restore them after the persistent path runs.
+    fn execute_stdio_only_exec_redirect_scoped(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<Option<i32>, ExecuteError> {
+        if self.builtin_wrapper_depth == 0 {
+            return self.execute_stdio_only_exec_redirect(cmd);
+        }
+        let saved_fd_table = self.fd_table.clone();
+        let mut saved_env: Vec<(String, Option<String>)> = Vec::new();
+        let mut fds: Vec<u32> = cmd
+            .redirects
+            .iter()
+            .map(|r| {
+                r.fd.unwrap_or(if r.operator.starts_with('<') { 0 } else { 1 })
+            })
+            .collect();
+        fds.sort_unstable();
+        fds.dedup();
+        for fd in fds {
+            let key = super::command_text::fd_closed_key(fd);
+            let value = self.shell_state.env_vars.get(&key).cloned();
+            saved_env.push((key, value));
+        }
+        let mut var_names: Vec<String> = cmd
+            .redirects
+            .iter()
+            .filter_map(|r| r.fd_var.clone())
+            .collect();
+        var_names.extend(
+            cmd.heredoc_redirects
+                .iter()
+                .filter_map(|r| r.fd_var.clone()),
+        );
+        var_names.sort();
+        var_names.dedup();
+        for name in var_names {
+            let value = self.shell_state.env_vars.get(&name).cloned();
+            saved_env.push((name, value));
+        }
+        let result = self.execute_stdio_only_exec_redirect(cmd);
+        self.fd_table = saved_fd_table;
+        for (key, value) in saved_env {
+            match value {
+                Some(value) => {
+                    self.shell_state.env_vars.insert(key, value);
+                }
+                None => {
+                    self.shell_state.env_vars.remove(&key);
+                }
+            }
+        }
+        result
     }
 
     fn execute_stdio_only_exec_redirect(

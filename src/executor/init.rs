@@ -409,6 +409,7 @@ impl Executor {
             pending_scalar_assignment: false,
             suppress_errexit: 0,
             command_builtin_depth: 0,
+            builtin_wrapper_depth: 0,
             standard_path_scope: None,
             debug_trap_running: false,
             debug_trap_action_cache: std::cell::RefCell::new(None),

@@ -559,6 +559,14 @@ pub struct Executor {
     /// the posix ERREXIT for `command eval '...broken...'` — errors8.sub
     /// `command eval '( '` must not exit the shell.
     command_builtin_depth: usize,
+    /// GNU builtins/builtin.def: the wrapped command runs under the
+    /// `builtin` builtin's dispatch. A redirect-only `exec` reached
+    /// through it is a one-shot redirection for that command only, not
+    /// the persistent form plain `exec` performs (rubash#1412).
+    /// execute_builtin_direct_command raises this around its `exec` and
+    /// `command` arms; execute_exec snapshots and restores the fd state
+    /// for its no-operand paths while it is non-zero.
+    builtin_wrapper_depth: usize,
     /// GNU `command -p` (builtins/command.def CDESC_STDPATH): the
     /// standard path for the re-dispatched command's OWN lookup only.
     /// Set for the duration of the re-dispatch and consulted by the

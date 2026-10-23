@@ -177,13 +177,23 @@ impl Executor {
                 self.exit_code = self.execute_enable(&builtin_cmd)?;
                 Ok(())
             }
-            "exec" => self.execute_exec_command(&builtin_cmd),
+            "exec" => {
+                self.builtin_wrapper_depth += 1;
+                let result = self.execute_exec_command(&builtin_cmd);
+                self.builtin_wrapper_depth -= 1;
+                result
+            }
             "logout" => {
                 self.exit_code = self.execute_logout(&builtin_cmd)?;
                 Ok(())
             }
             "eval" => self.execute_eval(&builtin_cmd),
-            "command" => self.execute_command_without_aliases(&builtin_cmd),
+            "command" => {
+                self.builtin_wrapper_depth += 1;
+                let result = self.execute_command_without_aliases(&builtin_cmd);
+                self.builtin_wrapper_depth -= 1;
+                result
+            }
             // GNU Bash has no `sudo` builtin (issue #759 item 4): the
             // host-capability builtin only exists while an embedding host
             // registered an elevation handler; otherwise `builtin sudo`
