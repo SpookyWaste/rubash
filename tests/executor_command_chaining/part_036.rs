@@ -279,7 +279,7 @@ fn test_wait_np_compact_var_assigns_requested_jobspec_pid() {
 }
 
 #[test]
-fn test_kill_background_jobspec_removes_job() {
+fn test_kill_background_jobspec_keeps_job_until_reap() {
     let _cwd_guard = CwdGuard::take();
     let output_path = "target/rubash-kill-jobspec-output.txt";
     let _ = fs::remove_file(output_path);
@@ -294,7 +294,21 @@ fn test_kill_background_jobspec_removes_job() {
 
     assert!(result.is_ok());
     assert_eq!(executor.last_exit_code(), 0);
-    assert_eq!(fs::read_to_string(output_path).unwrap(), "kill:0\n");
+    // rubash#1411 (GNU 5.3.20 on this exact script): the jobspec kill
+    // delivers SIGTERM but does NOT remove the entry synchronously —
+    // the following `jobs` still lists it (Running, racing to
+    // Terminated as the reap lands); removal happens at the reap
+    // boundary. The pre-fix expectation of an empty listing encoded
+    // the engine's synchronous removal.
+    let content = fs::read_to_string(output_path).unwrap();
+    assert!(
+        content.starts_with("kill:0\n"),
+        "kill succeeds: {content:?}"
+    );
+    assert!(
+        content.contains("[1]") && content.contains("while true; do true; done &"),
+        "jobs still lists the killed job until the reap: {content:?}"
+    );
     let _ = fs::remove_file(output_path);
 }
 
@@ -314,17 +328,30 @@ fn test_kill_current_jobspec_uses_last_background_job() {
 
     assert!(result.is_ok());
     assert_eq!(executor.last_exit_code(), 0);
-    assert_eq!(fs::read_to_string(output_path).unwrap(), "kill:0\n");
+    // rubash#1411: `%+' resolves to the last background job and the
+    // kill leaves the entry listed until the reap (GNU 5.3.20) — see
+    // test_kill_background_jobspec_keeps_job_until_reap.
+    let content = fs::read_to_string(output_path).unwrap();
+    assert!(
+        content.starts_with("kill:0\n"),
+        "kill succeeds: {content:?}"
+    );
+    assert!(
+        content.contains("[1]") && content.contains("while true; do true; done &"),
+        "jobs still lists the killed job until the reap: {content:?}"
+    );
     let _ = fs::remove_file(output_path);
 }
 
-/// rubash#796 differential (GNU 5.3.0 probe, 2026-10-13): a jobspec kill's
-/// death is the kill builtin's own doing — GNU's non-interactive reader
-/// suppresses the completion notice (jobs.c notify_of_job_status
-/// DONT_REPORT_SIGTERM arm: nothing printed, the dead job is cleaned up),
-/// so `kill %1; jobs` lists nothing and no `[1]+ Exit 143` line fires at
-/// the wait. The signal status stays resolvable through the completed
-/// status (pinning that contract is the pid-operand test below).
+/// rubash#796 + #1411 (GNU 5.3.20 re-probe, 2026-10-23): a jobspec
+/// kill's death gets no completion NOTICE (jobs.c
+/// notify_of_job_status DONT_REPORT_SIGTERM arm — nothing printed at
+/// the wait), but the entry itself stays in the table until the reap
+/// boundary: the `jobs` between kill and wait still lists it. The
+/// signal status stays resolvable through the completed status
+/// (pinning that contract is the pid-operand test below). An earlier
+/// reading of the #796 probe claimed an empty listing; the direct
+/// 5.3.20 oracle run lists the job, so the assertions follow it.
 #[test]
 fn test_kill_jobspec_keeps_job_listed_until_reap() {
     let _cwd_guard = CwdGuard::take();
