@@ -62,7 +62,7 @@ where
                         _ => {
                             writeln!(
                                 stderr,
-                                "{}umask: {value}: invalid option",
+                                "{}umask: -{option}: invalid option",
                                 diagnostic_prefix(env_vars)
                             )?;
                             writeln!(stderr, "umask: usage: umask [-p] [-S] [mode]")?;

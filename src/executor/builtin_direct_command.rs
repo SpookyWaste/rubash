@@ -36,9 +36,13 @@ impl Executor {
         // builtin_usage.
         if name.starts_with('-') && name != "--" && name != "-" {
             let mut stderr = Vec::new();
+            // GNU bashgetopt sh_invalidopt names `-` plus the first
+            // invalid option character, not the whole word (rubash#1259:
+            // `builtin --badflag` reports `--`, not `--badflag`).
+            let option = name.chars().nth(1).unwrap_or('-');
             writeln!(
                 &mut stderr,
-                "{}builtin: {name}: invalid option",
+                "{}builtin: -{option}: invalid option",
                 self.diagnostic_prefix()
             )?;
             writeln!(

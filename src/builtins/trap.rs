@@ -376,7 +376,7 @@ where
                 'P' => print_actions = true,
                 _ => {
                     let prefix = diagnostic_prefix(env_vars);
-                    writeln!(stderr, "{prefix}trap: {arg}: invalid option")?;
+                    writeln!(stderr, "{prefix}trap: -{option}: invalid option")?;
                     print_usage(stderr)?;
                     return Ok(EX_USAGE);
                 }

@@ -425,7 +425,10 @@ impl Executor {
                     index += 1;
                 }
                 word if word.starts_with('-') => {
-                    let option = word.trim_start_matches('-').chars().next().unwrap_or('-');
+                    // GNU sh_invalidopt names the first character after
+                    // exactly one dash (`--badflag` -> `--`), not the
+                    // first letter after all dashes (rubash#1259).
+                    let option = word[1..].chars().next().unwrap_or('-');
                     return self.mapfile_invalid_option(cmd, command_name, option, &mut stderr);
                 }
                 word if word.is_empty() => {
