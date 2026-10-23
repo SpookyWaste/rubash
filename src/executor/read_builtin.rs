@@ -2516,27 +2516,29 @@ impl Executor {
     }
 
     fn read_prompt_should_display(&self, cmd: &CommandNode, read_fd: Option<u32>) -> bool {
-        if self
-            .shell_state
-            .env_vars
-            .contains_key("__RUBASH_SCRIPT_NAME")
-            || self.shell_state.env_vars.contains_key(FUNCTION_STDIN)
+        if self.shell_state.env_vars.contains_key(FUNCTION_STDIN)
             || command_redirects_stdin(cmd)
             || command_closes_stdin(cmd)
         {
             return false;
         }
 
+        // GNU builtins/read.def:476-491: the -p prompt is printed iff
+        // the descriptor `read` reads from is a terminal — the shell's
+        // own interactivity is irrelevant (pty-verified GNU 5.3.20: a
+        // script FILE whose stdin is a tty shows the prompt; rubash
+        // #1255). The old blanket ban on script runs
+        // (__RUBASH_SCRIPT_NAME) inverted that rule. Probe the bound
+        // endpoint the way redirect_target_is_terminal does.
         let fd = read_fd.unwrap_or(0);
-        !matches!(
-            self.fd_table.read_endpoint(fd),
-            Some(
-                FdReadEndpoint::Text(_)
-                    | FdReadEndpoint::ProcessSubstitution(_)
-                    | FdReadEndpoint::CoprocStdout { .. }
-                    | FdReadEndpoint::InheritedProcessStdin
-            )
-        )
+        match self.fd_table.read_endpoint(fd) {
+            Some(FdReadEndpoint::File(file)) => crate::fd::is_console_handle(file.handle),
+            Some(FdReadEndpoint::InheritedProcessStdin) => {
+                crate::fd::is_console_handle(crate::fd::process_std_handle(0))
+            }
+            Some(_) => false,
+            None => crate::fd::is_console_handle(fd as crate::fd::HANDLE),
+        }
     }
 
     fn read_fd_is_available(&self, cmd: &CommandNode, fd: u32) -> bool {
