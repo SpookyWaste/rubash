@@ -573,12 +573,6 @@ impl Executor {
                 }
                 JobOperandResolution::NoMatch => {
                     if let Ok(pid) = cmd.words[1].parse::<u32>() {
-                        // rubash#1222: a disowned pid waits silently with
-                        // status 0 (GNU bgpids), before any child lookup.
-                        if self.shell_state.job_table.disowned_pids.contains(&pid) {
-                            self.write_buffered_builtin_output(cmd, &[], &[])?;
-                            return Ok(0);
-                        }
                         match self.wait_for_background_pid(pid, true)? {
                             WaitPidOutcome::Status(status)
                             | WaitPidOutcome::Interrupted(status) => {
@@ -638,29 +632,6 @@ impl Executor {
                 }
                 self.write_buffered_builtin_output(cmd, &[], &stderr)?;
                 return Ok(status);
-            }
-        }
-
-        // rubash#1222: when NO operand resolved through the job table but
-        // every operand is a pid disowned earlier in this shell, GNU's
-        // bgpids-backed wait still succeeds silently with status 0
-        // (multi-operand and `wait -p var` forms land here).
-        if let Some(operands) = wait_background_operands(&cmd.words[1..]) {
-            if !operands.is_empty()
-                && operands.iter().all(|operand| {
-                    operand
-                        .parse::<u32>()
-                        .is_ok_and(|pid| self.shell_state.job_table.disowned_pids.contains(&pid))
-                })
-            {
-                if let Some((wait_var, _)) = wait_assign_var(&cmd.words[1..]) {
-                    if let Some(last) = operands.last() {
-                        let arrayref = self.wait_var_arrayref();
-                        self.bind_wait_variable(&wait_var, last.clone(), arrayref);
-                    }
-                }
-                self.write_buffered_builtin_output(cmd, &[], &[])?;
-                return Ok(0);
             }
         }
 
@@ -804,17 +775,6 @@ impl Executor {
                     continue;
                 }
                 JobOperandResolution::NoMatch => {
-                    // rubash#1222: a pid disowned earlier in this shell
-                    // stays wait-able — GNU's bgpids list keeps it after
-                    // disown and the wait succeeds silently with status 0
-                    // (the child's real exit status is discarded).
-                    if let Ok(pid) = operand.parse::<u32>() {
-                        if self.shell_state.job_table.disowned_pids.contains(&pid) {
-                            status = 0;
-                            last_pid = Some(pid);
-                            continue;
-                        }
-                    }
                     status = write_wait_operand_error(
                         &operand,
                         &self.diagnostic_prefix(),
@@ -1804,9 +1764,10 @@ impl Executor {
                         .collect();
                     self.background_children.clear();
                     for pid in &pids {
-                        // rubash#1222: disowned pids stay wait-able with
-                        // status 0 (GNU bgpids survives disown_all_jobs).
-                        self.shell_state.job_table.disowned_pids.insert(*pid);
+                        // rubash#1304: `disown -a` leaves nothing
+                        // waitable (GNU: a later `wait <pid>` reports
+                        // "not a child of this shell", 127) — unlike a
+                        // single disown, no status is preserved here.
                         self.close_coproc_endpoints(*pid);
                         self.fd_table.close(*pid);
                     }
@@ -1890,10 +1851,7 @@ impl Executor {
                                 self.background_children.remove(&pid);
                                 self.close_coproc_endpoints(pid);
                                 self.fd_table.close(pid);
-                                // rubash#1222: record before removal —
-                                // `wait <pid>` must still succeed with 0.
-                                self.shell_state.job_table.disowned_pids.insert(pid);
-                                self.shell_state.job_table.remove_job_by_pid(pid);
+                                self.disown_job_by_pid(pid);
                             }
                         }
                     }
@@ -1934,10 +1892,38 @@ impl Executor {
         self.background_children.remove(&pid);
         self.close_coproc_endpoints(pid);
         self.fd_table.close(pid);
-        // rubash#1222: see the Jobs arm — disowned pids stay wait-able.
-        self.shell_state.job_table.disowned_pids.insert(pid);
-        self.shell_state.job_table.remove_job_by_pid(pid);
+        self.disown_job_by_pid(pid);
         true
+    }
+
+    /// GNU jobs.c delete_job as driven by disown_builtin, with bgpids
+    /// (jobs.c bgp_search) semantics for the survivors: the job leaves
+    /// the table, but its pids stay waitable. A status already recorded
+    /// for a terminated job survives the removal, and a still-running
+    /// job's pids read as already-waited — `wait <pid>` after disown
+    /// returns that status or 0, silently and repeatably, instead of
+    /// 127 "not a child of this shell" (rubash#1304). (DisownAction::All
+    /// is the exception: GNU `disown -a` leaves nothing waitable, which
+    /// clear_jobs' purge of completed_statuses already models.)
+    fn disown_job_by_pid(&mut self, pid: u32) {
+        let job_pids: Vec<u32> = self
+            .shell_state
+            .job_table
+            .pid_to_job
+            .get(&pid)
+            .and_then(|job_id| self.shell_state.job_table.jobs.get(job_id))
+            .map(|job| job.pids.clone())
+            .unwrap_or_else(|| vec![pid]);
+        self.shell_state
+            .job_table
+            .remove_job_by_pid_preserve_status(pid);
+        for p in job_pids {
+            self.shell_state
+                .job_table
+                .completed_statuses
+                .entry(p)
+                .or_insert(0);
+        }
     }
 
     /// GNU wait.def:294-311 / kill.def:226 / fg_bg.def:143 — the jobspec
