@@ -4289,6 +4289,64 @@ impl Executor {
         self.apply_shell_assignment(name, fd.to_string())
     }
 
+    /// GNU exec.def hands shell_execve an environment built from the
+    /// full export list, exported functions included (variables.c
+    /// make_env_array_from_var_list renders them as BASH_FUNC_*%%
+    /// entries). Rubash's exec spawn arms build the child environment
+    /// from env_vars alone (builtins/exec.rs apply_exported_environment
+    /// walks the EXPORTED_VARS marks), and env_vars never carries the
+    /// function entries — plain spawns add them per-process in
+    /// apply_exported_functions_to_child — so `exec` silently dropped
+    /// every exported function (rubash#1274). Materialize them for the
+    /// duration of the exec attempt; the caller restores the prior
+    /// state, which matters when the exec fails and the shell continues
+    /// (execfail / interactive). Returns (env key, prior value, prior
+    /// exported mark) triples for restore.
+    fn materialize_exported_functions_for_exec(&mut self) -> Vec<(String, Option<String>, bool)> {
+        let mut saved = Vec::new();
+        for name in marked_env_names(&self.shell_state.env_vars, EXPORTED_FUNCTIONS) {
+            let Some(body) = self.shell_state.functions.get(&name) else {
+                continue;
+            };
+            let def_redirects = self
+                .shell_state
+                .function_def_infos
+                .get(&name)
+                .map(|info| info.def_redirects.as_slice())
+                .unwrap_or(&[])
+                .to_vec();
+            let env_name = exported_function_env_name(&name);
+            let prior_value = self.shell_state.env_vars.get(&env_name).cloned();
+            let prior_marked = marked_env_names(&self.shell_state.env_vars, EXPORTED_VARS)
+                .iter()
+                .any(|marked| marked == &env_name);
+            saved.push((env_name.clone(), prior_value, prior_marked));
+            let value = exported_function_env_value(&body.commands, &def_redirects);
+            self.shell_state.env_vars.insert(env_name.clone(), value);
+            mark_env_name(&mut self.shell_state.env_vars, EXPORTED_VARS, &env_name);
+        }
+        saved
+    }
+
+    fn restore_exported_functions_after_exec(
+        &mut self,
+        saved: Vec<(String, Option<String>, bool)>,
+    ) {
+        for (env_name, prior_value, prior_marked) in saved {
+            match prior_value {
+                Some(value) => {
+                    self.shell_state.env_vars.insert(env_name.clone(), value);
+                }
+                None => {
+                    self.shell_state.env_vars.remove(&env_name);
+                }
+            }
+            if !prior_marked {
+                unmark_env_name(&mut self.shell_state.env_vars, EXPORTED_VARS, &env_name);
+            }
+        }
+    }
+
     pub(in crate::executor) fn execute_exec_command(
         &mut self,
         cmd: &CommandNode,
@@ -4304,13 +4362,27 @@ impl Executor {
         // profile that is the extensionless ~/.local/bin/env POSIX shim,
         // which ignores its operands and exits 0, so the whole exec chain
         // silently no-ops (rubash#172).
-        if let Some(status) = self.execute_exec_env_command(cmd)? {
-            self.exit_code = status;
-            return self.finish_exec_replacement(cmd, status);
-        }
-        let status = self.execute_exec(cmd)?;
-        self.exit_code = status;
-        self.finish_exec_replacement(cmd, status)
+        let saved = self.materialize_exported_functions_for_exec();
+        let status_result = match self.execute_exec_env_command(cmd) {
+            Ok(Some(status)) => {
+                self.exit_code = status;
+                Ok(status)
+            }
+            Ok(None) => match self.execute_exec(cmd) {
+                Ok(status) => {
+                    self.exit_code = status;
+                    Ok(status)
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        let result = match status_result {
+            Ok(status) => self.finish_exec_replacement(cmd, status),
+            Err(error) => Err(error),
+        };
+        self.restore_exported_functions_after_exec(saved);
+        result
     }
 
     /// The exit contract of `exec_builtin` (exec.def:248-260): with a
