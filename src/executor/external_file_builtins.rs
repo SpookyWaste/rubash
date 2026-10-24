@@ -1588,6 +1588,16 @@ impl Executor {
         // instead of reading the file operand.
         if !operands.is_empty() {
             let mut output = Vec::new();
+            // rubash#1371: operand diagnostics ACCUMULATE here and are
+            // emitted together with the output at the end of the loop.
+            // Flushing each diagnostic mid-loop through
+            // write_buffered_builtin_output applied the command's
+            // redirects once (creating `f` for `>f 2>&1` and landing the
+            // text there), after which write_cat_output re-created /
+            // truncated the same target for the (empty) stdout — the
+            // diagnostic was silently lost. GNU opens the redirects
+            // once, before cat runs; one combined emit reproduces that.
+            let mut diagnostics: Vec<u8> = Vec::new();
             // GNU cat.c: operand failures (missing file, input==output)
             // print a diagnostic and set exit 1 but do NOT stop the loop —
             // later operands are still processed.
@@ -1650,24 +1660,24 @@ impl Executor {
                         Some(read) if read.stdout_file && !read.bytes.is_empty() => {
                             // GNU cat.c: input resolves to the file fd 1
                             // writes to — report and skip it.
-                            let mut stderr = Vec::new();
                             writeln!(
-                                &mut stderr,
+                                &mut diagnostics,
                                 "{}cat: {}: input file is output file",
                                 self.diagnostic_prefix(),
                                 target
                             )?;
-                            self.write_buffered_builtin_output(cmd, &[], &stderr)?;
                             status = 1;
                             continue;
                         }
                         Some(read) => output.extend(read.bytes),
                         None => {
-                            let mut stderr = Vec::new();
                             // GNU cat.c reports its own errors bare, with
                             // no shell diagnostic prefix (rubash#1309).
-                            writeln!(&mut stderr, "cat: {}: No such file or directory", target)?;
-                            self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                            writeln!(
+                                &mut diagnostics,
+                                "cat: {}: No such file or directory",
+                                target
+                            )?;
                             status = 1;
                         }
                     }
@@ -1698,7 +1708,6 @@ impl Executor {
                 match read {
                     Ok(bytes) => output.extend(bytes),
                     Err(error) => {
-                        let mut stderr = Vec::new();
                         // GNU cat.c: cat reports its own operand errors
                         // bare — `cat: <file>: <strerror>` with the REAL
                         // strerror and no shell diagnostic prefix. The
@@ -1706,17 +1715,26 @@ impl Executor {
                         // blanket ENOENT text behind the script prefix
                         // (rubash#1309).
                         writeln!(
-                            &mut stderr,
+                            &mut diagnostics,
                             "cat: {}: {}",
                             target,
                             crate::posix_errors::message(&error)
                         )?;
-                        self.write_buffered_builtin_output(cmd, &[], &stderr)?;
                         status = 1;
                     }
                 }
             }
-            self.write_cat_output(cmd, &filter(&output))?;
+            let output = filter(&output);
+            if diagnostics.is_empty() {
+                self.write_cat_output(cmd, &output)?;
+            } else {
+                // rubash#1371: ONE emit for both streams so the ordered
+                // redirect walk opens each target exactly once — with
+                // `>f 2>&1` the diagnostic lands in f alongside the
+                // output instead of being truncated away by a second
+                // open (see the accumulator note above).
+                self.write_buffered_builtin_output(cmd, &output, &diagnostics)?;
+            }
             self.exit_code = status;
             return Ok(true);
         }
