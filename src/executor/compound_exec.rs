@@ -1893,6 +1893,14 @@ impl Executor {
         let Some(command) = commands.get(index) else {
             return Ok(None);
         };
+        // rubash#1355: an assignment prefix makes `time` a plain command
+        // name (GNU parse.y), never the timing keyword.
+        if !command.assignments.is_empty()
+            || !command.compound_assignments.is_empty()
+            || !command.array_element_assignments.is_empty()
+        {
+            return Ok(None);
+        }
         let Some(prefix) = time_prefix_parts(&command.words, self.posix_mode_enabled()) else {
             return Ok(None);
         };

@@ -1119,6 +1119,17 @@ fn time_prefix_from_command(command: &mut CommandNode) -> Option<TimePipelinePre
     if command.words.first().map(String::as_str) != Some("time") {
         return None;
     }
+    // rubash#1355: GNU parse.y — an assignment word is a prefix of a
+    // SIMPLE command only; after `A=1` the word `time` is the command
+    // NAME (an ordinary word, PATH-resolved, 127 when absent), never
+    // the TIME reserved word. A node carrying assignment prefixes
+    // therefore never folds into a TimeCommand.
+    if !command.assignments.is_empty()
+        || !command.compound_assignments.is_empty()
+        || !command.array_element_assignments.is_empty()
+    {
+        return None;
+    }
 
     let mut index = 1;
     let mut posix_format = false;

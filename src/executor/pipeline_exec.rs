@@ -4982,6 +4982,14 @@ fn time_pipeline_prefix(command: &CommandNode, posix_mode: bool) -> Option<TimeP
     if command.words.first().map(String::as_str) != Some("time") {
         return None;
     }
+    // rubash#1355: an assignment prefix makes `time` a plain command
+    // name (GNU parse.y), never the timing keyword.
+    if !command.assignments.is_empty()
+        || !command.compound_assignments.is_empty()
+        || !command.array_element_assignments.is_empty()
+    {
+        return None;
+    }
     // rubash#1218: posix mode + dash word — not the time keyword; the
     // pipeline runs an ordinary command named `time`.
     if posix_time_dash_word(&command.words, posix_mode) {

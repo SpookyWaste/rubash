@@ -96,6 +96,16 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        // rubash#1355: an assignment prefix makes `time` an ordinary
+        // command name (GNU parse.y simple_command prefix rule), never
+        // the keyword — dispatch it as an external lookup (127 when
+        // no `time` program is on PATH).
+        if !cmd.assignments.is_empty()
+            || !cmd.compound_assignments.is_empty()
+            || !cmd.array_element_assignments.is_empty()
+        {
+            return self.execute_external(cmd);
+        }
         // rubash#1218: in posix mode a dash word after `time` ends its
         // reserved-word status (GNU parse.y) — the whole command is an
         // ordinary external command named `time` (PATH-resolved, 127
