@@ -2282,6 +2282,59 @@ impl Executor {
         status
     }
 
+    /// rubash#1175: the gates for a true execve at the tail arm of
+    /// execute_exec_spawn. Every condition is an invariant the new
+    /// image depends on; any failure keeps the spawn-and-wait
+    /// simulation, whose observable behavior is already GNU-shaped
+    /// apart from the PID itself:
+    /// - the host binary opted in (a library host's process is not
+    ///   the shell's to replace);
+    /// - this executor owns the process image — fork-copy clones
+    ///   (comsub / pipeline stage / read) share the real shell's
+    ///   process and must never execve it away;
+    /// - no flat-subshell frame is live on this executor
+    ///   (subshell_depth > 0): `( exec ... )` runs in-process here,
+    ///   while GNU's forked subshell is what gets replaced;
+    /// - fds 0/1/2 are exactly the process's own inherited descriptors
+    ///   and no other modeled fd is open: a modeled redirect, capture,
+    ///   or numbered fd has no real descriptor to hand the new image.
+    ///   (The command's own output redirects are handled by the
+    ///   earlier arms of execute_exec_spawn and never reach here; its
+    ///   fd-0 input redirects were bound by execute_exec's guard and
+    ///   show up in the fd table, failing the fd-0 check.)
+    /// - no /dev/fd or /dev/std* word operands: those name modeled
+    ///   descriptors the materializer below resolves per-spawn.
+    #[cfg(unix)]
+    fn exec_image_replacement_applies(&self, cmd: &CommandNode) -> bool {
+        crate::builtins::exec::process_replacement_enabled()
+            && self.owns_process_image
+            && self.shell_state.subshell_depth.get() == 0
+            && self.stdout_capture.is_none()
+            && self.stderr_capture.is_none()
+            && !crate::executor::shell_options::stdout_capture_active()
+            && self.fd_table.write_endpoint(1) == Some(FdWriteEndpoint::Stdout)
+            && self.fd_table.write_endpoint(2) == Some(FdWriteEndpoint::Stderr)
+            && !self.fd_table.is_closed(0)
+            && !self.fd_table.is_closed(1)
+            && !self.fd_table.is_closed(2)
+            && match self.fd_table.entries.get(&0) {
+                Some(entry) => {
+                    !entry.closed
+                        && matches!(entry.read, Some(FdReadEndpoint::InheritedProcessStdin))
+                }
+                None => true,
+            }
+            && self
+                .fd_table
+                .entries
+                .iter()
+                .all(|(fd, entry)| *fd <= 2 || entry.closed)
+            && !cmd.words[1..].iter().any(|word| {
+                word.starts_with("/dev/fd/")
+                    || matches!(word.as_str(), "/dev/stdin" | "/dev/stdout" | "/dev/stderr")
+            })
+    }
+
     /// The spawn arms of execute_exec, run with the command's fd-0 input
     /// redirects already bound (see the guard in execute_exec). Every arm
     /// passes the child stdin resolved by exec_inherited_stdin explicitly —
@@ -2505,6 +2558,20 @@ impl Executor {
         }
 
         self.apply_no_output_builtin_redirects(cmd)?;
+        // rubash#1175: with every gate in exec_image_replacement_applies
+        // satisfied, replace this process's image for real (GNU
+        // shell_execve) instead of simulating it with a child whose PID
+        // differs from the shell's. A None result keeps the simulation
+        // below for the shapes replace_process_image declines.
+        #[cfg(unix)]
+        if self.exec_image_replacement_applies(cmd) {
+            if let Some(status) = crate::builtins::exec::replace_process_image(
+                &cmd.words[1..],
+                &self.shell_state.env_vars,
+            ) {
+                return Ok(status?);
+            }
+        }
         // GNU exec.def exec_builtin -> shell_execve (execute_cmd.c:6126):
         // the exec'd program inherits the shell's fd 1 — inside a command
         // substitution that descriptor IS the capture pipe (subst.c:7143

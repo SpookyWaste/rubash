@@ -646,6 +646,15 @@ pub struct Executor {
     /// its status; this latch tells the exit-trap choke point to skip the
     /// action on that unwind (rubash#1012).
     exec_replaced: bool,
+    /// rubash#1175: true only on the executor that IS this OS process's
+    /// shell (constructed by Executor::new for a real process root).
+    /// Fork-copy clones (command_substitution_executor) construct with
+    /// false: they share the process with the shell that must survive
+    /// them, so their `exec` keeps the spawn-and-wait simulation. Even a
+    /// rooted executor only replaces the image when the host binary
+    /// opted in (builtins::exec::enable_process_replacement) and the
+    /// live context passes the dispatcher's gates.
+    owns_process_image: bool,
     /// GNU execute_cmd.c:330 sourcenest — active `.`/source frames.
     source_nest_depth: usize,
     /// Child-death notifications that arrived while the SIGCHLD trap action

@@ -33,6 +33,12 @@ fn run_main() -> i32 {
     // Initialize locale state from environment (LC_ALL > LC_CTYPE > LANG)
     rubash::locale::init_locale();
 
+    // rubash#1175: this process IS the shell, so a top-level `exec` may
+    // replace its image for real (GNU shell_execve) instead of being
+    // simulated by a child process with a different PID. Library hosts
+    // (niubash) never opt in — their process is not the shell's.
+    rubash::builtins::exec::enable_process_replacement();
+
     // rubash#590: the bash.exe shim (src/bin/bash.rs) erases Windows argv[0]
     // when it re-execs this engine, so the invocation face travels in
     // NIU_INVOKED_AS (rubash#504 forwarded the sh/ash faces for the POSIX

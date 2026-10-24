@@ -422,6 +422,9 @@ impl Executor {
             trap_saved_exit_value: None,
             trap_saved_exit_context: 0,
             exec_replaced: false,
+            // rubash#1175: a process root IS its process's shell; the
+            // image-replacement gates live at the exec dispatcher.
+            owns_process_image: true,
             source_nest_depth: 0,
             sigchld_notifications_pending: std::cell::Cell::new(0),
             pending_signal_notices: std::cell::RefCell::new(Vec::new()),

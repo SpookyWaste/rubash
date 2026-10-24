@@ -48,6 +48,121 @@ pub(crate) fn replaces_shell(args: &[String]) -> bool {
     command_operand_index(args).is_some()
 }
 
+/// rubash#1175 host opt-in for a true process-image replacement. GNU
+/// exec_builtin ends in shell_execve (execute_cmd.c:6126): the shell's
+/// process image is replaced and the exec'd program keeps the shell's
+/// PID. This engine is also a library — niubash hosts it inside the
+/// terminal application's process, where an execve would destroy the
+/// host — so replacement stays OFF unless the hosting binary, whose
+/// process IS the shell (rubash's own main), opts in here. Library
+/// hosts never call this; on non-Unix hosts it changes nothing (there
+/// is no execve to replace with).
+static PROCESS_REPLACEMENT_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn enable_process_replacement() {
+    PROCESS_REPLACEMENT_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn process_replacement_enabled() -> bool {
+    PROCESS_REPLACEMENT_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// rubash#1175: attempt a true process-image replacement for
+/// `exec command ...` (builtins/exec.def exec_builtin ->
+/// execute_cmd.c:6126 shell_execve), for a dispatcher that has already
+/// established the replacement is sound (rooted executor, inherited
+/// fds 0/1/2, no modeled extras). Returns None when this exec shape
+/// keeps the spawn-and-wait simulation instead: an option outcome the
+/// caller must report, the internal printenv emulation (it has no
+/// image), an unresolvable command (the caller's normal path owns the
+/// search diagnostics), or ENOEXEC (the simulation's script wrapper
+/// owns that fallback). On success this function never returns — the
+/// process image IS the command, with the shell's PID. On a failed
+/// execve it prints the simulation's diagnostic and returns the status
+/// GNU's failed_exec path exits with (127 not-found, 126 cannot
+/// execute), so the caller's finish_exec_replacement contract applies
+/// unchanged.
+#[cfg(unix)]
+pub(crate) fn replace_process_image(
+    args: &[String],
+    env_vars: &crate::shell::var_table::VarTable,
+) -> Option<io::Result<i32>> {
+    let mut clean_env = false;
+    let mut login = false;
+    let mut argv0 = None;
+    let mut help = false;
+    let index = parse_options(
+        args,
+        &mut io::sink(),
+        "rubash: ",
+        &mut clean_env,
+        &mut login,
+        &mut argv0,
+        &mut help,
+    )
+    .ok()
+    .flatten()?;
+    let command = args.get(index).map(String::as_str)?;
+    let operands = &args[index + 1..];
+    if command == "printenv" {
+        return None;
+    }
+    let program = crate::executor::path::find_user_command(command, env_vars)?;
+    // Same argv[0] derivation as execute_impl (exec.def: -a wins, -l
+    // prefixes '-', bare -l dashes the command word).
+    let effective_argv0 = match (&argv0, login) {
+        (Some(name), true) => Some(format!("-{name}")),
+        (Some(name), false) => Some(name.clone()),
+        (None, true) => Some(format!("-{command}")),
+        (None, false) => None,
+    };
+    let mut process = external_exec_process(
+        &program,
+        command,
+        operands,
+        env_vars,
+        clean_env,
+        effective_argv0.as_deref(),
+    );
+    process
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    // GNU trap.c:1480 reset_signal_handlers runs inside exec_builtin
+    // before shell_execve: the new image starts from the shell-entry
+    // dispositions, not the runtime's (the Rust runtime ignores
+    // SIGPIPE; that ignore must not cross the replacement). The
+    // spawner's child reset (rubash#229) performs the same restore.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        process.pre_exec(crate::builtins::kill::child_pre_exec_reset);
+    }
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    let error = {
+        use std::os::unix::process::CommandExt;
+        process.exec()
+    };
+    if error.raw_os_error() == Some(libc::ENOEXEC) {
+        return None;
+    }
+    let status = if error.raw_os_error() == Some(libc::ENOENT) {
+        EX_NOTFOUND
+    } else {
+        EX_NOEXEC
+    };
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(
+        stderr,
+        "{}exec: {}: {}",
+        diagnostic_prefix(env_vars),
+        program.display(),
+        error
+    );
+    Some(Ok(status))
+}
+
 pub(crate) fn execute_with_io<W, E>(
     args: &[String],
     env_vars: &crate::shell::var_table::VarTable,
@@ -97,9 +212,12 @@ where
     W: Write,
     E: Write,
 {
-    // TODO(builtins/exec.def/execute_cmd.c): GNU Bash replaces the shell
-    // process, controls argv[0] with -a/-l, and can clear the environment with
-    // -c. This simulates only the observable upstream builtins.tests cases.
+    // builtins/exec.def/execute_cmd.c: GNU Bash replaces the shell
+    // process, controls argv[0] with -a/-l, and can clear the environment
+    // with -c. A rooted top-level context with inherited fds now does
+    // replace the image (replace_process_image, rubash#1175); this
+    // spawn-and-wait simulation serves every other context (library
+    // hosts, fork-copy clones, redirected or captured fds).
     let mut clean_env = false;
     let mut login = false;
     let mut argv0 = None;
