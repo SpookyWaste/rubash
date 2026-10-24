@@ -1,6 +1,114 @@
 use crate::executor::markers::DATA_DOLLAR;
 use crate::executor::substitution_metadata::bytes_to_shell_text;
 
+/// Whether a collected `${...}` body ends inside an unterminated
+/// single-quoted span, scanned with the same state machine
+/// [`collect_braced_parameter_body_into`] uses (plain `'`, `$'...'` with
+/// backslash escapes, `"..."`, backslash pairs). GNU subst.c:1954
+/// extract_dollar_brace_string: outside the POSIX+compat>42 literal
+/// case, a `'` inside `${...}` opens skip_single_quoted — an
+/// unterminated span swallows the closing `}` and the extraction fails.
+pub(in crate::executor) fn braced_body_ends_in_single_quote(body: &str) -> bool {
+    let mut chars = body.chars().peekable();
+    let mut single = false;
+    let mut double = false;
+    let mut ansi_c = false;
+    while let Some(ch) = chars.next() {
+        if single {
+            // DATA_SQUOTE (\u{17}) also closes: it is the lexer's data
+            // marking of the span's closing quote (see the match below).
+            if ch == '\'' || ch == '\u{17}' {
+                single = false;
+            }
+            continue;
+        }
+        if ansi_c {
+            if ch == '\\' {
+                chars.next();
+            } else if ch == '\'' {
+                ansi_c = false;
+            }
+            continue;
+        }
+        if double {
+            if ch == '"' {
+                double = false;
+            } else if ch == '\\' {
+                chars.next();
+            }
+            continue;
+        }
+        match ch {
+            '\\' => {
+                chars.next();
+            }
+            '$' if chars.peek().copied() == Some('\'') => {
+                chars.next();
+                ansi_c = true;
+            }
+            '\'' => single = true,
+            // DATA_SQUOTE: a quote the lexer already classified as data
+            // because its own span scan closed the expansion earlier —
+            // for the extraction verdict it is the span's closing quote
+            // (rubash#1109 paired form `${uq:-don'}'t}`).
+            '\u{17}' => single = !single,
+            '"' => double = true,
+            _ => {}
+        }
+    }
+    single || ansi_c
+}
+
+impl super::Executor {
+    /// rubash#1109 (GNU subst.c:1954 extract_dollar_brace_string): when
+    /// the POSIX literal-quote gate does NOT apply (not posix, or compat
+    /// <= 42), a `'` inside a double-quoted/heredoc `${...}` opens a
+    /// skip_single_quoted span; if that span is unterminated the brace
+    /// extraction fails with `bad substitution: no closing `}' in
+    /// "<word>"` and the word expansion fails (status 1, command
+    /// abandoned). Returns true when the verdict was raised — the
+    /// caller then contributes no value for this fragment. (The parse
+    /// gate, parse.y:4035 compat>41, is the lexer's side; a word that
+    /// reaches expansion has already passed it.)
+    pub(in crate::executor) fn no_closing_brace_verdict(
+        &self,
+        body: &str,
+        terminated: bool,
+        quoted_context: bool,
+        word: &str,
+    ) -> bool {
+        if terminated || !quoted_context {
+            return false;
+        }
+        if self.posix_mode_enabled()
+            && crate::builtins::shopt::compatibility_level(&self.shell_state.env_vars) > 42
+        {
+            return false;
+        }
+        if !braced_body_ends_in_single_quote(body) {
+            return false;
+        }
+        self.write_diagnostic_fd2(
+            format!(
+                "{}bad substitution: no closing `}}' in {}\n",
+                self.diagnostic_prefix(),
+                word
+            )
+            .as_bytes(),
+        );
+        // Not the parameter_bad_substitution latch: that one takes
+        // FORCE_EOF in a noninteractive POSIX shell (subst.c:10288),
+        // but the extract_dollar_brace_string failure is an
+        // expand_word_error with DISCARD semantics in every mode (GNU
+        // 5.3.20 probe: compat42+posix `echo "C=${uq:-don't}"` reports
+        // the error, abandons the command with status 1, and the next
+        // line runs). The dedicated latch is consumed next to the
+        // bad-substitution checks with ExpansionFailure(1).
+        self.no_closing_brace_failure.set(true);
+        true
+    }
+}
+
 pub(in crate::executor) fn collect_braced_parameter_name(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
 ) -> String {

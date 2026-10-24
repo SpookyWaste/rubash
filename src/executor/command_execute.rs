@@ -1240,6 +1240,13 @@ impl Executor {
         // exits with last_command_exit_value (EXECUTION_FAILURE=1). A
         // subshell child contains the jump at execute_cmd.c:1811 and exits
         // 1 (niubash#163), so expansion_fatal_status owns the mapping.
+        // rubash#1109: the extract_dollar_brace_string no-closing-brace
+        // verdict is DISCARD in every mode (see no_closing_brace_verdict).
+        if self.no_closing_brace_failure.replace(false) {
+            self.exit_code = 1;
+            self.command_expansion_failed.set(true);
+            return Err(ExecuteError::ExpansionFailure(1));
+        }
         if self.shell_state.parameter_bad_substitution.replace(false) {
             if self.posix_mode_enabled()
                 && self

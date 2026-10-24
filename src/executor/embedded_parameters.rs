@@ -649,6 +649,14 @@ impl Executor {
                         );
                     synthetic.push('}');
                     let name = synthetic[2..synthetic.len() - 1].to_string();
+                    if self.no_closing_brace_verdict(
+                        &name,
+                        terminated,
+                        in_double || double_quoted || heredoc,
+                        &format!("\"{word}\""),
+                    ) {
+                        continue;
+                    }
                     if double_quoted {
                         // Prompt-pass verdicts (GNU expand_prompt_string runs
                         // under no_longjmp_on_fatal_error, subst.c:4407, and

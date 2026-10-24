@@ -749,6 +749,10 @@ pub struct Executor {
     /// word expansion where it cannot return an error, so it latches here
     /// and execute_prepared_command raises ExpansionFailure(1).
     parameter_assignment_failure: Cell<bool>,
+    /// rubash#1109: an extract_dollar_brace_string failure (subst.c:1954
+    /// span rules) latched by the expansion walkers — DISCARD semantics
+    /// in every mode, consumed beside the bad-substitution checks.
+    no_closing_brace_failure: Cell<bool>,
     /// GNU subst.c:10272-10288 (parameter_brace_expand): a `${...}` whose
     /// parameter name ends on a character that starts no operator — a quote
     /// at name position (`${'x'%'t'}`, `${x'y'}`) — hits the `bad
