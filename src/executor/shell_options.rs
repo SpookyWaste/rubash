@@ -278,6 +278,33 @@ impl Executor {
         }
     }
 
+    /// niubash#529: fd 0's `test -t` verdict (GNU test.c isatty). The
+    /// inherited-process-stdin endpoint names the process stdin only while
+    /// no virtual input buffer is bound: a pipeline element or redirected
+    /// body reads FUNCTION_STDIN — pipe content in GNU terms
+    /// (execute_cmd.c execute_pipeline binds the pipe to fd 0) — never the
+    /// terminal, whatever the process stdin happens to be.
+    fn stdin_source_is_terminal(&self) -> bool {
+        if self.shell_state.env_vars.contains_key(FUNCTION_STDIN) {
+            return false;
+        }
+        crate::fd::is_console_handle(crate::fd::process_std_handle(0))
+    }
+
+    /// niubash#529: fd 1's `test -t` verdict. The Stdout endpoint resolves
+    /// to the active capture while one is installed — the command
+    /// substitution pipe (subst.c:7143 command_substitute: the child's
+    /// stdout is the capture pipe, never the caller's fd 1) or a pipeline
+    /// stage's staging buffer — and to the process stdout only when no
+    /// capture owns it. Judging it by the process stdout answers Y inside
+    /// `$( [ -t 1 ] )` on a terminal, where GNU answers N.
+    fn stdout_sink_is_terminal(&self) -> bool {
+        if self.stdout_capture.is_some() || stdout_capture_active() {
+            return false;
+        }
+        crate::fd::is_console_handle(crate::fd::process_std_handle(1))
+    }
+
     /// GNU test.c: `-t fd` answers isatty(fd) — whether the descriptor's
     /// current target is a terminal. The builtin only receives env_vars,
     /// so mirror the fd table plus the command's own (not yet bound)
@@ -295,16 +322,12 @@ impl Executor {
             }
             let read_tty = match &entry.read {
                 Some(FdReadEndpoint::File(file)) => crate::fd::is_console_handle(file.handle),
-                Some(FdReadEndpoint::InheritedProcessStdin) => {
-                    crate::fd::is_console_handle(crate::fd::process_std_handle(0))
-                }
+                Some(FdReadEndpoint::InheritedProcessStdin) => self.stdin_source_is_terminal(),
                 _ => false,
             };
             let write_tty = match &entry.write {
                 Some(FdWriteEndpoint::File(file)) => crate::fd::is_console_handle(file.handle),
-                Some(FdWriteEndpoint::Stdout) => {
-                    crate::fd::is_console_handle(crate::fd::process_std_handle(1))
-                }
+                Some(FdWriteEndpoint::Stdout) => self.stdout_sink_is_terminal(),
                 Some(FdWriteEndpoint::Stderr) => {
                     crate::fd::is_console_handle(crate::fd::process_std_handle(2))
                 }
@@ -356,15 +379,11 @@ impl Executor {
         if let Some(source_fd) = redirect_target_fd(target) {
             return Some(match self.fd_table.read_endpoint(source_fd) {
                 Some(FdReadEndpoint::File(file)) => crate::fd::is_console_handle(file.handle),
-                Some(FdReadEndpoint::InheritedProcessStdin) => {
-                    crate::fd::is_console_handle(crate::fd::process_std_handle(0))
-                }
+                Some(FdReadEndpoint::InheritedProcessStdin) => self.stdin_source_is_terminal(),
                 Some(_) => false,
                 None => match self.fd_table.output_endpoint(source_fd) {
                     Some(FdWriteEndpoint::File(file)) => crate::fd::is_console_handle(file.handle),
-                    Some(FdWriteEndpoint::Stdout) => {
-                        crate::fd::is_console_handle(crate::fd::process_std_handle(1))
-                    }
+                    Some(FdWriteEndpoint::Stdout) => self.stdout_sink_is_terminal(),
                     Some(FdWriteEndpoint::Stderr) => {
                         crate::fd::is_console_handle(crate::fd::process_std_handle(2))
                     }
