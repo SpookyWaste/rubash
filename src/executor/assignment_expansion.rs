@@ -1603,7 +1603,68 @@ impl Executor {
         let mut segment = String::new();
         let mut mode = QuoteMode::None;
 
-        for ch in value.chars() {
+        let chars: Vec<char> = value.chars().collect();
+        let mut index = 0usize;
+        while index < chars.len() {
+            let ch = chars[index];
+            // GNU parse.y:4451 parse_comsub: a nested substitution is a
+            // unit whose interior quotes belong to its own parse — they
+            // neither split the enclosing value's quote segments nor
+            // toggle its quote mode. Consume $(...), ${...} and `...`
+            // atomically into the current segment (in Single mode `$`
+            // and the backtick are literal text, which the state machine
+            // below already treats so). rubash#1468: a `"` inside the
+            // unit used to flip the mode and hand the expander a fragment
+            // (`$(echo `), which it reported as an unterminated command
+            // substitution and the whole assignment was dropped.
+            if mode != QuoteMode::Single {
+                if ch == '$' && chars.get(index + 1) == Some(&'(') {
+                    if let Some(end) =
+                        crate::lexer::skip_parenthesized_unit_corrected(&chars, index + 1)
+                    {
+                        segment.extend(chars[index..end].iter());
+                        index = end;
+                        continue;
+                    }
+                } else if ch == '$' && chars.get(index + 1) == Some(&'{') {
+                    let context = BraceContext {
+                        outer_double_quote: mode == QuoteMode::Double,
+                        posix: false,
+                        replacement_context: false,
+                        initial_state: DolbraceState::Param,
+                    };
+                    if let Some(scan) = crate::lexer::dolbrace::scan_braced_parameter_body_chars(
+                        &chars[index..],
+                        context,
+                    ) {
+                        let end = index + 2 + scan.end;
+                        if end <= chars.len() {
+                            segment.extend(chars[index..end].iter());
+                            index = end;
+                            continue;
+                        }
+                    }
+                } else if ch == '`' {
+                    // Backtick unit: a backslash escapes the next
+                    // character (including the closing backtick); an
+                    // unterminated unit runs to the end of the value.
+                    let mut end = index + 1;
+                    while end < chars.len() {
+                        match chars[end] {
+                            '\\' => end += 2,
+                            '`' => {
+                                end += 1;
+                                break;
+                            }
+                            _ => end += 1,
+                        }
+                    }
+                    let end = end.min(chars.len());
+                    segment.extend(chars[index..end].iter());
+                    index = end;
+                    continue;
+                }
+            }
             match (mode, ch) {
                 (QuoteMode::None, '\'') => {
                     output.push_str(&self.expand_embedded_parameters_mut(&segment));
@@ -1627,6 +1688,7 @@ impl Executor {
                 }
                 _ => segment.push(ch),
             }
+            index += 1;
         }
 
         if mode == QuoteMode::Single {
