@@ -453,26 +453,9 @@ impl<'a> Lexer<'a> {
                     Some((TokenKind::Word, prev)) if prev == "-p"
                 );
 
-        // rubash#1370: GNU produces a reserved-word TOKEN (COPROC,
-        // TIME, IF, ...) only when the word is read in command position
-        // (check_for_reserved_word, parse.y:3168); anywhere else the
-        // reader returns a plain WORD. Rubash's word path marks every
-        // keyword-VALUED word TokenKind::Keyword and lets the parser
-        // demote it, so the reader HISTORY must record the demotion:
-        // a keyword-valued token that was not itself read in a
-        // reserved position goes into last_token as a Word. Without
-        // this, `command coproc C { ...; }` left (Keyword, "coproc")
-        // in token_before_that, reserved_word_position() then treated
-        // the `{` after the coproc NAME as a group opener and folded
-        // the group into one word — GNU instead keeps `{`/`}` as word
-        // text there and syntax-errors on the stray `}`.
-        let history_kind = if token.kind == TokenKind::Keyword && !self.reserved_word_position() {
-            TokenKind::Word
-        } else {
-            token.kind.clone()
-        };
         self.parse_state.token_before_that = self.parse_state.last_token.take();
-        self.parse_state.last_token = Some((history_kind, TokStr::from(token.value.as_str())));
+        self.parse_state.last_token =
+            Some((token.kind.clone(), TokStr::from(token.value.as_str())));
     }
 
     #[inline]
