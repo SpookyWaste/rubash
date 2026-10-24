@@ -97,6 +97,11 @@ impl Executor {
 
         let mut ran_body = false;
         let mut last_body_status = 0;
+        // rubash#1358: a break consumed by THIS loop ends it with the
+        // break builtin's own status; the tail normalization below must
+        // not clobber it with last_body_status (mirrors execute_loop_
+        // command's ended_by_break in compound_exec.rs).
+        let mut ended_by_break = false;
         let loop_result = self.with_command_input_redirects(done_command, |executor| loop {
             let condition_ast = Ast {
                 commands: condition_commands.clone(),
@@ -113,6 +118,7 @@ impl Executor {
                 Ok(()) => {}
                 Err(ExecuteError::Break(level)) if level <= 1 => {
                     executor.exit_code = executor.take_break_failure_status().unwrap_or(0);
+                    ended_by_break = true;
                     break Ok(());
                 }
                 Err(ExecuteError::Break(level)) => break Err(ExecuteError::Break(level - 1)),
@@ -142,6 +148,7 @@ impl Executor {
                 }
                 Err(ExecuteError::Break(level)) if level <= 1 => {
                     executor.exit_code = executor.take_break_failure_status().unwrap_or(0);
+                    ended_by_break = true;
                     break Ok(());
                 }
                 Err(ExecuteError::Break(level)) => break Err(ExecuteError::Break(level - 1)),
@@ -170,7 +177,14 @@ impl Executor {
 
         if !ran_body {
             self.exit_code = 0;
-        } else if self.exit_code != 0 {
+        } else if !ended_by_break {
+            // GNU execute_cmd.c execute_while_or_until returns
+            // body_status unconditionally — the loop's status is the
+            // last body command's, not the final condition test's
+            // (rubash#1358). The old `exit_code != 0` gate kept the
+            // condition's 0 for `until` (which exits on a TRUE test),
+            // dropping a failing pipeline's status; `while` exits on a
+            // false test, so it accidentally agreed.
             self.exit_code = last_body_status;
         }
         Ok(Some(done_index + 1))
