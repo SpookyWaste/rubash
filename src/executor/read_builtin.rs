@@ -1377,7 +1377,9 @@ impl Executor {
                 }
                 word if word.starts_with('-')
                     && word.len() > 2
-                    && word[1..].chars().all(|ch| matches!(ch, 'e' | 'E' | 'r' | 's')) =>
+                    && word[1..]
+                        .chars()
+                        .all(|ch| matches!(ch, 'e' | 'E' | 'r' | 's')) =>
                 {
                     raw |= word[1..].contains('r');
                     index += 1;
@@ -2414,11 +2416,7 @@ impl Executor {
                         self.shell_state
                             .env_vars
                             .insert(name.clone(), read_array_storage(&[]));
-                        mark_env_name(
-                            &mut self.shell_state.env_vars,
-                            "__RUBASH_ARRAY_VARS",
-                            &name,
-                        );
+                        mark_env_name(&mut self.shell_state.env_vars, "__RUBASH_ARRAY_VARS", &name);
                     }
                     return if read_timed_out { 142 } else { 1 };
                 }
@@ -2439,8 +2437,7 @@ impl Executor {
             // the array store; see the post-scan validation comment).
             if !invalid_name {
                 let value = read_array_storage(&values);
-                let _ =
-                    replace_typed_indexed_array(&mut self.shell_state.variables, &name, values);
+                let _ = replace_typed_indexed_array(&mut self.shell_state.variables, &name, values);
                 self.shell_state.env_vars.insert(name.clone(), value);
                 mark_env_name(&mut self.shell_state.env_vars, "__RUBASH_ARRAY_VARS", &name);
             }
@@ -2543,11 +2540,21 @@ impl Executor {
                 // on a second raw read).
                 130
             } else if command_closes_stdin(cmd) || self.fd_table.is_closed(0) {
-                let assign_status = self.assign_read_scalar_names(
-                    &scalar_names,
-                    initial_text.as_deref().unwrap_or(""),
-                    raw,
-                );
+                // GNU builtins/read.def: an OS-level read error (EBADF
+                // here) is not an EOF — read.def:911 reports it and the
+                // builtin fails WITHOUT binding the names; only a real
+                // EOF binds the (empty/partial) record (rubash#1477:
+                // `read x <&-` left x set-but-empty). The -i prefill arm
+                // keeps binding the initial text (readline behavior).
+                let assign_status = if initial_text.is_some() {
+                    self.assign_read_scalar_names(
+                        &scalar_names,
+                        initial_text.as_deref().unwrap_or(""),
+                        raw,
+                    )
+                } else {
+                    0
+                };
                 if assign_status != 0 {
                     return self.finish_read_error(cmd, &stderr, assign_status);
                 }
@@ -2867,8 +2874,7 @@ impl Executor {
                 redirect.fd == Some(fd)
                     && matches!(
                         redirect.kind,
-                        crate::parser::RedirectKind::Input
-                            | crate::parser::RedirectKind::ReadWrite
+                        crate::parser::RedirectKind::Input | crate::parser::RedirectKind::ReadWrite
                     )
                     && !is_closed_redirect_target(&self.expand_redirect_target(redirect))
             }) {
