@@ -4418,7 +4418,14 @@ impl Executor {
     }
 
     fn lastpipe_enabled(&self) -> bool {
+        // GNU: lastpipe takes effect only when job control is not active
+        // (execute_cmd.c execute_pipeline / shopt.def lastpipe: the last
+        // element runs in the current shell "if job control is not active";
+        // under `set -m` every element forks, so a variable set by the last
+        // element never reaches the parent). Gate on the monitor option so
+        // `set -m; shopt -s lastpipe` stays inert (rubash#1476).
         crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "lastpipe")
+            && !crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "monitor")
     }
 
     /// Computes the first pipeline element's fd-0 payload. GNU gives every
