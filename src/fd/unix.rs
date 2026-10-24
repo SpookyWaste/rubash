@@ -43,6 +43,19 @@ pub fn is_disk_file(h: HANDLE) -> bool {
     }
 }
 
+/// S_ISFIFO — the handle refers to a pipe/FIFO. GNU test.c's `-p`
+/// file test on an fd path resolves through the descriptor itself, so
+/// fd slots backed by a real OS pipe (e.g. `exec N< <(...)`, which
+/// stores the pipe reader as a File endpoint) must classify as pipes
+/// (rubash#1467).
+pub fn is_pipe_handle(h: HANDLE) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::fstat(h, &mut st) == 0
+            && (u32::from(st.st_mode) & u32::from(libc::S_IFMT)) == u32::from(libc::S_IFIFO)
+    }
+}
+
 /// The filesystem path an open regular-file descriptor refers to, or
 /// None for pipes/ttys/devices. GNU's `open("/proc/self/fd/N", O_RDONLY)`
 /// on a regular file performs a FRESH open at offset 0 — callers

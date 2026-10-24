@@ -503,6 +503,9 @@ fn eval_unary(
     if let Some(result) = virtual_device_test(op, operand) {
         return Ok(result);
     }
+    if let Some(result) = fd_pipe_test(op, operand, env_vars) {
+        return Ok(result);
+    }
 
     match op {
         "-z" => Ok(operand.is_empty()),
@@ -629,6 +632,41 @@ fn virtual_device_test(op: &str, operand: &str) -> Option<bool> {
     }
 
     None
+}
+
+/// rubash#1467: `/dev/fd/N` and `/proc/self/fd/N` operands naming a
+/// pipe-like descriptor in the executor's fd table (process
+/// substitution, coproc, text feeds). The executor mirrors those
+/// descriptors into __RUBASH_FD_PIPE_<fd> before the builtin runs
+/// (sync_fd_pipe_marks), because the paths are virtual here and stat()
+/// on them would interrogate the host process's unrelated fd N. The
+/// verdict matrix is the probe-verified one the [[ ]] path uses
+/// (conditional.rs, rubash#545): a LIVE pipe fd answers true for
+/// -a -e -p -r -w -L -h -O -G and false for the remaining file tests.
+/// Without a mark the operand falls through to the filesystem, where a
+/// closed or foreign fd correctly fails its tests.
+fn fd_pipe_test(
+    op: &str,
+    operand: &str,
+    env_vars: &crate::shell::var_table::VarTable,
+) -> Option<bool> {
+    let fd: u32 = operand
+        .strip_prefix("/dev/fd/")
+        .or_else(|| operand.strip_prefix("/proc/self/fd/"))?
+        .parse()
+        .ok()?;
+    if env_vars
+        .get(&format!("__RUBASH_FD_PIPE_{fd}"))
+        .map(String::as_str)
+        != Some("1")
+    {
+        return None;
+    }
+    Some(match op {
+        "-a" | "-e" | "-p" | "-r" | "-w" | "-L" | "-h" | "-O" | "-G" => true,
+        "-f" | "-d" | "-x" | "-s" | "-S" | "-b" | "-c" | "-u" | "-g" | "-k" | "-N" => false,
+        _ => return None,
+    })
 }
 
 fn test_path(operand: &str, env_vars: &crate::shell::var_table::VarTable) -> std::path::PathBuf {

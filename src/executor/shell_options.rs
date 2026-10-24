@@ -371,6 +371,57 @@ impl Executor {
         }
     }
 
+    /// GNU test.c: a `/dev/fd/N` operand names the shell's OWN descriptor
+    /// N (via the magic symlink). Process-substitution and coproc
+    /// descriptors are virtual in this executor — stat() on the path
+    /// would interrogate the host process's unrelated fd N — so mirror
+    /// the pipe-like endpoints into __RUBASH_FD_PIPE_<fd> right before
+    /// `test`/`[` runs (rubash#1467; the verdict matrix lives in
+    /// builtins/test.rs fd_pipe_test, shared with the [[ ]] path).
+    /// Rewritten fresh each call, like the terminal marks.
+    pub(in crate::executor) fn sync_fd_pipe_marks(&mut self) {
+        self.shell_state
+            .env_vars
+            .retain(|key, _| !key.starts_with(FD_PIPE_PREFIX));
+        for (fd, entry) in &self.fd_table.entries {
+            if entry.closed {
+                continue;
+            }
+            let read_pipe = matches!(
+                entry.read,
+                Some(
+                    FdReadEndpoint::ProcessSubstitution(_)
+                        | FdReadEndpoint::Text(_)
+                        | FdReadEndpoint::CoprocStdout { .. }
+                )
+            ) || matches!(
+                &entry.read,
+                Some(FdReadEndpoint::File(file))
+                    if crate::fd::is_pipe_handle(file.handle)
+            );
+            // A File endpoint can also back the slot with a real OS pipe
+            // (`exec N< <(...)` stores the spawned child's pipe reader
+            // as a File) — classify by the handle, not the variant, so
+            // regular files stay unmarked (rubash#1467).
+            let write_pipe = matches!(
+                entry.write,
+                Some(
+                    FdWriteEndpoint::ProcessSubstitution { .. }
+                        | FdWriteEndpoint::CoprocStdin { .. }
+                )
+            ) || matches!(
+                &entry.write,
+                Some(FdWriteEndpoint::File(file))
+                    if crate::fd::is_pipe_handle(file.handle)
+            );
+            if read_pipe || write_pipe {
+                self.shell_state
+                    .env_vars
+                    .insert(format!("{FD_PIPE_PREFIX}{fd}"), "1".to_string());
+            }
+        }
+    }
+
     /// isatty() verdict for an expanded redirect target: `&N` and the
     /// /dev/fd/N aliases consult fd N's bound endpoint; a path is probed
     /// read-only (no create/truncate side effect) and judged by
