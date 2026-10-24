@@ -1039,9 +1039,16 @@ impl Executor {
         // ("Invalid character class name"); the regex crate parses the
         // span as a nested class instead, so validate names before
         // handing the pattern over (cond-regexp2.sub `[[:invalid:]`).
-        if !posix_bracket_class_names_valid(&pattern) || posix_ere_has_extended_group(&pattern) {
+        if !posix_bracket_class_names_valid(&pattern)
+            || posix_ere_has_extended_group(&pattern)
+            || posix_ere_has_dangling_quantifier(&pattern)
+        {
             return Err(regex::Regex::new("(").unwrap_err());
         }
+        // POSIX ERE quantifier spellings the regex crate reads
+        // differently (nested `?`, empty-minimum intervals): rewrite
+        // to the nested form before compiling (rubash#1058).
+        let pattern = translate_posix_ere_quantifiers(&pattern);
         // GNU regcomp is called WITHOUT REG_NEWLINE (lib/sh/shmatch.c
         // sh_regmatch), so `.` matches a newline (rubash#1058).
         // Granularity follows the locale model (rubash#1061): glibc
@@ -1694,6 +1701,278 @@ fn posix_ere_has_extended_group(pattern: &str) -> bool {
     false
 }
 
+/// Parse a POSIX ERE interval token at chars[start] == '{': `{n}`,
+/// `{n,}`, `{n,m}`, and the glibc empty-minimum forms `{,m}` / `{,}`
+/// (an omitted minimum is 0). Returns (end index, minimum, maximum)
+/// with maximum None for an open upper bound, or None when the brace
+/// does not form an interval and is literal text.
+fn ere_interval_at(chars: &[char], start: usize) -> Option<(usize, u64, Option<u64>)> {
+    let mut i = start + 1;
+    let min_start = i;
+    while i < chars.len() && chars[i].is_ascii_digit() {
+        i += 1;
+    }
+    let min_text: String = chars[min_start..i].iter().collect();
+    let (max_text, end) = if i < chars.len() && chars[i] == ',' {
+        i += 1;
+        let max_start = i;
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i >= chars.len() || chars[i] != '}' {
+            return None;
+        }
+        (Some(chars[max_start..i].iter().collect::<String>()), i + 1)
+    } else if i < chars.len() && chars[i] == '}' && !min_text.is_empty() {
+        (None, i + 1)
+    } else {
+        return None;
+    };
+    let minimum: u64 = if min_text.is_empty() {
+        0
+    } else {
+        min_text.parse().unwrap_or(u64::MAX)
+    };
+    let maximum: Option<u64> = match &max_text {
+        None => Some(minimum),
+        Some(text) if text.is_empty() => None,
+        Some(text) => Some(text.parse().unwrap_or(u64::MAX)),
+    };
+    Some((end, minimum, maximum))
+}
+
+/// Index just past the bracket expression at chars[start] == '[', or
+/// None when it never closes (the `[` is then literal text).
+fn bracket_expression_end(chars: &[char], start: usize) -> Option<usize> {
+    translate_bracket_expression(chars, start).map(|(next, _)| next)
+}
+
+/// glibc regcomp (REG_BADRPT): a repetition operator with no
+/// quantifiable operand — at the start of the pattern or a
+/// subexpression, right after `|` or `(`, or right after the `^`
+/// anchor (an anchor is not an operand: `a^*` is invalid, while `$`
+/// IS one: `$*a` compiles). Stacked operators are fine (`a**`,
+/// `a*{2}` nest); only the first operator of a run can dangle.
+fn posix_ere_has_dangling_quantifier(pattern: &str) -> bool {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut have_atom = false;
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                have_atom = true;
+                i += 2;
+            }
+            '[' => {
+                have_atom = true;
+                i = bracket_expression_end(&chars, i).unwrap_or(i + 1);
+            }
+            '(' => {
+                have_atom = false;
+                i += 1;
+            }
+            ')' => {
+                have_atom = true;
+                i += 1;
+            }
+            '|' => {
+                have_atom = false;
+                i += 1;
+            }
+            '^' => {
+                have_atom = false;
+                i += 1;
+            }
+            '*' | '+' | '?' => {
+                if !have_atom {
+                    return true;
+                }
+                i += 1;
+            }
+            '{' => {
+                if let Some((next, _, _)) = ere_interval_at(&chars, i) {
+                    if !have_atom {
+                        return true;
+                    }
+                    i = next;
+                } else {
+                    have_atom = true;
+                    i += 1;
+                }
+            }
+            _ => {
+                have_atom = true;
+                i += 1;
+            }
+        }
+    }
+    false
+}
+
+/// glibc regcomp (REG_BADBR): an interval whose minimum exceeds its
+/// maximum, `a{2,1}` — "Invalid content of \{\}". Bracket spans are
+/// skipped (a `{` inside one is a member character).
+fn posix_ere_has_bad_interval(pattern: &str) -> bool {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 2,
+            '[' => i = bracket_expression_end(&chars, i).unwrap_or(i + 1),
+            '{' => {
+                if let Some((next, minimum, Some(maximum))) = ere_interval_at(&chars, i) {
+                    if minimum > maximum {
+                        return true;
+                    }
+                    i = next;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// Rewrite the two POSIX ERE quantifier spellings the regex crate
+/// reads differently, leaving everything else byte-identical:
+///
+/// - A `?` directly after another quantifier is a NESTED quantifier
+///   in ERE (glibc: `a+?` is `(a+)?`, leftmost-longest, so it matches
+///   greedily) but the regex crate's LAZY marker. Wrap the whole
+///   repetition in a non-capturing group so the `?` quantifies it:
+///   `a+?` -> `(?:a+)?`, `a{2,}?` -> `(?:a{2,})?`, `(aa)+?` ->
+///   `(?:(aa)+)?`. Other stacked operators (`**`, `*{2}`, `?+`) nest
+///   identically in both engines and pass through.
+/// - The glibc empty-minimum intervals `{,m}` / `{,}` (== `{0,m}` /
+///   `{0,}`), which the regex crate rejects outright.
+fn translate_posix_ere_quantifiers(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out: Vec<char> = Vec::with_capacity(chars.len() + 8);
+    // (start, end) span in `out` of the most recent atom, and whether
+    // a quantifier already applies to it (the repetition tail a
+    // following `?` would nest over).
+    let mut last_atom: Option<(usize, usize)> = None;
+    let mut quantified = false;
+    let mut group_starts: Vec<usize> = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                let start = out.len();
+                out.push('\\');
+                if i + 1 < chars.len() {
+                    out.push(chars[i + 1]);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                last_atom = Some((start, out.len()));
+                quantified = false;
+            }
+            '[' => {
+                let start = out.len();
+                match bracket_expression_end(&chars, i) {
+                    Some(next) => {
+                        out.extend_from_slice(&chars[i..next]);
+                        i = next;
+                    }
+                    None => {
+                        out.push('[');
+                        i += 1;
+                    }
+                }
+                last_atom = Some((start, out.len()));
+                quantified = false;
+            }
+            '(' => {
+                group_starts.push(out.len());
+                out.push('(');
+                last_atom = None;
+                quantified = false;
+                i += 1;
+            }
+            ')' => {
+                out.push(')');
+                let start = group_starts.pop().unwrap_or_else(|| out.len() - 1);
+                last_atom = Some((start, out.len()));
+                quantified = false;
+                i += 1;
+            }
+            '|' => {
+                out.push('|');
+                last_atom = None;
+                quantified = false;
+                i += 1;
+            }
+            '*' | '+' => {
+                out.push(chars[i]);
+                if last_atom.is_some() {
+                    quantified = true;
+                }
+                i += 1;
+            }
+            '?' => {
+                if quantified {
+                    let (atom_start, _) = last_atom.unwrap();
+                    let mut wrapped: Vec<char> = Vec::with_capacity(out.len() + 4);
+                    wrapped.extend_from_slice(&out[..atom_start]);
+                    wrapped.extend(['(', '?', ':']);
+                    wrapped.extend_from_slice(&out[atom_start..]);
+                    wrapped.push(')');
+                    let group_end = wrapped.len();
+                    wrapped.push('?');
+                    out = wrapped;
+                    last_atom = Some((atom_start, group_end));
+                    // `quantified` stays true: the `?` just pushed is
+                    // the wrapped group's own quantifier, so a further
+                    // `?` nests over the whole group again (`a+??`).
+                } else {
+                    out.push('?');
+                    if last_atom.is_some() {
+                        quantified = true;
+                    }
+                }
+                i += 1;
+            }
+            '{' => {
+                match ere_interval_at(&chars, i) {
+                    Some((next, _, _)) => {
+                        // `{,m}` / `{,}`: emit the explicit `{0,...}`.
+                        if chars.get(i + 1) == Some(&',') {
+                            out.push('{');
+                            out.push('0');
+                            out.extend_from_slice(&chars[i + 1..next]);
+                        } else {
+                            out.extend_from_slice(&chars[i..next]);
+                        }
+                        if last_atom.is_some() {
+                            quantified = true;
+                        }
+                        i = next;
+                    }
+                    None => {
+                        let start = out.len();
+                        out.push('{');
+                        last_atom = Some((start, out.len()));
+                        quantified = false;
+                        i += 1;
+                    }
+                }
+            }
+            _ => {
+                let start = out.len();
+                out.push(chars[i]);
+                last_atom = Some((start, out.len()));
+                quantified = false;
+                i += 1;
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// Best-effort glibc regerror wording for patterns the regex crate
 /// rejected, so `[[ x =~ bad ]]` diagnostics match GNU's
 /// `invalid regular expression `<pat>': <reason>` shape.
@@ -1706,6 +1985,11 @@ fn regexp_error_reason(pattern: &str) -> &'static str {
     let trailing_bs = chars.iter().rev().take_while(|&&c| c == '\\').count();
     if trailing_bs % 2 == 1 {
         return "Trailing backslash";
+    }
+    // glibc REG_BADRPT, checked before REG_BADBR: `{2,1}` at the start
+    // of a pattern reports the dangling operator, not the bad range.
+    if posix_ere_has_dangling_quantifier(pattern) {
+        return "Invalid preceding regular expression";
     }
     // Bracket expression scan.
     let mut depth_paren = 0i32;
@@ -1774,6 +2058,9 @@ fn regexp_error_reason(pattern: &str) -> &'static str {
     }
     if depth_paren > 0 {
         return "Unmatched ( or \\(";
+    }
+    if posix_ere_has_bad_interval(pattern) {
+        return "Invalid content of \\{\\}";
     }
     "Invalid regular expression"
 }
