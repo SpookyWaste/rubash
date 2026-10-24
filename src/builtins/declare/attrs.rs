@@ -341,28 +341,38 @@ where
             // (nameref22.sub:84 `declare -i array[64]` on array=one).
         }
     }
-    if uppercase || lowercase || capcase {
+    // Effective case attributes: GNU declare.def:525-527 applies
+    // VSETATTR(flags_on) and then VUNSETATTR(flags_off), so an attribute
+    // that a sibling case option in the same command crossed off
+    // (`declare -lu` sets on={lower,upper}, off={upper,lower,capcase})
+    // neither survives as a mark nor drives the value conversion below
+    // (rubash#1458). At most one effective case attribute can remain:
+    // each set case option adds the other two to flags_off.
+    let eff_uppercase = uppercase && !unset_uppercase;
+    let eff_lowercase = lowercase && !unset_lowercase;
+    let eff_capcase = capcase && !unset_capcase;
+    if eff_uppercase || eff_lowercase || eff_capcase {
         for name in names {
             let name = name.split_once('=').map(|(name, _)| name).unwrap_or(name);
             let name = name.strip_suffix('+').unwrap_or(name);
-            if uppercase {
+            if eff_uppercase {
                 mark_typed(variables, UPPERCASE_VARS, name);
                 unmark_typed(variables, LOWERCASE_VARS, name);
             }
-            if lowercase {
+            if eff_lowercase {
                 mark_typed(variables, LOWERCASE_VARS, name);
                 unmark_typed(variables, UPPERCASE_VARS, name);
                 unmark_typed(variables, CAPCASE_VARS, name);
             }
-            if capcase {
+            if eff_capcase {
                 mark_typed(variables, CAPCASE_VARS, name);
                 unmark_typed(variables, UPPERCASE_VARS, name);
                 unmark_typed(variables, LOWERCASE_VARS, name);
             }
             if let Some(value) = variables.get(name).cloned() {
-                let value = if uppercase {
+                let value = if eff_uppercase {
                     value.to_uppercase()
-                } else if lowercase {
+                } else if eff_lowercase {
                     value.to_lowercase()
                 } else {
                     // GNU capitalize: first character uppercased, rest

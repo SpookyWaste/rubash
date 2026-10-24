@@ -1110,20 +1110,31 @@ impl Executor {
             // array subscript (valid_array_reference, arrayfunc.c:885). An
             // empty subscript (`${x[]}`) or a second subscript
             // (`${a[0][1]}`) is a bad substitution reported with the whole
-            // `${...}` text (subst.c:10278) — the read path used to expand
+            // WORD being expanded (subst.c:10278 report_error names the
+            // expand_word_internal string — `a2:[${arr[0][0]}]`, not the
+            // `${...}` span; the two coincide only when the word IS the
+            // fragment, rubash#1483) — the read path used to expand
             // both silently empty (rubash#536). The check runs first
             // because GNU validates the reference before the operator
             // dispatch, and it covers the indirect/length prefixes (`${!x[]}`,
             // `${#x[]}`) whose reference obeys the same rule.
             if Self::malformed_braced_reference(inner) {
-                return Some((format!("${{{inner}}}"), "bad substitution".to_string(), 1));
+                return Some((
+                    crate::executor::expand_word::bad_substitution_display(word),
+                    "bad substitution".to_string(),
+                    1,
+                ));
             }
             // GNU rejects a parameter expansion nested inside another
             // parameter expansion inside an array subscript. Reject it
             // before the mutable whole-word expander can recurse indefinitely;
             // a single nested subscript such as `${A[${i}]}` remains valid.
             if inner.contains("[${${") {
-                return Some((format!("${{{inner}}}"), "bad substitution".to_string(), 1));
+                return Some((
+                    crate::executor::expand_word::bad_substitution_display(word),
+                    "bad substitution".to_string(),
+                    1,
+                ));
             }
             // GNU subst.c:10053 valid_brace_expansion_word: after ${, the
             // parameter name must be a valid name/special-var/subscripted
@@ -1131,7 +1142,11 @@ impl Executor {
             // token, which is not a valid operator tail — bad substitution
             // (new-exp.tests `${c//${$(($#-1))}/x/}`).
             if inner.starts_with("$(") || inner.contains("${$(") {
-                return Some((format!("${{{inner}}}"), "bad substitution".to_string(), 1));
+                return Some((
+                    crate::executor::expand_word::bad_substitution_display(word),
+                    "bad substitution".to_string(),
+                    1,
+                ));
             }
             // GNU subst.c:8944-8951 parameter_brace_transform +
             // valid_parameter_transform (subst.c:8898): a `@xform` suffix on
@@ -1147,7 +1162,7 @@ impl Executor {
                     || self.shell_state.env_vars.contains_key(base);
                 if is_set {
                     return Some((
-                        format!("${{{inner}}}"),
+                        crate::executor::expand_word::bad_substitution_display(word),
                         "bad substitution".to_string(),
                         Self::FATAL_PARAMETER_EXPANSION_STATUS,
                     ));
@@ -1159,7 +1174,11 @@ impl Executor {
             // substitution in GNU Bash.
             if let Some(length_name) = inner.strip_prefix('#') {
                 if !Self::is_valid_length_parameter_name(length_name) {
-                    return Some((format!("${{{inner}}}"), "bad substitution".to_string(), 1));
+                    return Some((
+                        crate::executor::expand_word::bad_substitution_display(word),
+                        "bad substitution".to_string(),
+                        1,
+                    ));
                 }
             }
             // Indirect expansions accept a simple parameter reference, an
@@ -1168,7 +1187,11 @@ impl Executor {
             // is a bad substitution in GNU.
             if let Some(indirect) = self.indirect_parameter_body(inner) {
                 if !Self::is_valid_indirect_expression(indirect) {
-                    return Some((format!("${{{inner}}}"), "bad substitution".to_string(), 1));
+                    return Some((
+                        crate::executor::expand_word::bad_substitution_display(word),
+                        "bad substitution".to_string(),
+                        1,
+                    ));
                 }
                 // Value-dependent GNU diagnostics for the plain indirect
                 // form ${!name} (subst.c parameter_brace_expand_indir): an
@@ -1417,7 +1440,11 @@ impl Executor {
             if inner.chars().next().is_some_and(char::is_whitespace)
                 && !word_contains_current_shell_command_substitution(word)
             {
-                return Some((format!("${{{inner}}}"), "bad substitution".to_string(), 1));
+                return Some((
+                    crate::executor::expand_word::bad_substitution_display(word),
+                    "bad substitution".to_string(),
+                    1,
+                ));
             }
             if let Some((name, message, require_non_empty)) =
                 parse_parameter_error_operator(inner, self.posix_mode_enabled())

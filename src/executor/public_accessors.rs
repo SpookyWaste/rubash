@@ -1434,7 +1434,9 @@ impl Executor {
     /// __RUBASH_SHELL_NAME (argv[0], main.rs) is consulted before the
     /// BASH_ARGV0 fallback. rubash#162 N6: this prolog used to print the
     /// full executable path.
-    fn interactive_shell_basename(env_vars: &HashMap<String, String>) -> String {
+    pub(in crate::executor) fn interactive_shell_basename(
+        env_vars: &HashMap<String, String>,
+    ) -> String {
         let name = env_vars
             .get("__RUBASH_SHELL_NAME")
             .or_else(|| env_vars.get("BASH_ARGV0"))

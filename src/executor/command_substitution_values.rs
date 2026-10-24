@@ -594,6 +594,26 @@ impl Executor {
         Vec::new()
     }
 
+    /// Per-element values of an `AtModified` segment (rubash#1456): the
+    /// segment body is `<target><op>` where the admission gate already
+    /// proved the target is `@` or `name[@]` and the operator is one of
+    /// the pattern/replacement/case forms. Resolution reuses the exact
+    /// helpers the whole-word forms use — `positional_modified_word_values`
+    /// for `@` (quoted `@` semantics: the operator applies per parameter)
+    /// and `array_pattern_word_values` for `name[@]` — so the per-element
+    /// results are identical to the standalone `"${...}"` expansion; only
+    /// the enclosing word's affix attachment differs (handled by the
+    /// segment expander).
+    pub(in crate::executor) fn at_modified_segment_values(&self, inner: &str) -> Vec<String> {
+        if inner.starts_with('@') {
+            return self
+                .positional_modified_word_values(inner, true)
+                .unwrap_or_default();
+        }
+        self.array_pattern_word_values(&format!("${{{inner}}}"), true)
+            .unwrap_or_default()
+    }
+
     pub(in crate::executor) fn quoted_positional_at_word_values_with_raw(
         &self,
         word: &str,
@@ -625,6 +645,9 @@ impl Executor {
                         QuotedPositionalAtSegment::ArrayAtSlice(inner, _)
                         | QuotedPositionalAtSegment::PositionalAtSlice(inner, _) => {
                             self.at_slice_segment_values(inner)
+                        }
+                        QuotedPositionalAtSegment::AtModified(inner, _) => {
+                            self.at_modified_segment_values(inner)
                         }
                         // GNU string_list_dollar_star: `[*]` joins the
                         // elements with IFS[0] into one word.
@@ -1143,6 +1166,18 @@ enum QuotedPositionalAtSegment {
     /// same GNU parameter_brace_substring arm. Same fan-out contract as
     /// `ArrayAtSlice`.
     PositionalAtSlice(String, bool),
+    /// A `"${name[@]<op>}"`/`${<op>}` span with a per-element operator —
+    /// pattern removal (`%`/`%%`/`#`/`##`), pattern replacement (`/`),
+    /// or case modification (`^`/`,`): GNU subst.c:10119-10128
+    /// parameter_brace_expand runs chk_atstar (subst.c:7635-7639) before
+    /// the operator switch, so the @-list word boundaries survive the
+    /// operator and each element is transformed separately
+    /// (subst.c:9777 parameter_brace_expand's per-element operator loop);
+    /// affixes attach to the first/last element word exactly like the
+    /// unsliced list (rubash#1456). Carries the inner `${...}` body plus
+    /// the `quoted` split rule; resolution reuses the whole-word
+    /// per-element operator helpers.
+    AtModified(String, bool),
     /// A `"${name[*]}"`-class span reached through indirection (`${!name}`
     /// whose value is `arr[*]`, or a `$ref` nameref to `arr[*]`): GNU
     /// joins the elements with IFS[0] into one word (subst.c
@@ -1226,6 +1261,48 @@ fn at_slice_segment_body(inner: &str) -> Option<AtSliceTarget> {
         return None;
     }
     at_slice_rest_admitted(rest).then_some(AtSliceTarget::Array)
+}
+
+/// Validate an `${...}` inner body as a per-element-operator word-list
+/// source for the segment scanners (`name[@]%pat`, `name[@]/pat/repl`,
+/// `name[@]^^`, `@%pat`, ...; rubash#1456).
+///
+/// GNU anchor — subst.c:10119-10128 parameter_brace_expand calls
+/// chk_atstar (subst.c:7635-7639) BEFORE the operator switch, so a quoted
+/// `[@]`/`@` target keeps quoted_dollar_at and the operator is applied
+/// per element (subst.c:9777 parameter_brace_expand's array loop), never
+/// to the space-joined string the generic path produces.
+///
+/// Admission is a whitelist (rubash#117 discipline), mirroring
+/// `at_slice_segment_body`: the body must parse through one of the three
+/// pure text operator parsers the whole-word helpers themselves use, and
+/// its target must be exactly `@` or `name[@]`. Declined: `[*]` targets
+/// (GNU joins those into one word — the String path already does),
+/// `:-`-family operators (no per-element loop in GNU; the word stays a
+/// single value on the braced-alternate path), `${name[@]@Q}`-style
+/// transforms (different resolver), `!`-indirect targets, and bodies
+/// containing `$(` or a backtick anywhere (the `&self` segment resolver
+/// cannot execute command substitutions; those stay on the generic path).
+fn at_modified_segment_body(inner: &str) -> bool {
+    if inner.contains("$(") || inner.contains('`') {
+        return false;
+    }
+    let target_ok = |var_name: &str| {
+        var_name == "@"
+            || var_name
+                .strip_suffix("[@]")
+                .is_some_and(|name| is_shell_name(name))
+    };
+    if let Some((var_name, _, _)) = parse_indirect_pattern_removal(inner) {
+        return target_ok(var_name);
+    }
+    if let Some((var_name, _, _, _)) = parse_parameter_replacement(inner) {
+        return target_ok(var_name);
+    }
+    if let Some((var_name, _, _)) = parse_parameter_case_mod(inner) {
+        return target_ok(var_name);
+    }
+    false
 }
 
 /// Shared admission for the offset/length region after `@:`/`[@]:` — see
@@ -1466,6 +1543,24 @@ fn quoted_positional_at_segments(
                             literal_start = index;
                             continue;
                         }
+                        // Per-element-operator word-list source
+                        // (`pre${arr[@]%.txt}`, rubash#1456): same
+                        // chk_atstar anchor as the slice gate above;
+                        // unquoted results field-split like the unsliced
+                        // list (`quoted == false` contract).
+                        let inner_body: String = inner.iter().collect();
+                        if at_modified_segment_body(&inner_body) {
+                            push_quoted_positional_literal_segment(
+                                &mut segments,
+                                &chars[literal_start..index],
+                                false,
+                            )?;
+                            segments.push(QuotedPositionalAtSegment::AtModified(inner_body, false));
+                            saw_positional_at = true;
+                            index = raw[..=close_byte].chars().count();
+                            literal_start = index;
+                            continue;
+                        }
                         index = raw[..=close_byte].chars().count();
                         continue;
                     }
@@ -1646,6 +1741,22 @@ fn quoted_body_positional_at_segments(
                                         )
                                     }
                                 });
+                                saw_positional_at = true;
+                                index += 2 + rest[..=end_byte].chars().count();
+                                piece_start = index;
+                                continue;
+                            }
+                            // Per-element-operator word-list source
+                            // inside the quoted body
+                            // (`"pre${arr[@]%.txt}"`, rubash#1456): same
+                            // brace-aware true inner, same chk_atstar
+                            // anchor as the slice gate above.
+                            if at_modified_segment_body(true_inner) {
+                                push_body_piece(&mut segments, &body[piece_start..index])?;
+                                segments.push(QuotedPositionalAtSegment::AtModified(
+                                    true_inner.to_string(),
+                                    true,
+                                ));
                                 saw_positional_at = true;
                                 index += 2 + rest[..=end_byte].chars().count();
                                 piece_start = index;
@@ -1843,6 +1954,7 @@ where
                             | Some(QuotedPositionalAtSegment::ArrayAt(..))
                             | Some(QuotedPositionalAtSegment::ArrayAtSlice(..))
                             | Some(QuotedPositionalAtSegment::PositionalAtSlice(..))
+                            | Some(QuotedPositionalAtSegment::AtModified(..))
                     )
                 {
                     // Only an unquoted literal directly after $@ emulates the
@@ -1859,6 +1971,7 @@ where
             | QuotedPositionalAtSegment::ArrayAt(_, quoted)
             | QuotedPositionalAtSegment::ArrayAtSlice(_, quoted)
             | QuotedPositionalAtSegment::PositionalAtSlice(_, quoted)
+            | QuotedPositionalAtSegment::AtModified(_, quoted)
             | QuotedPositionalAtSegment::ArrayStar(_, quoted) => {
                 saw_positional_at = true;
                 let mut values = resolve_list(segment);

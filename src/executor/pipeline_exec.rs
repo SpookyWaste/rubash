@@ -4071,6 +4071,15 @@ impl Executor {
                     .iter()
                     .map(|word| self.expand_word(word))
                     .collect::<Vec<_>>();
+                // GNU has no sed builtin: a bare `sed` resolves through
+                // PATH (findcmd.c), so when a sed IS resolvable the
+                // internal bridge must not shadow it — a user or test
+                // harness sed earlier in PATH is the program GNU would
+                // run (rubash#1462). The bridge only serves the
+                // no-sed-on-PATH case it was built for.
+                if find_user_command("sed", &self.shell_state.env_vars).is_some() {
+                    return self.execute_external_pipeline_stage(command, input, stdin_inherit);
+                }
                 if let Some(output) = apply_simple_sed_args(input, &args) {
                     Ok(Some((output, String::new(), 0)))
                 } else {

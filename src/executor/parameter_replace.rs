@@ -782,8 +782,12 @@ fn is_ansic_printable(ch: char) -> bool {
         (0x20..=0x7e).contains(&(ch as u8))
     } else {
         // Non-ASCII bytes go through mbrtowc + iswprint in GNU; valid UTF-8
-        // non-ASCII code points that are not control characters print.
-        !ch.is_control()
+        // non-ASCII code points that are not control characters print —
+        // but only in a UTF-8 locale: ansic_quote's multibyte pass-through
+        // (strtrans.c:266-282) is the UTF-8-locale branch, and under
+        // LC_ALL=C every byte >= 0x80 is escaped octal instead
+        // (rubash#1464).
+        crate::locale::is_utf8() && !ch.is_control()
     }
 }
 

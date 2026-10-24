@@ -378,7 +378,12 @@ impl Executor {
                     &self.prompt_quote_for_expansion(&self.prompt_working_directory(true)),
                 ),
                 Some('l') => output.push_str(&prompt_terminal_basename(&self.shell_state.env_vars)),
-                Some('s') => output.push_str("bash"),
+                // GNU prompt.c decode_prompt_string: \s is the shell name —
+                // base_pathname(shell_name) from argv[0] (shell.c
+                // set_shell_name), NOT a hardcoded "bash" (rubash#1484).
+                Some('s') => output.push_str(&Self::interactive_shell_basename(
+                    &self.shell_state.env_vars,
+                )),
                 Some('v') => output.push_str(&prompt_short_version(&self.shell_state.env_vars)),
                 Some('V') => output.push_str(&prompt_release_version(&self.shell_state.env_vars)),
                 Some('j') => output.push_str(&self.prompt_job_count().to_string()),

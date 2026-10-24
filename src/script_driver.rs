@@ -2270,6 +2270,7 @@ pub(crate) fn run_source_pre_lexed_with_line_offset(
         redirect_cmd,
         diagnostic_text,
         Some(pre_lexed),
+        false,
     )
 }
 
@@ -2579,6 +2580,34 @@ pub fn run_source_with_line_offset(
         redirect_cmd,
         diagnostic_text,
         None,
+        false,
+    )
+}
+
+/// Run a complete-command PREFIX whose caller owns the pending
+/// diagnostic: the prefix's own unclosed-EOF route must still refuse
+/// its incomplete tail (and run ITS prefix), but must not print —
+/// GNU's reader reaches EOF once and reports once (rubash#1485: when
+/// later lines keep toggling quote state, the generic route's prefix
+/// itself ends mid-quote, and the recursive report duplicated the
+/// `unexpected EOF` diagnostic once per toggling segment).
+fn run_source_prefix_diagnostic_owned(
+    executor: &mut Executor,
+    input: &str,
+    interactive: bool,
+    line_offset: usize,
+    redirect_cmd: Option<&CommandNode>,
+    diagnostic_text: Option<&str>,
+) -> i32 {
+    run_source_impl(
+        executor,
+        input,
+        interactive,
+        line_offset,
+        redirect_cmd,
+        diagnostic_text,
+        None,
+        true,
     )
 }
 
@@ -2615,7 +2644,7 @@ fn report_heredoc_overflow_fatal(
     let prefix_complete = prefix.trim().is_empty()
         || !crate::lexer::has_unclosed_input_syntax_posix(&prefix, parse_posix);
     if prefix_complete && !prefix.trim().is_empty() {
-        let _ = run_source_with_line_offset(
+        let _ = run_source_prefix_diagnostic_owned(
             executor,
             &prefix,
             interactive,
@@ -2640,7 +2669,19 @@ fn run_source_impl(
     redirect_cmd: Option<&CommandNode>,
     diagnostic_text: Option<&str>,
     pre_lexed: Option<Vec<Token>>,
+    suppress_unclosed_diagnostic: bool,
 ) -> i32 {
+    // rubash#1485: a prefix run hands diagnostic ownership to its caller
+    // (run_source_prefix_diagnostic_owned); every report inside the
+    // unclosed-diagnostics route below goes through this gate so the
+    // caller's single EOF report is the only one printed.
+    macro_rules! unclosed_report {
+        ($($t:tt)*) => {
+            if !suppress_unclosed_diagnostic {
+                eprintln!($($t)*);
+            }
+        };
+    }
     // TODO(shell.c/eval.c/parse.y): GNU Bash parses complete command streams,
     // including pending here-documents, rather than executing script files one
     // physical line at a time. This keeps batch input whole; interactive mode
@@ -2669,7 +2710,7 @@ fn run_source_impl(
                 String::new()
             };
             if !prefix.trim().is_empty() {
-                let _ = run_source_with_line_offset(
+                let _ = run_source_prefix_diagnostic_owned(
                     executor,
                     &prefix,
                     interactive,
@@ -2679,7 +2720,7 @@ fn run_source_impl(
                 );
             }
             executor.mark_parse_error();
-            eprintln!(
+            unclosed_report!(
                 "{}unexpected EOF while looking for matching `{quote}'",
                 executor.parser_error_prefix_for_line(open_line + line_offset)
             );
@@ -2745,7 +2786,7 @@ fn run_source_impl(
                 String::new()
             };
             if !prefix.trim().is_empty() {
-                let _ = run_source_with_line_offset(
+                let _ = run_source_prefix_diagnostic_owned(
                     executor,
                     &prefix,
                     interactive,
@@ -2755,7 +2796,7 @@ fn run_source_impl(
                 );
             }
             executor.mark_parse_error();
-            eprintln!(
+            unclosed_report!(
                 "{}unexpected EOF while looking for matching `{closer}'",
                 executor.parser_error_prefix_for_line(open_line + line_offset)
             );
@@ -2793,7 +2834,7 @@ fn run_source_impl(
                 String::new()
             };
             if !prefix.trim().is_empty() {
-                let _ = run_source_with_line_offset(
+                let _ = run_source_prefix_diagnostic_owned(
                     executor,
                     &prefix,
                     interactive,
@@ -2803,7 +2844,7 @@ fn run_source_impl(
                 );
             }
             executor.mark_parse_error();
-            eprintln!(
+            unclosed_report!(
                 "{}unexpected EOF while looking for matching `{closure}'",
                 executor.parser_error_prefix_for_line(eof.report_line + line_offset),
                 closure = eof.closer
@@ -2830,7 +2871,7 @@ fn run_source_impl(
                 .unwrap_or_default(),
         };
         if !prefix.trim().is_empty() {
-            let _ = run_source_with_line_offset(
+            let _ = run_source_prefix_diagnostic_owned(
                 executor,
                 &prefix,
                 interactive,
@@ -2882,7 +2923,7 @@ fn run_source_impl(
                     {
                         let report = line + line_offset;
                         let prefix = executor.parser_error_prefix_for_line(report);
-                        eprintln!("{prefix}syntax error near unexpected token `{token}'");
+                        unclosed_report!("{prefix}syntax error near unexpected token `{token}'");
                         // error.c print_offending_line is non-interactive
                         // only (parse.y:6865) — the same gate the parser's
                         // source echoes use.
@@ -2895,7 +2936,7 @@ fn run_source_impl(
                                 .lines()
                                 .nth(line.saturating_sub(1))
                                 .unwrap_or_default();
-                            eprintln!("{prefix}`{offending}'");
+                            unclosed_report!("{prefix}`{offending}'");
                         }
                         executor.errexit_live_at_diagnostic();
                         return 2;
@@ -2921,7 +2962,7 @@ fn run_source_impl(
                     // the pre-merge branch behavior the issue390/issue413
                     // pins exercise.)
                     if crate::lexer::dparen_arith_group_never_closes(input, open_line) {
-                        eprintln!(
+                        unclosed_report!(
                             "{}unexpected EOF while looking for matching `)'",
                             executor.parser_error_prefix_for_line(global_open)
                         );
@@ -2937,7 +2978,7 @@ fn run_source_impl(
                     // (parse.y:489-490 only forces 2 on a still-zero
                     // status). error.c:324-327 forces 2 under live errexit.
                     if crate::lexer::dparen_subshell_reparse_compound_eof(input, open_line) {
-                        eprintln!(
+                        unclosed_report!(
                             "{}unexpected EOF while looking for matching `)'",
                             executor.parser_error_prefix_for_line(global_open)
                         );
@@ -2946,13 +2987,13 @@ fn run_source_impl(
                         }
                         return 1;
                     }
-                    eprintln!(
+                    unclosed_report!(
                         "{}syntax error: unexpected end of file from `(' command on line {global_open}",
                         executor.parser_error_prefix_for_line(global_eof)
                     );
                 } else {
                     let reported = if report_open { global_open } else { global_eof };
-                    eprintln!(
+                    unclosed_report!(
                         "{}unexpected EOF while looking for matching `{close}'",
                         executor.parser_error_prefix_for_line(reported)
                     );
@@ -2967,7 +3008,7 @@ fn run_source_impl(
                     return 1;
                 }
             }
-            None => eprintln!("rubash: syntax error: unexpected end of file"),
+            None => unclosed_report!("rubash: syntax error: unexpected end of file"),
         }
         return 2;
     }

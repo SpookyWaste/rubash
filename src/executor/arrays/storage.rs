@@ -829,7 +829,11 @@ pub(crate) fn ansic_shouldquote(value: &str) -> bool {
             continue;
         }
         match decode_utf8_char(&bytes[index..]) {
-            Some(ch) if is_printable_wide(ch) => index += ch.len_utf8(),
+            // The multibyte pass-through is the UTF-8-locale branch of
+            // strtrans.c:351-354; under a non-UTF-8 locale (LC_ALL=C)
+            // every high-bit byte is non-printing and forces quoting
+            // (rubash#1464).
+            Some(ch) if crate::locale::is_utf8() && is_printable_wide(ch) => index += ch.len_utf8(),
             _ => return true,
         }
     }
@@ -896,7 +900,11 @@ pub(crate) fn ansic_quote(value: &str) -> String {
                 index += 1;
             }
             _ if byte >= 0x80 => match decode_utf8_char(&bytes[index..]) {
-                Some(ch) if is_printable_wide(ch) => {
+                // Whole-character literal output is the UTF-8-locale
+                // branch (strtrans.c:266-282); under a non-UTF-8 locale
+                // each high-bit byte falls to the octal arm below, one
+                // byte at a time (rubash#1464).
+                Some(ch) if crate::locale::is_utf8() && is_printable_wide(ch) => {
                     out.push(ch);
                     index += ch.len_utf8();
                 }

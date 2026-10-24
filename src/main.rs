@@ -403,9 +403,12 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
     // trailing -r as a positional and drop the restriction.
     let mut read_from_stdin = false;
     let mut stdin_positionals: Vec<String> = Vec::new();
+    // rubash#1480: after a `--`/`-` marker every remaining argv is an
+    // operand; the tuple scrutinee routes them all to the `script` arm.
+    let mut options_ended = false;
     while index < args.len() {
-        match args[index].as_str() {
-            "-o" | "+o" => {
+        match (options_ended, args[index].as_str()) {
+            (false, "-o") | (false, "+o") => {
                 if let Some(option) = args.get(index + 1) {
                     if !executor.is_shell_option(option) {
                         // GNU shell.c:940-941: set_minus_o_option failure
@@ -438,11 +441,11 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
                     index += 1;
                 }
             }
-            "-i" => {
+            (false, "-i") => {
                 executor.set_env("__RUBASH_INTERACTIVE", "1");
                 index += 1;
             }
-            "--rcfile" | "--init-file" => {
+            (false, "--rcfile") | (false, "--init-file") => {
                 if let Some(path) = args.get(index + 1) {
                     init_file = Some(path.clone());
                     index += 2;
@@ -451,7 +454,7 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
                     return 2;
                 }
             }
-            "--debugger" => {
+            (false, "--debugger") => {
                 // Consumed by parse_long_options above (this arm exists for
                 // the respawn/pre-scan shapes that skip it). GNU
                 // shell.c:257: debugging_mode only; the starter runs via
@@ -459,20 +462,20 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
                 executor.set_env("__RUBASH_DEBUGGER_MODE", "1");
                 index += 1;
             }
-            "--posix" => {
+            (false, "--posix") => {
                 // GNU shell.c:566-572: --posix runs sv_strict_posix (the
                 // posix_vars walk) — carried by set::set_shell_option.
                 executor.set_shell_option("posix", true);
                 index += 1;
             }
-            "--login" | "-l" => {
+            (false, "--login") | (false, "-l") => {
                 // GNU shell.c:497-503: --login/-l flips LOGIN_SHELL; a login
                 // shell accepts the logout builtin and runs ~/.bash_logout
                 // at exit.
                 executor.mark_login_shell();
                 index += 1;
             }
-            "--noprofile" | "--norc" => {
+            (false, "--noprofile") | (false, "--norc") => {
                 // shell.c:269-270 (--norc/--noprofile -> no_rc/no_profile):
                 // recorded so run_startup_files can honor the skips. On a
                 // login shell --norc does not inhibit the profile chain and
@@ -485,7 +488,7 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
                 }
                 index += 1;
             }
-            "-O" | "+O" => {
+            (false, "-O") | (false, "+O") => {
                 if let Some(option) = args.get(index + 1) {
                     if !executor.set_shopt_option(option, args[index] == "-O") {
                         // GNU shell.c:2118-2125 (run_shopt_alist) ->
@@ -519,7 +522,7 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
                     index += 1;
                 }
             }
-            "-c" => {
+            (false, "-c") => {
                 // niubash #107 / GNU shell.c:857-889: keep parsing options —
                 // the first non-option argument encountered later in this
                 // loop becomes the command string (`script` arm). A `-c`
@@ -528,25 +531,29 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
                 pending_command = true;
                 index += 1;
             }
-            "-s" => {
+            (false, "-s") => {
                 read_from_stdin = true;
                 index += 1;
             }
-            "--" | "-" => {
+            (false, "--") | (false, "-") => {
                 // GNU shell.c:905-911: a lone - or -- ends option parsing;
-                // the next argv is the script file.
+                // the next argv is the script file. rubash#1480: the marker
+                // must END option processing — without the flag the loop
+                // went on to parse `-c` as an option (`rubash -- -c '...'`
+                // executed the string instead of failing on the file).
+                options_ended = true;
                 index += 1;
             }
-            option if apply_cli_shell_flags(executor, option) => {
+            (false, option) if apply_cli_shell_flags(executor, option) => {
                 index += 1;
             }
-            script => {
+            (_, script) => {
                 // niubash #107: GNU parses options until the first
                 // non-option argument; with a pending `-c`, that argument is
                 // the command string and the rest of argv becomes $0, $1, ...
                 // (shell.c:523-528). Option-looking arguments still get the
                 // GNU invalid-option check first (`bash -c -Z ...`).
-                if script.starts_with('-') || script.starts_with('+') {
+                if !options_ended && (script.starts_with('-') || script.starts_with('+')) {
                     let sign = &script[..1];
                     let invalid = script[1..]
                         .chars()
@@ -1640,10 +1647,12 @@ fn run_startup_files(executor: &mut Executor, rc_override: Option<&str>) -> Opti
     let no_profile = executor.get_env("__RUBASH_NO_PROFILE").as_deref() == Some("1");
     let no_rc = executor.get_env("__RUBASH_NO_RC").as_deref() == Some("1");
     let home = executor.get_env("HOME").unwrap_or_default();
-    if home.is_empty() {
-        return None;
-    }
-    let files = {
+    // The profile/rc branches need HOME; the $BASH_ENV branch below does
+    // not (GNU sources it with HOME unset), so an empty HOME only empties
+    // the file list instead of returning early (rubash#1479).
+    let files = if home.is_empty() {
+        Vec::new()
+    } else {
         let exists = |path: &str| std::fs::metadata(executor.resolve_shell_path(path)).is_ok();
         if login {
             login_profile_branch(&home, no_profile, exists)
@@ -1668,6 +1677,17 @@ fn run_startup_files(executor: &mut Executor, rc_override: Option<&str>) -> Opti
         let status = run_init_file(executor, &file);
         if executor.take_exit_jump_pending() {
             return Some(status);
+        }
+    }
+    // GNU shell.c run_startup_files / maybe_execute_env_file: every
+    // non-interactive shell — login shells included, after the profile
+    // chain — sources $BASH_ENV (rubash#1479).
+    if !interactive {
+        if let Some(file) = rubash::invocation::bash_env_file(executor) {
+            let status = run_init_file(executor, &file);
+            if executor.take_exit_jump_pending() {
+                return Some(status);
+            }
         }
     }
     None

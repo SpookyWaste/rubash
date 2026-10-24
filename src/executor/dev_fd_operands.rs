@@ -318,7 +318,32 @@ impl Executor {
                         .input_snapshot_bytes(fd)
                         .map(|(data, offset)| data[offset..].to_vec())
                         .unwrap_or_default(),
-                    _ => continue,
+                    _ => {
+                        // Output process-substitution endpoints
+                        // (`>(...)` spelled as an operand word,
+                        // rubash#1460): the endpoint is backed by a real
+                        // temp file the shell feeds to the body after the
+                        // command finishes, but the child only receives
+                        // the `/dev/fd/N` spelling — with no descriptor N
+                        // in the child, opening it fails ENOENT
+                        // (`tee >(cat > out)` wrote nothing). Open the
+                        // backing file here and pin it at fd N in the
+                        // child through the same attach machinery as the
+                        // read side; the child's opens of /dev/fd/N then
+                        // land on the file and the post-command drain
+                        // sees the bytes. GNU subst.c:6362
+                        // process_substitute hands the child the real
+                        // pipe write end under the same /dev/fd/N name.
+                        if let Some(FdWriteEndpoint::ProcessSubstitution { path, .. }) =
+                            &entry.write
+                        {
+                            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
+                                use std::os::unix::io::IntoRawFd;
+                                m.unix_fd_attach.push((fd, file.into_raw_fd()));
+                            }
+                        }
+                        continue;
+                    }
                 };
                 m.consume_fds.push(fd);
                 let Ok((read_end, write_end)) = crate::fd::create_capture_pipe() else {

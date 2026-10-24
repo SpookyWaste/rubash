@@ -944,7 +944,16 @@ impl Drop for PendingDiagnosticWordGuard {
 /// words quote-decoded before re-expansion carry data sentinels that
 /// must read back as the source characters like GNU's diagnostic.
 pub(in crate::executor) fn bad_substitution_display(word: &str) -> String {
+    // GNU cites the word as the lexer stored it (subst.c:10278): the
+    // `$` of a `$'...'` / `$"..."` parameter-name sigil is consumed by
+    // the lexer, so a fragment cited at its `${` start keeps the quote
+    // but drops the dollar — `${$'x'}` is reported as `${'x'}`
+    // (rubash#1483). A `$'` that is literal data elsewhere in the word
+    // (e.g. inside double quotes) keeps its dollar, so the replacement
+    // is anchored at the fragment start.
     crate::locale::decode_to_visible_text(word)
+        .replace("${$'", "${'")
+        .replace("${$\"", "${\"")
 }
 
 /// The parameter-name terminator set GNU scans for in

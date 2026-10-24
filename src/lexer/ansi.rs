@@ -340,6 +340,17 @@ fn push_unicode_ansi_c(output: &mut String, value: Option<(u32, String)>, prefix
 }
 
 fn push_ansi_c_codepoint(output: &mut String, value: u32) {
+    // Values with the top bit set (>= 0x80000000) produce NOTHING in every
+    // locale (rubash#1465): lib/sh/unicode.c u32cconv reaches wctomb only
+    // for `c <= 0x7fffffff`, and its u32toutf8 length table tops out below
+    // 0x80000000 (`wc < 0x080000000` is the widest, 6-byte, class), so the
+    // conversion yields zero bytes before the locale split is even
+    // consulted — `$'\UFFFFFFFF'` and `$'a\U80000000b'` lose the escape
+    // entirely. This drop must precede the #353 locale gate below, which
+    // would otherwise keep the escape literal under LC_ALL=C.
+    if value >= 0x8000_0000 {
+        return;
+    }
     // GNU strtrans.c:161-181 decodes $'\uNNNN'/'\UNNNNNNNN' through the same
     // u32cconv as printf (lib/sh/unicode.c:239): wctomb on a 4-byte-wchar_t
     // UTF-8 platform encodes every value <= 0x7fffffff, including surrogates
