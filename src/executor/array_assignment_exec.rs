@@ -387,6 +387,18 @@ impl Executor {
                 } else {
                     value.to_string()
                 };
+                // rubash#1400: the case attribute applies on an assoc
+                // element store too (GNU variables.c bind_assoc_variable
+                // runs the value through the att_uppercase/att_lowercase
+                // conversion, exactly like the indexed branch's #1401
+                // handling below) — `declare -uA h; h[k]=abc` stores ABC.
+                let stored = if attrs.uppercase {
+                    stored.to_uppercase()
+                } else if attrs.lowercase {
+                    stored.to_lowercase()
+                } else {
+                    stored
+                };
                 // rubash#618 budget: a fast append is scheduled by the
                 // per-variable budget, but the budget is spent only by an
                 // OVERWRITE. A new key adds a segment the mirror did not
@@ -492,6 +504,16 @@ impl Executor {
             // declare -Ai chaff; chaff[one]=3+7 stores 10, not 3+7).
             let value = if attrs.integer {
                 self.eval_integer_assignment_value(&value).to_string()
+            } else {
+                value
+            };
+            // rubash#1400: case attribute on the canonical path as well —
+            // this `value` is the final stored text for both `=` and the
+            // `+=` combined result (GNU converts the post-append value).
+            let value = if attrs.uppercase {
+                value.to_uppercase()
+            } else if attrs.lowercase {
+                value.to_lowercase()
             } else {
                 value
             };
