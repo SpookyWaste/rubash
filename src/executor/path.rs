@@ -2202,6 +2202,95 @@ fn repair_windows_drive_slash_argument(arg: &str) -> Option<String> {
     Some(repaired)
 }
 
+/// unixwin/rubash#1506: the native-child spelling of the POSIX null
+/// device. Returns the rewritten argument when `arg` carries the exact
+/// token `/dev/null` in a value position, or None when the word is not a
+/// null-device operand.
+///
+/// GNU hands argv verbatim to execve (execute_cmd.c:6119-6127
+/// shell_execve); the rewrite exists only because a NATIVE Windows child
+/// has no POSIX layer: it opens the literal name it is given, and no file
+/// named `/dev/null` exists on a Windows volume, so the open fails
+/// (`curl -o /dev/null` exits 23, "Failed writing received data").
+/// MSYS2/Cygwin runtimes perform the same single-token conversion at
+/// their Win32 boundary for native children, and Git Bash's observed
+/// output is the reporter's reference: `python -c ... /tmp/x /dev/null`
+/// arrives as `['C:/Users/<user>/AppData/Local/Temp/x', 'nul']` — the
+/// spelling emitted here is that lowercase `nul` (the Win32 device name
+/// is case-insensitive; the shell-internal path funnel
+/// `shell_path_to_windows` keeps its own `NUL` PathBuf spelling for the
+/// opens the SHELL performs, which is a different boundary).
+///
+/// This is deliberately the ONLY /dev/* member rewritten, and only at
+/// this funnel (native children; the legacy dialect included). The
+/// fd-bound devices stay verbatim per rubash#120: /dev/stdin, /dev/stdout,
+/// /dev/stderr, /dev/fd/N and /dev/tty name the CHILD's descriptors, and
+/// a device-name rewrite would pin the child to the console instead of
+/// its actual fd (`echo x | tee /dev/stdout | wc -l`). /dev/null names
+/// no descriptor — it is a sink, and `nul` is exactly that sink — so the
+/// #120 rationale does not apply to it. A POSIX-aware child never
+/// reaches this funnel with the STANDALONE token:
+/// `windows_shell_namespace_argument` classifies /dev/* as shell-tree
+/// spellings the bundled coreutils resolve in-child (their native_path
+/// layer maps /dev/null -> NUL), and shell-wrapped / command-processor
+/// children keep verbatim argv by their own branches in
+/// external_command_for_named_program. The attached forms below do not
+/// start with `/`, so they are not shell-namespace spellings and DO
+/// reach this funnel for every non-verbatim class; rewriting them is
+/// still safe for a POSIX-aware child, because `nul` is the very Win32
+/// device name its own layer would resolve the token to.
+///
+/// Value positions covered, mirroring the MSYS attached-value forms:
+/// the whole word (`/dev/null`), an assignment / long-option value
+/// (`FOO=/dev/null`, `--output=/dev/null`), and a short-option attached
+/// value (`-o/dev/null`). The general contract exemption for attached
+/// `--opt=/x` PATH values (docs/windows-path-contract.md L2: switch
+/// tokens are not rewritten) is untouched — it governs path values,
+/// whose translation is a root-map heuristic; `/dev/null` is one fixed
+/// device token with exactly one native spelling, not a heuristic.
+/// Matching is exact, like the existing device table
+/// (`shell_path_to_windows`, `is_shell_null_device`): case variants
+/// (`/DEV/NULL`), a trailing slash (`/dev/null/`), and longer paths that
+/// merely contain the component (`/foo/dev/null`, `/dev/null/x`,
+/// `/dev/nullfoo`, relative `dev/null`) are NOT rewritten.
+fn native_null_device_argument(arg: &str) -> Option<String> {
+    if arg == "/dev/null" {
+        return Some("nul".to_string());
+    }
+    // Assignment / long-option attached value: the token after the last
+    // '='. The prefix must be a plausible name/switch — non-empty, with
+    // no path separator, whitespace or quote — so path-, sentence- or
+    // quoted-literal-shaped data that happens to end in `=/dev/null` is
+    // not rewritten.
+    if let Some(eq) = arg.rfind('=') {
+        let prefix = &arg[..eq];
+        if &arg[eq + 1..] == "/dev/null"
+            && !prefix.is_empty()
+            && !prefix.contains('/')
+            && !prefix.contains('\\')
+            && !prefix.contains('"')
+            && !prefix.contains('\'')
+            && !prefix.contains(char::is_whitespace)
+        {
+            return Some(format!("{prefix}=nul"));
+        }
+        return None;
+    }
+    // Short-option attached value: `-` + option letters + `/dev/null`
+    // (`-o/dev/null`, bundled `-so/dev/null`). Long options (`--...`)
+    // only reach the token through the '=' form above.
+    if let Some(rest) = arg.strip_prefix('-') {
+        if !rest.starts_with('-') {
+            if let Some(opts) = rest.strip_suffix("/dev/null") {
+                if !opts.is_empty() && opts.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                    return Some(format!("-{opts}nul"));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn external_argument_path(arg: &str, env_vars: &HashMap<String, String>) -> String {
     if cfg!(windows) {
         if let Some(repaired) = repair_windows_drive_slash_argument(arg) {
@@ -2214,6 +2303,14 @@ fn external_argument_path(arg: &str, env_vars: &HashMap<String, String>) -> Stri
         // `\\n` as `/n` changes data arguments into paths under WINUXSH_ROOT.
         if arg.starts_with('\\') {
             return arg.to_string();
+        }
+        // rubash#1506: the null device has no Windows file under its
+        // POSIX spelling, so a native child (the only class that reaches
+        // this funnel without an in-child POSIX layer for the token)
+        // receives `nul`. See native_null_device_argument for the class
+        // boundary — /dev/std* and /dev/fd/N still pass through below.
+        if let Some(translated) = native_null_device_argument(arg) {
+            return translated;
         }
         let normalized = arg.replace('\\', "/");
         if !normalized.starts_with('/') {
@@ -2289,6 +2386,12 @@ fn windows_external_absolute_argument_needs_translation(
     // of its actual fd — `echo x | tee /dev/stdout | wc -l` must write the
     // pipe, not CONOUT$ (unixwin/rubash#120). Redirect targets still go
     // through shell_path_to_windows, which owns the fd/console mapping.
+    // Sole exception, handled before this predicate is consulted: the
+    // exact /dev/null token is rewritten to `nul` for native children in
+    // external_argument_path (native_null_device_argument, rubash#1506)
+    // — it names no descriptor, so the #120 fd rationale does not apply,
+    // and a native child has no layer that could resolve the POSIX
+    // spelling. The fd-bound members below stay literal for every class.
     if normalized == "/dev" || normalized.starts_with("/dev/") {
         return false;
     }
@@ -4893,6 +4996,129 @@ mod tests {
         // Empty-string operand (host-boundary quote collapse can reduce
         // `d="..."` to empty): stays empty, never gains `""` payload bytes.
         assert_eq!(external_argument_path("", &env), "");
+    }
+
+    // ---- rubash#1506: /dev/null for native children ------------------------
+
+    #[test]
+    fn native_null_device_argument_value_positions() {
+        // The reporter's shapes: a standalone operand, and the value of
+        // curl's separate `-o` (translated word-by-word at the funnel, so
+        // the pair is `-o` verbatim + the token rewritten).
+        assert_eq!(
+            native_null_device_argument("/dev/null").as_deref(),
+            Some("nul")
+        );
+        let pair: Vec<String> = ["-s", "-o", "/dev/null"]
+            .into_iter()
+            .map(|arg| native_null_device_argument(arg).unwrap_or_else(|| arg.to_string()))
+            .collect();
+        assert_eq!(pair, ["-s", "-o", "nul"]);
+        // Short-option attached value, plain and bundled.
+        assert_eq!(
+            native_null_device_argument("-o/dev/null").as_deref(),
+            Some("-onul")
+        );
+        assert_eq!(
+            native_null_device_argument("-so/dev/null").as_deref(),
+            Some("-sonul")
+        );
+        assert_eq!(
+            native_null_device_argument("-o=/dev/null").as_deref(),
+            Some("-o=nul")
+        );
+        // Assignment-shaped and long-option attached values.
+        assert_eq!(
+            native_null_device_argument("FOO=/dev/null").as_deref(),
+            Some("FOO=nul")
+        );
+        assert_eq!(
+            native_null_device_argument("--output=/dev/null").as_deref(),
+            Some("--output=nul")
+        );
+    }
+
+    #[test]
+    fn native_null_device_argument_rejects_lookalikes() {
+        for arg in [
+            // Case variants: the existing device table matches /dev/null
+            // exactly (only the native name NUL folds case).
+            "/DEV/NULL",
+            "/Dev/Null",
+            "/dev/NULL",
+            // Trailing slash / doubled separators are not the token.
+            "/dev/null/",
+            "/dev/null//",
+            "/dev//null",
+            // Paths that merely contain the component, and relatives.
+            "/foo/dev/null",
+            "/dev/null/x",
+            "/dev/nullfoo",
+            "/dev/null.bak",
+            "dev/null",
+            "./dev/null",
+            // Quoted literals: the quote bytes are data, not a path word
+            // (quote removal happens in the lexer, before this funnel).
+            "\"/dev/null\"",
+            "'/dev/null'",
+            "\"FOO=/dev/null\"",
+            // The token embedded in script/sentence data.
+            "open('/dev/null')",
+            "send it to /dev/null please",
+            "a=/dev/null b",
+            // Assignment-shaped data whose prefix is not a name/switch:
+            // empty, path-shaped, or whitespace-bearing.
+            "=/dev/null",
+            "/tmp/x=/dev/null",
+            "my file=/dev/null",
+            // The fd-bound siblings keep the rubash#120 verbatim rule:
+            // they name the child's descriptors, not a sink.
+            "/dev/stdin",
+            "/dev/stdout",
+            "/dev/stderr",
+            "/dev/fd/0",
+            "/dev/fd/1",
+            "/dev/tty",
+            "/dev",
+            // Already-native spellings and non-operands pass through.
+            "nul",
+            "NUL",
+            "",
+            "-",
+            "--",
+            "-o",
+            "/",
+        ] {
+            assert_eq!(
+                native_null_device_argument(arg),
+                None,
+                "{arg:?} must not be rewritten"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_external_argument_path_translates_null_device() {
+        // The funnel itself: on Windows a native child receives `nul`,
+        // while the #120 fd-bound devices and lookalike paths stay
+        // verbatim. (Off Windows the funnel is the identity, so the
+        // cross-platform tests above pin the pure function instead.)
+        let env = HashMap::new();
+        assert_eq!(external_argument_path("/dev/null", &env), "nul");
+        assert_eq!(external_argument_path("-o/dev/null", &env), "-onul");
+        assert_eq!(external_argument_path("FOO=/dev/null", &env), "FOO=nul");
+        assert_eq!(
+            external_argument_path("--output=/dev/null", &env),
+            "--output=nul"
+        );
+        assert_eq!(external_argument_path("/dev/stdout", &env), "/dev/stdout");
+        assert_eq!(external_argument_path("/dev/fd/1", &env), "/dev/fd/1");
+        assert_eq!(
+            external_argument_path("/foo/dev/null", &env),
+            "/foo/dev/null"
+        );
+        assert_eq!(external_argument_path("/dev/null/", &env), "/dev/null/");
     }
 
     // ---- Option B (niubash#124(b)): per-child argv dialect -------------------
