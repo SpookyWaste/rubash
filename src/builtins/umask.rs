@@ -100,8 +100,15 @@ where
     if let Some(mode) = mode {
         let mask = if mode.starts_with(|ch: char| ch.is_ascii_digit()) {
             match parse_mask(mode) {
-                Some(mask) => mask,
-                None => {
+                // GNU builtins/umask.def umask_builtin hands the parsed
+                // value to umask(2), which keeps only the low 9 bits
+                // (mode & 0777); the value read back for display is the
+                // masked one (`umask 7777` -> 0777, rubash#1486). The
+                // in-process __RUBASH_UMASK store must mask identically.
+                // Values above 07777 are the builtin's own range error
+                // (GNU probe: 10000/12345 rejected, state unchanged).
+                Some(mask) if mask <= 0o7777 => mask & 0o777,
+                _ => {
                     writeln!(
                         stderr,
                         "{}umask: {mode}: octal number out of range",
