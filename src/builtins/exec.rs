@@ -121,6 +121,7 @@ pub(crate) fn process_replacement_enabled() -> bool {
 pub(crate) fn replace_process_image(
     args: &[String],
     env_vars: &crate::shell::var_table::VarTable,
+    stdio: Option<(Stdio, Stdio, Stdio)>,
 ) -> Option<io::Result<i32>> {
     let mut clean_env = false;
     let mut login = false;
@@ -159,10 +160,19 @@ pub(crate) fn replace_process_image(
         clean_env,
         effective_argv0.as_deref(),
     );
+    // rubash#1175 (redirected forms): the dispatcher resolved the fd
+    // table's live bindings (ambient `exec >log`, group redirects) to
+    // real OS descriptors; Command::exec dup2's them onto 0/1/2 in the
+    // child pre-exec, exactly the descriptors shell_execve would hand
+    // the new image. None keeps the plain inherited triple.
+    let (child_stdin, child_stdout, child_stderr) = match stdio {
+        Some((stdin, stdout, stderr)) => (stdin, stdout, stderr),
+        None => (Stdio::inherit(), Stdio::inherit(), Stdio::inherit()),
+    };
     process
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stdin(child_stdin)
+        .stdout(child_stdout)
+        .stderr(child_stderr);
     // GNU trap.c:1480 reset_signal_handlers runs inside exec_builtin
     // before shell_execve: the new image starts from the shell-entry
     // dispositions, not the runtime's (the Rust runtime ignores

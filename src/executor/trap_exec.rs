@@ -2329,15 +2329,25 @@ impl Executor {
             && self.stdout_capture.is_none()
             && self.stderr_capture.is_none()
             && !crate::executor::shell_options::stdout_capture_active()
-            && self.fd_table.write_endpoint(1) == Some(FdWriteEndpoint::Stdout)
-            && self.fd_table.write_endpoint(2) == Some(FdWriteEndpoint::Stderr)
+            && matches!(
+                self.fd_table.write_endpoint(1),
+                Some(FdWriteEndpoint::Stdout) | Some(FdWriteEndpoint::File(_))
+            )
+            && matches!(
+                self.fd_table.write_endpoint(2),
+                Some(FdWriteEndpoint::Stderr) | Some(FdWriteEndpoint::File(_))
+            )
             && !self.fd_table.is_closed(0)
             && !self.fd_table.is_closed(1)
             && !self.fd_table.is_closed(2)
             && match self.fd_table.entries.get(&0) {
                 Some(entry) => {
                     !entry.closed
-                        && matches!(entry.read, Some(FdReadEndpoint::InheritedProcessStdin))
+                        && matches!(
+                            entry.read,
+                            Some(FdReadEndpoint::InheritedProcessStdin)
+                                | Some(FdReadEndpoint::File(_))
+                        )
                 }
                 None => true,
             }
@@ -2350,6 +2360,42 @@ impl Executor {
                 word.starts_with("/dev/fd/")
                     || matches!(word.as_str(), "/dev/stdin" | "/dev/stdout" | "/dev/stderr")
             })
+    }
+
+    /// rubash#1175: attempt a true image replacement for an exec whose
+    /// own stdio redirects were just resolved by a spawn arm (the arm
+    /// opened the target file itself). `stdout`/`stderr` carry the arm's
+    /// binding for that descriptor; the other descriptors resolve from
+    /// the live fd table exactly like the tail arm. None keeps the
+    /// arm's spawn-and-wait simulation.
+    #[cfg(unix)]
+    fn try_exec_image_replacement_with_stdio(
+        &self,
+        cmd: &CommandNode,
+        stdout: Option<Stdio>,
+        stderr: Option<Stdio>,
+    ) -> Option<Result<i32, ExecuteError>> {
+        if !self.exec_image_replacement_applies(cmd) {
+            return None;
+        }
+        let stdin = self.exec_inherited_stdin().ok()?;
+        let stdout = match stdout {
+            Some(stdio) => stdio,
+            None => self.exec_inherited_stdio(1).ok()?,
+        };
+        let stderr = match stderr {
+            Some(stdio) => stdio,
+            None => self.exec_inherited_stdio(2).ok()?,
+        };
+        let status = crate::builtins::exec::replace_process_image(
+            &cmd.words[1..],
+            &self.shell_state.env_vars,
+            Some((stdin, stdout, stderr)),
+        )?;
+        Some(match status {
+            Ok(status) => Ok(status),
+            Err(error) => Err(ExecuteError::from(error)),
+        })
     }
 
     /// The spawn arms of execute_exec, run with the command's fd-0 input
@@ -2393,6 +2439,16 @@ impl Executor {
             }
             let mut file = self.create_redirect_output(&target, redirect.clobber)?;
             let child_stdout = Stdio::from(file.try_clone()?);
+            // rubash#1175: `exec cmd >file` — GNU replaces the image with
+            // fd 1 bound to the file; try that before the simulation.
+            #[cfg(unix)]
+            if let Some(result) = self.try_exec_image_replacement_with_stdio(
+                cmd,
+                Some(Stdio::from(file.try_clone()?)),
+                None,
+            ) {
+                return result;
+            }
             let (exec_args, dev_ops) = self.materialize_dev_fd_operands(
                 &cmd.words[1..],
                 crate::executor::dev_fd_operands::DevOperandStdin::FdTable,
@@ -2419,6 +2475,16 @@ impl Executor {
             let mut file =
                 open_redirect_append(&shell_path_to_windows(&target, &self.shell_state.env_vars))?;
             let child_stdout = Stdio::from(file.try_clone()?);
+            // rubash#1175: `exec cmd >>file` — same replacement attempt
+            // as the `>file` arm above.
+            #[cfg(unix)]
+            if let Some(result) = self.try_exec_image_replacement_with_stdio(
+                cmd,
+                Some(Stdio::from(file.try_clone()?)),
+                None,
+            ) {
+                return result;
+            }
             let (exec_args, dev_ops) = self.materialize_dev_fd_operands(
                 &cmd.words[1..],
                 crate::executor::dev_fd_operands::DevOperandStdin::FdTable,
@@ -2495,6 +2561,17 @@ impl Executor {
             }
             let mut file = self.create_redirect_output(&target, redirect.clobber)?;
             let child_stderr = Stdio::from(file.try_clone()?);
+            // rubash#1175: `exec cmd 2>file` — replacement attempt with
+            // fd 2 bound to the file (the capture case declines via the
+            // gates inside the helper).
+            #[cfg(unix)]
+            if let Some(result) = self.try_exec_image_replacement_with_stdio(
+                cmd,
+                None,
+                Some(Stdio::from(file.try_clone()?)),
+            ) {
+                return result;
+            }
             let (exec_args, dev_ops) = self.materialize_dev_fd_operands(
                 &cmd.words[1..],
                 crate::executor::dev_fd_operands::DevOperandStdin::FdTable,
@@ -2540,6 +2617,16 @@ impl Executor {
             let mut file =
                 open_redirect_append(&shell_path_to_windows(&target, &self.shell_state.env_vars))?;
             let child_stderr = Stdio::from(file.try_clone()?);
+            // rubash#1175: `exec cmd 2>>file` — same replacement attempt
+            // as the `2>file` arm above.
+            #[cfg(unix)]
+            if let Some(result) = self.try_exec_image_replacement_with_stdio(
+                cmd,
+                None,
+                Some(Stdio::from(file.try_clone()?)),
+            ) {
+                return result;
+            }
             let (exec_args, dev_ops) = self.materialize_dev_fd_operands(
                 &cmd.words[1..],
                 crate::executor::dev_fd_operands::DevOperandStdin::FdTable,
@@ -2582,11 +2669,29 @@ impl Executor {
         // below for the shapes replace_process_image declines.
         #[cfg(unix)]
         if self.exec_image_replacement_applies(cmd) {
-            if let Some(status) = crate::builtins::exec::replace_process_image(
-                &cmd.words[1..],
-                &self.shell_state.env_vars,
+            // rubash#1175 redirected forms: hand the new image the fd
+            // table's live bindings resolved to real descriptors (an
+            // ambient `exec >log` or a group redirect bound fd 1 to a
+            // File endpoint — GNU's image inherits exactly that file).
+            let stdio = match (
+                self.exec_inherited_stdin(),
+                self.exec_inherited_stdio(1),
+                self.exec_inherited_stdio(2),
             ) {
-                return Ok(status?);
+                (Ok(stdin), Ok(stdout), Ok(stderr)) => Some((stdin, stdout, stderr)),
+                _ => None,
+            };
+            // If a live binding could not be resolved to a real
+            // descriptor, keep the simulation rather than replacing
+            // with the wrong (inherited) descriptors.
+            if let Some(stdio) = stdio {
+                if let Some(status) = crate::builtins::exec::replace_process_image(
+                    &cmd.words[1..],
+                    &self.shell_state.env_vars,
+                    Some(stdio),
+                ) {
+                    return Ok(status?);
+                }
             }
         }
         // GNU exec.def exec_builtin -> shell_execve (execute_cmd.c:6126):
