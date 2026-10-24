@@ -102,7 +102,21 @@ pub(in crate::executor) fn append_assoc_value(
             raw.to_string()
         }
     };
-    let mut entries = assoc_entries(current);
+    // rubash#914 (F2): the fold merges through a local slot map instead
+    // of rescanning the accumulated entries for every element — the old
+    // per-token `iter().rev().find()` made a 30k-element compound cost
+    // Θ(n²) (≈15 CPU-s where GNU needs 0.08). The map mirrors the
+    // `dedupe_assoc_entries` contract — first occurrence fixes the slot,
+    // last occurrence supplies the value — so seeding with the deduped
+    // parse and overwriting in place yields exactly the entry list the
+    // old push-then-dedupe pipeline produced, and the closing
+    // `format_assoc_storage` render stays byte-identical.
+    let mut entries = dedupe_assoc_entries(assoc_entries(current));
+    let mut slot_of: std::collections::HashMap<String, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(slot, (key, _))| (key.clone(), slot))
+        .collect();
     let tokens = merge_assoc_subscript_tokens(array_assignment_tokens(value));
     // GNU arrayfunc.c kvpair_assignment_p: the FIRST compound word decides
     // the mode — kvpair (alternating pairs) requires the first word to NOT
@@ -145,7 +159,14 @@ pub(in crate::executor) fn append_assoc_value(
                 .get(1)
                 .map(|value| crate::executor::arrays::dequote_compound_element_rhs(value))
                 .unwrap_or_default();
-            entries.push((key, eval_element(&value)));
+            let value = eval_element(&value);
+            match slot_of.get(&key) {
+                Some(&slot) => entries[slot].1 = value,
+                None => {
+                    slot_of.insert(key.clone(), entries.len());
+                    entries.push((key, value));
+                }
+            }
         }
         return format_assoc_storage(entries);
     }
@@ -160,11 +181,8 @@ pub(in crate::executor) fn append_assoc_value(
                 .unwrap_or_else(|| unquote_storage_value(key));
             let rhs = unquote_storage_value(rhs);
             if append {
-                if let Some((_, entry_value)) = entries
-                    .iter_mut()
-                    .rev()
-                    .find(|(entry_key, _)| entry_key == &key)
-                {
+                if let Some(&slot) = slot_of.get(&key) {
+                    let entry_value = &mut entries[slot].1;
                     if integer {
                         // GNU bind_assoc_variable: an integer append adds the
                         // two expressions arithmetically (wheat[foo bar]+=7
@@ -177,6 +195,7 @@ pub(in crate::executor) fn append_assoc_value(
                         *entry_value = append_scalar_value(entry_value, &rhs);
                     }
                 } else {
+                    slot_of.insert(key.clone(), entries.len());
                     entries.push((key, eval_element(&rhs)));
                 }
                 continue;
@@ -184,14 +203,12 @@ pub(in crate::executor) fn append_assoc_value(
             // GNU bind_assoc_variable -> assoc_insert: a repeated key keeps
             // its first-insert slot and the new value replaces the old one
             // (assoc13: declare a[*]=star2 overwrites [*]" star").
-            if let Some((_, entry_value)) = entries
-                .iter_mut()
-                .rev()
-                .find(|(entry_key, _)| entry_key == &key)
-            {
-                *entry_value = eval_element(&rhs);
-            } else {
-                entries.push((key, eval_element(&rhs)));
+            match slot_of.get(&key) {
+                Some(&slot) => entries[slot].1 = eval_element(&rhs),
+                None => {
+                    slot_of.insert(key.clone(), entries.len());
+                    entries.push((key, eval_element(&rhs)));
+                }
             }
             continue;
         }
