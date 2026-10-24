@@ -772,18 +772,54 @@ impl Executor {
     /// Called at every command boundary in debug builds
     /// (`command_execute.rs`) and directly by
     /// `tests/typed_cell_coherence_fuzz.rs`.
+    ///
+    /// rubash#1510: the full comparison is Θ(cell size), so running it for
+    /// every cell at every command boundary made ANY loop whose body runs
+    /// real commands pay Θ(total array elements) per iteration — the
+    /// `"${a[@]}"` iteration O(n²). The per-name freshness protocol in
+    /// `VarTable` (tracked / stale / mirror epoch) bounds the re-proof:
+    /// a cell is skipped while it is *fresh* — proven coherent by an
+    /// earlier pass of this very check, or marked synced by a write path
+    /// that built cell and mirror together (`note_typed_cell_synced`) —
+    /// and no mirror write has touched its name since. Every mirror
+    /// write passes a `VarTable` choke point (`insert` / `remove` /
+    /// `get_mut` / `entry` / `retain`; there is no `DerefMut`), which
+    /// marks a tracked name stale and bumps its epoch, so the class this
+    /// net exists to catch — a mirror write that neither synced the cell
+    /// nor set the global dirty bit — still lands on a stale (or never
+    /// tracked) name and is re-proven in full at the next boundary.
     #[cfg(debug_assertions)]
-    pub fn verify_typed_cells(&self) {
+    pub fn verify_typed_cells(&mut self) {
+        self.verify_typed_cells_impl(false);
+    }
+
+    /// Full-strength variant for the coherence fuzz: ignores per-name
+    /// freshness and does not feed it, so a direct call always re-proves
+    /// every structured cell against its mirror parse.
+    #[cfg(debug_assertions)]
+    pub fn verify_typed_cells_forced(&mut self) {
+        self.verify_typed_cells_impl(true);
+    }
+
+    #[cfg(debug_assertions)]
+    fn verify_typed_cells_impl(&mut self, forced: bool) {
         if self.shell_state.env_vars.array_cells_dirty() {
             return;
         }
         for (name, variable) in self.shell_state.variables.iter() {
-            match &variable.value {
+            // Freshness skip (rubash#1510): the cell was proven against
+            // this exact mirror epoch and no choked mirror write has
+            // touched the name since, so the comparison below would
+            // re-derive the same verdict element by element.
+            if !forced && self.shell_state.env_vars.cell_is_fresh(name) {
+                continue;
+            }
+            let coherent = match &variable.value {
                 // Most variables are scalars; skip them before the mirror
                 // hash lookup, which would otherwise dominate this
                 // per-command check (a 100k-iteration `while read` loop
                 // calls it 200k times).
-                crate::shell::ShellValue::Scalar(_) => {}
+                crate::shell::ShellValue::Scalar(_) => continue,
                 crate::shell::ShellValue::IndexedArray(cell) => {
                     let Some(mirror) = self.shell_state.env_vars.get(name) else {
                         continue;
@@ -805,6 +841,7 @@ impl Executor {
                         "typed indexed cell `{name}` disagrees with its mirror: \
                          cell={cell:?} mirror_parse={parsed:?} mirror={mirror:?}"
                     );
+                    coherent
                 }
                 crate::shell::ShellValue::AssociativeArray(cell) => {
                     let Some(mirror) = self.shell_state.env_vars.get(name) else {
@@ -820,8 +857,41 @@ impl Executor {
                         "typed assoc cell `{name}` disagrees with its mirror: \
                          cell={cell:?} mirror_parse={parsed:?} mirror={mirror:?}"
                     );
+                    coherent
                 }
+            };
+            // Just proven against the live mirror: register the cell in
+            // the freshness protocol so later boundaries skip it until a
+            // choked mirror write marks the name stale again.
+            if coherent && !forced {
+                self.shell_state.env_vars.track_cell(name);
             }
         }
+    }
+
+    /// rubash#1510: record that a write path just (re)built the typed
+    /// cell for `name` and its mirror together (the sync helpers and the
+    /// render they feed are one construction), so the command-boundary
+    /// verifier may trust the pair until the next choked mirror write.
+    /// Only an existing structured cell is registered — a refused write
+    /// (readonly) drops its cell at the sync site, and a name with no
+    /// structured cell keeps the mirror as its only truth. No-op in
+    /// release builds: the verifier it feeds is debug-only.
+    pub(in crate::executor) fn note_typed_cell_synced(&mut self, name: &str) {
+        #[cfg(debug_assertions)]
+        {
+            if matches!(
+                self.shell_state
+                    .variables
+                    .get(name)
+                    .map(|variable| &variable.value),
+                Some(crate::shell::ShellValue::IndexedArray(_))
+                    | Some(crate::shell::ShellValue::AssociativeArray(_))
+            ) {
+                self.shell_state.env_vars.track_cell(name);
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = name;
     }
 }

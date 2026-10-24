@@ -238,7 +238,16 @@ impl Executor {
             // is a pure read, so probing the cell first preserves GNU's
             // observable order while skipping the per-read O(n) clone+scan
             // on a typed hit.
-            if !self.shell_state.env_vars.array_cells_dirty() {
+            // Admission (rubash#1510): the global dirty bit OR a per-name
+            // freshness proof — the bit is set by ANY unsynced mirror
+            // write, but a name whose cell was proven/synced since its
+            // last choked mirror write stays trustworthy (every mirror
+            // write marks a tracked name stale at the VarTable choke
+            // points), so one array's dirty write no longer forces every
+            // other array's reads back onto the mirror path.
+            if !self.shell_state.env_vars.array_cells_dirty()
+                || self.shell_state.env_vars.cell_is_fresh(storage_name)
+            {
                 if let Some(cell_value) = self
                     .shell_state
                     .variables
@@ -250,16 +259,23 @@ impl Executor {
                     // write path missed its sync-or-dirty handling. The
                     // mirror is re-fetched on demand here so release builds
                     // (where debug_assert_eq! compiles out) skip the O(n)
-                    // clone entirely on this fast path.
-                    debug_assert_eq!(
-                        Some(typed.clone()),
-                        {
-                            let mirror =
-                                self.parameter_array_storage(array_name).unwrap_or_default();
-                            assoc_value_at(&mirror, &key)
-                        },
-                        "typed assoc cell disagrees with mirror for {storage_name}[{key}]"
-                    );
+                    // clone entirely on this fast path. A per-name-fresh
+                    // hit skips the re-check (rubash#1510): the pair was
+                    // already proven at the sync/boundary that made it
+                    // fresh, so re-deriving the element from the mirror
+                    // on every read was a duplicate Θ(n) proof.
+                    #[cfg(debug_assertions)]
+                    if !self.shell_state.env_vars.cell_is_fresh(storage_name) {
+                        debug_assert_eq!(
+                            Some(typed.clone()),
+                            {
+                                let mirror =
+                                    self.parameter_array_storage(array_name).unwrap_or_default();
+                                assoc_value_at(&mirror, &key)
+                            },
+                            "typed assoc cell disagrees with mirror for {storage_name}[{key}]"
+                        );
+                    }
                     return Some(typed);
                 }
             }
@@ -281,7 +297,10 @@ impl Executor {
         // views, dirty cells, empty arrays, still-negative results, holes —
         // falls through to the slow path below, which owns all diagnostics
         // byte-for-byte.
-        if dynamic_values.is_none() && !self.shell_state.env_vars.array_cells_dirty() {
+        if dynamic_values.is_none()
+            && (!self.shell_state.env_vars.array_cells_dirty()
+                || self.shell_state.env_vars.cell_is_fresh(storage_name))
+        {
             if let Some(negative) = clean_negative_literal_subscript(key) {
                 if let Some((_, Some(max_index))) = self
                     .shell_state
@@ -303,18 +322,27 @@ impl Executor {
                                 );
                                 // Same safety net as the non-negative typed probe below: the
                                 // cell must agree with the mirror; release builds compile this
-                                // re-fetch out and skip the O(n) clone entirely.
-                                debug_assert_eq!(
-                                    Some(typed.clone()),
-                                    {
-                                        let mirror = self
-                                            .parameter_array_storage(array_name)
-                                            .unwrap_or_default();
-                                        resolve_indexed_array_subscript(&mirror, normalized as i128)
-                                            .and_then(|resolved| array_value_at(&mirror, resolved))
-                                    },
-                                    "typed cell disagrees with mirror for {storage_name}[{normalized}]"
-                                );
+                                // re-fetch out and skip the O(n) clone entirely. Skipped for a
+                                // per-name-fresh hit (rubash#1510, duplicate proof).
+                                #[cfg(debug_assertions)]
+                                if !self.shell_state.env_vars.cell_is_fresh(storage_name) {
+                                    debug_assert_eq!(
+                                        Some(typed.clone()),
+                                        {
+                                            let mirror = self
+                                                .parameter_array_storage(array_name)
+                                                .unwrap_or_default();
+                                            resolve_indexed_array_subscript(
+                                                &mirror,
+                                                normalized as i128,
+                                            )
+                                            .and_then(|resolved| {
+                                                array_value_at(&mirror, resolved)
+                                            })
+                                        },
+                                        "typed cell disagrees with mirror for {storage_name}[{normalized}]"
+                                    );
+                                }
                                 return Some(typed);
                             }
                         }
@@ -500,7 +528,11 @@ impl Executor {
         // fetch below is a pure read, so deferring it until after the
         // index is resolved preserves GNU's observable order while
         // skipping the per-read O(n) mirror clone on a typed hit.
-        if !self.shell_state.env_vars.array_cells_dirty() {
+        // Admission (rubash#1510): global dirty bit clear OR per-name
+        // fresh, same discipline as the assoc leg above.
+        if !self.shell_state.env_vars.array_cells_dirty()
+            || self.shell_state.env_vars.cell_is_fresh(storage_name)
+        {
             if let Ok(typed_index) = i64::try_from(index) {
                 if let Some(cell_value) = self
                     .shell_state
@@ -515,17 +547,21 @@ impl Executor {
                     // write path missed its sync-or-dirty handling. The
                     // mirror is re-fetched on demand here so release builds
                     // (where debug_assert_eq! compiles out) skip the O(n)
-                    // clone entirely on this fast path.
-                    debug_assert_eq!(
-                        Some(typed.clone()),
-                        {
-                            let mirror =
-                                self.parameter_array_storage(array_name).unwrap_or_default();
-                            resolve_indexed_array_subscript(&mirror, index)
-                                .and_then(|resolved| array_value_at(&mirror, resolved))
-                        },
-                        "typed cell disagrees with mirror for {storage_name}[{index}]"
-                    );
+                    // clone entirely on this fast path. A per-name-fresh
+                    // hit skips the re-check (rubash#1510, duplicate proof).
+                    #[cfg(debug_assertions)]
+                    if !self.shell_state.env_vars.cell_is_fresh(storage_name) {
+                        debug_assert_eq!(
+                            Some(typed.clone()),
+                            {
+                                let mirror =
+                                    self.parameter_array_storage(array_name).unwrap_or_default();
+                                resolve_indexed_array_subscript(&mirror, index)
+                                    .and_then(|resolved| array_value_at(&mirror, resolved))
+                            },
+                            "typed cell disagrees with mirror for {storage_name}[{index}]"
+                        );
+                    }
                     return Some(typed);
                 }
             }
@@ -600,7 +636,8 @@ impl Executor {
         // read path, the cell is only trusted when no unsynced builtin
         // write happened since the last executor sync.
         if array_store_enabled(&self.shell_state.env_vars)
-            && !self.shell_state.env_vars.array_cells_dirty()
+            && (!self.shell_state.env_vars.array_cells_dirty()
+                || self.shell_state.env_vars.cell_is_fresh(name))
         {
             if let Some(crate::shell::ShellValue::IndexedArray(entries)) = self
                 .shell_state

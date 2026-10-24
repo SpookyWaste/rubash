@@ -436,6 +436,12 @@ impl Executor {
                             }
                         }
                         unmark_env_name(&mut self.shell_state.env_vars, DECLARED_UNSET_VARS, name);
+                        // Cell and mirror moved together above (in-place
+                        // upsert over the appended segment): register the
+                        // pair as synced for the boundary verifier
+                        // (rubash#1510). NoCell leaves no structured cell,
+                        // so the helper no-ops there.
+                        self.note_typed_cell_synced(name);
                         self.exit_code = 0;
                         return true;
                     }
@@ -522,6 +528,9 @@ impl Executor {
             // marker; an element assignment must clear it or the @A
             // transform keeps printing the bare name (rubash#371).
             unmark_env_name(&mut self.shell_state.env_vars, DECLARED_UNSET_VARS, name);
+            // The canonical render above synced the cell from the same
+            // entry list it folded into the mirror (rubash#1510).
+            self.note_typed_cell_synced(name);
             self.exit_code = 0;
             return true;
         }
@@ -902,6 +911,11 @@ impl Executor {
         // element is assigned. Clear the rubash declared-unset marker so
         // `${idx[*]@A}` renders the `=(...)` body (rubash#371).
         unmark_env_name(&mut self.shell_state.env_vars, DECLARED_UNSET_VARS, name);
+        // Every arm above leaves the structured cell and the mirror in
+        // lockstep (in-place segment append + cell extension, or the
+        // canonical re-parse + sync): register the pair as synced for
+        // the boundary verifier (rubash#1510).
+        self.note_typed_cell_synced(name);
         self.exit_code = 0;
         true
     }
