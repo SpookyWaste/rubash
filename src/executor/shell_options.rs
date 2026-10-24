@@ -388,6 +388,25 @@ impl Executor {
         })
     }
 
+    /// rubash#1312: measured GNU rule (glibc bash 5.3.20 oracle, script
+    /// file under a PTY): with `set -C`, `>` refuses only an existing
+    /// REGULAR file — `echo hi >/dev/tty` and `>/dev/null` both succeed.
+    /// A raw O_CREAT|O_EXCL open returns EEXIST for Linux device files,
+    /// so the refusal must be gated on the target's file type, not on
+    /// mere existence. Unix-only gate: the Windows device-name layer
+    /// keeps the blanket create_new behavior (see the #519 family).
+    #[cfg(unix)]
+    fn noclobber_target_is_device_like(path: &std::path::Path) -> bool {
+        std::fs::metadata(path)
+            .map(|m| !m.is_file())
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(unix))]
+    fn noclobber_target_is_device_like(_path: &std::path::Path) -> bool {
+        false
+    }
+
     pub(in crate::executor) fn create_redirect_output(
         &self,
         target: &str,
@@ -408,6 +427,7 @@ impl Executor {
         let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
         if !clobber
             && crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "noclobber")
+            && !Self::noclobber_target_is_device_like(&path)
         {
             // GNU wording (bash builtins/common.c): "<target>: cannot
             // overwrite existing file"; the redirect machinery prints the
