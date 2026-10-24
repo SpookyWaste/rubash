@@ -3067,6 +3067,14 @@ fn run_source_impl(
         // ExpansionFailure is GNU's DISCARD: the command list aborted but
         // the reader continues with the next complete command.
         Err(ExecuteError::ExpansionFailure(code)) => code,
+        // A `return` that unwinds to this unit's top ends the unit with
+        // its status as an ordinary value (builtins/evalfile.c
+        // source_file returns it; no jump_to_top_level). It can only
+        // reach here while a sourced-file context is live — the return
+        // builtin itself rejects top-level use otherwise — e.g. a
+        // startup file run by run_init_file (rubash#1161). Printing it
+        // via the catch-all below leaked a bare `return N` line.
+        Err(ExecuteError::Return(code)) => code,
         Err(e) => {
             if interactive {
                 eprintln!("Error: {}", e);
