@@ -363,35 +363,48 @@ where
     W: Write,
     E: Write,
 {
-    let Some(first) = args.first().map(String::as_str) else {
+    if args.is_empty() {
         write_kill_usage(stderr)?;
         return Ok(2);
-    };
+    }
 
-    if matches!(first, "-l" | "-L") {
-        if args.len() == 1 || args.get(1).is_some_and(|value| value == "-1") {
-            // POSIX mode (bash posix-mode notes / kill.def list_signals
-            // under POSIX_MODE): the bare list is ONE line of bare signal
-            // names, space-separated, no numbers and no SIG prefix
-            // (rubash#1054).
-            if posix {
-                write_signal_list_posix(stdout)?;
-            } else {
-                write_signal_list(stdout)?;
-            }
-            return Ok(0);
+    // GNU builtins/kill.def:104-168 kill_builtin: ONE option loop feeds
+    // both the listing dispatch and the delivery loop. `-l`/`-L` only set
+    // the listing flag, `-s`/`-n` (separate or attached) and a leading
+    // `-sigspec` word decode a signal (an invalid spec is remembered, not
+    // reported yet — with listing set it is never reported at all), `--`
+    // ends the loop, and the first non-option word ends it too. After
+    // the loop: listing -> display_signal_list(rest); else a NO_SIG spec
+    // -> sh_invalidsig; else no operands -> builtin_usage (EX_USAGE).
+    // The previous two-branch shape (a `-l`-first branch plus a delivery
+    // loop) diverged on the whole option-soup class: `kill -l -s TERM`
+    // listed nothing instead of the full list, `kill -s TERM -l` read
+    // `-l` as a pid operand, and `kill -l --` reported `--` as a bad
+    // sigspec (rubash#1399 family).
+    let mut listing = false;
+    let mut signal: Option<i32> = Some(15);
+    let mut sigspec: &str = "TERM";
+    // kill.def saw_signal: once any signal spec is seen (separate or
+    // attached), a later `-word` is an operand (process group) rather
+    // than another signal specification.
+    let mut saw_signal = false;
+    let mut index = 0;
+    while let Some(value) = args.get(index).map(String::as_str) {
+        if value == "-l" || value == "-L" {
+            listing = true;
+            index += 1;
+            continue;
         }
-        let mut status = 0;
-        let mut i = 1;
-        while i < args.len() {
-            let value = &args[i];
-            // GNU builtins/kill.def:114-132: `-s`/`-n` (separate or attached)
-            // are processed even when `-l` was seen; a trailing `-s` with no
-            // argument is `sh_needarg` ("option requires an argument"),
-            // not "invalid signal specification" (rubash#1399). The consumed
-            // sigspec is not listed.
-            if value == "-s" || value == "-n" {
-                if args.get(i + 1).is_none() {
+        // kill.def:114-142: `-s`/`-n` take the next word; the spec may
+        // also be attached (`-sNAME` with an alphabetic next char,
+        // `-nNUM` with a digit). A trailing separate form with no next
+        // word is sh_needarg ("option requires an argument", kill.def:
+        // 130-131) and returns EXECUTION_FAILURE immediately — even in
+        // listing mode (rubash#1399: `kill -l -s`).
+        let spec_form: Option<(&str, usize)> = if value == "-s" || value == "-n" {
+            match args.get(index + 1).map(String::as_str) {
+                Some(spec) => Some((spec, 2)),
+                None => {
                     writeln!(
                         stderr,
                         "{}kill: {value}: option requires an argument",
@@ -399,150 +412,64 @@ where
                     )?;
                     return Ok(1);
                 }
-                i += 2;
-                continue;
             }
-            let attached = value
-                .strip_prefix("-s")
-                .filter(|s| s.chars().next().is_some_and(|c| c.is_ascii_alphabetic()))
-                .or_else(|| {
-                    value
-                        .strip_prefix("-n")
-                        .filter(|s| s.chars().next().is_some_and(|c| c.is_ascii_digit()))
-                });
-            if attached.is_some() {
-                i += 1;
-                continue;
-            }
-            // GNU builtins/common.c:795-810 display_signal_list: a numeric
-            // argument is range-checked against NSIG; an IN-RANGE number
-            // whose slot has no name (glibc's reserved RT slots 32/33 —
-            // bash's signames array holds SIGJUNK there) prints NOTHING and
-            // keeps rc 0. Only an out-of-range number is an error
-            // (rubash#230: `kill -l 32` must be silent rc=0).
-            if let Ok(mut number) = value.parse::<i32>() {
-                if number > 128 {
-                    number -= 128;
-                }
-                if number == 0 {
-                    // signal_name slot 0 is bash's EXIT (signames.c), and
-                    // common.c prints it for `kill -l 0`.
-                    writeln!(stdout, "EXIT")?;
-                } else if !(0..=64).contains(&number) {
-                    writeln!(
-                        stderr,
-                        "{}kill: {value}: invalid signal specification",
-                        diagnostic_prefix()
-                    )?;
-                    status = 1;
-                } else if let Some(translation) = signal_name(number) {
-                    writeln!(stdout, "{translation}")?;
-                }
-                i += 1;
-                continue;
-            }
-            if let Some(translation) = translate_signal(value) {
-                writeln!(stdout, "{translation}")?;
-            } else {
-                writeln!(
-                    stderr,
-                    "{}kill: {value}: invalid signal specification",
-                    diagnostic_prefix()
-                )?;
-                status = 1;
-            }
-            i += 1;
-        }
-        return Ok(status);
-    }
-
-    let mut signal = 15;
-    let mut index = 0;
-    let mut operands_start = 0;
-    // GNU builtins/kill.def:99,124 saw_signal: once any signal spec is seen
-    // (separate or attached), a later `-word` is an operand (process group)
-    // rather than another signal specification.
-    let mut saw_signal = false;
-    while let Some(value) = args.get(index).map(String::as_str) {
-        if value == "--" {
-            operands_start = index + 1;
-            break;
-        }
-        if value == "-s" || value == "-n" {
-            let Some(sigspec) = args.get(index + 1).map(String::as_str) else {
-                // GNU builtins/kill.def:130-131: sh_needarg(word) prints
-                // "kill: -s: option requires an argument" with the full
-                // diagnostic prolog, then returns EXECUTION_FAILURE.
-                writeln!(
-                    stderr,
-                    "{}kill: {value}: option requires an argument",
-                    diagnostic_prefix()
-                )?;
-                return Ok(1);
-            };
-            if !sigspec_accepted(sigspec, posix) {
-                writeln!(
-                    stderr,
-                    "{}kill: {sigspec}: invalid signal specification",
-                    diagnostic_prefix()
-                )?;
-                return Ok(1);
-            }
-            signal = signal_number_from_spec(sigspec).unwrap_or(15);
-            index += 2;
-            operands_start = index;
-            saw_signal = true;
-            continue;
-        }
-        // GNU builtins/kill.def:134-142: the signal spec may be attached to
-        // the option letter — `-sNAME` when the letter is followed by an
-        // alphabetic char, `-nNUM` when followed by a digit.
-        let attached = value
+        } else if let Some(spec) = value
             .strip_prefix("-s")
             .filter(|s| s.chars().next().is_some_and(|c| c.is_ascii_alphabetic()))
-            .or_else(|| {
-                value
-                    .strip_prefix("-n")
-                    .filter(|s| s.chars().next().is_some_and(|c| c.is_ascii_digit()))
-            });
-        if let Some(sigspec) = attached {
-            if !sigspec_accepted(sigspec, posix) {
-                writeln!(
-                    stderr,
-                    "{}kill: {sigspec}: invalid signal specification",
-                    diagnostic_prefix()
-                )?;
-                return Ok(1);
-            }
-            signal = signal_number_from_spec(sigspec).unwrap_or(15);
-            index += 1;
-            operands_start = index;
+        {
+            Some((spec, 1))
+        } else if let Some(spec) = value
+            .strip_prefix("-n")
+            .filter(|s| s.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        {
+            Some((spec, 1))
+        } else {
+            None
+        };
+        if let Some((spec, advance)) = spec_form {
+            sigspec = spec;
+            signal = decode_signal_spec(spec, posix);
             saw_signal = true;
+            index += advance;
             continue;
         }
-        if value.starts_with('-') && value != "-" && !saw_signal {
-            // GNU kill.def takes the signal spec as the word after
-            // exactly one leading dash, so `--badflag` reports
-            // `-badflag` in the diagnostic (rubash#1259); stripping all
-            // dashes printed the bare `badflag`.
-            let sigspec = value.strip_prefix('-').unwrap_or(value);
-            if !sigspec_accepted(sigspec, posix) {
-                writeln!(
-                    stderr,
-                    "{}kill: {sigspec}: invalid signal specification",
-                    diagnostic_prefix()
-                )?;
-                return Ok(1);
-            }
-            signal = signal_number_from_spec(sigspec).unwrap_or(15);
+        if value == "--" {
             index += 1;
-            operands_start = index;
+            break;
+        }
+        if value == "-?" {
+            // kill.def ISOPTION(word, '?'): builtin_usage, EX_USAGE.
+            write_kill_usage(stderr)?;
+            return Ok(2);
+        }
+        if value.starts_with('-') && !saw_signal {
+            // kill.def takes the signal spec as the word after exactly
+            // one leading dash, so `--badflag` reports `-badflag` in the
+            // diagnostic (rubash#1259) and a bare `-` decodes the empty
+            // spec (invalid, per the GNU oracle).
+            sigspec = value.strip_prefix('-').unwrap_or(value);
+            signal = decode_signal_spec(sigspec, posix);
             saw_signal = true;
+            index += 1;
             continue;
         }
-        operands_start = index;
         break;
     }
+    let operands_start = index;
+
+    if listing {
+        return display_kill_list(&args[operands_start..], posix, stdout, stderr);
+    }
+
+    let Some(signal) = signal else {
+        // kill.def:171-175: sig == NO_SIG -> sh_invalidsig(sigspec).
+        writeln!(
+            stderr,
+            "{}kill: {sigspec}: invalid signal specification",
+            diagnostic_prefix()
+        )?;
+        return Ok(1);
+    };
 
     if operands_start >= args.len() {
         write_kill_usage(stderr)?;
@@ -801,6 +728,66 @@ fn signal_number_from_spec(value: &str) -> Option<i32> {
 /// the TERM default and delivered the wrong signal (rubash#1385).
 fn sigspec_accepted(value: &str, posix: bool) -> bool {
     decode_signal_spec(value, posix).is_some()
+}
+
+/// GNU builtins/common.c:747 display_signal_list over the words left
+/// after kill's option loop: no words -> the full list (POSIX mode: the
+/// one-line bare-names form, rubash#1054); a numeric word prints the
+/// signal name (with the >128 exit-status adjustment; an in-range hole
+/// prints nothing and keeps rc 0, rubash#230; 0 prints EXIT); a name
+/// word prints its number via decode_signal; an undecodable word is
+/// sh_invalidsig and the status becomes EXECUTION_FAILURE.
+fn display_kill_list<W, E>(
+    list: &[String],
+    posix: bool,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> io::Result<i32>
+where
+    W: Write,
+    E: Write,
+{
+    if list.is_empty() {
+        if posix {
+            write_signal_list_posix(stdout)?;
+        } else {
+            write_signal_list(stdout)?;
+        }
+        return Ok(0);
+    }
+    let mut status = 0;
+    for value in list {
+        let value = value.as_str();
+        if let Some(mut number) = valid_number(value) {
+            if number > 128 {
+                number -= 128;
+            }
+            if number == 0 {
+                writeln!(stdout, "EXIT")?;
+            } else if !(0..=64).contains(&number) {
+                writeln!(
+                    stderr,
+                    "{}kill: {value}: invalid signal specification",
+                    diagnostic_prefix()
+                )?;
+                status = 1;
+            } else if let Some(translation) = signal_name(number as i32) {
+                writeln!(stdout, "{translation}")?;
+            }
+            continue;
+        }
+        if let Some(translation) = decode_signal_name(value, !posix) {
+            writeln!(stdout, "{translation}")?;
+        } else {
+            writeln!(
+                stderr,
+                "{}kill: {value}: invalid signal specification",
+                diagnostic_prefix()
+            )?;
+            status = 1;
+        }
+    }
+    Ok(status)
 }
 
 fn parse_pid(value: &str) -> Option<i32> {
