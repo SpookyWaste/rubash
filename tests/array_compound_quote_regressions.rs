@@ -214,6 +214,112 @@ fn for_word_carrier_decode_leaves_clean_paths_unchanged() {
 }
 
 #[test]
+fn compound_double_quoted_element_with_expansion_stays_one_element() {
+    // rubash#1504 (external report, Azathothas): GNU
+    // expand_compound_array_assignment (arrayfunc.c:557) tokenizes the raw
+    // body with parse_string_to_word_list (arrayfunc.c:581 — the word
+    // `"a $v"` is ONE W_QUOTED word) and expand_words_no_vars
+    // (arrayfunc.c:610 -> subst.c:13219 expand_word_list_internal) never
+    // field-splits a W_QUOTED word, so the quoted expansion result stays a
+    // single element however much IFS whitespace it produced. Verified
+    // against GNU bash 5.3.20 script-file probes.
+    assert_eq!(
+        rubash_raw("v='b c'\na=(x \"a $v\")\nprintf '<%s>' \"${a[@]}\""),
+        b"<x><a b c>"
+    );
+    assert_eq!(
+        rubash_raw("v='b c'\na=(\"a $v\")\nprintf '<%s>' \"${a[@]}\""),
+        b"<a b c>"
+    );
+    // The wholly-quoted whole-expansion element already worked; pin it.
+    assert_eq!(
+        rubash_raw("v='b c'\na=(\"$v\")\nprintf '<%s>' \"${a[@]}\""),
+        b"<b c>"
+    );
+    // A quoted element whose expansion is empty keeps its literal part.
+    assert_eq!(
+        rubash_raw("a=(\"a $unset_v\")\nprintf '<%s>' \"${a[@]}\""),
+        b"<a >"
+    );
+}
+
+#[test]
+fn compound_quoted_element_with_newline_value_stays_one_element() {
+    // rubash#1504 case 3: a quoted expansion result containing a newline
+    // is still one element (GNU: the newline is quoted data, CTLESC
+    // protected, never an IFS split point inside a W_QUOTED word).
+    // The plain form asserts through ${a[0]} + the element count: the
+    // "${a[@]}" rendering of a newline-bearing element leaks a U+E401
+    // carrier byte on BOTH the baseline and this tree — that is the
+    // separate rubash#1505 sentinel-leak issue, not #1504 splitting
+    // (verified byte-identical against the unmodified master binary).
+    assert_eq!(
+        rubash_raw("vn=$'d\\ne'\na=(\"$vn\")\nprintf '%s/%s' \"${#a[@]}\" \"${a[0]}\""),
+        b"1/d\ne"
+    );
+    assert_eq!(
+        rubash_raw("vn=$'d\\ne'\ndeclare -a a=(\"$vn\")\nprintf '<%s>' \"${a[@]}\""),
+        b"<d\ne>"
+    );
+    assert_eq!(
+        rubash_raw("vn=$'d\\ne'\nf() { local -a a=(\"$vn\"); printf '<%s>' \"${a[@]}\"; }\nf"),
+        b"<d\ne>"
+    );
+}
+
+#[test]
+fn local_compound_quoted_positional_and_brace_element_shapes() {
+    // rubash#1504 case 3 via a positional parameter (the issue's exact
+    // shape): the declare/local operand route delivers the element with
+    // RAW quote delimiters (no hoisting), and a quoted bare `$1` is one
+    // W_QUOTED word for GNU (arrayfunc.c:581) — with a space value as
+    // well as a newline value.
+    assert_eq!(
+        rubash_raw("f3() { local -a a=(\"$1\"); printf '<%s>' \"${a[@]}\"; }\nf3 'a b'"),
+        b"<a b>"
+    );
+    assert_eq!(
+        rubash_raw("f3() { local -a a=(\"$1\"); printf '<%s>' \"${a[@]}\"; }\nf3 $'d\\ne'"),
+        b"<d\ne>"
+    );
+    // rubash#1504 case 2 also fires single-line: ANY element carrying a
+    // balanced brace group inside quotes ('{}') must not dequote the
+    // operand word — braces.c brace_expand is quote-aware, so the group
+    // is literal text and brace expansion is a no-op for the word. Real
+    // brace expansion of an operand is untouched (GNU expands
+    // `declare a={x,y}` to two assignments; a ends as y).
+    assert_eq!(
+        rubash_raw("v='b c'\nf() { local -a a=('{}' \"a $v\"); printf '<%s>' \"${a[@]}\"; }\nf"),
+        b"<{}><a b c>"
+    );
+    assert_eq!(
+        rubash_raw("v='b c'\ndeclare -a a=('{}' \"a $v\")\nprintf '<%s>' \"${a[@]}\""),
+        b"<{}><a b c>"
+    );
+    assert_eq!(rubash_raw("declare a={x,y}\nprintf '%s' \"$a\""), b"y");
+    // An ANSI-C quoted element is one quoted word too: the whitespace
+    // its decoding produces is data (declare storage must not re-split
+    // the `$'...'` serialized form).
+    assert_eq!(
+        rubash_raw("declare -a a=($'x\\ty')\nprintf '<%s>' \"${a[@]}\""),
+        b"<x\ty>"
+    );
+}
+
+#[test]
+fn local_compound_multiline_after_brace_element_keeps_quoted_element() {
+    // rubash#1504 case 2 (the curl Authorization-header shape): a
+    // multi-line `local -a` whose first line carries a single-quoted
+    // brace element must not corrupt the following quoted element.
+    assert_eq!(
+        rubash_raw(
+            "v='b c'\nf2() {\n  local -a a=('{}'\n              \"a $v\")\n  printf '<%s>' \"${a[@]}\"\n}\nf2"
+        ),
+        b"<{}><a b c>"
+    );
+}
+
+#[test]
 fn fully_single_quoted_for_word_drops_quoted_tilde_prefix() {
     // rubash#629: the same fast path also returned the lexer's
     // QUOTED_WORD_PREFIX (0x1b, markers.rs:107) — the marker a word that

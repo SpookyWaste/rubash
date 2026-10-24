@@ -393,6 +393,48 @@ out=3
         r##"i=1:x:1
 "##,
     ),
+    // rubash#1505: an element holding a newline renders into the storage
+    // mirror in $'...' form; parsing that form back must yield the final
+    // value verbatim (GNU array.c: elements are stored and retrieved
+    // verbatim), not the ANSI-C transport form with a U+E401 guard before
+    // every blank. The assoc case additionally panicked the debug-build
+    // typed-cell coherence check before the fix.
+    (
+        "at_expansion_newline_element",
+        r##"v=$'a b\nc'; a=("$v"); printf '%s' "${a[@]}""##,
+        r##"a b
+c"##,
+    ),
+    (
+        "at_expansion_newline_element_with_quote",
+        r##"a=($'a"b\nc'); printf '%s' "${a[@]}""##,
+        r##"a"b
+c"##,
+    ),
+    (
+        "at_expansion_newline_element_with_glob_char",
+        r##"a=($'a*b\nc'); printf '%s' "${a[@]}""##,
+        r##"a*b
+c"##,
+    ),
+    (
+        "assoc_at_expansion_newline_element",
+        r##"declare -A h=([k]=$'a b\nc'); printf '%s' "${h[@]}""##,
+        r##"a b
+c"##,
+    ),
+    (
+        "at_expansion_newline_element_rearray",
+        r##"v=$'a b\nc'; a=("$v"); b=("${a[@]}"); printf '%s' "${b[0]}""##,
+        r##"a b
+c"##,
+    ),
+    (
+        "at_expansion_second_element_newline",
+        r##"a=(x); a[1]=$'l1\nl2 end'; printf '<%s>' "${a[@]}""##,
+        r##"<x><l1
+l2 end>"##,
+    ),
 ];
 
 #[test]

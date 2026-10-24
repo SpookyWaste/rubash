@@ -195,9 +195,17 @@ pub(in crate::builtins) fn append_array_value(
 
         // GNU keeps whitespace inside a quoted compound word as ONE element
         // for both quote families ('a b' and "a b" each store a single
-        // element; only unquoted whitespace splits).
+        // element; only unquoted whitespace splits). The ANSI-C form is
+        // the third quoting family: a whole-token `$'...'` is one quoted
+        // word (parse.y read_token_word), and unquote_storage_value
+        // decodes it to bytes whose whitespace (e.g. the \n in `$'d\ne'`,
+        // the serialized form of a quoted element holding a newline) is
+        // DATA. Missing it here re-split the decoded element at that
+        // whitespace (rubash#1504: `local -a a=("$1")`, $1=$'d\ne',
+        // stored two elements).
         let quoted_token = (token.starts_with('"') && token.ends_with('"'))
-            || (token.starts_with('\'') && token.ends_with('\''));
+            || (token.starts_with('\'') && token.ends_with('\''))
+            || (token.len() >= 3 && token.starts_with("$'") && token.ends_with('\''));
         let token = unquoted_token;
         let unquoted_command_substitution = token.starts_with(STORAGE_WORD_PREFIX);
         let token = token.strip_prefix(STORAGE_WORD_PREFIX).unwrap_or(&token);

@@ -619,12 +619,15 @@ fn assoc_entries_uncached(value: &str) -> Vec<(String, String)> {
                 // subscript close so a quoted `=` inside a stored key stays in
                 // the key (assoc.tests assoc4: ["a]=test1;#a"]="123").
                 if let Some((key, value, _)) = assoc_assignment_token(&part) {
-                    return Some((unquote_storage_value(key), unquote_storage_value(value)));
+                    return Some((
+                        unquote_stored_element_value(key),
+                        unquote_stored_element_value(value),
+                    ));
                 }
                 let (key, value) = part.split_once('=')?;
                 Some((
-                    unquote_storage_value(key.trim_start_matches('[').trim_end_matches(']')),
-                    unquote_storage_value(value),
+                    unquote_stored_element_value(key.trim_start_matches('[').trim_end_matches(']')),
+                    unquote_stored_element_value(value),
                 ))
             })
             .collect();
@@ -1451,6 +1454,30 @@ pub(in crate::executor) fn unquote_storage_value(value: &str) -> String {
         return "\"\"".to_string();
     }
     restore_quote_markers(&unquoted)
+}
+
+/// Storage-mirror parse of one rendered element (key or value). The mirror
+/// string is rendered from FINAL cell values (quote_array_element_value /
+/// quote_assoc_storage_value), so a whole-token `$'...'` element is an
+/// ansic_quote rendering and decodes PLAIN — the inverse the second `$'`
+/// arm of `unquote_storage_value` documents for exactly this roundtrip.
+/// Routing a stored element through that function's first `$'` arm instead
+/// returns the ANSI-C *transport* form (E010/E011 quote markers, CTLESC
+/// pairs, and a U+E401 ANSI_C_IFS_GUARD before every decoded blank), which
+/// is only correct for a SOURCE token that still faces a second
+/// quote-removal pass (issue #109). Read back as a stored value, the
+/// carriers leaked into `"${a[@]}"` expansions and disagreed with the
+/// typed cell (rubash#1505: cell `a b\nc` vs mirror parse
+/// `a\u{e401} b\u{e401}\nc`). Every other element form keeps the shared
+/// `unquote_storage_value` decode.
+pub(in crate::executor) fn unquote_stored_element_value(value: &str) -> String {
+    if let Some(inner) = value
+        .strip_prefix("$'")
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        return crate::lexer::decode_ansi_c_quoted(inner);
+    }
+    unquote_storage_value(value)
 }
 
 pub(in crate::executor) fn quote_compound_field_value(value: &str) -> String {

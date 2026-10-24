@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 
 use crate::executor::markers::STORAGE_WORD_PREFIX;
 use crate::executor::markers::STORAGE_WORD_PREFIX_STR;
-use crate::executor::{mark_env_name, split_storage_words, unquote_storage_value, ARRAY_VARS};
+use crate::executor::{
+    mark_env_name, split_storage_words, unquote_storage_value, unquote_stored_element_value,
+    ARRAY_VARS,
+};
 
 pub(in crate::executor) fn normalize_array_expanded_value(value: String) -> String {
     // GNU array.c: array element values are stored and retrieved verbatim.
@@ -40,8 +43,8 @@ pub(in crate::executor) fn array_values(value: &str) -> Vec<String> {
             let value = part
                 .split_once('=')
                 .map(|(_, value)| value)
-                .map(unquote_storage_value)
-                .unwrap_or_else(|| unquote_storage_value(&part));
+                .map(unquote_stored_element_value)
+                .unwrap_or_else(|| unquote_stored_element_value(&part));
             normalize_array_expanded_value(value)
         })
         .collect()

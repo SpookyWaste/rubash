@@ -2372,6 +2372,22 @@ impl Executor {
                         values.push(token_raw.clone());
                         continue;
                     }
+                    // The bare element is double-quoted (GNU W_QUOTED,
+                    // arrayfunc.c:581 parse_string_to_word_list) when
+                    // token_raw wraps the parameter in quote delimiters.
+                    // Two deliveries exist: the hoisted \u{E302} pair,
+                    // which the E302 trim in `core` exposes as
+                    // token != core, and a raw `"` pair, which is how
+                    // the declare/local operand route delivers the word
+                    // (expand_word_mut_with_context does not hoist).
+                    // Judging quotedness by the hoisted form alone
+                    // field-split a raw-quoted `"$1"` element on its
+                    // IFS whitespace (rubash#1504).
+                    let quoted_bare = prefix.is_none()
+                        && (token != core
+                            || (raw_param.len() >= 2
+                                && raw_param.starts_with('"')
+                                && raw_param.ends_with('"')));
                     if name.chars().all(|c| c.is_ascii_digit()) && !name.is_empty() {
                         let expanded = if name == "0" {
                             Some(self.script_name_value())
@@ -2397,7 +2413,7 @@ impl Executor {
                             // tokenizer re-splits its IFS whitespace
                             // (`R=( "$1" )` with $1='a b' stored two
                             // elements, sort-pos-params family).
-                            if prefix.is_none() && token != core {
+                            if quoted_bare {
                                 values.push(store!(&value));
                                 continue;
                             }
@@ -2446,6 +2462,11 @@ impl Executor {
                         changed = true;
                         if let Some(p) = prefix {
                             values.push(format!("{p}={value}"));
+                        } else if quoted_bare {
+                            // Same W_QUOTED invariant as the $N arm
+                            // above: a quoted bare dynamic word is one
+                            // element, never field-split (rubash#1504).
+                            values.push(store!(&value));
                         } else {
                             // BARE unquoted dynamic word ($EPOCHREALTIME,
                             // $LINENO...): same GNU expand_words_no_vars
@@ -2693,6 +2714,37 @@ impl Executor {
             // LIVE quote delimiters (rubash#295: `Y=($W'Q')` with
             // W='a b\tc' kept one element instead of [a][b\tcQ]).
             if token_has_hoisted_quote_carriers(token_raw) {
+                // A word wrapped in ONE hoisted double-quote span and
+                // nothing else is WHOLLY quoted: GNU parse_string_to_word_list
+                // (arrayfunc.c:581) sets W_QUOTED on the whole word and
+                // expand_words_no_vars (arrayfunc.c:610 -> subst.c:13219
+                // expand_word_list_internal) never field-splits it, however
+                // much IFS whitespace its expansion produced. The mixed-word
+                // splitter below cannot see this case: compound_element_
+                // expansion_text already removed the whole-token E302 wrap
+                // (its documented whole-wrap rule), so the text it hands
+                // over carries no span delimiters at all and the splitter
+                // would cut the bare expansion text on every IFS character
+                // (rubash#1504: `a=("a $v")` with v='b c' stored a/b/c
+                // instead of one `a b c` element). Detect the whole wrap on
+                // token_raw — exactly one bare E302 at each end and no bare
+                // E302 inside (an interior bare E302 means adjacent spans
+                // or span-plus-tail, which stay on the splitter path) — and
+                // store the visible text as the single element it is.
+                let dq = crate::executor::markers::ASSIGN_DATA_DQUOTE;
+                let wholly_dquoted = token_raw.starts_with(dq)
+                    && crate::executor::markers::ends_with_bare_sentinel(token_raw, dq)
+                    && token_raw.chars().count() >= 2
+                    && !crate::executor::markers::contains_bare_sentinel(
+                        &token_raw[dq.len_utf8()..token_raw.len() - dq.len_utf8()],
+                        dq,
+                    );
+                if wholly_dquoted {
+                    let text = decode_compound_expansion_carriers(
+                        &text.replace(crate::executor::markers::IFS_GLUE, ""),
+                    );
+                    return vec![quote_array_value(&text)];
+                }
                 // The splitter re-serializes each field as STORAGE SYNTAX —
                 // span content re-wrapped in `'...'` (literal data, the
                 // CTLESC-protected bytes of add_quoted_string), expansion
