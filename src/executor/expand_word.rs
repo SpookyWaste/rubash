@@ -1157,7 +1157,10 @@ pub(in crate::executor) fn braced_name_is_bad_substitution(name: &str) -> bool {
     // sibling forms `${#$v}`, `${#$1}`, `${#$"..."}` and `${#'...'}`
     // stay bad substitutions in GNU too, so only the $'...' literal is
     // admitted here.
-    if bytes.first() == Some(&b'#') && ansi_c_literal_end(&bytes[1..]) == Some(bytes.len() - 2) {
+    if bytes.len() >= 2
+        && bytes.first() == Some(&b'#')
+        && ansi_c_literal_end(&bytes[1..]) == Some(bytes.len() - 2)
+    {
         return false;
     }
 
