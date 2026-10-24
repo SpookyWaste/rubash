@@ -366,6 +366,19 @@ fn apply_simple_sed_substitutions(input: &str, scripts: &[&str]) -> Option<Strin
         }
         substitutions.extend(parse_sed_substitutions(script)?);
     }
+    // A pattern this BRE engine cannot parse at all (`\{m,n\}` intervals,
+    // unknown `[:name:]` classes, unterminated groups) must decline the
+    // whole fast path: apply_simple_sed_line used to swallow the parse
+    // failure per line and pass the input through unchanged, so the
+    // internal sed silently shadowed the real one with wrong output
+    // (rubash#1462). GNU sed either handles the pattern or errors —
+    // both live on the external path this None selects.
+    for (pattern, _, _) in &substitutions {
+        let pattern_chars: Vec<char> = pattern.chars().collect();
+        if parse_bre(&pattern_chars).is_none() {
+            return None;
+        }
+    }
     let mut output = input
         .lines()
         .enumerate()
@@ -459,6 +472,29 @@ fn parse_bre(pattern: &[char]) -> Option<Vec<BrePiece>> {
     Some(atoms_to_pieces(&atoms))
 }
 
+/// C-locale ranges for a POSIX named character class `[:name:]`
+/// (POSIX.1-2017 §9.3.5 / glibc ctype tables under LC_ALL=C, the locale
+/// this BRE engine's other tables already assume). None for an unknown
+/// class name, which GNU sed rejects outright.
+fn named_char_class_ranges(name: &str) -> Option<Vec<(char, char)>> {
+    let ranges: &[(char, char)] = match name {
+        "alnum" => &[('0', '9'), ('A', 'Z'), ('a', 'z')],
+        "alpha" => &[('A', 'Z'), ('a', 'z')],
+        "blank" => &[(' ', ' '), ('\t', '\t')],
+        "cntrl" => &[('\0', '\u{1f}'), ('\u{7f}', '\u{7f}')],
+        "digit" => &[('0', '9')],
+        "graph" => &[('\u{21}', '\u{7e}')],
+        "lower" => &[('a', 'z')],
+        "print" => &[(' ', '\u{7e}')],
+        "punct" => &[('!', '/'), (':', '@'), ('[', '`'), ('{', '~')],
+        "space" => &[('\t', '\r'), (' ', ' ')],
+        "upper" => &[('A', 'Z')],
+        "xdigit" => &[('0', '9'), ('A', 'F'), ('a', 'f')],
+        _ => return None,
+    };
+    Some(ranges.to_vec())
+}
+
 fn parse_bre_atoms(
     pattern: &[char],
     mut index: usize,
@@ -530,6 +566,33 @@ fn parse_bre_atoms(
                         break;
                     }
                     first = false;
+                    // POSIX named class `[:name:]` (POSIX.1-2017 §9.3.5,
+                    // glibc regex): a single class item denoting the
+                    // C-locale ranges of named_char_class_ranges, NOT the
+                    // literal characters '[', ':', ... it is spelled
+                    // with — the old fall-through parsed `[[:space:]]`
+                    // as the set {[, :, s, p, a, c, e} plus a literal ']'
+                    // atom, so it could never match whitespace
+                    // (rubash#1462). An unknown class name fails the
+                    // whole parse (GNU sed: "invalid character class
+                    // name", exit 1) so the caller declines to the
+                    // external sed instead of guessing.
+                    if item == '[' && pattern.get(index + 1) == Some(&':') {
+                        let mut end = index + 2;
+                        let mut name = String::new();
+                        while pattern.get(end).is_some_and(|c| *c != ':') {
+                            name.push(pattern[end]);
+                            end += 1;
+                        }
+                        if pattern.get(end) == Some(&':') && pattern.get(end + 1) == Some(&']') {
+                            let Some(class_ranges) = named_char_class_ranges(&name) else {
+                                return None;
+                            };
+                            ranges.extend(class_ranges);
+                            index = end + 2;
+                            continue;
+                        }
+                    }
                     let lo = item;
                     index += 1;
                     if pattern.get(index) == Some(&'-')
