@@ -13,6 +13,23 @@ impl Executor {
             || self.eval_list_depth.get() == Some(self.evalerror_exec_depth.get())
     }
 
+    /// Mark the list a following execute_ast call will run as a DISCARD
+    /// boundary list, returning the saved marker for restoration.
+    /// evalstring.c's parse_and_execute is the execution unit for reader
+    /// input, eval strings AND sourced files (evalfile.c source_file):
+    /// each installs its own top_level catch, so a DISCARD ends only
+    /// that unit's list. execute_eval_source_inner marks this inline for
+    /// eval; the source driver (builtins::source) uses this pair around
+    /// its per-group runs (rubash#753 case 17).
+    pub(crate) fn enter_discard_boundary_list(&self) -> Option<usize> {
+        self.eval_list_depth
+            .replace(Some(self.evalerror_exec_depth.get() + 1))
+    }
+
+    pub(crate) fn leave_discard_boundary_list(&self, saved: Option<usize>) {
+        self.eval_list_depth.set(saved);
+    }
+
     pub fn execute_ast(&mut self, ast: &Ast) -> Result<(), ExecuteError> {
         if EXECUTION_LOCK_DEPTH.with(|depth| depth.get() > 0) {
             return self.execute_ast_inner(&ast.commands);

@@ -99,6 +99,7 @@ fn run_source_groups(
                 .shell_state
                 .env_vars
                 .insert("__RUBASH_ALIAS_STREAMED".to_string(), "1".to_string());
+            let saved_list_boundary = executor.enter_discard_boundary_list();
             let status = crate::script_driver::run_source_with_line_offset(
                 executor,
                 &exec_text,
@@ -111,6 +112,7 @@ fn run_source_groups(
                     Some(pre_alias_text.as_str())
                 },
             );
+            executor.leave_discard_boundary_list(saved_list_boundary);
             executor.absorb_failglob_discard();
             match old_streamed {
                 Some(value) => executor
@@ -227,7 +229,9 @@ fn run_source_groups(
             .shell_state
             .env_vars
             .insert("__RUBASH_ALIAS_STREAMED".to_string(), "1".to_string());
+        let saved_list_boundary = executor.enter_discard_boundary_list();
         let group_result = executor.execute_ast(&ast);
+        executor.leave_discard_boundary_list(saved_list_boundary);
         executor.absorb_failglob_discard();
         match old_streamed {
             Some(value) => executor

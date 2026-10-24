@@ -1717,18 +1717,20 @@ impl Executor {
             return self.execute_command(&plain);
         }
         let started = time_command_started();
-        if let Some(coproc_cmd) = &time_command.command.coproc_command {
-            self.execute_coproc_command(&time_command.command, coproc_cmd)?;
+        let inner_result = if let Some(coproc_cmd) = &time_command.command.coproc_command {
+            self.execute_coproc_command(&time_command.command, coproc_cmd)
         } else if time_command.command.words.is_empty()
             && command_has_no_effect(&time_command.command)
         {
             self.exit_code = 0;
+            Ok(())
         } else if let Some(pipeline_command) = &time_command.command.pipeline_command {
-            self.execute_pipeline_command(pipeline_command)?;
+            self.execute_pipeline_command(pipeline_command)
         } else if time_command.command.brace_group.is_some() {
-            self.execute_brace_group_pipeline(&time_command.command)?;
+            self.execute_brace_group_pipeline(&time_command.command)
+                .map(|_| ())
         } else if time_command.command.words.first().map(String::as_str) == Some("coproc") {
-            self.execute_time_reparsed_coproc(&time_command.command)?;
+            self.execute_time_reparsed_coproc(&time_command.command)
         } else {
             // GNU execute_time_command dispatches the inner command through
             // execute_command, so a simple/`(( ))`/`[[ ]]` inner fires its own
@@ -1757,7 +1759,22 @@ impl Executor {
                 let inner_text = bash_command_source_text(inner);
                 let _ = self.run_debug_trap(&inner_text)?;
             }
-            self.execute_command(&time_command.command)?;
+            self.execute_command(&time_command.command)
+        };
+        match inner_result {
+            Ok(()) => {}
+            // GNU execute_cmd.c execute_time_command reports the timed
+            // command's status either way: a DISCARD-class expansion
+            // failure inside it (expr.c evalerror / failglob) is the
+            // command's failure status, not a shell unwind — time prints
+            // its report and returns that status, while the armed
+            // reader-level abandon still discards the rest of the line
+            // (rubash#753 case 5: the discard penetrates `time`;
+            // rubash#1240).
+            Err(ExecuteError::ExpansionFailure(code)) => {
+                self.exit_code = code;
+            }
+            Err(error) => return Err(error),
         }
         self.print_time_shell(time_command.posix_format, started);
         if time_command.inverted {
