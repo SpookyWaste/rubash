@@ -554,6 +554,30 @@ pub fn nonlogin_interactive_files(
     files
 }
 
+/// GNU shell.c run_startup_files / maybe_execute_env_file: a
+/// NON-interactive shell (login or not) sources the file named by
+/// $BASH_ENV, after expanding the value (tilde + parameter + command +
+/// arithmetic expansion, expand_string_unsplit). A value that does not
+/// resolve to an existing regular file is silently skipped (the
+/// directory case is diagnosed separately by the caller's
+/// diagnose_bash_env_directory, rubash#1146). Returns the expanded file
+/// name to source, or None (rubash#1479: the standalone binary never
+/// sourced it at all; only the niubash host compensated).
+pub fn bash_env_file(executor: &Executor) -> Option<String> {
+    let value = executor.get_env("BASH_ENV")?;
+    if value.is_empty() {
+        return None;
+    }
+    let expanded = executor.expand_word(&value);
+    if expanded.is_empty() {
+        return None;
+    }
+    let path = executor.resolve_shell_path(&expanded);
+    std::fs::metadata(&path)
+        .is_ok_and(|meta| meta.is_file())
+        .then_some(expanded)
+}
+
 fn parse_post_c_option(
     args: &[String],
     index: usize,

@@ -1608,10 +1608,12 @@ fn run_startup_files(executor: &mut Executor, rc_override: Option<&str>) -> Opti
     let no_profile = executor.get_env("__RUBASH_NO_PROFILE").as_deref() == Some("1");
     let no_rc = executor.get_env("__RUBASH_NO_RC").as_deref() == Some("1");
     let home = executor.get_env("HOME").unwrap_or_default();
-    if home.is_empty() {
-        return None;
-    }
-    let files = {
+    // The profile/rc branches need HOME; the $BASH_ENV branch below does
+    // not (GNU sources it with HOME unset), so an empty HOME only empties
+    // the file list instead of returning early (rubash#1479).
+    let files = if home.is_empty() {
+        Vec::new()
+    } else {
         let exists = |path: &str| std::fs::metadata(executor.resolve_shell_path(path)).is_ok();
         if login {
             login_profile_branch(&home, no_profile, exists)
@@ -1636,6 +1638,17 @@ fn run_startup_files(executor: &mut Executor, rc_override: Option<&str>) -> Opti
         let status = run_init_file(executor, &file);
         if executor.take_exit_jump_pending() {
             return Some(status);
+        }
+    }
+    // GNU shell.c run_startup_files / maybe_execute_env_file: every
+    // non-interactive shell — login shells included, after the profile
+    // chain — sources $BASH_ENV (rubash#1479).
+    if !interactive {
+        if let Some(file) = rubash::invocation::bash_env_file(executor) {
+            let status = run_init_file(executor, &file);
+            if executor.take_exit_jump_pending() {
+                return Some(status);
+            }
         }
     }
     None
