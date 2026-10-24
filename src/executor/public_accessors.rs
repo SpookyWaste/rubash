@@ -1020,6 +1020,12 @@ impl Executor {
         saved_state: crate::shell::ShellState,
         saved_cwd: Option<PathBuf>,
     ) {
+        // Every caller is a fork boundary (flat `( )` regions and
+        // command-substitution children): the region's descriptor copies
+        // close here, so run the deferred bodies of the output process
+        // substitutions the region opened before the parent's env (which
+        // carries their registrations) is swapped back (rubash#1336).
+        self.flush_region_owned_output_process_substitutions(&saved_state.env_vars);
         self.restore_shell_env(saved_state.env_vars.clone());
         self.shell_state = saved_state;
         if let Some(dir) = saved_cwd {

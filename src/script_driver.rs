@@ -4504,7 +4504,7 @@ pub fn finish_shell(executor: &mut Executor, status: i32, interactive: bool) -> 
             }
         }
     }
-    match executor.run_exit_trap_with_status(status) {
+    let code = match executor.run_exit_trap_with_status(status) {
         Ok(code) => code,
         Err(ExecuteError::ExitCode(code)) => code,
         Err(e) => {
@@ -4515,7 +4515,14 @@ pub fn finish_shell(executor: &mut Executor, status: i32, interactive: bool) -> 
             }
             1
         }
-    }
+    };
+    // After the EXIT trap (whose writes still belong to the streams):
+    // shell exit closes every descriptor, so each still-open persistent
+    // output process substitution sees EOF and finishes — run the
+    // deferred bodies with their accumulated input (rubash#1336:
+    // `exec > >(tee log)` scripts lost the whole log at end-of-script).
+    executor.close_all_persistent_output_process_substitutions();
+    code
 }
 
 /// shell.c:1830-1842 init_interactive + bashhist.c:320-345: create the

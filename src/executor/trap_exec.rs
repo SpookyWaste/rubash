@@ -2959,6 +2959,9 @@ impl Executor {
                         if source_fd == fd {
                             continue;
                         }
+                        // dup2 onto an fd holding a process substitution
+                        // closes the old description first (rubash#1336).
+                        self.flush_persistent_output_process_substitution(fd)?;
                         self.copy_exec_output_fd_resolving_ambient(fd, source_fd, &ambient);
                         if move_source {
                             self.close_persistent_output_fd(source_fd)?;
@@ -2978,7 +2981,9 @@ impl Executor {
                         if !is_null_device(&path) {
                             self.create_redirect_output(&path, redirect.clobber)?;
                         }
+                        self.flush_persistent_output_process_substitution(1)?;
                         self.set_fd_output_file(1, path.clone(), false, false)?;
+                        self.flush_persistent_output_process_substitution(2)?;
                         self.share_fd_output_file(1, 2, &path, false);
                         continue;
                     }
@@ -2995,6 +3000,10 @@ impl Executor {
                         // the real handle open in set_fd_output_file follows.
                         self.create_redirect_output(&target, redirect.clobber)?;
                     }
+                    // Rebinding closes the descriptor's previous
+                    // description first in GNU; run a pending process
+                    // substitution's deferred body (rubash#1336).
+                    self.flush_persistent_output_process_substitution(fd)?;
                     self.set_fd_output_file(fd, target.clone(), fd >= 10, append)?;
                     if matches!(
                         redirect.kind,
@@ -3004,6 +3013,7 @@ impl Executor {
                         // &>file / &>>file: stderr follows stdout through
                         // the same open file description (redir.c
                         // r_err_and_out / r_append_err_and_out).
+                        self.flush_persistent_output_process_substitution(2)?;
                         self.share_fd_output_file(fd, 2, &target, fd >= 10);
                     }
                 }
@@ -3022,6 +3032,7 @@ impl Executor {
                         if source_fd == fd {
                             continue;
                         }
+                        self.flush_persistent_output_process_substitution(fd)?;
                         self.copy_exec_output_fd_resolving_ambient(fd, source_fd, &ambient);
                         if move_source {
                             self.close_persistent_output_fd(source_fd)?;
@@ -3038,7 +3049,9 @@ impl Executor {
                         if !is_null_device(&path) {
                             self.create_redirect_output(&path, redirect.clobber)?;
                         }
+                        self.flush_persistent_output_process_substitution(1)?;
                         self.set_fd_output_file(1, path.clone(), false, false)?;
+                        self.flush_persistent_output_process_substitution(2)?;
                         self.share_fd_output_file(1, 2, &path, false);
                         continue;
                     }
@@ -3517,6 +3530,12 @@ impl Executor {
         // status yet) so `kill -0 $!`/`kill $!` reach the forked child in
         // the meantime. The status lands in completed_statuses when the fd
         // closes and the body runs (close_persistent_output_fd).
+        // Rebinding an fd that still holds a process substitution closes
+        // the old descriptor first in GNU (dup2 onto it): the old body
+        // receives everything written so far. Run the deferred body via
+        // the regular close instead of abandoning it (rubash#1336:
+        // `exec > >(tee a); echo 1; exec > >(tee b)` lost "1" entirely).
+        self.flush_persistent_output_process_substitution(fd)?;
         let previous =
             self.fd_table
                 .entries
@@ -3526,9 +3545,9 @@ impl Executor {
                     _ => None,
                 });
         if let Some(previous) = previous {
-            // A replaced-but-never-closed fd abandons its body (pre-existing
-            // temp/body lifecycle); at least reap the orphaned zombie so a
-            // rebinding loop cannot accumulate one placeholder per iteration.
+            // Defensive (unreachable after the flush above): reap an
+            // orphaned placeholder so a rebinding loop cannot accumulate
+            // one zombie per iteration.
             self.reap_procsub_placeholder(previous, true);
         }
         #[cfg(unix)]
@@ -3559,6 +3578,117 @@ impl Executor {
             .env_vars
             .insert(fd_output_process_substitution_key(fd), source.to_string());
         Ok(true)
+    }
+
+    /// Run the deferred body of a persistent output process substitution
+    /// bound to `fd`, if any (no-op for every other endpoint). GNU binds
+    /// `>(...)` to a real pipe (subst.c process_substitute): rebinding or
+    /// closing the descriptor delivers EOF and the substitution reader
+    /// consumes everything written so far. rubash's deferred model buffers
+    /// the bytes in a carrier file and runs the body at close
+    /// (close_persistent_output_fd), so every persistent overwrite of the
+    /// descriptor must close it first — the sites that silently overwrote
+    /// the endpoint dropped the body and all buffered output (rubash#1336:
+    /// `exec > >(tee log)` followed by any later rebind or by shell exit
+    /// lost the whole stream).
+    pub(in crate::executor) fn flush_persistent_output_process_substitution(
+        &mut self,
+        fd: u32,
+    ) -> Result<(), ExecuteError> {
+        let is_procsub = self.fd_table.entries.get(&fd).is_some_and(|entry| {
+            !entry.closed
+                && matches!(
+                    entry.write.as_ref(),
+                    Some(FdWriteEndpoint::ProcessSubstitution { .. })
+                )
+        });
+        if is_procsub {
+            self.close_persistent_output_fd(fd)?;
+        }
+        Ok(())
+    }
+
+    /// Shell-exit sweep (script_driver::finish_shell, after the EXIT trap):
+    /// close every still-open persistent output process substitution so
+    /// its deferred body runs with the accumulated input. GNU's exit path
+    /// closes the shell's descriptors; each substitution reader sees EOF
+    /// and finishes (subst.c process_substitute pipe semantics). Without
+    /// the sweep, `exec > >(tee log)` at the top of a script — the standard
+    /// logging idiom — silently discarded the entire stream when the
+    /// script simply ran off its end (rubash#1336).
+    pub fn close_all_persistent_output_process_substitutions(&mut self) {
+        let mut fds: Vec<u32> = self
+            .fd_table
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                !entry.closed
+                    && matches!(
+                        entry.write.as_ref(),
+                        Some(FdWriteEndpoint::ProcessSubstitution { .. })
+                    )
+            })
+            .map(|(fd, _)| *fd)
+            .collect();
+        // Descending: within one substitution's dup group the final
+        // close must be the lowest fd, so that when fds 1/2 belong to
+        // the group the deferred body runs from a close of that very fd
+        // and close_persistent_output_fd's stdio-marker fixup gives the
+        // body its stdout/stderr back (rubash#1336).
+        fds.sort_unstable_by(|a, b| b.cmp(a));
+        for fd in fds {
+            let _ = self.close_persistent_output_fd(fd);
+        }
+    }
+
+    /// Fork-boundary sweep (called from restore_flat_subshell): close the
+    /// persistent output process substitutions the closing region OPENED
+    /// (or rebound) before the parent's state is restored. GNU's forked
+    /// child owns copies of the parent's descriptors
+    /// (execute_cmd.c:1576 execute_in_subshell; subst.c:7143
+    /// command_substitute); at child exit the copies close, so a
+    /// substitution created inside sees EOF and finishes, while an
+    /// inherited one keeps streaming for the parent. Identity is the
+    /// registration the open left in the env (carrier path + body source):
+    /// an fd whose parent-env registration matches the live endpoint is
+    /// inherited and left alone; anything else is region-owned
+    /// (rubash#1336).
+    pub(in crate::executor) fn flush_region_owned_output_process_substitutions(
+        &mut self,
+        parent_env: &crate::shell::var_table::VarTable,
+    ) {
+        let mut owned: Vec<u32> = self
+            .fd_table
+            .entries
+            .iter()
+            .filter(|(fd, entry)| {
+                if entry.closed {
+                    return false;
+                }
+                let Some(FdWriteEndpoint::ProcessSubstitution { path, command, .. }) =
+                    entry.write.as_ref()
+                else {
+                    return false;
+                };
+                let path_text = path.to_string_lossy();
+                parent_env
+                    .get(&super::command_text::fd_output_process_substitution_key(
+                        **fd,
+                    ))
+                    .map(String::as_str)
+                    != Some(command.as_str())
+                    || parent_env
+                        .get(&super::command_text::fd_output_key(**fd))
+                        .map(String::as_str)
+                        != Some(path_text.as_ref())
+            })
+            .map(|(fd, _)| *fd)
+            .collect();
+        // Descending, same dup-group ordering as the exit sweep.
+        owned.sort_unstable_by(|a, b| b.cmp(a));
+        for fd in owned {
+            let _ = self.close_persistent_output_fd(fd);
+        }
     }
 
     pub(in crate::executor) fn close_persistent_output_fd(
@@ -3594,10 +3724,59 @@ impl Executor {
             .shell_state
             .env_vars
             .remove(&fd_output_process_substitution_key(fd));
+        // GNU delivers EOF to the substitution reader only when the LAST
+        // descriptor referring to the pipe closes: a dup'd copy (`N>&M`,
+        // `exec >&$fd`) keeps the stream alive across an intermediate
+        // close. While another open entry still references this
+        // substitution (same carrier path + body source), this close
+        // drops only this descriptor's registration — the deferred body
+        // and the carrier teardown wait for the final close
+        // (rubash#1336).
+        if let (Some(target_text), Some(source_text)) = (&target, &source) {
+            let carrier = shell_path_to_windows(target_text, &self.shell_state.env_vars);
+            let still_referenced = self.fd_table.entries.values().any(|entry| {
+                !entry.closed
+                    && matches!(
+                        entry.write.as_ref(),
+                        Some(FdWriteEndpoint::ProcessSubstitution { path, command, .. })
+                            if *path == carrier && command == source_text
+                    )
+            });
+            if still_referenced {
+                return Ok(());
+            }
+        }
         if let (Some(target), Some(source)) = (target, source) {
             let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
             let input = fs::read_to_string(&path).unwrap_or_default();
-            self.execute_persistent_output_process_substitution(&source, input, pending_pid)?;
+            // The deferred body runs as the substitution child GNU forked
+            // at open time: its stdio is the shell's as of the fork. For
+            // fds 1/2 that is the process stdout/stderr the binding
+            // covered — but close_output just cleared the slot, so a body
+            // writing to the same descriptor (tee's stdout copy on fd 1)
+            // would be silently discarded. Reinstate the stdio marker
+            // for the body's duration, then put the closed slot back
+            // exactly as close_output left it (rubash#1336).
+            let saved_entry = self.fd_table.entries.get(&fd).cloned();
+            if fd == 1 || fd == 2 {
+                let marker = if fd == 1 {
+                    FdWriteEndpoint::Stdout
+                } else {
+                    FdWriteEndpoint::Stderr
+                };
+                self.fd_table.open_output(fd, marker, false);
+            }
+            let result =
+                self.execute_persistent_output_process_substitution(&source, input, pending_pid);
+            match saved_entry {
+                Some(entry) => {
+                    self.fd_table.entries.insert(fd, entry);
+                }
+                None => {
+                    self.fd_table.entries.remove(&fd);
+                }
+            }
+            result?;
             let _ = fs::remove_file(path);
         }
         Ok(())
