@@ -97,7 +97,24 @@ impl Executor {
         // sample must be intact when its adjudication runs after the
         // nested list returns.
         let saved_err_trap_sample = self.err_trap_armed_sample.get();
+        // rubash#1497: the -c tail exec-replacement stamp survives only
+        // the final unit's own top frame (and, via the one-shot hold, an
+        // and_or_list tail element's wrapper frame — GNU
+        // execute_cmd.c:2886 execute_connection walks &&/|| operands in
+        // the caller's frame; this port wraps each operand in its own
+        // execute_ast). Every other nested list walk — function bodies,
+        // trap actions, sourced/eval units, compound bodies — clears it
+        // for its duration, so a spawn inside can never mistake itself
+        // for the -c string's last top-level command.
+        let saved_exec_replace_stamp = self.exec_replace_dispatch_stamp.get();
+        if self.exec_replace_stamp_hold.replace(0) == 0
+            && !(self.exec_replace_final_frame.get() && self.evalerror_exec_depth.get() == 1)
+        {
+            self.exec_replace_dispatch_stamp.set(0);
+        }
         let result = self.execute_ast_inner_body(commands);
+        self.exec_replace_dispatch_stamp
+            .set(saved_exec_replace_stamp);
         self.err_trap_armed_sample.set(saved_err_trap_sample);
         self.evalerror_exec_depth
             .set(self.evalerror_exec_depth.get().saturating_sub(1));
@@ -177,6 +194,71 @@ impl Executor {
         }
         self.exit_code = 1;
         Ok(())
+    }
+
+    /// rubash#1497: the node shapes GNU's fork optimization accepts
+    /// for the last command of a -c string (builtins/evalstring.c:106
+    /// should_optimize_fork: a cm_simple command, not a pipeline
+    /// element, carrying no redirections; parse_and_execute also
+    /// refuses CMD_TIME_PIPELINE / CMD_INVERT_RETURN carriers). Prefix
+    /// assignments are fine — they fold into the child's environment
+    /// exactly as in the fork path. A folded &&/|| list qualifies
+    /// through its last element, mirroring optimize_connection_fork
+    /// (builtins/evalstring.c:148).
+    fn exec_replace_shape_ok(command: &CommandNode) -> bool {
+        if let Some(list) = &command.and_or_list {
+            return !command.background
+                && command.redirects.is_empty()
+                && command.redirect_in.is_none()
+                && command.redirect_out.is_none()
+                && command.redirect_err.is_none()
+                && command.append.is_none()
+                && command.redirect_err_append.is_none()
+                && command.heredoc.is_none()
+                && command.here_string.is_none()
+                && command.heredoc_redirects.is_empty()
+                && list
+                    .commands
+                    .last()
+                    .is_some_and(Self::exec_replace_simple_shape_ok);
+        }
+        Self::exec_replace_simple_shape_ok(command)
+    }
+
+    fn exec_replace_simple_shape_ok(command: &CommandNode) -> bool {
+        !command.words.is_empty()
+            && command.pipeline_command.is_none()
+            && command.and_or_list.is_none()
+            && command.time_command.is_none()
+            && command.background_command.is_none()
+            && command.inverted_command.is_none()
+            && command.coproc_command.is_none()
+            && command.for_command.is_none()
+            && command.arithmetic_command.is_none()
+            && command.if_command.is_none()
+            && command.loop_command.is_none()
+            && command.conditional_command.is_none()
+            && command.subshell_command.is_none()
+            && command.case_command.is_none()
+            && command.select_command.is_none()
+            && command.function_command.is_none()
+            && command.brace_group.is_none()
+            && command.pipe.is_none()
+            && command.and_or.is_none()
+            && !command.background
+            && !command.inverted
+            && !command.subshell
+            && !command.subshell_end
+            && command.redirects.is_empty()
+            && command.redirect_in.is_none()
+            && command.redirect_out.is_none()
+            && command.redirect_err.is_none()
+            && command.append.is_none()
+            && command.redirect_err_append.is_none()
+            && command.heredoc.is_none()
+            && command.heredoc_body.is_none()
+            && command.here_string.is_none()
+            && command.heredoc_redirects.is_empty()
     }
 
     fn execute_ast_inner_body(&mut self, commands: &[CommandNode]) -> Result<(), ExecuteError> {
@@ -363,6 +445,25 @@ impl Executor {
                     (command.inverted || command.inverted_command.is_some())
                         && command.and_or().is_none(),
                 );
+            }
+            // rubash#1497: stamp the final -c unit's last top-level
+            // command dispatch (GNU builtins/evalstring.c:126
+            // should_suppress_fork + execute_cmd.c:5813: the last
+            // command of a -c string replaces the shell process when it
+            // is a plain external command). The stamp is consumed at
+            // the spawn site; nested walks clear it (execute_ast_inner),
+            // so only this node's own spawn can observe it.
+            if self.exec_replace_final_frame.get() && self.evalerror_exec_depth.get() == 1 {
+                let armed = index + 1 == commands.len()
+                    && subshell_state.is_none()
+                    && Self::exec_replace_shape_ok(command);
+                if armed {
+                    let stamp = self.exec_replace_stamp_counter.get() + 1;
+                    self.exec_replace_stamp_counter.set(stamp);
+                    self.exec_replace_dispatch_stamp.set(stamp);
+                } else {
+                    self.exec_replace_dispatch_stamp.set(0);
+                }
             }
             // GNU parse.y/eval.c: a syntax error inside a command
             // substitution is a read-time failure of the enclosing command —
@@ -1819,8 +1920,8 @@ impl Executor {
             // compounds (cm_arith/cm_cond) — `if`/`while`/`until`/`for`/
             // `case`/etc. leave the last pipeline's PIPESTATUS untouched
             // (rubash#1383 #1384).
-            let is_pipestatus_compound = command.arithmetic_command.is_some()
-                || command.conditional_command.is_some();
+            let is_pipestatus_compound =
+                command.arithmetic_command.is_some() || command.conditional_command.is_some();
             let is_non_pipestatus_compound = command.if_command.is_some()
                 || command.loop_command.is_some()
                 || command.for_command.is_some()

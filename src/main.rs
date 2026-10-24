@@ -1165,6 +1165,15 @@ fn run_command_string_with_init(
     // current_command_number never increments (`\#` prints 1 — GNU probe
     // target/gapfix2/cc.sh).
     executor.set_command_string_mode(true);
+    // rubash#1497: arm the final-unit exec replacement for this -c
+    // string (consumed by its last reader unit; the grouped driver
+    // re-arms per group so only the final group carries it).
+    // Respawned children (background/coproc bodies) run under a
+    // different process contract — the parent shell reaps and reports
+    // them as jobs — so they never arm.
+    if !rubash::executor::RESPAWNED_CHILD.load(std::sync::atomic::Ordering::Relaxed) {
+        executor.set_command_string_final_pending(true);
+    }
     // rubash#414: alias expansion live at reader start (CLI -o posix /
     // --posix / -O expand_aliases — shell.c:1853 init_noninteractive sets
     // expand_aliases = posixly_correct) takes the incremental grouped

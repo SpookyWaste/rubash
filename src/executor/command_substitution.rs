@@ -1664,6 +1664,11 @@ impl Executor {
             // transients of the parent, not fork state.
             reader_last_list_line: Cell::new(None),
             command_string_mode: Cell::new(false),
+            command_string_final_pending: Cell::new(false),
+            exec_replace_final_frame: Cell::new(false),
+            exec_replace_dispatch_stamp: Cell::new(0),
+            exec_replace_stamp_counter: Cell::new(0),
+            exec_replace_stamp_hold: Cell::new(0),
             line_lex_locales: std::cell::RefCell::new(HashMap::new()),
             unit_lex_locale: std::cell::RefCell::new(None),
             ambient_line: Cell::new(None),

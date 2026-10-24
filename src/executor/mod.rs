@@ -939,6 +939,29 @@ pub struct Executor {
     /// never increments (WSL GNU 5.3.0: `bash -c 'x="\#"; echo ${x@P}'`
     /// prints 1).
     command_string_mode: Cell<bool>,
+    /// rubash#1497: armed by the -c driver for the command string's
+    /// final reader unit (GNU builtins/evalstring.c:126
+    /// should_suppress_fork requires startup_state == 2 — a command
+    /// string, never a script file); run_source_impl consumes it and
+    /// raises exec_replace_final_frame for that unit's execute_ast only.
+    pub(crate) command_string_final_pending: Cell<bool>,
+    /// rubash#1497: true while run_source_impl executes the final -c
+    /// unit's AST; the depth-1 list walk stamps that unit's last plain
+    /// command (see exec_replace_dispatch_stamp).
+    pub(crate) exec_replace_final_frame: Cell<bool>,
+    /// rubash#1497: nonzero stamp of the -c tail dispatch currently in
+    /// flight on this executor. execute_ast_inner zeroes it for every
+    /// nested list walk (function bodies, trap actions, sourced/eval
+    /// units, compound bodies), so the spawn-site exec gate can only
+    /// ever fire for the tail command's own dispatch.
+    pub(crate) exec_replace_dispatch_stamp: Cell<u64>,
+    /// rubash#1497: monotonic source for exec_replace_dispatch_stamp.
+    pub(crate) exec_replace_stamp_counter: Cell<u64>,
+    /// rubash#1497: one-shot pass letting an and_or_list's last element
+    /// keep the enclosing dispatch stamp across its execute_ast wrapper
+    /// (GNU execute_cmd.c:2886 execute_connection walks operands in the
+    /// caller's frame; this port wraps each operand in execute_ast).
+    pub(crate) exec_replace_stamp_hold: Cell<u32>,
     /// rubash#353: locale in effect when each SOURCE LINE was first reached
     /// at reader level — the locale GNU's parser would decode that line's
     /// `$'...'` backslash-u escapes under (GNU reads a newline-terminated

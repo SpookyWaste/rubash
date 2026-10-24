@@ -380,6 +380,16 @@ impl Executor {
             if index < and_or_list.connectors.len() {
                 self.with_errexit_suppressed(|executor| executor.execute_ast(&commands))?;
             } else {
+                // rubash#1497: the last &&/|| operand of the final -c
+                // unit keeps the enclosing dispatch stamp across this
+                // execute_ast wrapper (one-shot hold, consumed at
+                // execute_ast_inner entry) — GNU execute_connection
+                // (execute_cmd.c:2886) walks operands in the caller's
+                // frame, so the tail operand is the -c string's last
+                // command for should_suppress_fork purposes.
+                if self.exec_replace_dispatch_stamp.get() != 0 {
+                    self.exec_replace_stamp_hold.set(1);
+                }
                 self.execute_ast(&commands)?;
             }
         }

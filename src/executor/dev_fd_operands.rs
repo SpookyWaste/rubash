@@ -94,6 +94,16 @@ impl Drop for DevOperandMaterialization {
     }
 }
 
+impl DevOperandMaterialization {
+    /// rubash#1497: deferred flushes copy buffered bytes back to the
+    /// real target after the child exits — a process-replacing exec
+    /// has no "after", so the spawn site must refuse exec replacement
+    /// while any flush is pending.
+    pub(in crate::executor) fn has_deferred_flushes(&self) -> bool {
+        !self.flushes.is_empty()
+    }
+}
+
 #[cfg(unix)]
 /// Pin every recorded `/dev/fd/N` pipe read end at its own descriptor number
 /// in the child between fork and exec (std Command pre_exec): the child then
