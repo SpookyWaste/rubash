@@ -1020,7 +1020,10 @@ fn take_all_signals() -> Vec<i32> {
     //     with no traps (the common loop case).
     let self_pending = PENDING_ANY.load(std::sync::atomic::Ordering::Acquire);
     let kernel_pending = kernel_signals::handler_any_installed();
-    if !self_pending && !kernel_pending {
+    // rubash#1475: the fatal pair's handler is always installed, so its
+    // queue is a third independent producer for this drain.
+    let fatal_pending = kernel_signals::fatal_pending_any();
+    if !self_pending && !kernel_pending && !fatal_pending {
         return Vec::new();
     }
     let mut signals = if self_pending {
@@ -1030,6 +1033,9 @@ fn take_all_signals() -> Vec<i32> {
     };
     if kernel_pending {
         signals.extend(kernel_signals::drain());
+    }
+    if fatal_pending {
+        signals.extend(kernel_signals::drain_fatal());
     }
     // Clear only when both sources are provably empty again. A delivery
     // that raced this drain either set PENDING_ANY or installed a handler
@@ -2053,7 +2059,189 @@ mod kernel_signals {
     /// (trap cleared): SIG_DFL would have killed the process and SIG_IGN
     /// swallows, so neither can produce a legitimate pending entry.
     pub(super) fn handler_installed(sig: i32) -> bool {
+        if fatal_index(sig).is_some() {
+            // The fatal-pair handler is installed unconditionally at
+            // startup (rubash#1475); a queued entry for the pair is
+            // legitimate by construction, never a stale registry flag.
+            return true;
+        }
         MANAGED.contains(&sig) && HANDLER_SET.load(Ordering::Relaxed) & bit(sig) != 0
+    }
+
+    /// rubash#1475: the fatal pair, SIGSEGV and SIGBUS. Both are caught
+    /// by the Rust runtime before main() — its stack-overflow guard
+    /// installs a handler for them (visible in /proc/self/status SigCgt
+    /// on every rubash process) — and that handler RETURNS for a signal
+    /// that was SENT rather than faulted, so an untrapped `kill -SEGV
+    /// $$`, whether from this shell's own kill builtin (a real raise(2)
+    /// on unix) or from any other process, was silently swallowed and
+    /// the shell ran on. GNU runs both at SIG_DFL in a script shell
+    /// (sig.c initialize_signals never catches them), so an untrapped
+    /// delivery kills the shell and a trapped one runs its trap.
+    /// signal_hook cannot serve the pair: its handler is a signo queue
+    /// writer with no siginfo, and returning from a handler for a
+    /// synchronous fault re-executes the faulting instruction forever.
+    /// The custom handler below splits arrivals on siginfo.si_code:
+    ///   - si_code <= 0 (SI_USER / SI_TKILL / SI_QUEUE / ...): the
+    ///     signal was SENT. With a trap armed, count it for the boundary
+    ///     dispatcher (drained through drain_fatal into the same
+    ///     Vec<i32> as the managed set); with `trap ''`, drop it;
+    ///     untrapped, restore SIG_DFL and re-raise so the process dies
+    ///     BY the signal on the spot, exactly as a default disposition.
+    ///   - si_code > 0: a hardware fault (SEGV_MAPERR, BUS_ADRALN...).
+    ///     Chain to the disposition saved at install time — in practice
+    ///     the runtime's overflow handler — so stack-overflow detection
+    ///     and genuine-fault death keep working byte for byte.
+    const FATAL: [i32; 2] = [libc::SIGSEGV as i32, libc::SIGBUS as i32];
+
+    /// Queued SENT deliveries per fatal signal (handler increments,
+    /// drain_fatal swaps out; a plain atomic add is async-signal-safe).
+    static FATAL_PENDING: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+    /// Trap routing for SENT deliveries, per fatal signal:
+    /// 0 = Default (die), 1 = Ignore (drop), 2 = Handler (queue).
+    /// Mirrored from the trap table by reconcile_fatal.
+    static FATAL_STATE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+    /// Dispositions saved when the fatal handler was installed — the
+    /// hardware-fault chain targets. Written once inside
+    /// capture_entry_and_policy's Once before the handler is installed;
+    /// the Once's happens-before edge covers the handler's later reads.
+    static FATAL_PREV_HANDLER: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    static FATAL_PREV_FLAGS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+    fn fatal_index(sig: i32) -> Option<usize> {
+        FATAL.iter().position(|&f| f == sig)
+    }
+
+    extern "C" fn fatal_signal_handler(
+        sig: i32,
+        info: *mut libc::siginfo_t,
+        context: *mut libc::c_void,
+    ) {
+        let Some(index) = fatal_index(sig) else {
+            return;
+        };
+        let si_code = if info.is_null() {
+            0
+        } else {
+            unsafe { (*info).si_code }
+        };
+        if si_code > 0 {
+            // Hardware fault: chain to the saved disposition.
+            let prev = FATAL_PREV_HANDLER[index].load(Ordering::Relaxed) as usize;
+            match prev {
+                libc::SIG_IGN => return,
+                libc::SIG_DFL | 0 => {
+                    set_kernel_handler(sig, libc::SIG_DFL);
+                    unsafe { libc::raise(sig) };
+                    return;
+                }
+                _ => {}
+            }
+            let prev_flags = FATAL_PREV_FLAGS[index].load(Ordering::Relaxed) as i32;
+            // SAFETY: prev is the handler address the process had
+            // installed for this signal at startup (the Rust runtime's
+            // overflow guard); invoking it with the delivery's own
+            // arguments is exactly what the kernel would have done.
+            unsafe {
+                if prev_flags & libc::SA_SIGINFO != 0 {
+                    let handler: extern "C" fn(i32, *mut libc::siginfo_t, *mut libc::c_void) =
+                        std::mem::transmute(prev);
+                    handler(sig, info, context);
+                } else {
+                    let handler: extern "C" fn(i32) = std::mem::transmute(prev);
+                    handler(sig);
+                }
+            }
+            return;
+        }
+        // Sent by kill/tgkill/raise/sigqueue: shell semantics apply.
+        match FATAL_STATE[index].load(Ordering::Relaxed) {
+            2 => {
+                FATAL_PENDING[index].fetch_add(1, Ordering::Relaxed);
+            }
+            1 => {}
+            _ => {
+                set_kernel_handler(sig, libc::SIG_DFL);
+                unsafe { libc::raise(sig) };
+            }
+        }
+    }
+
+    /// Install the fatal-pair handler, saving the current dispositions
+    /// as the hardware-fault chain targets. Called from
+    /// capture_entry_and_policy's Once, before any trap can exist, so
+    /// both signals start at Default routing (an untrapped sent delivery
+    /// dies). A signal that is SIG_IGN at this point (entry-ignored, or
+    /// on a platform whose runtime ignores it) starts at Ignore routing
+    /// and reconcile_fatal never arms it — POSIX hard-ignore.
+    fn install_fatal_handlers() {
+        for (index, &sig) in FATAL.iter().enumerate() {
+            let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+            unsafe { libc::sigaction(sig, std::ptr::null(), &mut current) };
+            FATAL_PREV_HANDLER[index].store(current.sa_sigaction as u64, Ordering::Relaxed);
+            FATAL_PREV_FLAGS[index].store(current.sa_flags as i64 as u64, Ordering::Relaxed);
+            if current.sa_sigaction == libc::SIG_IGN {
+                FATAL_STATE[index].store(1, Ordering::Relaxed);
+            }
+            let action = libc::sigaction {
+                sa_sigaction: fatal_signal_handler as *const () as usize,
+                sa_flags: libc::SA_SIGINFO,
+                sa_mask: unsafe { std::mem::zeroed() },
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                sa_restorer: None,
+            };
+            unsafe { libc::sigaction(sig, &action, std::ptr::null_mut()) };
+        }
+    }
+
+    /// Drain the fatal pair's queued SENT deliveries (take_all_signals
+    /// merges them with the managed drain).
+    pub(super) fn drain_fatal() -> Vec<i32> {
+        let mut signals = Vec::new();
+        for (index, &sig) in FATAL.iter().enumerate() {
+            let count = FATAL_PENDING[index].swap(0, Ordering::Relaxed);
+            for _ in 0..count {
+                signals.push(sig);
+            }
+        }
+        signals
+    }
+
+    pub(super) fn fatal_pending_any() -> bool {
+        FATAL_PENDING
+            .iter()
+            .any(|count| count.load(Ordering::Relaxed) > 0)
+    }
+
+    /// True when both fatal signals sit at Default routing, so the
+    /// boundary reconcile's fast path may skip the trap-table walk.
+    pub(super) fn fatal_at_default() -> bool {
+        FATAL_STATE
+            .iter()
+            .all(|state| state.load(Ordering::Relaxed) == 0)
+    }
+
+    /// Mirror the trap table's wishes for the fatal pair (the managed
+    /// reconcile's Disposition mapping): Handler queues sent deliveries
+    /// for the boundary dispatcher, Ignore drops them, Default restores
+    /// die-on-delivery. Entry-ignored signals stay pinned at Ignore.
+    pub(super) fn reconcile_fatal(dispositions: &[(i32, Disposition)]) {
+        for &(sig, want) in dispositions {
+            let Some(index) = fatal_index(sig) else {
+                continue;
+            };
+            if FATAL_PREV_HANDLER[index].load(Ordering::Relaxed) as usize == libc::SIG_IGN {
+                continue;
+            }
+            let target = match want {
+                Disposition::Handler => 2u64,
+                Disposition::Ignore => 1u64,
+                Disposition::Default => 0u64,
+            };
+            FATAL_STATE[index].store(target, Ordering::Relaxed);
+        }
     }
 
     /// rubash#1250: foreground-builtin SIGINT hold. While set, the
@@ -2122,6 +2310,9 @@ mod kernel_signals {
                 set_kernel_handler(libc::SIGQUIT as i32, libc::SIG_IGN);
             }
             store_state(libc::SIGQUIT as i32, 1);
+            // rubash#1475: replace the runtime's SIGSEGV/SIGBUS handlers
+            // with the fatal-pair handler (see install_fatal_handlers).
+            install_fatal_handlers();
         });
     }
 
@@ -2370,13 +2561,24 @@ pub fn reconcile_kernel_trap_dispositions(env_vars: &std::collections::HashMap<S
             break;
         }
     }
+    // rubash#1475: a trap on the fatal pair (SIGSEGV/SIGBUS) also forces
+    // the slow path — its routing bits live outside the managed state.
+    if !any_armed {
+        any_armed = env_vars.contains_key("__RUBASH_TRAP_SIGSEGV")
+            || env_vars.contains_key("__RUBASH_TRAP_SIGBUS");
+    }
     // An armed EXIT trap also forces the slow path: it routes every
     // otherwise-untrapped managed signal through the handler
     // (sig.c:226-229, rubash#1332 — see the disposition loop below).
     let exit_armed = env_vars
         .get("__RUBASH_TRAP_EXIT")
         .is_some_and(|action| !action.is_empty());
-    if !any_armed && !exit_armed && no_reset && kernel_signals::at_default_state() {
+    if !any_armed
+        && !exit_armed
+        && no_reset
+        && kernel_signals::at_default_state()
+        && kernel_signals::fatal_at_default()
+    {
         return;
     }
     let reset = env_vars
@@ -2416,6 +2618,28 @@ pub fn reconcile_kernel_trap_dispositions(env_vars: &std::collections::HashMap<S
         *slot = (sig, want);
     }
     kernel_signals::reconcile(&dispositions);
+    // rubash#1475: mirror the fatal pair's trap state into the fatal
+    // handler's routing bits, with the same mapping as the managed set
+    // (a reset-listed fatal trap behaves like no trap; an armed EXIT
+    // trap does NOT reroute the pair — GNU's sig.c:226-229 applies to
+    // the terminating-signal handler set, and a fatal signal's default
+    // death already runs the EXIT trap through the shell's exit path).
+    let fatal_want = |short: &str, key: &str| match env_vars.get(key) {
+        Some(action) if !action.is_empty() && !reset_contains(reset, short) => Disposition::Handler,
+        Some(_) if reset_contains(reset, short) => Disposition::Default,
+        Some(_) => Disposition::Ignore,
+        None => Disposition::Default,
+    };
+    kernel_signals::reconcile_fatal(&[
+        (
+            libc::SIGSEGV as i32,
+            fatal_want("SEGV", "__RUBASH_TRAP_SIGSEGV"),
+        ),
+        (
+            libc::SIGBUS as i32,
+            fatal_want("BUS", "__RUBASH_TRAP_SIGBUS"),
+        ),
+    ]);
 }
 
 /// Short signal name (TERM) for the __RUBASH_TRAP_SIG* key family, matching
