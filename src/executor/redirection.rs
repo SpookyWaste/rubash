@@ -1130,7 +1130,37 @@ impl Executor {
                 self.last_builtin_write_failed.set(true);
                 Ok(())
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                // rubash#1496: a NON-closed write failure on the stdout
+                // stream (ENOSPC from a /dev/full redirect target is the
+                // canonical case) is GNU's sh_chkwrite arm
+                // (builtins/common.c:320-334): the command reports
+                // `<name>: write error: <strerror>` through builtin_error
+                // and fails with status 1 — the io error must not escape
+                // to the command boundary, which renders it bare as
+                // `<script>: line N: <strerror>` under the shell's name.
+                if fd == 1 {
+                    if let ExecuteError::IoError(io_error) = &error {
+                        if !builtin_output_write_is_unchecked(cmd) {
+                            let command =
+                                cmd.words.first().map(String::as_str).unwrap_or("command");
+                            let text = format!(
+                                "{}{command}: write error: {}\n",
+                                self.diagnostic_prefix(),
+                                crate::posix_errors::message(io_error)
+                            );
+                            // The diagnostic rides fd 2 as THIS command's
+                            // redirects bound it; a failed delivery (fd 2
+                            // is the same full device) is lost like GNU's.
+                            let _ = state.write_to_fd(self, 2, text.as_bytes());
+                            self.exit_code = 1;
+                            self.last_builtin_write_failed.set(true);
+                        }
+                        return Ok(());
+                    }
+                }
+                Err(error)
+            }
         }
     }
 
@@ -1787,7 +1817,29 @@ impl Executor {
             OutputTarget::Path(path) => {
                 let mut file =
                     open_redirect_append(&shell_path_to_windows(path, &self.shell_state.env_vars))?;
-                file.write_all(&bytes)?;
+                // GNU builtins/common.c:320-334 sh_chkwrite: a builtin's
+                // failed flush is reported by the BUILTIN as
+                // `<name>: write error: <strerror>` (builtin_error via
+                // sh_wrerror) and fails the builtin — it must not escape
+                // as a bare io error, which the command boundary renders
+                // as `<script>: line N: <strerror>` with no command name
+                // (rubash#1496: `echo hi > /dev/full`, `printf .. >
+                // /dev/full`, and the internally-emulated /bin/echo all
+                // took that bare channel). Mirror the Closed arm: diag
+                // into the opposite stream, status + write-failed flag.
+                if let Err(error) = file.write_all(&bytes) {
+                    if !bytes.is_empty() {
+                        let command = cmd.words.first().map(String::as_str).unwrap_or("command");
+                        diag.push_str(&format!(
+                            "{}{command}: write error: {}\n",
+                            self.diagnostic_prefix(),
+                            crate::posix_errors::message(&error)
+                        ));
+                        self.exit_code = 1;
+                        self.last_builtin_write_failed.set(true);
+                        *status = 1;
+                    }
+                }
             }
             OutputTarget::SharedFile(file) => {
                 crate::fd::write_all(file.handle, &bytes)?;
