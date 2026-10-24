@@ -3412,7 +3412,21 @@ impl Executor {
         word: &str,
     ) -> Vec<String> {
         self.bind_compfunc_variables("", 0, &[], 0);
-        let quoted = [cmd, word, ""]
+        let result = self.run_completion_command_line(command, cmd, word, "");
+        self.unbind_compfunc_variables();
+        result
+    }
+
+    /// The -C execution core shared by the compgen shape above and the
+    /// live-completion shape below: the caller owns the COMP_* binding.
+    fn run_completion_command_line(
+        &mut self,
+        command: &str,
+        cmd: &str,
+        word: &str,
+        prev: &str,
+    ) -> Vec<String> {
+        let quoted = [cmd, word, prev]
             .iter()
             .map(|arg| {
                 // lib/sh/shquote.c sh_single_quote: wrap in single quotes,
@@ -3438,7 +3452,6 @@ impl Executor {
                 crate::executor::substitution_metadata::SubstitutionQuoteContext::Unquoted,
             )
             .assignment_text();
-        self.unbind_compfunc_variables();
         if output.is_empty() {
             return Vec::new();
         }
@@ -3458,6 +3471,159 @@ impl Executor {
         }
         words.push(current);
         words
+    }
+
+    /// niubash#520: resolve the dynamic inputs for a LIVE completion
+    /// (`Executor::complete_line`). The compspec governing the line
+    /// (bashline.c attempt_shell_completion: the command's own, else the
+    /// `-D` default; on an empty line the `-E` compspec, else `-D`) runs
+    /// its -F function / -C command with the real completion context
+    /// bound, and its -W wordlist is expanded, mirroring the compgen
+    /// resolution in `execute_compgen` but over the actual word list.
+    /// Returns None when no compspec governs or it carries no dynamic
+    /// action. For the empty line GNU passes the placeholder command name
+    /// `_EmptycmD_` with an empty COMP_WORDS and COMP_CWORD -1 (probed on
+    /// GNU bash 5.3.20).
+    pub(in crate::executor) fn completion_dynamic_for_line(
+        &mut self,
+        line: &str,
+        cursor: usize,
+    ) -> Option<crate::builtins::complete::CompgenDynamic> {
+        let (words, cur_idx, cur_word) =
+            crate::builtins::complete::split_for_completion(line, cursor);
+        let spec = crate::builtins::complete::resolve_compspec(
+            &self.shell_state.completion_specs,
+            &words,
+            cur_idx,
+        )
+        .cloned()?;
+        if spec.funcname.is_none() && spec.command.is_none() && spec.words.is_none() {
+            return None;
+        }
+        let (cmd_name, prev_word, bind_words, cword): (String, String, Vec<String>, i64) =
+            if words.is_empty() {
+                ("_EmptycmD_".to_string(), String::new(), Vec::new(), -1)
+            } else {
+                let prev = if cur_idx >= 1 {
+                    words.get(cur_idx - 1).cloned().unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                (
+                    words.first().cloned().unwrap_or_default(),
+                    prev,
+                    words.clone(),
+                    cur_idx as i64,
+                )
+            };
+        let mut dynamic = crate::builtins::complete::CompgenDynamic::default();
+        if let Some(funcname) = spec.funcname.as_deref() {
+            dynamic.function_candidates = self.run_completion_function_live(
+                funcname,
+                line,
+                cursor,
+                &bind_words,
+                cword,
+                &cmd_name,
+                &cur_word,
+                &prev_word,
+            );
+        }
+        if let Some(command) = spec.command.as_deref() {
+            dynamic.command_candidates = self.run_completion_command_live(
+                command,
+                line,
+                cursor,
+                &bind_words,
+                cword,
+                &cmd_name,
+                &cur_word,
+                &prev_word,
+            );
+        }
+        if let Some(wordlist) = spec.words.as_deref() {
+            dynamic.expanded_wordlist = Some(self.expand_compgen_wordlist(wordlist));
+        }
+        Some(dynamic)
+    }
+
+    /// pcomplete.c:1046 gen_shell_function_matches for a live completion:
+    /// the same COMP_* binding and COMPREPLY capture as the compgen shape
+    /// (`run_compgen_completion_function`), but over the real line and
+    /// word list, with build_arg_list's arguments (pcomplete.c:1004:
+    /// $1 = command name, $2 = word being completed, $3 = previous word).
+    #[allow(clippy::too_many_arguments)]
+    fn run_completion_function_live(
+        &mut self,
+        funcname: &str,
+        line: &str,
+        point: usize,
+        words: &[String],
+        cword: i64,
+        cmd_name: &str,
+        cur_word: &str,
+        prev_word: &str,
+    ) -> Vec<String> {
+        if !self.has_function(funcname) {
+            // GNU writes internal_error to the completion's stderr; the
+            // host completion channel carries no stderr — no candidates.
+            return Vec::new();
+        }
+        self.bind_compfunc_variables_live(line, point, words, cword);
+        let args = [
+            cmd_name.to_string(),
+            cur_word.to_string(),
+            prev_word.to_string(),
+        ];
+        let _ = self.call_function(funcname, args);
+        let reply = self
+            .array_at_word_values("${COMPREPLY[@]}")
+            .unwrap_or_default();
+        self.unbind_compfunc_variables();
+        reply
+    }
+
+    /// pcomplete.c:1140 gen_command_matches for a live completion: the -C
+    /// command runs under command substitution with the live COMP_*
+    /// context bound and build_arg_list's arguments appended.
+    #[allow(clippy::too_many_arguments)]
+    fn run_completion_command_live(
+        &mut self,
+        command: &str,
+        line: &str,
+        point: usize,
+        words: &[String],
+        cword: i64,
+        cmd_name: &str,
+        cur_word: &str,
+        prev_word: &str,
+    ) -> Vec<String> {
+        self.bind_compfunc_variables_live(line, point, words, cword);
+        let result = self.run_completion_command_line(command, cmd_name, cur_word, prev_word);
+        self.unbind_compfunc_variables();
+        result
+    }
+
+    /// pcomplete.c:929 bind_compfunc_variables with the live completion's
+    /// own line and word list: unlike the compgen shape, COMP_WORDS is the
+    /// actual list being completed — GNU rebuilds it from the readline
+    /// word list on every completion attempt, so a caller-set COMP_WORDS
+    /// is overwritten here rather than inherited (the rubash#1088
+    /// pass-through applies only outside a live completion).
+    fn bind_compfunc_variables_live(
+        &mut self,
+        line: &str,
+        point: usize,
+        words: &[String],
+        cword: i64,
+    ) {
+        self.set_env("COMP_LINE", line);
+        self.set_env("COMP_POINT", &point.to_string());
+        self.set_env("COMP_TYPE", "0");
+        self.set_env("COMP_KEY", "0");
+        store_indexed_array_state(&mut self.shell_state, "COMP_WORDS", words.to_vec());
+        self.shell_state.variables.remove("COMP_WORDS");
+        self.set_env("COMP_CWORD", &cword.to_string());
     }
 
     /// pcomplete.c:863 gen_wordlist_matches: split the -W wordlist at shell

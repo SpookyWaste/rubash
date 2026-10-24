@@ -860,7 +860,7 @@ pub(crate) fn apply_completion_actions(
 /// word list, the index of the word currently being completed, and that word's
 /// partial text. A trailing separator means a fresh (empty) word is being
 /// completed; an interior cursor completes the partial last word.
-fn split_for_completion(line: &str, cursor: usize) -> (Vec<String>, usize, String) {
+pub(crate) fn split_for_completion(line: &str, cursor: usize) -> (Vec<String>, usize, String) {
     let cursor = cursor.min(line.len());
     let prefix = &line[..cursor];
     let ends_with_ws = prefix
@@ -879,6 +879,29 @@ fn split_for_completion(line: &str, cursor: usize) -> (Vec<String>, usize, Strin
     }
 }
 
+/// Which compspec governs a completion, if any (bashline.c
+/// attempt_shell_completion): the command's own registration first; the
+/// `-D` default compspec when the command has none; the `-E` compspec only
+/// for completion attempted on an empty line, where `-D` serves as its
+/// fallback. Completing the first word itself is command-name completion —
+/// no compspec applies. (Probed against GNU bash 5.3.20: a `-D` hook fires
+/// for argument words of an unregistered command and for the empty line,
+/// an `-E` hook fires only for the empty line, and neither fires for a
+/// non-empty first word or for argument words outside its class.)
+pub(crate) fn resolve_compspec<'a>(
+    specs: &'a CompletionRegistry,
+    words: &[String],
+    cur_idx: usize,
+) -> Option<&'a Compspec> {
+    if words.is_empty() {
+        return specs.get("-E").or_else(|| specs.get("-D"));
+    }
+    if cur_idx == 0 {
+        return None;
+    }
+    specs.get(&words[0]).or_else(|| specs.get("-D"))
+}
+
 /// Host completion hook. Given the in-progress command `line` and the `cursor`
 /// position, return completion candidates for the word under the cursor,
 /// honoring the compspec registered for the command (if any) and falling back
@@ -891,8 +914,9 @@ fn split_for_completion(line: &str, cursor: usize) -> (Vec<String>, usize, Strin
 ///
 /// Dynamic compspec actions `-C` (external command) and `-F` (shell function
 /// filling `COMPREPLY`) are resolved by the executor; see
-/// `Executor::complete_line`, which calls this with the registry and merges any
-/// dynamic candidates.
+/// `Executor::complete_line`, which calls
+/// `complete_line_candidates_with_dynamic` with the registry and the
+/// pre-resolved dynamic candidates.
 pub(crate) fn complete_line_candidates(
     line: &str,
     cursor: usize,
@@ -902,10 +926,39 @@ pub(crate) fn complete_line_candidates(
     function_names: &[String],
     job_names: &[String],
 ) -> Vec<String> {
-    let (words, cur_idx, cur_word) = split_for_completion(line, cursor);
-    let command = words.first().cloned().unwrap_or_default();
+    complete_line_candidates_with_dynamic(
+        line,
+        cursor,
+        specs,
+        env_vars,
+        aliases,
+        function_names,
+        job_names,
+        None,
+    )
+}
 
-    let mut candidates: Vec<String> = if let Some(cs) = specs.get(&command) {
+/// `complete_line_candidates` with the executor's pre-resolved dynamic
+/// candidates merged the way pcomplete.c gen_compspec_completions merges
+/// them: the static generators' output is prefix-filtered against the word
+/// being completed, the -F function's COMPREPLY and the -C command's
+/// output are appended UNfiltered (pcomplete.c:1129-1132), and the -X
+/// filter then runs over the whole list (pcomplete.c:1402-1407).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn complete_line_candidates_with_dynamic(
+    line: &str,
+    cursor: usize,
+    specs: &CompletionRegistry,
+    env_vars: &crate::shell::var_table::VarTable,
+    aliases: &HashMap<String, Alias>,
+    function_names: &[String],
+    job_names: &[String],
+    dynamic: Option<CompgenDynamic>,
+) -> Vec<String> {
+    let (words, cur_idx, cur_word) = split_for_completion(line, cursor);
+    let resolved = resolve_compspec(specs, &words, cur_idx);
+
+    let mut candidates: Vec<String> = if let Some(cs) = resolved {
         let mut c = Vec::new();
         if cs.actions != 0 {
             c.extend(apply_completion_actions(
@@ -925,9 +978,15 @@ pub(crate) fn complete_line_candidates(
             }
         }
         if let Some(wordlist) = cs.words.as_deref() {
-            c.extend(wordlist.split_whitespace().map(str::to_string));
+            // With the executor attached, the -W wordlist arrives
+            // pre-expanded (compgen expands it the same way); standalone,
+            // split it literally.
+            if let Some(expanded) = dynamic.as_ref().and_then(|d| d.expanded_wordlist.as_ref()) {
+                c.extend(expanded.iter().cloned());
+            } else {
+                c.extend(wordlist.split_whitespace().map(str::to_string));
+            }
         }
-        // -C command / -F function candidates are contributed by the executor.
         c
     } else if cur_idx == 0 {
         command_completion_candidates(env_vars, aliases, function_names)
@@ -935,9 +994,17 @@ pub(crate) fn complete_line_candidates(
         path_completion_candidates(&cur_word, PathCompletionKind::File, env_vars)
     };
 
-    // Apply the compspec prefix/suffix and the -X filter, then keep only
-    // candidates that extend the partial word (same rule compgen uses).
-    let (prefix, suffix, filterpat) = if let Some(cs) = specs.get(&command) {
+    // Keep only static candidates that extend the partial word, then merge
+    // the dynamic candidates unfiltered (pcomplete.c:1129-1132: COMPREPLY
+    // and -C output are NOT prefix-filtered), then apply the compspec's -X
+    // filter over the merged list (pcomplete.c:1402-1407) and its -P/-S
+    // wrapping.
+    candidates.retain(|c| c.starts_with(&cur_word));
+    if let Some(dynamic) = dynamic.as_ref() {
+        candidates.extend(dynamic.function_candidates.iter().cloned());
+        candidates.extend(dynamic.command_candidates.iter().cloned());
+    }
+    let (prefix, suffix, filterpat) = if let Some(cs) = resolved {
         (cs.prefix.clone(), cs.suffix.clone(), cs.filterpat.clone())
     } else {
         (None, None, None)
@@ -950,7 +1017,6 @@ pub(crate) fn complete_line_candidates(
             |candidate: &str| -> bool { completion_filter_excludes(filter, candidate, extglob) };
         candidates.retain(|c| !keep_out(c));
     }
-    candidates.retain(|c| c.starts_with(&cur_word));
     if let (Some(p), Some(s)) = (prefix, suffix) {
         candidates = candidates
             .into_iter()
@@ -2255,6 +2321,68 @@ mod completion_hook_tests {
         assert!(
             out.iter().all(|c| c.starts_with('/')),
             "entries should be absolute paths: {out:?}"
+        );
+    }
+
+    #[test]
+    fn default_compspec_governs_unregistered_command() {
+        // niubash#520: with only a -D compspec registered, an unregistered
+        // command's argument words complete from it (bashline.c
+        // attempt_shell_completion falls back to the default compspec).
+        let (env, aliases, fns, jobs) = empty_context();
+        let mut specs = CompletionRegistry::new();
+        specs.insert("-D", wordlist_compspec("dalpha dbeta"));
+        let out = complete_line_candidates("ls da", 5, &specs, &env, &aliases, &fns, &jobs);
+        assert_eq!(out, vec!["dalpha".to_string()]);
+    }
+
+    #[test]
+    fn emptycm_compspec_resolves_on_empty_line_only() {
+        // niubash#520: -E governs completion attempted on an empty line
+        // and never governs argument words.
+        let (env, aliases, fns, jobs) = empty_context();
+        let mut specs = CompletionRegistry::new();
+        specs.insert("-E", wordlist_compspec("eone etwo"));
+        let out = complete_line_candidates("", 0, &specs, &env, &aliases, &fns, &jobs);
+        assert_eq!(out, vec!["eone".to_string(), "etwo".to_string()]);
+        let out = complete_line_candidates("ls e", 4, &specs, &env, &aliases, &fns, &jobs);
+        assert!(
+            !out.iter().any(|c| c == "eone"),
+            "-E wordlist must not govern argument words: {out:?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_candidates_merge_unfiltered() {
+        // niubash#520 / pcomplete.c:1129-1132: -F COMPREPLY output is NOT
+        // prefix-filtered — an entry that does not extend the partial word
+        // still reaches the host — while the static generators' output is.
+        let (env, aliases, fns, jobs) = empty_context();
+        let mut specs = CompletionRegistry::new();
+        specs.insert("dyncmd", wordlist_compspec("alpha alpine"));
+        let dynamic = CompgenDynamic {
+            function_candidates: vec!["zzz".to_string(), "alps".to_string()],
+            command_candidates: Vec::new(),
+            expanded_wordlist: None,
+        };
+        let out = complete_line_candidates_with_dynamic(
+            "dyncmd al",
+            9,
+            &specs,
+            &env,
+            &aliases,
+            &fns,
+            &jobs,
+            Some(dynamic),
+        );
+        assert_eq!(
+            out,
+            vec![
+                "alpha".to_string(),
+                "alpine".to_string(),
+                "alps".to_string(),
+                "zzz".to_string()
+            ]
         );
     }
 }

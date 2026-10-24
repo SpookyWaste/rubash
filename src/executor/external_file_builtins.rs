@@ -808,13 +808,21 @@ impl Executor {
         // between operands, and `--` ends option parsing. -r/-R/-a recurse
         // into directories, -n/--no-clobber skips files that already exist
         // (and warns that the short form is non-portable), -i/--interactive
-        // prompts before overwriting, -v/--verbose prints `'src' -> 'dst', -p preserves metadata,
+        // prompts before overwriting, -v/--verbose prints `'src' -> 'dst',
         // -u/--update copies only when the source is newer or the destination
         // is absent, --remove-destination unlinks the destination first, and
         // -t/--target-directory routes every operand into one directory.
+        // -p/--preserve keeps the source's mode and timestamps on the
+        // destination (niubash#533: the flags used to parse as no-ops, so
+        // the destination always took the copy time); -a/--archive is
+        // -dR --preserve=all, so it preserves too. Ownership from the
+        // preserve list is parsed but not actionable (an unprivileged GNU
+        // cp skips it silently as well).
         // Tolerated but unimplemented (accepted as no-ops, like cp itself):
         // -f, -l, -s, -d/-P, --parents, --backup, -S/--suffix.
         let mut recursive = false;
+        let mut preserve_mode = false;
+        let mut preserve_times = false;
         let mut no_clobber = false;
         let mut interactive = false;
         let mut verbose = false;
@@ -853,15 +861,30 @@ impl Executor {
                 };
                 match name {
                     "recursive" => recursive = true,
-                    "archive" => recursive = true,
+                    "archive" => {
+                        recursive = true;
+                        preserve_mode = true;
+                        preserve_times = true;
+                    }
                     "no-clobber" => no_clobber = true,
                     "interactive" => interactive = true,
                     "verbose" => verbose = true,
-                    "preserve" => {}
+                    "preserve" => cp_apply_preserve_list(
+                        value.as_deref(),
+                        &mut preserve_mode,
+                        &mut preserve_times,
+                        true,
+                    ),
+                    "no-preserve" => cp_apply_preserve_list(
+                        value.as_deref(),
+                        &mut preserve_mode,
+                        &mut preserve_times,
+                        false,
+                    ),
                     "update" => update_only = true,
                     "remove-destination" => remove_dest = true,
                     "force" | "link" | "symbolic-link" | "parents" | "backup"
-                    | "no-dereference" | "no-preserve" | "suffix" | "context" => {}
+                    | "no-dereference" | "suffix" | "context" => {}
                     "target-directory" | "target-dir" => {
                         // The -t/--target-directory value is argv too: take
                         // it as-is (issue #555).
@@ -888,11 +911,19 @@ impl Executor {
             let mut index = 0;
             while index < chars.len() {
                 match chars[index] {
-                    'r' | 'R' | 'a' => recursive = true,
+                    'r' | 'R' => recursive = true,
+                    'a' => {
+                        recursive = true;
+                        preserve_mode = true;
+                        preserve_times = true;
+                    }
                     'n' => no_clobber = true,
                     'i' => interactive = true,
                     'v' => verbose = true,
-                    'p' => {}
+                    'p' => {
+                        preserve_mode = true;
+                        preserve_times = true;
+                    }
                     'u' => update_only = true,
                     'f' | 'l' | 's' | 'd' | 'P' | 'Z' => {}
                     't' => {
@@ -1217,13 +1248,20 @@ impl Executor {
                 }
 
                 let result = if source.is_dir() {
-                    cp_copy_tree(&source, &target, 0)
+                    cp_copy_tree(&source, &target, 0, preserve_mode, preserve_times)
                 } else {
                     fs::copy(&source, &target).map(|_| ())
                 };
                 match result {
                     Ok(_) => {
-                        if !source.is_dir() {
+                        if preserve_mode || preserve_times {
+                            // Tree copies apply preservation per node
+                            // inside cp_copy_tree; a plain file copy is
+                            // stamped here (niubash#533).
+                            if !source.is_dir() {
+                                cp_apply_preserved(&source, &target, preserve_mode, preserve_times);
+                            }
+                        } else if !source.is_dir() {
                             cp_set_modified_now(&target);
                         }
                         if verbose {
@@ -1334,6 +1372,26 @@ impl Executor {
         let mut stderr = Vec::new();
         for expanded in operands {
             let target = shell_path_to_windows(expanded, &self.shell_state.env_vars);
+            // coreutils rm.c (niubash#534 wording residual): a recursive
+            // removal whose operand's last component is `.` or `..` is
+            // refused outright — `refusing to remove '.' or '..' directory:
+            // skipping '<operand>'`, status 1 — instead of attempting the
+            // removal and reporting the OS error (rubash answered
+            // "No such file or directory"). The refusal fires only when the
+            // operand resolves to an existing directory: a missing `foo/.`
+            // keeps the plain existence error (or the -f silence) GNU
+            // gives it, and without -r the operand still earns the plain
+            // `Is a directory` refusal.
+            if recursive && rm_operand_is_dot_or_dotdot(expanded) {
+                if fs::metadata(&target).is_ok_and(|meta| meta.is_dir()) {
+                    status = 1;
+                    writeln!(
+                        &mut stderr,
+                        "rm: refusing to remove '.' or '..' directory: skipping '{expanded}'"
+                    )?;
+                    continue;
+                }
+            }
             let result = match fs::symlink_metadata(&target) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
                     // A symlink operand names the link itself; a directory
@@ -1365,10 +1423,13 @@ impl Executor {
                     }
                 }
                 // GNU rm -f removes the "did not exist" diagnostic; it is
-                // not a license to hide a failed removal.
+                // not a license to hide a failed removal. gnulib remove.c
+                // counts ENOTDIR with ENOENT there (`rm -rf f/.` on a
+                // regular file f is silent, status 0 — niubash#534).
                 Err(error)
                     if force
                         && (error.kind() == io::ErrorKind::NotFound
+                            || error.kind() == io::ErrorKind::NotADirectory
                             || (cfg!(windows)
                                 && contains_windows_forbidden_posix_filename_char(&expanded))) => {}
                 Err(error) => {
@@ -1943,6 +2004,16 @@ fn cp_usage_text() -> &'static str {
 
 /// cp quotes names with quotearg_colon: single quotes around the name, and
 /// an embedded single quote becomes '\'' .
+/// coreutils' last-component test for the rm dot refusal: trailing
+/// slashes do not hide the component (`existing/../` and `./` still name
+/// `..`/`.`); a bare root names the root, not a dot component.
+fn rm_operand_is_dot_or_dotdot(operand: &str) -> bool {
+    let normalized = operand.replace('\\', "/");
+    let trimmed = normalized.trim_end_matches('/');
+    let last = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    last == "." || last == ".."
+}
+
 fn cp_quoted_name(name: &str) -> String {
     let mut out = String::new();
     out.push('\u{27}');
@@ -2071,6 +2142,8 @@ fn cp_copy_tree(
     source: &std::path::Path,
     target: &std::path::Path,
     depth: usize,
+    preserve_mode: bool,
+    preserve_times: bool,
 ) -> io::Result<()> {
     if depth > 40 {
         return Err(io::Error::new(
@@ -2080,7 +2153,13 @@ fn cp_copy_tree(
     }
     let metadata = fs::symlink_metadata(source)?;
     if metadata.file_type().is_symlink() {
-        return cp_copy_tree(&fs::canonicalize(source)?, target, depth + 1);
+        return cp_copy_tree(
+            &fs::canonicalize(source)?,
+            target,
+            depth + 1,
+            preserve_mode,
+            preserve_times,
+        );
     }
     if metadata.is_dir() {
         fs::create_dir_all(target)?;
@@ -2091,12 +2170,76 @@ fn cp_copy_tree(
                 entry.path().as_path(),
                 &target.join(entry.file_name()),
                 depth + 1,
+                preserve_mode,
+                preserve_times,
             )?;
+        }
+        // GNU sets a copied directory's preserved attributes only after
+        // its contents land, so child writes cannot clobber them.
+        if preserve_mode || preserve_times {
+            cp_apply_preserved(source, target, preserve_mode, preserve_times);
         }
         return Ok(());
     }
     fs::copy(source, target)?;
+    if preserve_mode || preserve_times {
+        cp_apply_preserved(source, target, preserve_mode, preserve_times);
+    }
     Ok(())
+}
+
+/// One `--preserve`/`--no-preserve` attribute list (coreutils cp.c:
+/// the bare option means the default list mode,ownership,timestamps;
+/// `all` names every attribute). Only mode and timestamps are actionable
+/// in this emulation; ownership/links/context/xattr parse and are
+/// skipped, matching what an unprivileged GNU cp can actually honor.
+fn cp_apply_preserve_list(list: Option<&str>, mode: &mut bool, times: &mut bool, value: bool) {
+    let Some(list) = list else {
+        *mode = value;
+        *times = value;
+        return;
+    };
+    for attr in list.split(',') {
+        match attr.trim() {
+            "mode" => *mode = value,
+            "timestamps" => *times = value,
+            "all" => {
+                *mode = value;
+                *times = value;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// niubash#533: stamp a copy destination with the source's attributes
+/// for `cp -p`/`-a`/`--preserve`. Times go on before the mode so a
+/// restrictive preserved mode cannot block the timestamp write on
+/// handle-based platforms; failures are ignored — preservation is
+/// best-effort exactly where GNU's is (unprivileged ownership).
+fn cp_apply_preserved(source: &std::path::Path, target: &std::path::Path, mode: bool, times: bool) {
+    let Ok(meta) = fs::metadata(source) else {
+        return;
+    };
+    if times {
+        let file_times = std::fs::FileTimes::new()
+            .set_accessed(meta.accessed().unwrap_or(SystemTime::UNIX_EPOCH))
+            .set_modified(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+        // SetFileTime needs a write-attributes handle on Windows while
+        // futimens accepts a read-only one on Unix; try both shapes.
+        let stamped = File::options()
+            .write(true)
+            .open(target)
+            .and_then(|file| file.set_times(file_times))
+            .is_ok()
+            || File::open(target)
+                .and_then(|file| file.set_times(file_times))
+                .is_ok();
+        let _ = stamped;
+    }
+    if mode {
+        let _ = fs::set_permissions(target, meta.permissions());
+    }
 }
 
 /// GNU cat -v: display control characters using `^` notation and high-bit
