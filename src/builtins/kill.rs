@@ -2149,14 +2149,37 @@ mod kernel_signals {
                     let mut set: libc::sigset_t = std::mem::zeroed();
                     libc::sigemptyset(&mut set);
                     libc::sigaddset(&mut set, libc::SIGPIPE);
-                    let timeout = libc::timespec {
-                        tv_sec: 0,
-                        tv_nsec: 0,
-                    };
-                    let _ = libc::sigtimedwait(&set, std::ptr::null_mut(), &timeout);
+                    dequeue_pending_sigpipe(&set);
                 }
                 libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut());
             }
+        }
+    }
+
+    /// Dequeue a pending SIGPIPE for this thread without ever blocking
+    /// (SIGPIPE is blocked on the thread at this point, so a pending one
+    /// just sits in the thread's pending set). Linux/Android spell this
+    /// `sigtimedwait` with a zero timeout; that call does not exist in
+    /// Darwin's libc (E0425 there), where the portable equivalent is
+    /// `sigpending` to test + `sigwait` to consume — sigwait returns
+    /// immediately because the signal is already pending, and no other
+    /// thread in this process ever waits on SIGPIPE.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe fn dequeue_pending_sigpipe(set: &libc::sigset_t) {
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let _ = libc::sigtimedwait(set, std::ptr::null_mut(), &timeout);
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    unsafe fn dequeue_pending_sigpipe(set: &libc::sigset_t) {
+        let mut pending: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut pending);
+        if libc::sigpending(&mut pending) == 0 && libc::sigismember(&pending, libc::SIGPIPE) == 1 {
+            let mut received: libc::c_int = 0;
+            let _ = libc::sigwait(set, &mut received);
         }
     }
 
