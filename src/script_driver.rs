@@ -25,29 +25,64 @@ use crate::parser::CommandNode;
 /// bashhist.c: does this script turn history on? Detects the long-form
 /// option (set -o history / -o histexpand) and the short flag cluster
 /// containing -H, which is how the histexp tests enable expansion.
+///
+/// The scan is a whitelist admission like script_uses_aliases: it may
+/// over-admit (a `set -o history` inside a string takes the grouped
+/// driver too — slower, never wrong), but it must not under-admit.
+/// GNU's reader is incremental, so a `set` in ANY command position —
+/// line start, or after `;`/`&`/`|`/`(` — enables history for every
+/// later line. The old line-initial-only scan missed
+/// `shopt -s histverify; set -o history; set -H` (rubash#1072): the
+/// script fell to the whole-file fast path, which does no history
+/// processing at all, so `!!` stayed literal and histverify was moot.
 pub fn script_uses_history(contents: &str) -> bool {
-    for line in contents.lines() {
-        let Some(rest) = line.trim_start().strip_prefix("set ") else {
-            continue;
-        };
-        let mut expecting_option = false;
-        for token in rest.split_whitespace() {
-            if expecting_option {
-                if token == "history" || token == "histexpand" {
-                    return true;
-                }
-                expecting_option = false;
-                continue;
-            }
-            if token == "-o" {
-                expecting_option = true;
-            } else if token.len() >= 2
-                && token.starts_with('-')
-                && !token.starts_with("--")
-                && token[1..].contains('H')
-            {
+    contents.lines().any(line_enables_history)
+}
+
+fn line_enables_history(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i + 3 <= bytes.len() {
+        if &bytes[i..i + 3] == b"set"
+            && (i == 0
+                || matches!(
+                    bytes[i - 1],
+                    b' ' | b'\t' | b';' | b'&' | b'|' | b'(' | b'{'
+                ))
+            && (i + 3 == bytes.len() || matches!(bytes[i + 3], b' ' | b'\t'))
+        {
+            if set_args_enable_history(&line[i + 3..]) {
                 return true;
             }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+fn set_args_enable_history(args: &str) -> bool {
+    let mut expecting_option = false;
+    for token in args.split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|')) {
+        if token.is_empty() {
+            continue;
+        }
+        if expecting_option {
+            if token == "history" || token == "histexpand" {
+                return true;
+            }
+            expecting_option = false;
+            continue;
+        }
+        if token == "-o" {
+            expecting_option = true;
+        } else if token.len() >= 2
+            && token.starts_with('-')
+            && !token.starts_with("--")
+            && token[1..].contains('H')
+        {
+            return true;
         }
     }
     false
@@ -2968,6 +3003,14 @@ fn run_source_impl(
         for token in &mut tokens {
             token.position += line_offset;
             token.column += line_offset;
+            // rubash#1186: logical_line must shift with position — the
+            // DISCARD skip gates compare command.logical_line against
+            // reader-line state seeded in the absolute (offset) space, so
+            // an unshifted logical_line left every interactive line after
+            // the first comparing unequal and the failglob discard died at
+            // compound boundaries (`{ set -- /no/such/*.zzz; }; echo rc`
+            // printed rc in the REPL only).
+            token.logical_line += line_offset;
         }
     }
     // GNU parse.y: a `)` or case-clause terminator at command position is
@@ -3032,6 +3075,14 @@ fn run_source_impl(
         // ExpansionFailure is GNU's DISCARD: the command list aborted but
         // the reader continues with the next complete command.
         Err(ExecuteError::ExpansionFailure(code)) => code,
+        // A `return` that unwinds to this unit's top ends the unit with
+        // its status as an ordinary value (builtins/evalfile.c
+        // source_file returns it; no jump_to_top_level). It can only
+        // reach here while a sourced-file context is live — the return
+        // builtin itself rejects top-level use otherwise — e.g. a
+        // startup file run by run_init_file (rubash#1161). Printing it
+        // via the catch-all below leaked a bare `return N` line.
+        Err(ExecuteError::Return(code)) => code,
         Err(e) => {
             if interactive {
                 eprintln!("Error: {}", e);
@@ -4461,7 +4512,7 @@ pub fn finish_shell(executor: &mut Executor, status: i32, interactive: bool) -> 
             }
         }
     }
-    match executor.run_exit_trap_with_status(status) {
+    let code = match executor.run_exit_trap_with_status(status) {
         Ok(code) => code,
         Err(ExecuteError::ExitCode(code)) => code,
         Err(e) => {
@@ -4472,7 +4523,14 @@ pub fn finish_shell(executor: &mut Executor, status: i32, interactive: bool) -> 
             }
             1
         }
-    }
+    };
+    // After the EXIT trap (whose writes still belong to the streams):
+    // shell exit closes every descriptor, so each still-open persistent
+    // output process substitution sees EOF and finishes — run the
+    // deferred bodies with their accumulated input (rubash#1336:
+    // `exec > >(tee log)` scripts lost the whole log at end-of-script).
+    executor.close_all_persistent_output_process_substitutions();
+    code
 }
 
 /// shell.c:1830-1842 init_interactive + bashhist.c:320-345: create the

@@ -1516,18 +1516,30 @@ impl Executor {
     /// observe_signals_while_blocked between slices.
     ///
     /// rubash#1034: the emulation has one gap a real child does not —
-    /// a group-delivered terminating signal (^C, `kill` of the job)
-    /// kills GNU's real sleep instantly, wait_for returns, and the
-    /// shell's trap dispatches at once; the virtual child cannot die,
-    /// so the trap used to sit queued for the sleep's whole remainder.
-    /// When a pending delivery is a trapped signal from the kernel-
-    /// managed terminating set (HUP/INT/QUIT/TERM/USR1/USR2 — the set
-    /// a default-disposition child dies from), model the child as
-    /// killed by it: dispatch the pending traps now and end the sleep,
-    /// reporting the killing signal so the caller records 128+sig as
-    /// the command's status, exactly like a reaped signal death.
-    /// Non-terminating trapped signals (WINCH, CHLD...) keep GNU's
-    /// defer-to-completion semantics untouched.
+    /// a group-delivered terminating signal (^C) kills GNU's real
+    /// sleep instantly, wait_for returns, and the shell's trap
+    /// dispatches at once; the virtual child cannot die, so without a
+    /// model the trap sits queued for the sleep's whole remainder.
+    /// But the model must key on WHO the delivery could have killed:
+    /// a kill(2) addressed to the shell alone (`kill -INT $$` from a
+    /// background job) leaves GNU's real sleep untouched, and GNU
+    /// defers the trap until the sleep completes — the first port of
+    /// this model aborted on ANY trapped terminating delivery and
+    /// fired the trap immediately there too, the mirror-image bug.
+    /// The observable boundary is the delivery's origin (siginfo
+    /// si_code, recorded by the kernel backend's drain): a
+    /// KERNEL-caused delivery is the terminal driver's group signal
+    /// (^C/^\\), which a real foreground child in the group dies
+    /// from — model the child as killed by it: dispatch the pending
+    /// traps now and end the sleep, reporting the killing signal so
+    /// the caller records 128+sig as the command's status, exactly
+    /// like a reaped signal death. Kill(2)-caused deliveries (any
+    /// sender process, including this shell's own kill builtin) keep
+    /// GNU's defer-to-completion semantics untouched, as do
+    /// non-terminating trapped signals (WINCH, CHLD...). A kill(2)
+    /// addressed to the whole process group still defers: the queues
+    /// cannot distinguish its addressing from a pid-addressed kill,
+    /// and no real child exists whose death could report it.
     pub(crate) fn sleep_interruptibly(
         &mut self,
         seconds: f64,
@@ -1586,6 +1598,7 @@ impl Executor {
                 #[cfg(unix)]
                 {
                     crate::builtins::kill::kernel_handler_installed(signal)
+                        && crate::builtins::kill::last_delivery_kernel_caused(signal)
                         && signal_trap_name(signal).is_some_and(|name| {
                             crate::builtins::trap::get_trap_action(
                                 &self.shell_state.env_vars,
@@ -1877,16 +1890,26 @@ impl Executor {
         // The old function-scoped gate (__RUBASH_RETURN_TRAP_FUNCTION:
         // outer-must-match) dropped the outer fire.
         //
-        // A `return N` inside the RETURN action would recurse forever in GNU
-        // (trap.c _run_trap_internal rethrows through return_catch and
-        // execute_cmd.c:5377 refires because the from_return_trap setter is
-        // #if 0'd out — probe p1106 hangs bash 5.3.20): absorb it once as
-        // the function's status instead of hanging (rubash#1106).
-        match self.run_return_trap() {
-            Err(ExecuteError::Return(status)) => Ok(Some(status)),
-            Ok(()) => Ok(None),
-            Err(error) => Err(error),
+        // A `return N` inside the RETURN action REFIRES the trap in GNU:
+        // trap.c _run_trap_internal rethrows through return_catch and
+        // execute_cmd.c:5377 runs the trap again because the
+        // from_return_trap suppression setter is #if 0'd out, so
+        // `trap 'return 9' RETURN` spins forever (oracle: timeout kill,
+        // rubash#1106). Mirror it: a Return out of the action restarts
+        // the fire with that status as the pending return value; when a
+        // fire completes without returning, the function returns the
+        // LAST thrown status (finite-chain oracle: fires that return 9
+        // while n<3, then complete, leave rc=9 with n=3 — not the body's
+        // original status and not the completing fire's $?).
+        let mut trap_status = None;
+        loop {
+            match self.run_return_trap() {
+                Err(ExecuteError::Return(status)) => trap_status = Some(status),
+                Ok(()) => break,
+                Err(error) => return Err(error),
+            }
         }
+        Ok(trap_status)
     }
 
     pub(crate) fn apply_command_output_redirects(
@@ -2256,7 +2279,77 @@ impl Executor {
             self.restore_command_fd0_input(guard);
         }
         self.restore_compound_numbered_input_redirects(saved_numbered);
+        // rubash#1493: an `exec`ed command that died by a signal inside a
+        // subshell — GNU's forked subshell was replaced by the command,
+        // and the PARENT shell's waitchld reports the job's death at the
+        // next notification point (jobs.c:4625 notify_of_job_status:
+        // `<pid> File size limit exceeded ( <subshell text> )`). The exec
+        // spawn helpers flatten the wait status to 128+signal, so the
+        // death is handed back through the builtin's record. At the top
+        // level there is nothing to report (GNU's shell is gone — it WAS
+        // the exec'd process), hence the subshell gate. The command text
+        // follows signal_notice_command_text's existing subshell
+        // convention (last member's text inside the parens).
+        if let Some((pid, signal)) = crate::builtins::exec::take_last_exec_signal_death() {
+            if self.shell_state.subshell_depth.get() > 0 {
+                let text = self.signal_notice_command_text(cmd);
+                self.note_child_signal_death(pid, signal, text, true);
+            }
+        }
         status
+    }
+
+    /// rubash#1175: the gates for a true execve at the tail arm of
+    /// execute_exec_spawn. Every condition is an invariant the new
+    /// image depends on; any failure keeps the spawn-and-wait
+    /// simulation, whose observable behavior is already GNU-shaped
+    /// apart from the PID itself:
+    /// - the host binary opted in (a library host's process is not
+    ///   the shell's to replace);
+    /// - this executor owns the process image — fork-copy clones
+    ///   (comsub / pipeline stage / read) share the real shell's
+    ///   process and must never execve it away;
+    /// - no flat-subshell frame is live on this executor
+    ///   (subshell_depth > 0): `( exec ... )` runs in-process here,
+    ///   while GNU's forked subshell is what gets replaced;
+    /// - fds 0/1/2 are exactly the process's own inherited descriptors
+    ///   and no other modeled fd is open: a modeled redirect, capture,
+    ///   or numbered fd has no real descriptor to hand the new image.
+    ///   (The command's own output redirects are handled by the
+    ///   earlier arms of execute_exec_spawn and never reach here; its
+    ///   fd-0 input redirects were bound by execute_exec's guard and
+    ///   show up in the fd table, failing the fd-0 check.)
+    /// - no /dev/fd or /dev/std* word operands: those name modeled
+    ///   descriptors the materializer below resolves per-spawn.
+    #[cfg(unix)]
+    fn exec_image_replacement_applies(&self, cmd: &CommandNode) -> bool {
+        crate::builtins::exec::process_replacement_enabled()
+            && self.owns_process_image
+            && self.shell_state.subshell_depth.get() == 0
+            && self.stdout_capture.is_none()
+            && self.stderr_capture.is_none()
+            && !crate::executor::shell_options::stdout_capture_active()
+            && self.fd_table.write_endpoint(1) == Some(FdWriteEndpoint::Stdout)
+            && self.fd_table.write_endpoint(2) == Some(FdWriteEndpoint::Stderr)
+            && !self.fd_table.is_closed(0)
+            && !self.fd_table.is_closed(1)
+            && !self.fd_table.is_closed(2)
+            && match self.fd_table.entries.get(&0) {
+                Some(entry) => {
+                    !entry.closed
+                        && matches!(entry.read, Some(FdReadEndpoint::InheritedProcessStdin))
+                }
+                None => true,
+            }
+            && self
+                .fd_table
+                .entries
+                .iter()
+                .all(|(fd, entry)| *fd <= 2 || entry.closed)
+            && !cmd.words[1..].iter().any(|word| {
+                word.starts_with("/dev/fd/")
+                    || matches!(word.as_str(), "/dev/stdin" | "/dev/stdout" | "/dev/stderr")
+            })
     }
 
     /// The spawn arms of execute_exec, run with the command's fd-0 input
@@ -2482,6 +2575,20 @@ impl Executor {
         }
 
         self.apply_no_output_builtin_redirects(cmd)?;
+        // rubash#1175: with every gate in exec_image_replacement_applies
+        // satisfied, replace this process's image for real (GNU
+        // shell_execve) instead of simulating it with a child whose PID
+        // differs from the shell's. A None result keeps the simulation
+        // below for the shapes replace_process_image declines.
+        #[cfg(unix)]
+        if self.exec_image_replacement_applies(cmd) {
+            if let Some(status) = crate::builtins::exec::replace_process_image(
+                &cmd.words[1..],
+                &self.shell_state.env_vars,
+            ) {
+                return Ok(status?);
+            }
+        }
         // GNU exec.def exec_builtin -> shell_execve (execute_cmd.c:6126):
         // the exec'd program inherits the shell's fd 1 — inside a command
         // substitution that descriptor IS the capture pipe (subst.c:7143
@@ -2869,6 +2976,9 @@ impl Executor {
                         if source_fd == fd {
                             continue;
                         }
+                        // dup2 onto an fd holding a process substitution
+                        // closes the old description first (rubash#1336).
+                        self.flush_persistent_output_process_substitution(fd)?;
                         self.copy_exec_output_fd_resolving_ambient(fd, source_fd, &ambient);
                         if move_source {
                             self.close_persistent_output_fd(source_fd)?;
@@ -2888,7 +2998,9 @@ impl Executor {
                         if !is_null_device(&path) {
                             self.create_redirect_output(&path, redirect.clobber)?;
                         }
+                        self.flush_persistent_output_process_substitution(1)?;
                         self.set_fd_output_file(1, path.clone(), false, false)?;
+                        self.flush_persistent_output_process_substitution(2)?;
                         self.share_fd_output_file(1, 2, &path, false);
                         continue;
                     }
@@ -2905,6 +3017,10 @@ impl Executor {
                         // the real handle open in set_fd_output_file follows.
                         self.create_redirect_output(&target, redirect.clobber)?;
                     }
+                    // Rebinding closes the descriptor's previous
+                    // description first in GNU; run a pending process
+                    // substitution's deferred body (rubash#1336).
+                    self.flush_persistent_output_process_substitution(fd)?;
                     self.set_fd_output_file(fd, target.clone(), fd >= 10, append)?;
                     if matches!(
                         redirect.kind,
@@ -2914,6 +3030,7 @@ impl Executor {
                         // &>file / &>>file: stderr follows stdout through
                         // the same open file description (redir.c
                         // r_err_and_out / r_append_err_and_out).
+                        self.flush_persistent_output_process_substitution(2)?;
                         self.share_fd_output_file(fd, 2, &target, fd >= 10);
                     }
                 }
@@ -2932,6 +3049,7 @@ impl Executor {
                         if source_fd == fd {
                             continue;
                         }
+                        self.flush_persistent_output_process_substitution(fd)?;
                         self.copy_exec_output_fd_resolving_ambient(fd, source_fd, &ambient);
                         if move_source {
                             self.close_persistent_output_fd(source_fd)?;
@@ -2948,7 +3066,9 @@ impl Executor {
                         if !is_null_device(&path) {
                             self.create_redirect_output(&path, redirect.clobber)?;
                         }
+                        self.flush_persistent_output_process_substitution(1)?;
                         self.set_fd_output_file(1, path.clone(), false, false)?;
+                        self.flush_persistent_output_process_substitution(2)?;
                         self.share_fd_output_file(1, 2, &path, false);
                         continue;
                     }
@@ -3427,6 +3547,12 @@ impl Executor {
         // status yet) so `kill -0 $!`/`kill $!` reach the forked child in
         // the meantime. The status lands in completed_statuses when the fd
         // closes and the body runs (close_persistent_output_fd).
+        // Rebinding an fd that still holds a process substitution closes
+        // the old descriptor first in GNU (dup2 onto it): the old body
+        // receives everything written so far. Run the deferred body via
+        // the regular close instead of abandoning it (rubash#1336:
+        // `exec > >(tee a); echo 1; exec > >(tee b)` lost "1" entirely).
+        self.flush_persistent_output_process_substitution(fd)?;
         let previous =
             self.fd_table
                 .entries
@@ -3436,9 +3562,9 @@ impl Executor {
                     _ => None,
                 });
         if let Some(previous) = previous {
-            // A replaced-but-never-closed fd abandons its body (pre-existing
-            // temp/body lifecycle); at least reap the orphaned zombie so a
-            // rebinding loop cannot accumulate one placeholder per iteration.
+            // Defensive (unreachable after the flush above): reap an
+            // orphaned placeholder so a rebinding loop cannot accumulate
+            // one zombie per iteration.
             self.reap_procsub_placeholder(previous, true);
         }
         #[cfg(unix)]
@@ -3469,6 +3595,117 @@ impl Executor {
             .env_vars
             .insert(fd_output_process_substitution_key(fd), source.to_string());
         Ok(true)
+    }
+
+    /// Run the deferred body of a persistent output process substitution
+    /// bound to `fd`, if any (no-op for every other endpoint). GNU binds
+    /// `>(...)` to a real pipe (subst.c process_substitute): rebinding or
+    /// closing the descriptor delivers EOF and the substitution reader
+    /// consumes everything written so far. rubash's deferred model buffers
+    /// the bytes in a carrier file and runs the body at close
+    /// (close_persistent_output_fd), so every persistent overwrite of the
+    /// descriptor must close it first — the sites that silently overwrote
+    /// the endpoint dropped the body and all buffered output (rubash#1336:
+    /// `exec > >(tee log)` followed by any later rebind or by shell exit
+    /// lost the whole stream).
+    pub(in crate::executor) fn flush_persistent_output_process_substitution(
+        &mut self,
+        fd: u32,
+    ) -> Result<(), ExecuteError> {
+        let is_procsub = self.fd_table.entries.get(&fd).is_some_and(|entry| {
+            !entry.closed
+                && matches!(
+                    entry.write.as_ref(),
+                    Some(FdWriteEndpoint::ProcessSubstitution { .. })
+                )
+        });
+        if is_procsub {
+            self.close_persistent_output_fd(fd)?;
+        }
+        Ok(())
+    }
+
+    /// Shell-exit sweep (script_driver::finish_shell, after the EXIT trap):
+    /// close every still-open persistent output process substitution so
+    /// its deferred body runs with the accumulated input. GNU's exit path
+    /// closes the shell's descriptors; each substitution reader sees EOF
+    /// and finishes (subst.c process_substitute pipe semantics). Without
+    /// the sweep, `exec > >(tee log)` at the top of a script — the standard
+    /// logging idiom — silently discarded the entire stream when the
+    /// script simply ran off its end (rubash#1336).
+    pub fn close_all_persistent_output_process_substitutions(&mut self) {
+        let mut fds: Vec<u32> = self
+            .fd_table
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                !entry.closed
+                    && matches!(
+                        entry.write.as_ref(),
+                        Some(FdWriteEndpoint::ProcessSubstitution { .. })
+                    )
+            })
+            .map(|(fd, _)| *fd)
+            .collect();
+        // Descending: within one substitution's dup group the final
+        // close must be the lowest fd, so that when fds 1/2 belong to
+        // the group the deferred body runs from a close of that very fd
+        // and close_persistent_output_fd's stdio-marker fixup gives the
+        // body its stdout/stderr back (rubash#1336).
+        fds.sort_unstable_by(|a, b| b.cmp(a));
+        for fd in fds {
+            let _ = self.close_persistent_output_fd(fd);
+        }
+    }
+
+    /// Fork-boundary sweep (called from restore_flat_subshell): close the
+    /// persistent output process substitutions the closing region OPENED
+    /// (or rebound) before the parent's state is restored. GNU's forked
+    /// child owns copies of the parent's descriptors
+    /// (execute_cmd.c:1576 execute_in_subshell; subst.c:7143
+    /// command_substitute); at child exit the copies close, so a
+    /// substitution created inside sees EOF and finishes, while an
+    /// inherited one keeps streaming for the parent. Identity is the
+    /// registration the open left in the env (carrier path + body source):
+    /// an fd whose parent-env registration matches the live endpoint is
+    /// inherited and left alone; anything else is region-owned
+    /// (rubash#1336).
+    pub(in crate::executor) fn flush_region_owned_output_process_substitutions(
+        &mut self,
+        parent_env: &crate::shell::var_table::VarTable,
+    ) {
+        let mut owned: Vec<u32> = self
+            .fd_table
+            .entries
+            .iter()
+            .filter(|(fd, entry)| {
+                if entry.closed {
+                    return false;
+                }
+                let Some(FdWriteEndpoint::ProcessSubstitution { path, command, .. }) =
+                    entry.write.as_ref()
+                else {
+                    return false;
+                };
+                let path_text = path.to_string_lossy();
+                parent_env
+                    .get(&super::command_text::fd_output_process_substitution_key(
+                        **fd,
+                    ))
+                    .map(String::as_str)
+                    != Some(command.as_str())
+                    || parent_env
+                        .get(&super::command_text::fd_output_key(**fd))
+                        .map(String::as_str)
+                        != Some(path_text.as_ref())
+            })
+            .map(|(fd, _)| *fd)
+            .collect();
+        // Descending, same dup-group ordering as the exit sweep.
+        owned.sort_unstable_by(|a, b| b.cmp(a));
+        for fd in owned {
+            let _ = self.close_persistent_output_fd(fd);
+        }
     }
 
     pub(in crate::executor) fn close_persistent_output_fd(
@@ -3504,10 +3741,59 @@ impl Executor {
             .shell_state
             .env_vars
             .remove(&fd_output_process_substitution_key(fd));
+        // GNU delivers EOF to the substitution reader only when the LAST
+        // descriptor referring to the pipe closes: a dup'd copy (`N>&M`,
+        // `exec >&$fd`) keeps the stream alive across an intermediate
+        // close. While another open entry still references this
+        // substitution (same carrier path + body source), this close
+        // drops only this descriptor's registration — the deferred body
+        // and the carrier teardown wait for the final close
+        // (rubash#1336).
+        if let (Some(target_text), Some(source_text)) = (&target, &source) {
+            let carrier = shell_path_to_windows(target_text, &self.shell_state.env_vars);
+            let still_referenced = self.fd_table.entries.values().any(|entry| {
+                !entry.closed
+                    && matches!(
+                        entry.write.as_ref(),
+                        Some(FdWriteEndpoint::ProcessSubstitution { path, command, .. })
+                            if *path == carrier && command == source_text
+                    )
+            });
+            if still_referenced {
+                return Ok(());
+            }
+        }
         if let (Some(target), Some(source)) = (target, source) {
             let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
             let input = fs::read_to_string(&path).unwrap_or_default();
-            self.execute_persistent_output_process_substitution(&source, input, pending_pid)?;
+            // The deferred body runs as the substitution child GNU forked
+            // at open time: its stdio is the shell's as of the fork. For
+            // fds 1/2 that is the process stdout/stderr the binding
+            // covered — but close_output just cleared the slot, so a body
+            // writing to the same descriptor (tee's stdout copy on fd 1)
+            // would be silently discarded. Reinstate the stdio marker
+            // for the body's duration, then put the closed slot back
+            // exactly as close_output left it (rubash#1336).
+            let saved_entry = self.fd_table.entries.get(&fd).cloned();
+            if fd == 1 || fd == 2 {
+                let marker = if fd == 1 {
+                    FdWriteEndpoint::Stdout
+                } else {
+                    FdWriteEndpoint::Stderr
+                };
+                self.fd_table.open_output(fd, marker, false);
+            }
+            let result =
+                self.execute_persistent_output_process_substitution(&source, input, pending_pid);
+            match saved_entry {
+                Some(entry) => {
+                    self.fd_table.entries.insert(fd, entry);
+                }
+                None => {
+                    self.fd_table.entries.remove(&fd);
+                }
+            }
+            result?;
             let _ = fs::remove_file(path);
         }
         Ok(())

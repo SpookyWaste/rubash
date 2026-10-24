@@ -938,9 +938,11 @@ impl Executor {
             // here rested on 5.2-era probes claiming the caller keeps
             // running; 5.3.20 contradicts them for this error class.)
             Err(ExecuteError::Return(status)) => {
-                // A `return N` absorbed from the RETURN trap action ran
-                // after the body completed, so it wins over the body's own
-                // return (rubash#1106: run once, trap's status stands).
+                // A `return N` thrown by the RETURN trap action (after
+                // its refire loop settles, trap_exec.rs
+                // run_function_return_trap) wins over the body's own
+                // return (rubash#1106: the trap's last thrown status
+                // stands).
                 self.exit_code = trap_return_status.unwrap_or(status);
                 Ok(())
             }

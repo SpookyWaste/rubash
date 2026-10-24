@@ -2505,6 +2505,33 @@ impl Executor {
                 // timeout / fallback arms (the fallback would block
                 // on a second raw read).
                 130
+            } else if self.fd_table.read_error.is_some() {
+                // GNU read.def:911: a hard read(2) failure (EISDIR when
+                // the input descriptor names a directory) is reported as
+                // `read: <fd>: read error: <strerror>` and the builtin
+                // fails — it is not plain EOF (rubash#1495). The fd-table
+                // reader recorded the strerror text; the closed-fd arm
+                // below is the EBADF special case of the same shape.
+                let message = self.fd_table.read_error.take().unwrap_or_default();
+                let fd = read_fd.unwrap_or(0);
+                let assign_status = self.assign_read_scalar_names(
+                    &scalar_names,
+                    initial_text.as_deref().unwrap_or(""),
+                    raw,
+                );
+                if assign_status != 0 {
+                    return self.finish_read_error(cmd, &stderr, assign_status);
+                }
+                let _ = writeln!(
+                    &mut stderr,
+                    "{}read: {fd}: read error: {message}",
+                    self.diagnostic_prefix()
+                );
+                if initial_text.is_none() {
+                    self.finish_read_error(cmd, &stderr, 1)
+                } else {
+                    0
+                }
             } else if command_closes_stdin(cmd) || self.fd_table.is_closed(0) {
                 let assign_status = self.assign_read_scalar_names(
                     &scalar_names,

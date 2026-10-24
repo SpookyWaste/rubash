@@ -193,13 +193,23 @@ impl Executor {
             // poller, so the kill path's marking is its only stop detector;
             // gate it on monitor mode or a `set +m` shell would report its
             // jobs Stopped where GNU reports Running.
+            //
+            // rubash#1494: GNU kill_pid is pure delivery — the waitchld
+            // report lands at a notification point observably ONE reader
+            // command later (an immediate `jobs` still shows the
+            // pre-signal state and +/- marks; one intervening command
+            // lets the new state appear). Defer the mark instead of
+            // applying it synchronously inside the kill.
             if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "monitor") {
                 if request.signal == 18 {
-                    self.shell_state.job_table.mark_running(pid);
-                } else if matches!(request.signal, 19 | 20) {
                     self.shell_state
                         .job_table
-                        .mark_stopped(pid, Some(request.signal));
+                        .defer_state_mark(pid, crate::jobs::table::DeferredJobState::Running);
+                } else if matches!(request.signal, 19 | 20) {
+                    self.shell_state.job_table.defer_state_mark(
+                        pid,
+                        crate::jobs::table::DeferredJobState::Stopped(Some(request.signal)),
+                    );
                 }
             }
             // A terminating signal changes nothing in the table here:

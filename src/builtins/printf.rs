@@ -72,6 +72,16 @@ struct RenderedPrintf {
 enum ParsedFormat {
     Spec(FormatSpec),
     Missing(String),
+    /// A `%(...` time directive that never validly closes with `)T`:
+    /// either the closing paren is missing entirely, or the format ends
+    /// right after `)`. GNU printf.def:586-614 (case '(') reports
+    /// `warning: `\0': invalid time format specification`, prints the
+    /// `%` literally, and RESCANS the rest of the directive as ordinary
+    /// format text (rc stays 0). The payload is that rescan text — the
+    /// raw directive without its leading `%` (rubash#1490).
+    InvalidTime {
+        rescan: String,
+    },
 }
 
 struct ParsedNumber<T> {
@@ -809,14 +819,60 @@ fn render_one_pass(
                             conversion_error: false,
                         };
                     }
+                    ParsedFormat::InvalidTime { rescan } => {
+                        // GNU printf.def:609-614: warning naming the NUL
+                        // terminator, `%` printed literally, then the scan
+                        // restarts just after the `%` — the directive text
+                        // is reprocessed as ordinary format (escapes and
+                        // any later directives still apply), rc unaffected
+                        // (rubash#1490).
+                        errors.push(format!(
+                            "{prefix}printf: warning: `\0': invalid time format specification"
+                        ));
+                        output.push('%');
+                        let inner =
+                            render_one_pass(&rescan, args, arg_index, String::new(), env_vars);
+                        output.push_str(&inner.output);
+                        errors.extend(inner.errors);
+                        conversion_error |= inner.conversion_error;
+                        if inner.stop_output || inner.status != EXECUTION_SUCCESS {
+                            return RenderedPrintf {
+                                output,
+                                status: inner.status,
+                                errors,
+                                stop_output: true,
+                                conversion_error,
+                            };
+                        }
+                        continue;
+                    }
                 };
 
                 if spec.time_format.is_some() && spec.specifier != 'T' {
+                    // GNU printf.def:609-614: the char after `)` is not
+                    // `T` — warning naming THAT char, `%` printed, and the
+                    // directive rescanned as ordinary format text (the
+                    // old arm printed the raw spec verbatim, which skipped
+                    // escape/directive processing inside the parens).
                     errors.push(format!(
                         "{prefix}printf: warning: `{}': invalid time format specification",
                         spec.specifier
                     ));
-                    output.push_str(&spec.raw);
+                    output.push('%');
+                    let inner =
+                        render_one_pass(&spec.raw[1..], args, arg_index, String::new(), env_vars);
+                    output.push_str(&inner.output);
+                    errors.extend(inner.errors);
+                    conversion_error |= inner.conversion_error;
+                    if inner.stop_output || inner.status != EXECUTION_SUCCESS {
+                        return RenderedPrintf {
+                            output,
+                            status: inner.status,
+                            errors,
+                            stop_output: true,
+                            conversion_error,
+                        };
+                    }
                     continue;
                 }
 

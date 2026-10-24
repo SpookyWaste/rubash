@@ -451,7 +451,7 @@ where
                 print_usage(stderr)?;
                 return Ok(EX_USAGE_INTERNAL);
             }
-            remove_trap(env_vars, signal);
+            remove_trap(env_vars, &signal);
             #[cfg(unix)]
             crate::builtins::kill::reconcile_kernel_trap_dispositions(env_vars);
             return Ok(0);
@@ -603,7 +603,7 @@ where
     let mut invalid = false;
     for arg in args {
         match normalize_signal(arg) {
-            Some(signal) => signals.push(signal.to_string()),
+            Some(signal) => signals.push(signal),
             None => {
                 invalid = true;
                 writeln!(stderr, "{prefix}trap: {arg}: invalid signal specification")?;
@@ -654,27 +654,46 @@ where
     Ok(())
 }
 
-fn normalize_signal(signal: &str) -> Option<&'static str> {
+fn normalize_signal(signal: &str) -> Option<String> {
     let signal = signal.to_ascii_uppercase();
     match signal.as_str() {
-        "0" | "EXIT" => return Some("EXIT"),
-        "DEBUG" => return Some("DEBUG"),
-        "ERR" => return Some("ERR"),
-        "RETURN" => return Some("RETURN"),
+        "0" | "EXIT" => return Some("EXIT".to_string()),
+        "DEBUG" => return Some("DEBUG".to_string()),
+        "ERR" => return Some("ERR".to_string()),
+        "RETURN" => return Some("RETURN".to_string()),
         _ => {}
     }
 
     if let Ok(number) = signal.parse::<usize>() {
-        return number
-            .checked_sub(1)
-            .and_then(|index| SIGNALS.get(index).copied());
+        return number.checked_sub(1).and_then(|index| {
+            SIGNALS.get(index).copied().map(|name| {
+                // GNU trap.c keys a nameless (hole) slot by its number:
+                // decode_signal has no name for Linux 32/33 (bionic
+                // 32..40), yet the trap table holds those signals under
+                // the bare number — `trap '' 32` lists back as
+                // `trap -- '' 32`, and an entry-ignored hole (bionic
+                // signal 38 in rubash#1124) lists the same way. Returning
+                // the empty slot name here keyed every hole trap under
+                // "", so listings dropped them and `-p 38` printed an
+                // empty signal name.
+                if name.is_empty() {
+                    number.to_string()
+                } else {
+                    name.to_string()
+                }
+            })
+        });
     }
 
     let name = signal.strip_prefix("SIG").unwrap_or(&signal);
+    if name.is_empty() {
+        return None;
+    }
     SIGNALS
         .iter()
         .copied()
-        .find(|candidate| candidate.strip_prefix("SIG") == Some(name))
+        .find(|candidate| !candidate.is_empty() && candidate.strip_prefix("SIG") == Some(name))
+        .map(str::to_string)
 }
 
 /// GNU trap.c set_signal for the special traps. `pub(crate)` for the
@@ -773,6 +792,21 @@ fn store_orig_ignored_signals(env_vars: &mut VarTable, mut signals: Vec<String>)
     }
 }
 
+/// Trap-table key for an entry-ignored signal number. Named slots key by
+/// name; hole slots (no name in SIGNALS — Linux 32/33, bionic 32..40)
+/// key by the bare number, exactly as normalize_signal keys a numeric
+/// operand and canonical_trap_order lists them. Dropping holes here lost
+/// the entry-ignored bionic signal 38 of rubash#1124: GNU lists it as
+/// `trap -- '' 38`, rubash listed nothing.
+fn entry_ignored_key(number: i32) -> Option<String> {
+    let name = SIGNALS.get(number.checked_sub(1)? as usize).copied()?;
+    if name.is_empty() {
+        Some(number.to_string())
+    } else {
+        Some(name.to_string())
+    }
+}
+
 fn add_orig_ignored_signal(env_vars: &mut VarTable, signal: &str) {
     let mut signals = orig_ignored_signals(env_vars);
     if signals.iter().any(|ignored| ignored == signal) {
@@ -801,12 +835,8 @@ pub(crate) fn seed_startup_traps(env_vars: &mut VarTable) {
     // Idempotent (orig list is sorted/deduped), so subshell executors
     // re-entering this constructor keep the same set.
     for number in crate::builtins::kill::entry_ignored_signal_numbers() {
-        if let Some(name) = SIGNALS
-            .get((number - 1) as usize)
-            .copied()
-            .filter(|name| !name.is_empty())
-        {
-            add_orig_ignored_signal(env_vars, name);
+        if let Some(key) = entry_ignored_key(number) {
+            add_orig_ignored_signal(env_vars, &key);
         }
     }
     // Rebuild the empty trap-table entries for ignores transported across a
@@ -1223,7 +1253,7 @@ mod tests {
                 let expected = format!("SIG{name}");
                 assert_eq!(
                     super::normalize_signal(&number.to_string()),
-                    Some(expected.as_str()),
+                    Some(expected),
                     "trap slot for signal {number}"
                 );
             }
@@ -1268,12 +1298,20 @@ mod tests {
                 .copied()
                 .unwrap_or("<past end>");
             assert_eq!(slot, name, "slot for libc signal {name}");
-            assert_eq!(super::normalize_signal(name), Some(name), "{name}");
+            assert_eq!(
+                super::normalize_signal(name),
+                Some(name.to_string()),
+                "{name}"
+            );
             let bare = name.trim_start_matches("SIG");
-            assert_eq!(super::normalize_signal(bare), Some(name), "{bare}");
+            assert_eq!(
+                super::normalize_signal(bare),
+                Some(name.to_string()),
+                "{bare}"
+            );
             assert_eq!(
                 super::normalize_signal(&constant.to_string()),
-                Some(name),
+                Some(name.to_string()),
                 "numeric {name}"
             );
         }
@@ -1284,15 +1322,23 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_realtime_and_holes() {
-        assert_eq!(super::normalize_signal("RTMIN"), Some("SIGRTMIN"));
-        assert_eq!(super::normalize_signal("RTMIN+1"), Some("SIGRTMIN+1"));
-        assert_eq!(super::normalize_signal("34"), Some("SIGRTMIN"));
-        assert_eq!(super::normalize_signal("64"), Some("SIGRTMAX"));
-        assert_eq!(super::normalize_signal("STKFLT"), Some("SIGSTKFLT"));
-        assert_eq!(super::normalize_signal("17"), Some("SIGCHLD"));
-        assert_eq!(super::normalize_signal("32"), Some(""));
-        assert_eq!(super::normalize_signal("33"), Some(""));
+        assert_eq!(super::normalize_signal("RTMIN"), Some("SIGRTMIN".into()));
+        assert_eq!(
+            super::normalize_signal("RTMIN+1"),
+            Some("SIGRTMIN+1".into())
+        );
+        assert_eq!(super::normalize_signal("34"), Some("SIGRTMIN".into()));
+        assert_eq!(super::normalize_signal("64"), Some("SIGRTMAX".into()));
+        assert_eq!(super::normalize_signal("STKFLT"), Some("SIGSTKFLT".into()));
+        assert_eq!(super::normalize_signal("17"), Some("SIGCHLD".into()));
+        // Holes key by bare number (GNU: `trap '' 32` lists as
+        // `trap -- '' 32`; rubash#1124).
+        assert_eq!(super::normalize_signal("32"), Some("32".into()));
+        assert_eq!(super::normalize_signal("33"), Some("33".into()));
         assert_eq!(super::normalize_signal("65"), None);
+        assert_eq!(super::entry_ignored_key(32), Some("32".into()));
+        assert_eq!(super::entry_ignored_key(38), Some("SIGRTMIN+4".into()));
+        assert_eq!(super::entry_ignored_key(65), None);
     }
 
     /// Android (bionic): the realtime block sits at 41..64
@@ -1301,33 +1347,43 @@ mod tests {
     #[cfg(target_os = "android")]
     #[test]
     fn android_realtime_and_holes() {
-        assert_eq!(super::normalize_signal("RTMIN"), Some("SIGRTMIN"));
-        assert_eq!(super::normalize_signal("RTMIN+7"), Some("SIGRTMIN+7"));
-        assert_eq!(super::normalize_signal("RTMAX"), Some("SIGRTMAX"));
-        assert_eq!(super::normalize_signal("RTMAX-1"), Some("SIGRTMAX-1"));
-        assert_eq!(super::normalize_signal("41"), Some("SIGRTMIN"));
-        assert_eq!(super::normalize_signal("52"), Some("SIGRTMIN+11"));
-        assert_eq!(super::normalize_signal("53"), Some("SIGRTMAX-11"));
-        assert_eq!(super::normalize_signal("64"), Some("SIGRTMAX"));
-        assert_eq!(super::normalize_signal("STKFLT"), Some("SIGSTKFLT"));
-        assert_eq!(super::normalize_signal("17"), Some("SIGCHLD"));
-        assert_eq!(super::normalize_signal("32"), Some(""));
-        assert_eq!(super::normalize_signal("40"), Some(""));
+        assert_eq!(super::normalize_signal("RTMIN"), Some("SIGRTMIN".into()));
+        assert_eq!(
+            super::normalize_signal("RTMIN+7"),
+            Some("SIGRTMIN+7".into())
+        );
+        assert_eq!(super::normalize_signal("RTMAX"), Some("SIGRTMAX".into()));
+        assert_eq!(
+            super::normalize_signal("RTMAX-1"),
+            Some("SIGRTMAX-1".into())
+        );
+        assert_eq!(super::normalize_signal("41"), Some("SIGRTMIN".into()));
+        assert_eq!(super::normalize_signal("52"), Some("SIGRTMIN+11".into()));
+        assert_eq!(super::normalize_signal("53"), Some("SIGRTMAX-11".into()));
+        assert_eq!(super::normalize_signal("64"), Some("SIGRTMAX".into()));
+        assert_eq!(super::normalize_signal("STKFLT"), Some("SIGSTKFLT".into()));
+        assert_eq!(super::normalize_signal("17"), Some("SIGCHLD".into()));
+        // Bionic holes 32..40 key by bare number; signal 38 is the
+        // entry-ignored hole of rubash#1124 (GNU: `trap -- '' 38`).
+        assert_eq!(super::normalize_signal("32"), Some("32".into()));
+        assert_eq!(super::normalize_signal("40"), Some("40".into()));
         assert_eq!(super::normalize_signal("65"), None);
+        assert_eq!(super::entry_ignored_key(38), Some("38".into()));
+        assert_eq!(super::entry_ignored_key(41), Some("SIGRTMIN".into()));
     }
 
     /// Darwin/BSD: reordered slots follow libc, Linux-only names are gone.
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     #[test]
     fn darwin_family_slots() {
-        assert_eq!(super::normalize_signal("EMT"), Some("SIGEMT"));
-        assert_eq!(super::normalize_signal("INFO"), Some("SIGINFO"));
-        assert_eq!(super::normalize_signal("17"), Some("SIGSTOP"));
-        assert_eq!(super::normalize_signal("18"), Some("SIGTSTP"));
-        assert_eq!(super::normalize_signal("19"), Some("SIGCONT"));
-        assert_eq!(super::normalize_signal("20"), Some("SIGCHLD"));
-        assert_eq!(super::normalize_signal("30"), Some("SIGUSR1"));
-        assert_eq!(super::normalize_signal("31"), Some("SIGUSR2"));
+        assert_eq!(super::normalize_signal("EMT"), Some("SIGEMT".into()));
+        assert_eq!(super::normalize_signal("INFO"), Some("SIGINFO".into()));
+        assert_eq!(super::normalize_signal("17"), Some("SIGSTOP".into()));
+        assert_eq!(super::normalize_signal("18"), Some("SIGTSTP".into()));
+        assert_eq!(super::normalize_signal("19"), Some("SIGCONT".into()));
+        assert_eq!(super::normalize_signal("20"), Some("SIGCHLD".into()));
+        assert_eq!(super::normalize_signal("30"), Some("SIGUSR1".into()));
+        assert_eq!(super::normalize_signal("31"), Some("SIGUSR2".into()));
         assert_eq!(super::normalize_signal("STKFLT"), None);
         assert_eq!(super::normalize_signal("PWR"), None);
         assert_eq!(super::normalize_signal("RTMIN"), None);

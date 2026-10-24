@@ -143,16 +143,20 @@ impl Executor {
     }
 
     /// GNU parse.y:6865/6886 (report_syntax_error): the offending-input-line
-    /// echo (`print_offending_line', parse.y:6814) runs only `if (interactive
-    /// == 0)'. An interactive shell prints the two `parser_error' diagnostic
-    /// lines and NO `` `line' `` echo (verified: `bash -i < err.sh' prints
-    /// the syntax error pair without the third backquote line). Every
+    /// echo (`print_offending_line', parse.y:6814) is suppressed only for
+    /// the interactive shell's OWN input stream — a line read from a FILE
+    /// echoes in both modes (verified vs the GNU 5.3.20 oracle:
+    /// `printf 'if then\n' | bash -i` prints no `` `if then' `` line, but
+    /// `bash -i -c 'source badrc'` and `--rcfile badrc -i` both print
+    /// `bash: badrc: line 1: \`if then'`; the earlier `bash -i < err.sh`
+    /// verification covered only the stdin-stream case). Every
     /// `__RUBASH_PARSE_SOURCE__' echo site must consult this gate.
     pub(in crate::executor) fn offending_line_echo_enabled(&self) -> bool {
         !self
             .shell_state
             .env_vars
             .contains_key("__RUBASH_INTERACTIVE")
+            || self.in_source_context()
     }
 
     /// GNU error.c:324-327 (parser_error): when `exit_immediately_on_error`
@@ -647,11 +651,7 @@ impl Executor {
             // fixup; cli_tests function_call_stack_* encode the GNU
             // shape). The SCRIPT_NAME branch below guards the reverse
             // seeding order.
-            store_indexed_array_state(
-                &mut self.shell_state,
-                "BASH_SOURCE",
-                Vec::<String>::new(),
-            );
+            store_indexed_array_state(&mut self.shell_state, "BASH_SOURCE", Vec::<String>::new());
         }
         if name == "__RUBASH_SCRIPT_NAME" {
             let source_value = if self
@@ -1020,6 +1020,12 @@ impl Executor {
         saved_state: crate::shell::ShellState,
         saved_cwd: Option<PathBuf>,
     ) {
+        // Every caller is a fork boundary (flat `( )` regions and
+        // command-substitution children): the region's descriptor copies
+        // close here, so run the deferred bodies of the output process
+        // substitutions the region opened before the parent's env (which
+        // carries their registrations) is swapped back (rubash#1336).
+        self.flush_region_owned_output_process_substitutions(&saved_state.env_vars);
         self.restore_shell_env(saved_state.env_vars.clone());
         self.shell_state = saved_state;
         if let Some(dir) = saved_cwd {
@@ -1625,8 +1631,24 @@ impl Executor {
             {
                 return self.gnu_error_line(&format!("{script}: eval"), line);
             }
-            if is_c {
+            // rubash#1161: sourced-file input suppresses the `-c`
+            // segment, as in parser_diagnostic_prefix.
+            if is_c && !self.in_source_context() {
                 return self.gnu_error_line(&format!("{script}: -c"), line);
+            }
+            if self.in_source_context()
+                && self
+                    .shell_state
+                    .env_vars
+                    .contains_key("__RUBASH_INTERACTIVE")
+            {
+                return self.gnu_error_line(
+                    &format!(
+                        "{}: {script}",
+                        Self::interactive_shell_basename(&self.shell_state.env_vars)
+                    ),
+                    line,
+                );
             }
             return self.gnu_error_line(script, line);
         }
@@ -1805,8 +1827,26 @@ impl Executor {
             return self.gnu_error_line("bash: eval", line);
         }
         if let Some(script) = self.shell_state.env_vars.get("__RUBASH_SCRIPT_NAME") {
-            if is_c {
+            // rubash#1161: same yy_input_name rule as
+            // parser_diagnostic_prefix_for_line — a sourced file's input
+            // name replaces the `-c` stream tag, and in an interactive
+            // shell the file rides behind the shell-name prolog.
+            if is_c && !self.in_source_context() {
                 return self.gnu_error_line(&format!("{script}: -c"), line);
+            }
+            if self.in_source_context()
+                && self
+                    .shell_state
+                    .env_vars
+                    .contains_key("__RUBASH_INTERACTIVE")
+            {
+                return self.gnu_error_line(
+                    &format!(
+                        "{}: {script}",
+                        Self::interactive_shell_basename(&self.shell_state.env_vars)
+                    ),
+                    line,
+                );
             }
             return self.gnu_error_line(script, line);
         }

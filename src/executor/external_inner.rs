@@ -699,12 +699,22 @@ impl Executor {
             // buffered builtin channel so command substitution captures it
             // (execute_cmd.c pipes external stdout like any other command).
             let mut stdout = Vec::new();
+            // rubash#1488: the emulated /bin/echo is still the echo
+            // builtin's escape path — same locale guard as execute_echo.
+            let _locale_guard = crate::locale::ShellLocaleGuard::new(&self.shell_state.env_vars);
             crate::builtins::echo::write_echo(
                 cmd.words[1..].iter().map(String::as_str),
                 &mut stdout,
             )?;
             self.write_buffered_builtin_output(cmd, &stdout, &[])?;
-            self.exit_code = 0;
+            // rubash#1496: sh_chkwrite — a write failure the routing
+            // folded into the flag (e.g. /bin/echo hi > /dev/full) fails
+            // the command; the unconditional 0 here erased it.
+            self.exit_code = if self.take_builtin_write_failed() {
+                1
+            } else {
+                0
+            };
             return Ok(true);
         }
 

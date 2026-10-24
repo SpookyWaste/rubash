@@ -109,12 +109,18 @@ fn untraced_nested_functions_do_not_fire_inherited_return_trap() {
     assert_eq!(code, Some(0));
 }
 
-/// #1106: `return N` in the RETURN action runs once (GNU hangs here).
+/// #1106: `return N` in the RETURN action REFIRES the trap in GNU
+/// (an unconditional `return 9` spins forever — oracle timeout kill).
+/// The finite chain pins the refire semantics without hanging the
+/// suite: the action returns only while n<3, so GNU fires it exactly
+/// three times and the function returns the last thrown status (9),
+/// not the body's 7. Absorb-once semantics would stop at n=1.
 #[test]
-fn return_inside_return_trap_runs_once_without_hang() {
-    let (stdout, stderr, code) =
-        rubash("r() { trap 'return 3' RETURN; echo in-r; return 0; }\nr; echo \"rc=$?\"");
+fn return_inside_return_trap_refires_until_action_completes() {
+    let (stdout, stderr, code) = rubash(
+        "n=0\nf() { trap 'n=$((n+1)); if [ $n -lt 3 ]; then return 9; fi' RETURN; return 7; }\nf\necho \"rc=$? n=$n\"",
+    );
     assert_eq!(stderr, "");
-    assert_eq!(stdout, "in-r\nrc=3\n");
+    assert_eq!(stdout, "rc=9 n=3\n");
     assert_eq!(code, Some(0));
 }

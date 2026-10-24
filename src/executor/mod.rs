@@ -646,6 +646,15 @@ pub struct Executor {
     /// its status; this latch tells the exit-trap choke point to skip the
     /// action on that unwind (rubash#1012).
     exec_replaced: bool,
+    /// rubash#1175: true only on the executor that IS this OS process's
+    /// shell (constructed by Executor::new for a real process root).
+    /// Fork-copy clones (command_substitution_executor) construct with
+    /// false: they share the process with the shell that must survive
+    /// them, so their `exec` keeps the spawn-and-wait simulation. Even a
+    /// rooted executor only replaces the image when the host binary
+    /// opted in (builtins::exec::enable_process_replacement) and the
+    /// live context passes the dispatcher's gates.
+    owns_process_image: bool,
     /// GNU execute_cmd.c:330 sourcenest — active `.`/source frames.
     source_nest_depth: usize,
     /// Child-death notifications that arrived while the SIGCHLD trap action
@@ -714,6 +723,18 @@ pub struct Executor {
     /// A deferred time report's (start, posix_format), stashed by the
     /// stage executor for the pipeline executor (rubash#1263).
     pending_stage_time_report: Option<(read_helpers::TimeCommandStart, bool)>,
+    /// rubash#1277: while the list loop executes a `time` command it
+    /// raises this flag so execute_time_ast_command queues its report
+    /// instead of printing it. GNU's ERR trap for the timed command fires
+    /// inside the inner execute_command (execute_cmd.c
+    /// execute_time_command -> execute_command -> run_error_trap),
+    /// BEFORE execute_time_command prints the timing block; the list
+    /// loop flushes the queue after its own maybe_run_error_trap and
+    /// before the errexit jump, reproducing that order.
+    defer_list_time_report: bool,
+    /// Queued (start, posix_format) reports under
+    /// defer_list_time_report, in completion order (innermost first).
+    pending_list_time_reports: Vec<(read_helpers::TimeCommandStart, bool)>,
     /// GNU subst.c: an assignment performed by `${var:=word}`/`${var=word}`
     /// that fails (invalid nameref target value, readonly, ...) is a word
     /// expansion error — expand_word_error -> exp_jump_to_top_level(DISCARD)
@@ -971,6 +992,15 @@ pub struct Executor {
     /// walk re-opens `>f` and would truncate the bytes the child already
     /// wrote live through the shared description (niubash#144).
     pipeline_stage_fds_pre_wired: Cell<bool>,
+    /// rubash#1454: set by the sequential pipeline driver around the LAST
+    /// stage's dispatch only. The stage spawner may then hand an external
+    /// final member the shell's own stdout (Stdio::inherit) instead of a
+    /// capture pipe when final_member_stdout_streams_to_host agrees —
+    /// GNU execute_cmd.c:2620 leaves the rightmost element's fd 1 on the
+    /// shell's stdout, so a pager there sees the terminal. Non-final
+    /// stages never observe this flag: their fd 1 is the inter-member
+    /// pipe whose payload the driver routes onward.
+    pipeline_final_stage: Cell<bool>,
     /// rubash#1342: set on the throwaway subshell clone in
     /// execute_builtin_pipeline_stage, whose stage command the pipeline
     /// driver already traced (execute_pipeline_stage_inner prints every

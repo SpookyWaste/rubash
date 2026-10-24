@@ -934,7 +934,23 @@ impl Executor {
                     process.stdout(stdio_from_fd_handle(duplicated));
                 }
                 None => {
-                    process.stdout(Stdio::piped());
+                    // rubash#1454: for the FINAL stage, fd 1's payload
+                    // lands on the shell's own stdout (write_pipeline_output
+                    // is the only consumer), so when that resolution is the
+                    // host stdout itself, hand the child the real fd
+                    // (GNU execute_cmd.c:2620) instead of a capture pipe
+                    // the shell forwards after exit — the member then
+                    // sees the terminal/file directly (pagers page).
+                    // wait_with_output yields an empty stdout for the
+                    // inherited end, so the returned payload stays empty.
+                    if matches!(&fd1_target, OutputTarget::Stdout)
+                        && self.pipeline_final_stage.get()
+                        && self.final_member_stdout_streams_to_host(command)
+                    {
+                        process.stdout(Stdio::inherit());
+                    } else {
+                        process.stdout(Stdio::piped());
+                    }
                 }
             }
             match &fd2_target {

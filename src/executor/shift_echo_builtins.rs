@@ -146,6 +146,10 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        // rubash#1488: echo's \u/\U locale gate must observe this shell's
+        // variable-table locale (a plain `LC_ALL=C` assignment counts, per
+        // GNU's sv_lc* watchers), not just the process environment.
+        let _locale_guard = crate::locale::ShellLocaleGuard::new(&self.shell_state.env_vars);
         self.exit_code = 0;
         // TODO(redir.c/execute_cmd.c/builtins/echo.def): Generalize builtin
         // redirection. This covers upstream source tests that create sourced
@@ -181,10 +185,21 @@ impl Executor {
                 return Ok(());
             }
             let mut file = self.create_redirect_output(&target, redirect.clobber)?;
-            crate::builtins::echo::write_echo_decoded(
+            // rubash#1496: sh_chkwrite (builtins/common.c:320) — a failed
+            // write is `echo: write error: <strerror>` from the builtin,
+            // not a bare io error at the command boundary.
+            if let Err(error) = crate::builtins::echo::write_echo_decoded(
                 echo_args.iter().map(String::as_str),
                 &mut file,
-            )?;
+            ) {
+                let message = format!(
+                    "{}echo: write error: {}\n",
+                    self.diagnostic_prefix(),
+                    crate::posix_errors::message(&error)
+                );
+                self.write_default_stderr(message.as_bytes())?;
+                self.exit_code = 1;
+            }
             return Ok(());
         }
 
@@ -222,10 +237,19 @@ impl Executor {
             }
             let mut file =
                 open_redirect_append(&shell_path_to_windows(&target, &self.shell_state.env_vars))?;
-            crate::builtins::echo::write_echo_decoded(
+            // rubash#1496: sh_chkwrite arm, as in the truncate path above.
+            if let Err(error) = crate::builtins::echo::write_echo_decoded(
                 echo_args.iter().map(String::as_str),
                 &mut file,
-            )?;
+            ) {
+                let message = format!(
+                    "{}echo: write error: {}\n",
+                    self.diagnostic_prefix(),
+                    crate::posix_errors::message(&error)
+                );
+                self.write_default_stderr(message.as_bytes())?;
+                self.exit_code = 1;
+            }
             return Ok(());
         }
 

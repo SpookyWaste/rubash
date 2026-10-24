@@ -13,6 +13,25 @@ pub enum ProcessState {
     Completed,
 }
 
+/// A job-state transition the shell has SENT (via its own `kill`) but not
+/// yet LEARNED through a notification point (rubash#1494). GNU's kill_pid
+/// is pure signal delivery; the shell learns of the stop/continue only in
+/// waitchld, whose report lands at reader notification points — observably
+/// one top-level command later than the kill: `kill -STOP %1` on one line
+/// and `jobs` on the next still shows the pre-signal state and the old
+/// current/previous marks, an intervening command lets the new state (and
+/// the stopped job's promotion to current) appear, and `kill -STOP %1;
+/// jobs` on ONE line never sees it. Rubash has no waitchld/WUNTRACED
+/// poller for its own kill, so the kill path records the transition here
+/// stamped with the reader command sequence, and the per-command refresh
+/// applies it once a full intervening command boundary has passed —
+/// the same lag GNU's SIGCHLD processing exhibits in scripts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredJobState {
+    Stopped(Option<i32>),
+    Running,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessEntry {
     pub pid: u32,
@@ -99,6 +118,13 @@ pub struct JobTable {
     pub procsub_placeholders: HashSet<u32>,
     current_job: Option<JobId>,
     previous_job: Option<JobId>,
+    /// Monotonic count of top-level (reader) commands started; the
+    /// executor bumps it once per command at depth 1 (rubash#1494).
+    pub reader_command_seq: u64,
+    /// Stop/continue transitions sent by the shell's own `kill`, stamped
+    /// with `reader_command_seq`, awaiting their notification lag
+    /// (rubash#1494, see [`DeferredJobState`]).
+    pub deferred_state_marks: Vec<(u32, DeferredJobState, u64)>,
 }
 
 impl JobTable {
@@ -415,6 +441,49 @@ impl JobTable {
 
     pub fn job_id_for_pid(&self, pid: u32) -> Option<JobId> {
         self.pid_to_job.get(&pid).copied()
+    }
+
+    /// Record that a new top-level reader command has started
+    /// (rubash#1494's notification-lag clock).
+    pub fn note_reader_command(&mut self) {
+        self.reader_command_seq += 1;
+    }
+
+    /// Queue a stop/continue transition sent by the shell's own `kill`
+    /// for application at a later notification point (rubash#1494).
+    pub fn defer_state_mark(&mut self, pid: u32, state: DeferredJobState) {
+        // A newer signal to the same pid supersedes an unapplied older
+        // one (STOP then CONT inside the lag window nets to Running).
+        self.deferred_state_marks
+            .retain(|(marked_pid, _, _)| *marked_pid != pid);
+        self.deferred_state_marks
+            .push((pid, state, self.reader_command_seq));
+    }
+
+    /// Apply every deferred mark at least one full reader command old
+    /// (rubash#1494): a mark recorded during command S becomes visible
+    /// at command S+2's refresh — the immediately following command
+    /// (S+1) still observes the pre-signal state, exactly as GNU's
+    /// waitchld lag presents it.
+    pub fn apply_deferred_state_marks(&mut self) {
+        let now = self.reader_command_seq;
+        let mut pending = std::mem::take(&mut self.deferred_state_marks);
+        let mut ready = Vec::new();
+        pending.retain(|(pid, state, seq)| {
+            if *seq + 1 < now {
+                ready.push((*pid, *state));
+                false
+            } else {
+                true
+            }
+        });
+        self.deferred_state_marks = pending;
+        for (pid, state) in ready {
+            match state {
+                DeferredJobState::Stopped(signal) => self.mark_stopped(pid, signal),
+                DeferredJobState::Running => self.mark_running(pid),
+            }
+        }
     }
 
     pub fn mark_stopped(&mut self, pid: u32, stop_signal: Option<i32>) {

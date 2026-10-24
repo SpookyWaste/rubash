@@ -422,6 +422,9 @@ impl Executor {
             trap_saved_exit_value: None,
             trap_saved_exit_context: 0,
             exec_replaced: false,
+            // rubash#1175: a process root IS its process's shell; the
+            // image-replacement gates live at the exec dispatcher.
+            owns_process_image: true,
             source_nest_depth: 0,
             sigchld_notifications_pending: std::cell::Cell::new(0),
             pending_signal_notices: std::cell::RefCell::new(Vec::new()),
@@ -434,6 +437,8 @@ impl Executor {
             getopts_optind_arith_fatal: false,
             defer_stage_time_report: false,
             pending_stage_time_report: None,
+            defer_list_time_report: false,
+            pending_list_time_reports: Vec::new(),
             pending_assignment_diagnostics: Vec::new(),
             parameter_assignment_failure: Cell::new(false),
             tempenv_names: Vec::new(),
@@ -471,6 +476,7 @@ impl Executor {
             comsub_stdin_writeback: Cell::new(None),
             pipeline_stdin_consumed: Cell::new(None),
             pipeline_stage_fds_pre_wired: std::cell::Cell::new(false),
+            pipeline_final_stage: std::cell::Cell::new(false),
             pipeline_stage_pre_traced: std::cell::Cell::new(false),
             pipeline_stage_restricted_refused: std::cell::Cell::new(false),
             last_heredoc_warning_source: RefCell::new(None),

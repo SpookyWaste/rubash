@@ -62,6 +62,7 @@ where
     }
 
     let mut delete = false;
+    let mut reset = false;
     let mut pathname: Option<&str> = None;
     let mut translate = false;
     let mut reusable = false;
@@ -92,12 +93,16 @@ where
             while let Some((offset, option)) = chars.next() {
                 match option {
                     'r' => {
-                        env_vars.remove(HASH_TABLE);
-                        // GNU `hash -r` forgets all remembered locations; the
-                        // internal lookup cache holds the same information, so
-                        // it must be dropped too or misses/hits stay stale.
-                        crate::executor::path::clear_command_lookup_cache();
-                        return Ok(EXECUTION_SUCCESS);
+                        // GNU builtins/hash.def:107-109: `-r` only SETS
+                        // expunge_hash_table — option parsing continues and
+                        // any operands are processed AFTER the flush
+                        // (hash.def:150-151 phash_flush, then the name loop
+                        // rehashes each name). Returning here made
+                        // `hash -r name` silently delete just that entry
+                        // with rc 0; GNU clears the table, then rehashes
+                        // the name and reports `hash: name: not found`
+                        // (rc 1) when it does not resolve (rubash#1489).
+                        reset = true;
                     }
                     'd' => delete = true,
                     't' => translate = true,
@@ -159,6 +164,32 @@ where
             script_prefix(env_vars)
         )?;
         return Ok(EXECUTION_FAILURE);
+    }
+
+    // GNU builtins/hash.def:131-135: `hash -p pathname` with no name is a
+    // usage error (EX_USAGE) — and it is reported BEFORE the -r expunge
+    // below (hash.def's checks precede phash_flush), so the table
+    // survives a malformed `hash -r -p path`.
+    if pathname.is_some() && names.is_empty() {
+        writeln!(
+            stderr,
+            "hash: usage: hash [-lr] [-p pathname] [-dt] [name ...]"
+        )?;
+        return Ok(EX_USAGE);
+    }
+
+    // GNU builtins/hash.def:150-151: with expunge set, the whole table is
+    // flushed before the name loop (and before -t target listing); with
+    // no names at all the builtin then ends silently at rc 0 — the table
+    // print above-all is skipped whenever expunge was requested.
+    if reset {
+        env_vars.remove(HASH_TABLE);
+        // The internal lookup cache holds the same remembered locations,
+        // so it must be dropped too or misses/hits stay stale.
+        crate::executor::path::clear_command_lookup_cache();
+        if names.is_empty() {
+            return Ok(EXECUTION_SUCCESS);
+        }
     }
 
     let mut table = hash_table(env_vars);

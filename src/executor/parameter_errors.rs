@@ -854,6 +854,38 @@ impl Executor {
         None
     }
 
+    /// Side-effect-free detection twin of `parameter_expansion_error` plus
+    /// the heredoc/here-string gate (`parameter_heredoc_expansion_error`):
+    /// true when executing this command through the full simple-command
+    /// path would report a word-expansion error. The reporting entry point
+    /// cannot be probed speculatively — its nounset arm executes the
+    /// collected comsub prefix bodies for their side effects — so the
+    /// concurrent-pipeline admission (pipeline_exec.rs) asks this pure
+    /// question instead and declines to the sequential stage executor,
+    /// whose own gates then report the error exactly once (rubash#1130:
+    /// a pipeline element's here-string skipped the nounset check on both
+    /// the concurrent path and, for the heredoc family, the stage path).
+    pub(in crate::executor) fn parameter_expansion_error_pending(&self, cmd: &CommandNode) -> bool {
+        if cmd.arithmetic_command.is_some() {
+            return false;
+        }
+        if self.parameter_heredoc_expansion_error(cmd).is_some() {
+            return true;
+        }
+        if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "nounset") {
+            for text in cmd.words.iter().chain(cmd.assignment_values()) {
+                let (unbound, _bodies) = self.nounset_unbound_parameter_with_comsubs(text);
+                if unbound.is_some() {
+                    return true;
+                }
+            }
+        }
+        cmd.words
+            .iter()
+            .chain(cmd.assignment_values())
+            .any(|word| self.parameter_expansion_error_in_word(word).is_some())
+    }
+
     pub(in crate::executor) fn parameter_expansion_error_in_heredoc_body(
         &self,
         body: &str,

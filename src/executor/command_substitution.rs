@@ -1632,6 +1632,8 @@ impl Executor {
             getopts_optind_arith_fatal: false,
             defer_stage_time_report: false,
             pending_stage_time_report: None,
+            defer_list_time_report: false,
+            pending_list_time_reports: Vec::new(),
             pending_assignment_diagnostics: Vec::new(),
             parameter_assignment_failure: Cell::new(false),
             tempenv_names: Vec::new(),
@@ -1691,6 +1693,9 @@ impl Executor {
             // exec-replacement latch never propagates (a post-reset exec
             // always exits its own frame, so a live parent cannot carry it).
             exec_replaced: false,
+            // rubash#1175: a fork copy shares the parent shell's process;
+            // it must never execve that process away.
+            owns_process_image: false,
             source_nest_depth: 0,
             sigchld_notifications_pending: std::cell::Cell::new(0),
             // jobs.c:4607-4612: a comsub child (startup_state 2 +
@@ -1706,6 +1711,7 @@ impl Executor {
             comsub_stdin_writeback: Cell::new(None),
             pipeline_stdin_consumed: Cell::new(None),
             pipeline_stage_fds_pre_wired: std::cell::Cell::new(false),
+            pipeline_final_stage: std::cell::Cell::new(false),
             pipeline_stage_pre_traced: std::cell::Cell::new(false),
             pipeline_stage_restricted_refused: std::cell::Cell::new(false),
             last_heredoc_warning_source: RefCell::new(None),

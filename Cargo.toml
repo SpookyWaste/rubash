@@ -38,7 +38,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-signal-hook = "0.3"
+signal-hook = { version = "0.3", features = ["extended-siginfo"] }
 
 # rubash#827: build.rs stamps a `-dirty-<8 hex>` digest of the uncommitted
 # diff into the version banner (#488: a bare HEAD hash does not guarantee

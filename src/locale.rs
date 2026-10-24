@@ -57,6 +57,60 @@ pub enum Encoding {
     Utf8,
 }
 
+// The locale name of the shell whose builtin is currently executing,
+// resolved from its VARIABLE table rather than the process environment.
+// GNU's sv_lc* watchers (variables.c:4283-4350) make a plain (unexported)
+// `LC_ALL=C` assignment change the shell's own locale semantics at once;
+// rubash only syncs the process env on `export`, so executor-side builtin
+// dispatch installs this override from env_vars for the duration of the
+// builtin (rubash#1488: `LC_ALL=C; echo -e '\u00e9'` must see the C locale
+// inside echo even though LC_ALL was never exported).
+thread_local! {
+    static SHELL_LOCALE_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// RAII guard installing [`SHELL_LOCALE_OVERRIDE`] from a variable table.
+pub struct ShellLocaleGuard;
+
+impl ShellLocaleGuard {
+    pub fn new(env_vars: &std::collections::HashMap<String, String>) -> Self {
+        SHELL_LOCALE_OVERRIDE.with(|cell| {
+            *cell.borrow_mut() = Some(locale_name_from_vars(env_vars));
+        });
+        ShellLocaleGuard
+    }
+}
+
+impl Drop for ShellLocaleGuard {
+    fn drop(&mut self) {
+        SHELL_LOCALE_OVERRIDE.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+    }
+}
+
+/// Locale name from a variable table: LC_ALL > LC_CTYPE > LC_MESSAGES >
+/// LANG, empty values skipped (same precedence as [`locale_name`]).
+pub fn locale_name_from_vars(env_vars: &std::collections::HashMap<String, String>) -> String {
+    for name in ["LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LANG"] {
+        if let Some(value) = env_vars.get(name) {
+            if !value.is_empty() {
+                return value.clone();
+            }
+        }
+    }
+    String::new()
+}
+
+/// The locale name a running builtin should observe: the executing
+/// shell's variable-table locale when a guard is installed, the process
+/// environment otherwise.
+pub fn active_locale_name() -> String {
+    SHELL_LOCALE_OVERRIDE
+        .with(|cell| cell.borrow().clone())
+        .unwrap_or_else(locale_name)
+}
+
 /// Get the active locale name from environment variables.
 /// Priority: LC_ALL > LC_CTYPE > LC_MESSAGES > LANG
 pub fn locale_name() -> String {

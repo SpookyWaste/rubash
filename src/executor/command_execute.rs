@@ -1034,7 +1034,7 @@ impl Executor {
 }
 
 impl Executor {
-    fn parameter_heredoc_expansion_error(
+    pub(in crate::executor) fn parameter_heredoc_expansion_error(
         &self,
         cmd: &CommandNode,
     ) -> Option<(String, String, i32)> {

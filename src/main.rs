@@ -33,6 +33,12 @@ fn run_main() -> i32 {
     // Initialize locale state from environment (LC_ALL > LC_CTYPE > LANG)
     rubash::locale::init_locale();
 
+    // rubash#1175: this process IS the shell, so a top-level `exec` may
+    // replace its image for real (GNU shell_execve) instead of being
+    // simulated by a child process with a different PID. Library hosts
+    // (niubash) never opt in — their process is not the shell's.
+    rubash::builtins::exec::enable_process_replacement();
+
     // rubash#590: the bash.exe shim (src/bin/bash.rs) erases Windows argv[0]
     // when it re-execs this engine, so the invocation face travels in
     // NIU_INVOKED_AS (rubash#504 forwarded the sh/ash faces for the POSIX
@@ -103,7 +109,11 @@ fn run_main() -> i32 {
         // form within one shell.
         let path =
             rubash::executor::shell_pwd_display_path(&path.to_string_lossy().replace('\\', "/"));
-        executor.export_env("BASH", &path);
+        // rubash#1325: GNU seeds $BASH WITHOUT the export attribute
+        // (variables.c: BASH is a plain shell variable; `export -p` in a
+        // clean env lists only OLDPWD/PWD/SHLVL). export_env here made
+        // `env -i rubash -c 'export -p'` diverge by leaking BASH.
+        executor.set_env("BASH", &path);
     }
     // GNU variables.c:1547-1555 (set_argv0, called from
     // initialize_shell_variables:608 via assign_bash_argv0:1528-1545): a
@@ -1554,6 +1564,20 @@ fn run_init_file(executor: &mut Executor, init_file: &str) -> i32 {
     // that echo; everything else interactive (expansion flags, $-) is
     // unaffected (rubash#297).
     executor.set_env("__RUBASH_INTERACTIVE_FLAG_OFF", "1");
+    // GNU shell.c run_startup_files sources the startup files
+    // (maybe_execute_file -> source_file): while one runs, the file IS
+    // the input stream (error.c:300-316 yy_input_name) and a top-level
+    // `return` is legal. The direct whole-file run below set neither
+    // marker, so diagnostics fell back to the invocation's `-c` stream
+    // name (`bash: -c: line 1:` for a bad rcfile) and a startup file's
+    // `return` — e.g. /etc/bash.bashrc's `[ -z "$PS1" ] && return`
+    // guard — errored as if typed at top level (rubash#1161). Establish
+    // the sourced-file context for the run and restore the caller's
+    // afterwards.
+    let old_in_source = executor.get_env("__RUBASH_IN_SOURCE").map(str::to_string);
+    let old_script_name = executor.get_env("__RUBASH_SCRIPT_NAME").map(str::to_string);
+    executor.set_env("__RUBASH_IN_SOURCE", "1");
+    executor.set_env("__RUBASH_SCRIPT_NAME", init_file);
     // Drop any stale parse latch so the check below reflects THIS file.
     let _ = executor.take_parse_error();
     let status = run_source(executor, &contents, false);
@@ -1568,6 +1592,14 @@ fn run_init_file(executor: &mut Executor, init_file: &str) -> i32 {
     // flag and still propagates (rubash#297).
     if executor.take_parse_error() {
         executor.take_exit_jump_pending();
+    }
+    match old_in_source {
+        Some(value) => executor.set_env("__RUBASH_IN_SOURCE", &value),
+        None => executor.remove_env("__RUBASH_IN_SOURCE"),
+    }
+    match old_script_name {
+        Some(value) => executor.set_env("__RUBASH_SCRIPT_NAME", &value),
+        None => executor.remove_env("__RUBASH_SCRIPT_NAME"),
     }
     executor.remove_env("__RUBASH_INTERACTIVE_FLAG_OFF");
     status
