@@ -9,6 +9,32 @@ enum WaitPidOutcome {
     NotFound,
     Status(i32),
     Interrupted(i32),
+    /// The job is already known to be stopped. GNU's wait never blocks
+    /// on a stopped job (jobs.c wait_for_background_pids /
+    /// wait_for_job); the caller renders the form-specific warning and
+    /// status (rubash#1246).
+    Stopped {
+        job_id: u32,
+        stop_signal: i32,
+    },
+}
+
+/// GNU jobs.c:1969 printable_job_status -> j_strsignal: the
+/// strsignal(3) description of the recorded stop signal, used only by
+/// the `jobs -l` long format. SIGTSTP's description is plain `Stopped`
+/// (the caller's fallback), so it has no entry here.
+fn stopped_long_text(stop_signal: Option<i32>) -> Option<&'static str> {
+    let _ = stop_signal;
+    #[cfg(unix)]
+    {
+        match stop_signal {
+            Some(sig) if sig == libc::SIGSTOP as i32 => return Some("Stopped (signal)"),
+            Some(sig) if sig == libc::SIGTTIN as i32 => return Some("Stopped (tty input)"),
+            Some(sig) if sig == libc::SIGTTOU as i32 => return Some("Stopped (tty output)"),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `resolve_background_job` with GNU's three-way get_job_spec result
@@ -180,6 +206,40 @@ impl Executor {
     }
 
     pub(in crate::executor) fn execute_wait(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<i32, ExecuteError> {
+        // GNU jobs.c wait_for: a job reaped BY the wait itself has its
+        // signal-death notice pretty-printed while wait still owns the
+        // command's descriptors — `wait $p 2>/dev/null` silences the
+        // "Killed" notice. Notices queued BEFORE this wait (reaped at
+        // an earlier boundary) keep the boundary route: the raw-stderr
+        // flush in report_pending_signal_notices. So: snapshot the
+        // queue length, run the wait, then drain only the notices this
+        // wait produced and route them through the wait command's own
+        // fd-2 binding instead of leaving them for the raw flush
+        // (rubash#1303).
+        let notice_mark = self.pending_signal_notices.borrow().len();
+        let result = self.execute_wait_inner(cmd);
+        let drained: Vec<(u32, i32, String, bool)> = {
+            let mut queue = self.pending_signal_notices.borrow_mut();
+            let mark = notice_mark.min(queue.len());
+            queue.drain(mark..).collect()
+        };
+        if !drained.is_empty() {
+            let text = self.format_signal_notices(drained);
+            if !text.is_empty() {
+                if result.is_ok() {
+                    self.write_buffered_builtin_output(cmd, &[], text.as_bytes())?;
+                } else {
+                    let _ = self.write_buffered_builtin_output(cmd, &[], text.as_bytes());
+                }
+            }
+        }
+        result
+    }
+
+    fn execute_wait_inner(
         &mut self,
         cmd: &CommandNode,
     ) -> Result<i32, ExecuteError> {
@@ -449,15 +509,29 @@ impl Executor {
                 .filter(|job| job.background)
                 .flat_map(|job| job.pids.iter().copied())
                 .collect::<Vec<_>>();
+            let mut wait_stderr: Vec<u8> = Vec::new();
             for pid in pids {
                 // wait.def:238-245 wait_for_any_job + :328-331: a trapped
                 // signal interrupts the no-operand wait too, returning
                 // 128+sig.
-                if let WaitPidOutcome::Interrupted(interrupt) =
-                    self.wait_for_background_pid(pid, false)?
-                {
-                    self.write_buffered_builtin_output(cmd, &[], &[])?;
-                    return Ok(interrupt);
+                match self.wait_for_background_pid(pid, false)? {
+                    WaitPidOutcome::Interrupted(interrupt) => {
+                        self.write_buffered_builtin_output(cmd, &[], &wait_stderr)?;
+                        return Ok(interrupt);
+                    }
+                    WaitPidOutcome::Stopped { job_id, .. } => {
+                        // GNU jobs.c:2818 wait_for_background_pids: a
+                        // stopped job is reported, never waited for
+                        // (rubash#1246).
+                        writeln!(
+                            wait_stderr,
+                            "{}wait: warning: job {}[{}] stopped",
+                            self.diagnostic_prefix(),
+                            job_id,
+                            pid
+                        )?;
+                    }
+                    _ => {}
                 }
             }
             // rubash#1022: GNU's no-operand wait also reaps finished
@@ -469,7 +543,7 @@ impl Executor {
             // left alone: GNU would block, but an unkillable block here
             // could hang the shell, so they stay signallable instead.
             self.sweep_procsub_placeholders();
-            self.write_buffered_builtin_output(cmd, &[], &[])?;
+            self.write_buffered_builtin_output(cmd, &[], &wait_stderr)?;
             // Bash's no-operand wait reports success after waiting for all
             // current jobs; individual statuses require an explicit operand.
             return Ok(0);
@@ -500,6 +574,21 @@ impl Executor {
                         self.write_buffered_builtin_output(cmd, &[], &[])?;
                         return Ok(status);
                     }
+                    WaitPidOutcome::Stopped {
+                        job_id,
+                        stop_signal,
+                    } => {
+                        // GNU jobs.c wait_for_job (rubash#1246).
+                        let mut stderr = Vec::new();
+                        writeln!(
+                            stderr,
+                            "{}warning: wait_for_job: job {} is stopped",
+                            self.diagnostic_prefix(),
+                            job_id
+                        )?;
+                        self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                        return Ok(128 + stop_signal);
+                    }
                     WaitPidOutcome::NotFound => {}
                 },
                 JobOperandResolution::Ambiguous => {
@@ -523,6 +612,21 @@ impl Executor {
                             | WaitPidOutcome::Interrupted(status) => {
                                 self.write_buffered_builtin_output(cmd, &[], &[])?;
                                 return Ok(status);
+                            }
+                            WaitPidOutcome::Stopped {
+                                job_id,
+                                stop_signal,
+                            } => {
+                                // GNU jobs.c wait_for_job (rubash#1246).
+                                let mut stderr = Vec::new();
+                                writeln!(
+                                    stderr,
+                                    "{}warning: wait_for_job: job {} is stopped",
+                                    self.diagnostic_prefix(),
+                                    job_id
+                                )?;
+                                self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                                return Ok(128 + stop_signal);
                             }
                             WaitPidOutcome::NotFound => {}
                         }
@@ -719,6 +823,23 @@ impl Executor {
                 WaitPidOutcome::Interrupted(interrupt_status) => {
                     self.write_buffered_builtin_output(cmd, &[], &stderr)?;
                     return Ok(interrupt_status);
+                }
+                WaitPidOutcome::Stopped {
+                    job_id,
+                    stop_signal,
+                } => {
+                    // GNU jobs.c wait_for_job: a stopped job is reported
+                    // (`warning: wait_for_job: job %d is stopped`) and
+                    // the wait returns the stop status 128+sig without
+                    // blocking (rubash#1246).
+                    writeln!(
+                        stderr,
+                        "{}warning: wait_for_job: job {} is stopped",
+                        self.diagnostic_prefix(),
+                        job_id
+                    )?;
+                    status = 128 + stop_signal;
+                    last_pid = Some(pid);
                 }
                 WaitPidOutcome::Status(wait_status) => {
                     status = wait_status;
@@ -958,15 +1079,25 @@ impl Executor {
     ///   a foreground TERM death lands);
     /// - background TERM/INT/PIPE or trapped deaths: silent.
     pub(crate) fn report_pending_signal_notices(&mut self) -> Result<(), ExecuteError> {
+        let notices = std::mem::take(&mut *self.pending_signal_notices.borrow_mut());
+        let out = self.format_signal_notices(notices);
+        if !out.is_empty() {
+            crate::executor::shell_options::write_stderr_bytes(out.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Format queued signal-death notices exactly as
+    /// report_pending_signal_notices prints them at the command
+    /// boundary. Split out so execute_wait can route the notices ITS
+    /// reap produced through the wait command's own fd-2 binding
+    /// (rubash#1303).
+    fn format_signal_notices(&self, notices: Vec<(u32, i32, String, bool)>) -> String {
         // Signal numbers are the invariant Linux/MSVC values (libc is a
         // unix-only dependency, and job_builtins.rs compiles on both).
         const SIGINT: i32 = 2;
         const SIGPIPE: i32 = 13;
         const SIGTERM: i32 = 15;
-        let notices = std::mem::take(&mut *self.pending_signal_notices.borrow_mut());
-        if notices.is_empty() {
-            return Ok(());
-        }
         let mut out = String::new();
         for (pid, signal, command, foreground) in notices {
             // jobs.c:4628-4638: INT is never reported; PIPE via
@@ -999,10 +1130,7 @@ impl Executor {
             }
             // Background TERM/trapped deaths print nothing.
         }
-        if !out.is_empty() {
-            crate::executor::shell_options::write_stderr_bytes(out.as_bytes())?;
-        }
-        Ok(())
+        out
     }
 
     /// Per-command boundary reap of background children (GNU's
@@ -1020,12 +1148,19 @@ impl Executor {
                 finished.push((
                     *pid,
                     crate::executor::wait_status::process_exit_status(&status),
+                    crate::executor::wait_status::exit_status_signal(&status),
                 ));
             }
         }
 
-        for (pid, status) in finished {
+        for (pid, status, term_signal) in finished {
             self.background_children.remove(&pid);
+            // The raw wait status knows whether the child died by a
+            // signal; the flattened status does not. Record it so the
+            // jobs listing prints the signal description (rubash#1256).
+            if let Some(signal) = term_signal {
+                self.shell_state.job_table.note_term_signal(pid, signal);
+            }
             // rubash#229: a background child killed by a signal gets the
             // jobs.c:4625 notify_of_job_status notice at the reader
             // boundary; the command text must be read before the job entry
@@ -1261,6 +1396,27 @@ impl Executor {
         if let Some(interrupt) = self.wait_pending_signal_status()? {
             return Ok(WaitPidOutcome::Interrupted(interrupt));
         }
+        // GNU jobs.c wait_for_background_pids (bare wait) and
+        // wait_for_job (explicit wait): a job the shell already knows
+        // is stopped is never blocked on — a stopped child never exits,
+        // so the poll loop below would hang forever (rubash#1246,
+        // verified GNU 5.3.20: bare wait warns and returns 0, an
+        // explicit wait warns and returns 128+stopsig). The caller
+        // renders the form-specific warning.
+        if let Some((job_id, stop_signal)) = self
+            .shell_state
+            .job_table
+            .pid_to_job
+            .get(&pid)
+            .and_then(|job_id| self.shell_state.job_table.jobs.get(job_id))
+            .filter(|job| job.state == crate::jobs::ProcessState::Stopped)
+            .map(|job| (job.id, job.stop_signal.unwrap_or(19)))
+        {
+            return Ok(WaitPidOutcome::Stopped {
+                job_id,
+                stop_signal,
+            });
+        }
         if let Some(status) = self
             .shell_state
             .job_table
@@ -1294,9 +1450,21 @@ impl Executor {
         let status = loop {
             // Signal queue first (see trap.c:604-611 note above): a trap
             // delivered before the child exited must win the race.
-            if let Some(interrupt) = self.wait_pending_signal_status()? {
-                self.background_children.insert(pid, child);
-                return Ok(WaitPidOutcome::Interrupted(interrupt));
+            match self.wait_pending_signal_status() {
+                Ok(Some(interrupt)) => {
+                    self.background_children.insert(pid, child);
+                    return Ok(WaitPidOutcome::Interrupted(interrupt));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    // An untrapped signal aborts the wait with
+                    // ExitCode(128+sig): put the handle back before
+                    // propagating, like the trapped branch above, so
+                    // the job remains waitable and reportable — the
+                    // child may still be alive.
+                    self.background_children.insert(pid, child);
+                    return Err(error);
+                }
             }
             if let Some(done) = child.try_wait()? {
                 // rubash#229: queue the signal-death notice (the job entry
@@ -1502,9 +1670,16 @@ impl Executor {
                 .map(|job| match job.state {
                     crate::jobs::ProcessState::Running => "Running".to_string(),
                     crate::jobs::ProcessState::Stopped => "Stopped".to_string(),
-                    crate::jobs::ProcessState::Completed => match job.exit_status.unwrap_or(1) {
-                        0 => "Done".to_string(),
-                        status => format!("Exit {status}"),
+                    // GNU jobs.c pretty_print_job: a job killed by a
+                    // signal lists the signal description (Terminated,
+                    // Killed, ...), not the flattened 128+signal status
+                    // (rubash#1256).
+                    crate::jobs::ProcessState::Completed => match job.term_signal {
+                        Some(signal) => crate::builtins::kill::signal_death_description(signal),
+                        None => match job.exit_status.unwrap_or(1) {
+                            0 => "Done".to_string(),
+                            status => format!("Exit {status}"),
+                        },
                     },
                 });
             // Apply state-based filters
@@ -1529,6 +1704,22 @@ impl Executor {
                 continue;
             }
             let state_text = state_text_opt.unwrap_or_else(|| "Unknown".to_string());
+
+            // GNU jobs.c:1969 printable_job_status: in the LONG format a
+            // stopped job renders the stop signal's strsignal text —
+            // SIGSTOP `Stopped (signal)`, SIGTTIN `Stopped (tty input)`,
+            // SIGTTOU `Stopped (tty output)` (SIGTSTP's description is
+            // plain `Stopped`). The short format and the notification
+            // lines always use the plain state text (rubash#1246,
+            // verified against GNU 5.3.20 in a pty).
+            let display_text = if options.long && state_text == "Stopped" {
+                let stop_signal = job_id
+                    .and_then(|id| self.shell_state.job_table.jobs.get(&id))
+                    .and_then(|job| job.stop_signal);
+                stopped_long_text(stop_signal).unwrap_or(&state_text)
+            } else {
+                &state_text
+            };
 
             // GNU jobs.c:2118-2120 pretty_print_pipeline: the trailing ` &`
             // is printed only while the job is RUNNING and not foreground —
@@ -1565,7 +1756,7 @@ impl Executor {
                 // `[1]+ 17063` (rubash#233: the old `{marker}  {pid}` shape
                 // printed a fixed two spaces with a left-aligned pid).
                 output.push_str(&format!(
-                    "[{job_number}]{marker} {pid:>5} {state_text:<27}{source}{async_suffix}\n"
+                    "[{job_number}]{marker} {pid:>5} {display_text:<27}{source}{async_suffix}\n"
                 ));
             } else {
                 output.push_str(&format!(
@@ -1613,9 +1804,13 @@ impl Executor {
                         .chain(self.background_children.keys().copied())
                         .collect();
                     self.background_children.clear();
-                    for pid in pids {
-                        self.close_coproc_endpoints(pid);
-                        self.fd_table.close(pid);
+                    for pid in &pids {
+                        // rubash#1304: `disown -a` leaves nothing
+                        // waitable (GNU: a later `wait <pid>` reports
+                        // "not a child of this shell", 127) — unlike a
+                        // single disown, no status is preserved here.
+                        self.close_coproc_endpoints(*pid);
+                        self.fd_table.close(*pid);
                     }
                     self.shell_state.job_table.clear_jobs();
                     0
@@ -1697,7 +1892,7 @@ impl Executor {
                                 self.background_children.remove(&pid);
                                 self.close_coproc_endpoints(pid);
                                 self.fd_table.close(pid);
-                                self.shell_state.job_table.remove_job_by_pid(pid);
+                                self.disown_job_by_pid(pid);
                             }
                         }
                     }
@@ -1738,8 +1933,38 @@ impl Executor {
         self.background_children.remove(&pid);
         self.close_coproc_endpoints(pid);
         self.fd_table.close(pid);
-        self.shell_state.job_table.remove_job_by_pid(pid);
+        self.disown_job_by_pid(pid);
         true
+    }
+
+    /// GNU jobs.c delete_job as driven by disown_builtin, with bgpids
+    /// (jobs.c bgp_search) semantics for the survivors: the job leaves
+    /// the table, but its pids stay waitable. A status already recorded
+    /// for a terminated job survives the removal, and a still-running
+    /// job's pids read as already-waited — `wait <pid>` after disown
+    /// returns that status or 0, silently and repeatably, instead of
+    /// 127 "not a child of this shell" (rubash#1304). (DisownAction::All
+    /// is the exception: GNU `disown -a` leaves nothing waitable, which
+    /// clear_jobs' purge of completed_statuses already models.)
+    fn disown_job_by_pid(&mut self, pid: u32) {
+        let job_pids: Vec<u32> = self
+            .shell_state
+            .job_table
+            .pid_to_job
+            .get(&pid)
+            .and_then(|job_id| self.shell_state.job_table.jobs.get(job_id))
+            .map(|job| job.pids.clone())
+            .unwrap_or_else(|| vec![pid]);
+        self.shell_state
+            .job_table
+            .remove_job_by_pid_preserve_status(pid);
+        for p in job_pids {
+            self.shell_state
+                .job_table
+                .completed_statuses
+                .entry(p)
+                .or_insert(0);
+        }
     }
 
     /// GNU wait.def:294-311 / kill.def:226 / fg_bg.def:143 — the jobspec
@@ -1899,7 +2124,7 @@ impl Executor {
         stderr: &mut Vec<u8>,
     ) -> Result<i32, ExecuteError> {
         let job = jobs.first().map(String::as_str);
-        let pid = match self.resolve_requested_background_job(job) {
+        let pid = match self.resolve_fg_bg_operand("fg", job, stderr)? {
             JobOperandResolution::Pid(pid) => pid,
             JobOperandResolution::Ambiguous => {
                 // GNU fg_bg.def:144-152: DUP_JOB skips sh_badjob — the
@@ -1980,8 +2205,32 @@ impl Executor {
             entry.foreground = true;
             entry.background = false;
         }
-        match self.wait_for_background_pid(pid, false)? {
+        // rubash#1252: GNU jobs.c:3064 wait_for blocks with the shell's
+        // own signal handling installed — the terminal's ^C is aimed at
+        // the foreground JOB, and the shell survives it, returning
+        // 128+SIGINT as fg's status. The emulated wait must therefore
+        // hold the same foreground SIGINT guard as an external-child
+        // wait; without it the shell process takes SIGINT at SIG_DFL
+        // while fg blocks and dies outright (pty-verified). The wait's
+        // untrapped-signal ExitCode(128+sig) is fg's ordinary status,
+        // not a shell exit, so convert it back here.
+        #[cfg(unix)]
+        let _sigint_guard =
+            super::external_inner::ForegroundBuiltinSigintGuard::hold_if_interactive_untrapped(
+                self,
+            );
+        let wait_outcome = match self.wait_for_background_pid(pid, false) {
+            Ok(outcome) => Ok(outcome),
+            Err(ExecuteError::ExitCode(code)) if code > 128 => {
+                Ok(WaitPidOutcome::Interrupted(code))
+            }
+            Err(error) => Err(error),
+        };
+        match wait_outcome? {
             WaitPidOutcome::Status(status) | WaitPidOutcome::Interrupted(status) => Ok(status),
+            // Unreachable in practice: fg SIGCONTs and marks the job
+            // running above, before the wait. Mapped for exhaustiveness.
+            WaitPidOutcome::Stopped { stop_signal, .. } => Ok(128 + stop_signal),
             WaitPidOutcome::NotFound => {
                 self.write_job_not_found("fg", job, stderr)?;
                 Ok(1)
@@ -2007,7 +2256,7 @@ impl Executor {
 
         let mut status = 0;
         for job in requested {
-            match self.resolve_requested_background_job(job) {
+            match self.resolve_fg_bg_operand("bg", job, stderr)? {
                 JobOperandResolution::Pid(pid) => {
                     if !self.shell_state.job_table.job_control_for_pid(pid) {
                         let job_id = self.shell_state.job_table.job_id_for_pid(pid).unwrap_or(0);
@@ -2115,6 +2364,35 @@ impl Executor {
         }
     }
 
+    /// GNU fg_bg.def / jobs.c get_job_from_arg: an fg/bg operand that does
+    /// not start with `%` is NOT read as a pid. Bash warns
+    /// `job specification requires leading '%'` and then resolves the
+    /// operand as a jobspec anyway — `bg 1` selects job 1, `bg sleep`
+    /// matches by name, and a bare pid like 4788 matches nothing because
+    /// no jobspec spells it. wait/disown/kill keep the pid reading of bare
+    /// numbers; only fg and bg warn and reinterpret (rubash#1408,
+    /// rubash#1409). The caller has already applied the no-job-control
+    /// gate, which GNU reports before any operand processing.
+    fn resolve_fg_bg_operand(
+        &self,
+        builtin: &str,
+        job: Option<&str>,
+        stderr: &mut Vec<u8>,
+    ) -> Result<JobOperandResolution, ExecuteError> {
+        let Some(job) = job else {
+            return Ok(self.resolve_requested_background_job(None));
+        };
+        if job.starts_with('%') {
+            return Ok(self.resolve_background_job_operand(job));
+        }
+        writeln!(
+            stderr,
+            "{}{builtin}: warning: {job}: job specification requires leading `%'",
+            self.diagnostic_prefix()
+        )?;
+        Ok(self.resolve_background_job_operand(&format!("%{job}")))
+    }
+
     fn current_background_pid(&self) -> Option<u32> {
         let job_id = self.shell_state.job_table.current_job()?;
         self.shell_state
@@ -2146,12 +2424,24 @@ impl Executor {
         cmd: &CommandNode,
     ) -> Result<i32, ExecuteError> {
         let mut stderr = Vec::new();
-        let status = crate::builtins::suspend::execute_with_io(
+        let (status, too_many_arguments) = crate::builtins::suspend::execute_with_io(
             &cmd.words[1..],
             &self.diagnostic_prefix(),
             &mut stderr,
         )?;
         self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+        if too_many_arguments {
+            // GNU builtins/common.c no_args (the `exit 1 2` class,
+            // rubash#705): the diagnostic is out, $? is EX_BADUSAGE (2),
+            // and a DISCARD jump abandons the rest of the current list —
+            // script readers resume at the next line, a `-c` string is
+            // abandoned whole and the shell exits 1 (shell.c:1477). An
+            // `||` cannot rescue it (rubash#1331).
+            self.exit_code = 2;
+            self.raise_evalerror_abort();
+            self.evalerror_exit_toomany_pending.set(true);
+            return Ok(2);
+        }
         Ok(status)
     }
 
@@ -2569,9 +2859,18 @@ impl Executor {
                     return Ok(0);
                 }
                 // fc.def:539: echo_input_at_read = 1 before fc_execute_file.
-                // y.tab.c:5071-5075: each input line is echoed to stderr.
+                // y.tab.c:5071-5075: each input line is echoed to stderr —
+                // the COMMAND's stderr, so an `fc ... 2>file` redirect
+                // captures the echo like any builtin diagnostic. The raw
+                // eprintln! here bypassed the redirect entirely
+                // (rubash#1211). The echo is written below, inside the
+                // compound-redirect scope: that scope is what binds fd 2
+                // to the command's redirect target, and writing before it
+                // opens would lose the bytes to its truncation.
+                let mut echo = Vec::new();
                 for line in edited.lines() {
-                    eprintln!("{line}");
+                    use std::io::Write as _;
+                    let _ = writeln!(echo, "{line}");
                 }
                 if let Some(session) = session.as_ref() {
                     let control = self.get_env("HISTCONTROL").unwrap_or_default();
@@ -2597,7 +2896,14 @@ impl Executor {
                     },
                 );
                 self.apply_command_output_redirects(cmd, &mut ast)?;
-                self.with_compound_output_redirects(cmd, |executor| executor.execute_ast(&ast))?;
+                self.with_compound_output_redirects(cmd, |executor| {
+                    // rubash#1211: the fc echo (built above) goes to fd 2
+                    // as bound by this command's redirects, BEFORE the
+                    // re-executed text runs — GNU's echo_input_at_read
+                    // order (fc.def:539).
+                    executor.write_default_stderr(&echo)?;
+                    executor.execute_ast(&ast)
+                })?;
                 Ok(self.exit_code)
             }
             crate::builtins::fc::FcResult::Status(status) => Ok(status),

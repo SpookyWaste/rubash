@@ -83,7 +83,7 @@ impl Executor {
     pub(in crate::executor) fn print_time_shell(
         &mut self,
         posix_format: bool,
-        started: std::time::Instant,
+        started: TimeCommandStart,
     ) {
         let metrics = TimeCommandMetrics::from_start(started);
         if let Some(report) = format_time_report(&self.shell_state.env_vars, posix_format, metrics)
@@ -96,6 +96,13 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        // rubash#1218: in posix mode a dash word after `time` ends its
+        // reserved-word status (GNU parse.y) — the whole command is an
+        // ordinary external command named `time` (PATH-resolved, 127
+        // when absent), never the timing keyword.
+        if posix_time_dash_word(&cmd.words, self.posix_mode_enabled()) {
+            return self.execute_external(cmd);
+        }
         let mut index = 1;
         let mut inverted = false;
         while let Some(word) = cmd.words.get(index).map(String::as_str) {
@@ -121,12 +128,18 @@ impl Executor {
             timed.word_kinds = cmd.word_kinds[index..].to_vec();
         }
         let started = time_command_started();
-        self.execute_command(&timed)?;
+        // GNU execute_cmd.c: the time report (print_time_info) is part of
+        // executing the timed command — it is printed even when the
+        // command fails and errexit then terminates the shell
+        // (rubash#1278: `set -e; time false` prints the real/user/sys
+        // block in GNU). Capture the execution result, print the report,
+        // and only then propagate an errexit/exit unwind.
+        let result = self.execute_command(&timed);
         self.print_time_shell(cmd.words.iter().skip(1).any(|word| word == "-p"), started);
-        if inverted {
+        if result.is_ok() && inverted {
             self.exit_code = invert_exit_status(self.exit_code);
         }
-        Ok(())
+        result
     }
 
     pub(in crate::executor) fn execute_echo(

@@ -1,0 +1,18 @@
++ export FOO=bar
++ FOO=bar
++ export A=1 B=2
++ A=1
++ B=2
++ export B
++ readonly R=5
++ R=5
++ C=q
++ export C+=z
++ C+=z
++ export E=
++ E=
++ export 'SP=a b'
++ SP='a b'
++ declare D=9
++ local_never=1
++ set +x

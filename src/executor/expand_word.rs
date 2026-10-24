@@ -642,8 +642,34 @@ impl Executor {
         // raw parenthesized text first; the preserve variant keeps element
         // quote syntax so the storage tokenizer sees GNU's raw words
         // (assoc11.sub quote elements, d=(x $(echo 'y z') w) assoc glue).
+        // GNU subst.c: expand_word_internal applies tilde expansion to the
+        // RAW word BEFORE parameter expansion. A tilde that comes from
+        // ${param} expansion is never re-expanded (unicode1.sub: EChar=${Array[0x7e]}
+        // where the value is "~" must stay literal), and a glued `~$u` is
+        // judged on its raw text: the would-be user name `$u` fails the
+        // passwd lookup, so the segment stays literal and the parameter is
+        // expanded afterwards into the unexpanded text (rubash#1417:
+        // `u=/x; v=~$u` is `~/x`, not `$HOME/x`). GNU expands `~` at the
+        // start of the RHS and after every `:` in an assignment value
+        // (subst.c:11410-11460 internal_tilde + assignoff tracking).
+        // A compound `( ... )` RHS already took its per-element tilde pass
+        // (assign_assoc_from_kvlist key/value split, arrayfunc.c:630) — a
+        // whole-text `:`-tilde would wrongly expand `~` inside key-position
+        // elements like `p:~/r` that GNU leaves literal.
+        let tilde_first = !quoted
+            && !compound_assignment
+            && tilde_expand::assignment_value_needs_tilde_expansion(value, true)
+            && (self
+                .shell_state
+                .env_vars
+                .get("__RUBASH_POSIX_MODE")
+                .map(String::as_str)
+                != Some("1")
+                || value.starts_with("~/"));
         let expanded = if compound_assignment {
             self.expand_embedded_parameters_compound(value)
+        } else if tilde_first {
+            self.expand_embedded_parameters(&self.expand_assignment_tilde(value))
         } else {
             self.expand_embedded_parameters(value)
         };
@@ -652,30 +678,6 @@ impl Executor {
         } else {
             expanded
         };
-        // GNU subst.c: expand_word_internal applies tilde expansion to the
-        // RAW word before parameter expansion. A tilde that comes from
-        // ${param} expansion is never re-expanded (unicode1.sub: EChar=${Array[0x7e]}
-        // where the value is "~" must stay literal). GNU expands `~` at the
-        // start of the RHS and after every `:` in an assignment value
-        // (subst.c:11410-11460 internal_tilde + assignoff tracking).
-        // A compound `( ... )` RHS already took its per-element tilde pass
-        // (assign_assoc_from_kvlist key/value split, arrayfunc.c:630) — a
-        // whole-text `:`-tilde would wrongly expand `~` inside key-position
-        // elements like `p:~/r` that GNU leaves literal.
-        if !quoted
-            && !compound_assignment
-            && !expanded.contains('=')
-            && tilde_expand::assignment_value_needs_tilde_expansion(value, true)
-            && (self
-                .shell_state
-                .env_vars
-                .get("__RUBASH_POSIX_MODE")
-                .map(String::as_str)
-                != Some("1")
-                || expanded.starts_with("~/"))
-        {
-            return format!("{name}={}", self.expand_assignment_tilde(&expanded));
-        }
 
         format!("{name}={expanded}")
     }
@@ -775,6 +777,16 @@ impl Executor {
                     format!("{}{}\n", self.error_prefix(), message).as_bytes(),
                 );
             }
+            // The word WAS admitted as a whole-word arithmetic expansion
+            // above, so its failure is final: never fall through to the
+            // `$(` command-substitution arm below, which re-reads
+            // `$((1/0))` as `$(` + `(1/0)` + `)` and executes `1/0` as a
+            // command — rubash#1241's phantom `1/0: No such file or
+            // directory` printed after the real diagnostic in for-loop
+            // and case word lists. GNU decides `$((` vs `$(` at parse
+            // time (parse.y parse_comsub / parse_matched_pair); an
+            // arithmetic word can never become a command substitution.
+            return Some(String::new());
         }
 
         if let Some(source) = word
@@ -1037,6 +1049,24 @@ fn valid_brace_array_reference(head: &[u8]) -> bool {
     }
 }
 
+/// If `bytes` begins with a complete ANSI-C quoted literal `$'...'`,
+/// return the index of its closing quote within `bytes` (backslash
+/// escapes the next byte). rubash#1287.
+pub(in crate::executor) fn ansi_c_literal_end(bytes: &[u8]) -> Option<usize> {
+    if bytes.first() != Some(&b'$') || bytes.get(1) != Some(&b'\'') {
+        return None;
+    }
+    let mut index = 2;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'\'' => return Some(index),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
 /// subst.c:7583 `valid_brace_expansion_word` minus its length arm: an array
 /// reference is validated as `identifier[non-empty-subscript]` ending at the
 /// `]` (subst.c:10042-10046 -> arrayfunc.c valid_array_reference), so
@@ -1120,6 +1150,19 @@ fn braced_name_has_empty_substring_operand(name: &str) -> bool {
 ///   `${x(M)}`, `${1a}`, `${x!}`, `${a\b}`, `${${x}}`, `${日本}`.
 pub(in crate::executor) fn braced_name_is_bad_substitution(name: &str) -> bool {
     let bytes = name.as_bytes();
+
+    // rubash#1287: `${#$'...'}` — a complete ANSI-C quoted literal as the
+    // length operand. GNU subst.c parameter_brace_expand accepts it and
+    // expands the length of the (unset) parameter, printing 0; the
+    // sibling forms `${#$v}`, `${#$1}`, `${#$"..."}` and `${#'...'}`
+    // stay bad substitutions in GNU too, so only the $'...' literal is
+    // admitted here.
+    if bytes.len() >= 2
+        && bytes.first() == Some(&b'#')
+        && ansi_c_literal_end(&bytes[1..]) == Some(bytes.len() - 2)
+    {
+        return false;
+    }
 
     // `${#name}` with an identifier starter: whole-body length form.
     if bytes.first() == Some(&b'#') && bytes.get(1).is_some_and(|b| is_variable_starter(*b)) {

@@ -477,6 +477,19 @@ impl Executor {
         if name.is_empty() {
             return true;
         }
+        // rubash#1287: `${#$'...'}` — a complete ANSI-C quoted literal is
+        // a valid length operand (GNU subst.c parameter_brace_expand
+        // accepts it and expands the length of the unset parameter, 0).
+        // The k5 fix admitted the form in the expansion gate and the
+        // length dispatcher but missed this pre-scan, so the shell still
+        // rejected it end to end; admitted here at integration.
+        let name_bytes = name.as_bytes();
+        if crate::executor::expand_word::ansi_c_literal_end(name_bytes)
+            == Some(name_bytes.len().saturating_sub(1))
+            && name_bytes.len() >= 3
+        {
+            return true;
+        }
         // `${##}` is the length of `$#` (exp.tests:376 -> 1 with $#=5) and
         // `${#!}` the length of `$!` (more-exp.tests -> 0 while unset), so
         // both special names are valid length parameters in GNU.

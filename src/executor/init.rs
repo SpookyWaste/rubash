@@ -157,8 +157,26 @@ impl Executor {
             }
         }
 
-        let (imported_functions, imported_function_def_infos) =
+        let (imported_functions, imported_function_def_infos, failed_function_imports) =
             import_exported_functions_from_env(&env_vars);
+        // GNU variables.c: an imported function keeps att_exported — it
+        // shows as `declare -fx` and re-exports to grandchildren
+        // (rubash#1275). The import stripped the BASH_FUNC_* env entry
+        // but never recorded the attribute.
+        for name in imported_functions.keys() {
+            mark_env_name(&mut env_vars, EXPORTED_FUNCTIONS, name);
+        }
+        // GNU variables.c import refusal (the ShellShock guard) reports
+        // both lines under the shell's invocation name (rubash#1276).
+        if !failed_function_imports.is_empty() {
+            let shell_name = std::env::args()
+                .next()
+                .unwrap_or_else(|| "rubash".to_string());
+            for name in &failed_function_imports {
+                eprintln!("{shell_name}: warning: {name}: ignoring function definition attempt");
+                eprintln!("{shell_name}: error importing function definition for `{name}'");
+            }
+        }
         // GNU variables.c:397-446 (initialize_shell_variables,
         // FUNCTION_IMPORT): a successfully imported exported function
         // becomes a shell function, NOT a variable — the BASH_FUNC_name%%
@@ -364,6 +382,7 @@ impl Executor {
                 arithmetic_nonfatal_error: Cell::new(false),
                 arithmetic_fatal_error: Cell::new(false),
                 arithmetic_nounset_error: Cell::new(false),
+                arithmetic_readonly_error: Cell::new(false),
                 conditional_nounset_error: Cell::new(false),
                 arithmetic_last_error_category: Cell::new(None),
                 parameter_bad_substitution: Cell::new(false),
@@ -390,6 +409,7 @@ impl Executor {
             pending_scalar_assignment: false,
             suppress_errexit: 0,
             command_builtin_depth: 0,
+            builtin_wrapper_depth: 0,
             standard_path_scope: None,
             debug_trap_running: false,
             debug_trap_action_cache: std::cell::RefCell::new(None),
@@ -411,6 +431,9 @@ impl Executor {
             arithmetic_last_eval_input: std::cell::RefCell::new(String::new()),
             assignment_command_name: None,
             buffer_assignment_diagnostics: false,
+            getopts_optind_arith_fatal: false,
+            defer_stage_time_report: false,
+            pending_stage_time_report: None,
             pending_assignment_diagnostics: Vec::new(),
             parameter_assignment_failure: Cell::new(false),
             tempenv_names: Vec::new(),
@@ -422,6 +445,8 @@ impl Executor {
             evalerror_pending: Cell::new(false),
             nounset_force_eof: Cell::new(false),
             conditional_expansion_fatal: Cell::new(false),
+            conditional_fatal_status: Cell::new(None),
+            conditional_expansion_error_status: Cell::new(None),
             evalerror_subscript_pending: Cell::new(false),
             evalerror_failglob_pending: Cell::new(false),
             evalerror_exit_toomany_pending: Cell::new(false),
@@ -446,6 +471,7 @@ impl Executor {
             comsub_stdin_writeback: Cell::new(None),
             pipeline_stdin_consumed: Cell::new(None),
             pipeline_stage_fds_pre_wired: std::cell::Cell::new(false),
+            pipeline_stage_pre_traced: std::cell::Cell::new(false),
             pipeline_stage_restricted_refused: std::cell::Cell::new(false),
             last_heredoc_warning_source: RefCell::new(None),
             comsub_leading_newlines: Cell::new(0),
@@ -466,6 +492,8 @@ impl Executor {
             fd_var_external_undo: Vec::new(),
             read_deadline: None,
             read_timed_out: false,
+            read_interrupted_signal: None,
+            read_sigint_guard_armed: false,
             read_eof_no_delimiter: false,
             stdout_capture: None,
             stderr_capture: None,
@@ -566,6 +594,13 @@ impl Executor {
                 }
             }
         }
+        // Whether SHELL/PATH arrived with the environment: the fabricated
+        // fallbacks below are bound WITHOUT att_exported in GNU (a
+        // passwd-derived SHELL and the set_if_not PATH default are plain
+        // shell variables; `env -i` export -p lists neither), so any name
+        // fabricated here must be unmarked again after
+        // mark_initial_exported_vars sweeps the table (rubash#1325).
+        let shell_inherited = env_vars.contains_key("SHELL");
         env_vars
             .entry("SHELL".to_string())
             .or_insert_with(login_shell_value);
@@ -575,6 +610,8 @@ impl Executor {
         // /usr/sbin:/bin:/sbin:." — a shell started with no PATH in its
         // environment (env -i) still resolves the standard utilities; a
         // PATH that is present but empty is imported verbatim (rubash#1129).
+        #[cfg(unix)]
+        let path_inherited = env_vars.contains_key("PATH");
         #[cfg(unix)]
         env_vars.entry("PATH".to_string()).or_insert_with(|| {
             "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:.".to_string()
@@ -632,6 +669,17 @@ impl Executor {
         initialize_shell_level(env_vars);
         mark_initial_exported_vars(env_vars);
         mark_env_name(env_vars, EXPORTED_VARS, "OLDPWD");
+        // Undo the export mark for the SHELL/PATH fallbacks fabricated
+        // above (see the note at the SHELL bind): GNU binds both without
+        // att_exported, so `env -i` shells must not export them
+        // (rubash#1325). Inherited values keep their imported mark.
+        if !shell_inherited {
+            unmark_env_name(env_vars, EXPORTED_VARS, "SHELL");
+        }
+        #[cfg(unix)]
+        if !path_inherited {
+            unmark_env_name(env_vars, EXPORTED_VARS, "PATH");
+        }
         // GNU variables.c initialize_shell_variables only imports TMPDIR from
         // the environment — it never invents a value (WSL probe: `env -i
         // bash -c 'echo ${TMPDIR-UNSET}'` prints UNSET), and a value it never
@@ -664,9 +712,15 @@ impl Executor {
                 shell_pwd_display(&safe_temp_dir_string().replace('\\', "/"))
             });
         }
-        env_vars
-            .entry("IFS".to_string())
-            .or_insert_with(|| " \t\n".to_string());
+        // GNU variables.c initialize_shell_variables: IFS is never
+        // imported from the environment — a fresh shell always binds it
+        // to the default " \t\n", discarding any inherited value (even an
+        // empty one, which would disable field splitting entirely). This
+        // initializer runs exactly at fresh-shell starts (process start
+        // and the in-process child path), never for state-cloned
+        // subshells, so an unconditional bind is the GNU shape
+        // (rubash#1334).
+        env_vars.insert("IFS".to_string(), " \t\n".to_string());
         // GNU variables.c initialize_shell_variables binds these defaults
         // for every fresh shell (an inherited value wins): OPTERR=1
         // (getopts diagnostic default), PS4="+ " (xtrace prefix), and the
@@ -700,6 +754,16 @@ impl Executor {
         env_vars
             .entry("COMP_WORDBREAKS".to_string())
             .or_insert_with(|| " \t\n\"'@><=;|&(:".to_string());
+        // GNU binds COMP_WORDBREAKS with att_invisible: the variable
+        // exists (`declare -p COMP_WORDBREAKS` succeeds) but print_var_list
+        // (the `set` listing) skips invisible variables (rubash#1325).
+        mark_env_name(env_vars, INVISIBLE_VARS, "COMP_WORDBREAKS");
+        // GNU shell.c: a shell whose environment carries no TERM binds
+        // TERM="dumb" (plain, unexported) instead of leaving it unset
+        // (rubash#1325).
+        env_vars
+            .entry("TERM".to_string())
+            .or_insert_with(|| "dumb".to_string());
         env_vars.insert(
             SHELL_START_EPOCH.to_string(),
             current_epoch_seconds().to_string(),
@@ -735,6 +799,19 @@ impl Executor {
             for name in value.split(':').filter(|name| !name.is_empty()) {
                 if crate::builtins::set::is_shell_option(name) {
                     crate::builtins::set::set_shell_option(env_vars, name, true);
+                } else {
+                    // GNU shell.c initialize_shell_options -> set.def
+                    // parse_shellopts: an unknown inherited name is
+                    // reported once at startup (`<shell>: line 0: <name>:
+                    // invalid option name`) and startup continues
+                    // (rubash#1246). The value is rebuilt sanitized below,
+                    // so re-entered constructors (subshells) never repeat
+                    // the report.
+                    let shell_name = std::env::args()
+                        .next()
+                        .filter(|arg| !arg.is_empty())
+                        .unwrap_or_else(|| "bash".to_string());
+                    eprintln!("{shell_name}: line 0: {name}: invalid option name");
                 }
             }
         }
@@ -753,6 +830,10 @@ impl Executor {
         mark_env_name(env_vars, READONLY_VARS, "BASHOPTS");
         mark_env_name(env_vars, ARRAY_VARS, "PIPESTATUS");
         env_vars.insert("OPTIND".to_string(), "1".to_string());
+        // GNU variables.c creates OPTIND with att_integer (it prints as
+        // `declare -i OPTIND="1"`), which is also why a getopts name bind
+        // into OPTIND arith-evaluates (rubash#1270).
+        mark_env_name(env_vars, INTEGER_VARS, "OPTIND");
         env_vars.remove("OPTARG");
         env_vars.remove("__RUBASH_GETOPTS_OFFSET");
         env_vars
@@ -796,5 +877,12 @@ impl Executor {
         mark_env_name(env_vars, READONLY_VARS, "UID");
         mark_env_name(env_vars, READONLY_VARS, "EUID");
         mark_env_name(env_vars, READONLY_VARS, "PPID");
+        // GNU variables.c create_variable_tables/initialize_shell_variables:
+        // UID/EUID/PPID are created with V_INTEGER|V_READONLY, so
+        // `declare -p UID` reports -ir, not just -r (rubash#1326, same root
+        // as #1184 finding 3 — both clusters landed this fix; kept once).
+        mark_env_name(env_vars, INTEGER_VARS, "UID");
+        mark_env_name(env_vars, INTEGER_VARS, "EUID");
+        mark_env_name(env_vars, INTEGER_VARS, "PPID");
     }
 }

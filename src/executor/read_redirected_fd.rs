@@ -9,11 +9,30 @@ impl Executor {
         delimiter: char,
         char_limit: Option<usize>,
         exact_char_limit: bool,
+        escape_aware: bool,
+        raw: bool,
     ) -> Option<String> {
-        let redirect = cmd.redirect_in.as_ref()?;
-        if redirect.fd != Some(fd) {
-            return None;
-        }
+        // GNU redir.c applies the command's own redirections before the
+        // builtin runs, so `read -u 3 x 3< file` reads the file. rubash
+        // parks a numbered input redirect in cmd.redirects (only the
+        // fd-0 one lands in redirect_in); mapfile already consults both
+        // stores (mapfile_fd_is_available), read consulted only
+        // redirect_in and reported the fd invalid (rubash#1296). The
+        // last matching redirect in source order is the effective one.
+        let redirect = cmd
+            .redirect_in
+            .as_ref()
+            .filter(|redirect| redirect.fd == Some(fd))
+            .or_else(|| {
+                cmd.redirects.iter().rev().find(|redirect| {
+                    redirect.fd == Some(fd)
+                        && matches!(
+                            redirect.kind,
+                            crate::parser::RedirectKind::Input
+                                | crate::parser::RedirectKind::ReadWrite
+                        )
+                })
+            })?;
 
         if let Some(source) = redirect
             .target
@@ -26,6 +45,8 @@ impl Executor {
                 delimiter,
                 char_limit,
                 exact_char_limit,
+                escape_aware,
+                raw,
             ));
         }
 
@@ -58,6 +79,8 @@ impl Executor {
             delimiter,
             char_limit,
             exact_char_limit,
+            escape_aware,
+            raw,
         ))
     }
 
@@ -68,6 +91,8 @@ impl Executor {
         delimiter: char,
         char_limit: Option<usize>,
         exact_char_limit: bool,
+        escape_aware: bool,
+        raw: bool,
     ) -> Option<String> {
         let redirect = cmd
             .heredoc_redirects
@@ -84,6 +109,8 @@ impl Executor {
                     delimiter,
                     char_limit,
                     exact_char_limit,
+                    escape_aware,
+                    raw,
                 ));
             }
         }
@@ -96,6 +123,8 @@ impl Executor {
                 delimiter,
                 char_limit,
                 exact_char_limit,
+                escape_aware,
+                raw,
             ));
         }
         let input = if let Some(pre) = preexpanded_stdin_body(body) {
@@ -108,6 +137,8 @@ impl Executor {
             delimiter,
             char_limit,
             exact_char_limit,
+            escape_aware,
+            raw,
         ))
     }
 }

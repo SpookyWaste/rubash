@@ -976,6 +976,17 @@ pub(super) fn parse_parenthesized_function_body(
         return None;
     }
 
+    // GNU parse.y:1097: a subshell function body is `'(' compound_list
+    // ')'`, and compound_list must contain a command — `f() ( )` is a
+    // syntax error near `)'`, exactly like the bare `( )` handled in
+    // parse_subshell_command (rubash#221). Without this the empty body
+    // defined the function silently (rubash#1310). The error node rides
+    // as the body so finish_function_command's find_body_parse_error
+    // surfaces it in place of the definition.
+    if let Some(error) = empty_compound_body_error_node(tokens, start + 1, i) {
+        return Some((vec![error], i));
+    }
+
     let mut body = parse_function_body(&tokens[start + 1..i], diagnostic_text, source_line_offset);
     if let Some(first) = body.first_mut() {
         first.subshell = true;

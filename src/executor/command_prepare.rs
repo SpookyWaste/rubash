@@ -202,7 +202,7 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Option<Result<(), ExecuteError>> {
-        if command_is_time_prefixed_compound(cmd) {
+        if command_is_time_prefixed_compound(cmd, self.posix_mode_enabled()) {
             return Some(self.execute_time_prefixed_compound_command(cmd));
         }
         // GNU execute_cmd.c:485 (shell_control_structure) counts cm_arith,
@@ -340,7 +340,16 @@ impl Executor {
         // in place from expand_conditional_word; unwind with the
         // FORCE_EOF class (or the interactive DISCARD class).
         let conditional_fatal = self.conditional_expansion_fatal.replace(false);
+        let conditional_fatal_status = self.conditional_fatal_status.replace(None);
+        let conditional_error = self.conditional_expansion_error_status.take();
         if conditional_fatal {
+            // rubash#1201: execute_conditional_command just overwrote
+            // exit_code with the predicate's own status (e.g. -z of the
+            // empty failed expansion -> 0); the FORCE_EOF unwind keeps
+            // the fatal expansion status expand_conditional_word parked.
+            if let Some(status) = conditional_fatal_status {
+                self.exit_code = status;
+            }
             self.finish_conditional_output_procsubs()?;
             self.close_command_scoped_procsub_input_fds_from(procsub_fd_base);
             for (fd, saved) in [(1u32, saved_stdout), (2, saved_stderr)] {
@@ -369,6 +378,13 @@ impl Executor {
                     self.fd_table.entries.remove(&fd);
                 }
             }
+        }
+        // rubash#1422: a non-fatal expansion error in a [[ ]] operand
+        // (recorded by expand_conditional_word) abandons the current
+        // command list with the recorded status — DISCARD, so the next
+        // list still runs — after the command's redirects are restored.
+        if let Some(status) = conditional_error {
+            return Err(ExecuteError::ExpansionFailure(status));
         }
         // rubash#1177: a nounset fatal latched while expanding a `=~`
         // operand inside the conditional converts to the FORCE_EOF exit
@@ -430,6 +446,9 @@ impl Executor {
             }
             // rubash#439: expansion error, not a failed command — no ERR trap.
             self.command_expansion_failed.set(true);
+            // rubash#1318: the DISCARD must survive the group/function
+            // boundaries the Err crosses on its way to the reader.
+            self.raise_assignment_discard(cmd.logical_line.or(cmd.line));
             return Err(ExecuteError::ExpansionFailure(status));
         }
         // Bash 5.3 (parser.h FUNSUB_CHAR) executes whitespace-led
@@ -684,6 +703,9 @@ impl Executor {
                     self.exit_code = code;
                     return Err(ExecuteError::ExitCode(code));
                 }
+                // rubash#1318: the DISCARD must survive the group/function
+                // boundaries the Err crosses on its way to the reader.
+                self.raise_assignment_discard(cmd.logical_line.or(cmd.line));
                 return Err(ExecuteError::ExpansionFailure(1));
             }
             // GNU variables.c make_variable_value: an integer-attribute
@@ -792,6 +814,9 @@ impl Executor {
             }
             // rubash#439: expansion error, not a failed command — no ERR trap.
             self.command_expansion_failed.set(true);
+            // rubash#1318: the DISCARD must survive the group/function
+            // boundaries the Err crosses on its way to the reader.
+            self.raise_assignment_discard(cmd.logical_line.or(cmd.line));
             return Err(ExecuteError::ExpansionFailure(status));
         }
         // Bash 5.3 (parser.h FUNSUB_CHAR) executes whitespace-led

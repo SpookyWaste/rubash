@@ -495,14 +495,6 @@ where
         let (value, compound_marked) =
             if let Some(compound) = value.strip_prefix(COMPOUND_ASSIGNMENT_MARKER) {
                 (compound, true)
-            } else if value.is_empty() && var_name == "assoc" {
-                // TODO(parse.y/array.c): The current parser can split compound
-                // assignment words after `declare -A`. Preserve builtins5.sub's
-                // declaration shape until compound assignments remain atomic.
-                ("([one]=one [two]=two [three]=three)", true)
-            } else if value.is_empty() && var_name == "array" {
-                // TODO(parse.y/array.c): Same narrow bridge for `declare -a`.
-                ("(one two three)", true)
             } else {
                 (value, false)
             };

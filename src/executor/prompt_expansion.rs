@@ -797,12 +797,26 @@ impl Executor {
     }
 
     pub(in crate::executor) fn xtrace_prefix(&self) -> String {
-        let ps4 = self
-            .shell_state
-            .env_vars
-            .get("PS4")
-            .cloned()
-            .unwrap_or_else(|| "+ ".to_string());
+        // GNU print_cmd.c:455-466 indirection_level_string reads PS4 via
+        // get_string_value: an UNSET PS4 yields NULL and an empty one
+        // yields "" — both render an EMPTY prefix, not the startup
+        // default. The "+ " default only exists because startup binds it
+        // (init.rs); an explicit `unset PS4` must remove the prefix
+        // (rubash#1343).
+        let ps4 = match self.shell_state.env_vars.get("PS4") {
+            Some(value) => value.clone(),
+            None => return String::new(),
+        };
+        if ps4.is_empty() {
+            return String::new();
+        }
+        // GNU print_cmd.c:469: the PS4 text goes through
+        // decode_prompt_string, so prompt escapes (\w, \t, \$, ...) are
+        // decoded before the expansion pass — the same decode-then-expand
+        // composition as the PS1 channel (parse.y prompt decoding). The
+        // old expansion-only pipeline left `\w` literal in the prefix
+        // (rubash#1343).
+        let decoded = self.decode_prompt_string(&ps4);
         // GNU print_cmd.c:462-466 indirection_level_string: `change_flag
         // ('x', FLAG_OFF)` around decode_prompt_string, restored after —
         // the prefix expansion runs untraced. The suspension counter is
@@ -813,8 +827,9 @@ impl Executor {
         // through xtrace_enabled/shell_option_flags, so both routes agree.
         let suspended = self.shell_state.xtrace_suspended.get();
         self.shell_state.xtrace_suspended.set(suspended + 1);
-        let expanded = self.expand_embedded_parameters(&ps4);
+        let expanded = self.expand_embedded_parameters(&decoded);
         self.shell_state.xtrace_suspended.set(suspended);
+        let expanded = strip_prompt_ignore_markers(&expanded);
         // GNU print_cmd.c:445-510 indirection_level_string: expand PS4
         // (decode_prompt_string), then repeat its FIRST CHARACTER once per
         // indirection_level and append the rest of the string. The base
@@ -844,10 +859,10 @@ impl Executor {
     /// increments indirection_level around its reader loop; trap.c:496/1071
     /// route every trap action through it) with the xtrace indirection
     /// level raised by one, restoring the previous level on the way out.
-    pub(in crate::executor) fn with_xtrace_indirection<R>(
-        &mut self,
-        body: impl FnOnce(&mut Self) -> R,
-    ) -> R {
+    // Shared by the eval/source execution paths (GNU evalstring.c:348
+    // parse_and_execute bumps indirection_level around the nested list),
+    // so this is pub(crate), not executor-private (rubash#1341).
+    pub(crate) fn with_xtrace_indirection<R>(&mut self, body: impl FnOnce(&mut Self) -> R) -> R {
         let saved = self.shell_state.xtrace_indirection_level.get();
         self.shell_state.xtrace_indirection_level.set(saved + 1);
         let result = body(self);
@@ -952,6 +967,37 @@ impl Executor {
             visible
         };
         format!("{name}={rendered}")
+    }
+
+    /// GNU setattr.def:275: export/readonly perform each assignment
+    /// operand through do_assignment_no_expand, and subst.c:3580 traces
+    /// the performed bind (xtrace_print_assignment) — one
+    /// `{prefix}name=value` line per operand, after the command's own
+    /// trace line and in operand order. declare/typeset/local perform
+    /// the same do_assignment but GNU emits no such lines for them, so
+    /// only the export/readonly executors call this (rubash#1340). The
+    /// records are (written name, append flag, RHS text) collected by
+    /// builtins/setattr/apply.rs. Compound operands are skipped: the
+    /// declaration expansion phase already traced them before the
+    /// command line, exactly as GNU orders it.
+    pub(in crate::executor) fn xtrace_setattr_assignments(
+        &mut self,
+        traced: &[(String, bool, String)],
+    ) {
+        if !self.xtrace_enabled() {
+            return;
+        }
+        for (name, append, rhs) in traced {
+            if rhs.starts_with('(') && rhs.ends_with(')') {
+                continue;
+            }
+            let mut line = self.xtrace_assignment_line_from_expanded(name, rhs, rhs, true);
+            if *append {
+                line = line.replacen('=', "+=", 1);
+            }
+            let text = format!("{}{}\n", self.xtrace_prefix(), line);
+            self.xtrace_write(text.as_bytes());
+        }
     }
 
     pub(in crate::executor) fn xtrace_assignment_text(

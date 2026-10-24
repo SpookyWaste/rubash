@@ -1,6 +1,35 @@
 use super::*;
 
 impl Executor {
+    /// rubash#1240: is the list currently executing a DISCARD boundary —
+    /// the reader's top list, or an eval'd string's own top list
+    /// (evalstring.c installs a local top_level catch, so the discard
+    /// ends that string's list and no more)? GNU's jump_to_top_level
+    /// (DISCARD) unwinds every frame in between: brace-group bodies,
+    /// &&/|| element lists, loop bodies and function bodies are the
+    /// SAME list as their enclosing line for this purpose.
+    pub(in crate::executor) fn at_discard_boundary(&self) -> bool {
+        self.evalerror_exec_depth.get() <= 1
+            || self.eval_list_depth.get() == Some(self.evalerror_exec_depth.get())
+    }
+
+    /// Mark the list a following execute_ast call will run as a DISCARD
+    /// boundary list, returning the saved marker for restoration.
+    /// evalstring.c's parse_and_execute is the execution unit for reader
+    /// input, eval strings AND sourced files (evalfile.c source_file):
+    /// each installs its own top_level catch, so a DISCARD ends only
+    /// that unit's list. execute_eval_source_inner marks this inline for
+    /// eval; the source driver (builtins::source) uses this pair around
+    /// its per-group runs (rubash#753 case 17).
+    pub(crate) fn enter_discard_boundary_list(&self) -> Option<usize> {
+        self.eval_list_depth
+            .replace(Some(self.evalerror_exec_depth.get() + 1))
+    }
+
+    pub(crate) fn leave_discard_boundary_list(&self, saved: Option<usize>) {
+        self.eval_list_depth.set(saved);
+    }
+
     pub fn execute_ast(&mut self, ast: &Ast) -> Result<(), ExecuteError> {
         if EXECUTION_LOCK_DEPTH.with(|depth| depth.get() > 0) {
             return self.execute_ast_inner(&ast.commands);
@@ -732,7 +761,7 @@ impl Executor {
                 || command.time_command.is_some()
                 || command.coproc_command.is_some()
                 || command.background_command.is_some()
-                || command_is_time_prefixed_compound(command);
+                || command_is_time_prefixed_compound(command, self.posix_mode_enabled());
             let debug_trap_active = crate::builtins::trap::has_active_trap_action(
                 &self.shell_state.env_vars,
                 "DEBUG",
@@ -1063,6 +1092,25 @@ impl Executor {
                         return Err(error);
                     }
                 }
+                // GNU execute_cmd.c: the ERR trap and the errexit jump run
+                // for a completed `time` command exactly as for a pipeline
+                // (the branch below) — this branch used to skip both, so
+                // `set -e; time f` with f failing, and a pipefail-failing
+                // pipeline under `time`, never exited (rubash#1277). The
+                // timed command's own `!` (time_command.inverted, already
+                // folded into exit_code by execute_time_ast_command)
+                // exempts the command like an outer inversion.
+                self.maybe_run_error_trap(command)?;
+                if self.errexit_enabled()
+                    && self.errexit_is_active()
+                    && self.suppress_errexit == 0
+                    && self.exit_code != 0
+                    && !command.inverted
+                    && !time_command.inverted
+                    && command.and_or().is_none()
+                {
+                    return Err(ExecuteError::ExitCode(self.exit_code));
+                }
                 if let Some(next_index) = self.skip_and_or_rhs(commands, index) {
                     index = next_index;
                 } else {
@@ -1124,7 +1172,7 @@ impl Executor {
                 continue;
             }
 
-            if command_is_time_prefixed_compound(command) {
+            if command_is_time_prefixed_compound(command, self.posix_mode_enabled()) {
                 let execution_result = self.execute_time_prefixed_compound_command(command);
                 match execution_result {
                     Ok(()) => {}
@@ -1322,6 +1370,31 @@ impl Executor {
                     }
                     Err(ExecuteError::ExpansionFailure(code)) => {
                         self.exit_code = code;
+                        // GNU expr.c evalerror -> jump_to_top_level
+                        // (DISCARD): a fatal expansion failure inside an
+                        // &&/|| chain discards the rest of the current
+                        // list, not just the chain (rubash#1240). In a
+                        // nested list the error keeps unwinding to the
+                        // discard boundary; only there is the remainder
+                        // of the line skipped (mirroring the
+                        // plain-command DISCARD skip below).
+                        if !self.at_discard_boundary() {
+                            return Err(ExecuteError::ExpansionFailure(code));
+                        }
+                        let failed_line = command
+                            .logical_line
+                            .or(command.line)
+                            .filter(|line| *line != 0);
+                        if failed_line.is_some() {
+                            while let Some(next) = commands.get(index + 1) {
+                                let next_logical = next.logical_line.or(next.line);
+                                if next_logical == failed_line && !next.subshell_end {
+                                    index += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
                     }
                     Err(ExecuteError::IoError(error)) => {
                         // rubash#440: a closed output (SIGPIPE analogue) is a
@@ -1392,6 +1465,52 @@ impl Executor {
                 }
                 Err(ExecuteError::ExpansionFailure(code)) => {
                     self.exit_code = code;
+                    // GNU expr.c evalerror -> jump_to_top_level
+                    // (DISCARD): a fatal expansion failure inside a brace
+                    // group discards the rest of the current list, not
+                    // just the group (rubash#1240). In a nested list the
+                    // error keeps unwinding to the discard boundary; only
+                    // there is the remainder of the line skipped
+                    // (mirroring the plain-command DISCARD skip below).
+                    if !self.at_discard_boundary() {
+                        return Err(ExecuteError::ExpansionFailure(code));
+                    }
+                    let failed_line = command
+                        .logical_line
+                        .or(command.line)
+                        .filter(|line| *line != 0);
+                    if failed_line.is_some() {
+                        while let Some(next) = commands.get(index + 1) {
+                            let next_logical = next.logical_line.or(next.line);
+                            if next_logical == failed_line && !next.subshell_end {
+                                index += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    // The absorb must END this command's dispatch.
+                    // Falling through to the simple/execution dispatches
+                    // re-runs the group through execute_command; with the
+                    // DISCARD armed (rubash#1318, and the evalerror arming
+                    // generally), the re-run's body list silently skips
+                    // the failing line and completes with status 0,
+                    // clobbering the failure status recorded above
+                    // (`{ z=1; }` left $? = 0 for the next line; GNU 1).
+                    // Mirror the plain-command arm's errexit promotion,
+                    // then consume the command like the Ok(true) arm.
+                    if self.errexit_enabled()
+                        && self.errexit_is_active()
+                        && self.suppress_errexit == 0
+                        && self.exit_code != 0
+                        && !command.inverted
+                        && command.and_or().is_none()
+                    {
+                        return Err(ExecuteError::ExitCode(self.exit_code));
+                    }
+                    close_subshell_region_if_ended!(command);
+                    index += 1;
+                    continue;
                 }
                 Err(ExecuteError::IoError(error)) => {
                     // rubash#440: a closed output (SIGPIPE analogue) is this
@@ -1501,11 +1620,21 @@ impl Executor {
                 // skipped and the next line runs (GNU probe 2026-09-01:
                 // `echo $((1/0)); echo same-line` never prints "same-line",
                 // the next line does).
+                // rubash#1240: the absorption must happen only in a
+                // DISCARD-boundary list — the reader top, or an eval'd
+                // string's own top list (eval_list_depth). A brace-group
+                // body or an &&/|| element list is the SAME flat list in
+                // GNU (execute_connection / cm_group walk one LIST), so
+                // absorbing there — as this arm used to — let the
+                // enclosing line's remaining commands run
+                // (`{ x=$((1/0)); }; echo after` printed `after`).
+                // Nested lists now fall to the catch-all and unwind.
                 Err(ExecuteError::ExpansionFailure(code))
                     if self.shell_state.loop_depth == 0
                         && self.shell_state.function_depth == 0
                         && subshell_state.is_none()
-                        && !self.inside_compound_condition.get() =>
+                        && !self.inside_compound_condition.get()
+                        && self.at_discard_boundary() =>
                 {
                     self.exit_code = code;
                     // GNU 5.2: under `set -e` a fatal word-expansion

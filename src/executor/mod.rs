@@ -559,6 +559,14 @@ pub struct Executor {
     /// the posix ERREXIT for `command eval '...broken...'` — errors8.sub
     /// `command eval '( '` must not exit the shell.
     command_builtin_depth: usize,
+    /// GNU builtins/builtin.def: the wrapped command runs under the
+    /// `builtin` builtin's dispatch. A redirect-only `exec` reached
+    /// through it is a one-shot redirection for that command only, not
+    /// the persistent form plain `exec` performs (rubash#1412).
+    /// execute_builtin_direct_command raises this around its `exec` and
+    /// `command` arms; execute_exec snapshots and restores the fd state
+    /// for its no-operand paths while it is non-zero.
+    builtin_wrapper_depth: usize,
     /// GNU `command -p` (builtins/command.def CDESC_STDPATH): the
     /// standard path for the re-dispatched command's OWN lookup only.
     /// Set for the duration of the re-dispatch and consulted by the
@@ -688,6 +696,24 @@ pub struct Executor {
     /// position relative to the bind error.
     buffer_assignment_diagnostics: bool,
     pending_assignment_diagnostics: Vec<u8>,
+    /// GNU getopts.def dogetopts: binding the option character into an
+    /// integer-attributed OPTIND (name == "OPTIND") whose value is not
+    /// arithmetic (`?`/`:`) raises an evalexp error that abandons the
+    /// rest of the call — the trailing OPTARG bind/unbind never runs —
+    /// while the script continues with status 1 (rubash#1270). The name
+    /// bind latches the fatality here; execute_getopts reads and clears
+    /// it at the affected call sites.
+    getopts_optind_arith_fatal: bool,
+    /// GNU parse.y builds `time` [`!`] pipeline — the timing and the
+    /// inversion bind to the WHOLE pipeline (execute_cmd.c
+    /// execute_pipeline under CMD_TIMED). Rubash's compound parse parks
+    /// the TimeCommand on pipeline element 0 instead; while the pipeline
+    /// executor runs that element it raises this flag so the stage
+    /// executor defers both effects to pipeline scope (rubash#1263).
+    defer_stage_time_report: bool,
+    /// A deferred time report's (start, posix_format), stashed by the
+    /// stage executor for the pipeline executor (rubash#1263).
+    pending_stage_time_report: Option<(read_helpers::TimeCommandStart, bool)>,
     /// GNU subst.c: an assignment performed by `${var:=word}`/`${var=word}`
     /// that fails (invalid nameref target value, readonly, ...) is a word
     /// expansion error — expand_word_error -> exp_jump_to_top_level(DISCARD)
@@ -765,6 +791,21 @@ pub struct Executor {
     /// into the FORCE_EOF/DISCARD unwind, since the conditional
     /// evaluator itself only returns an i32 status.
     pub(crate) conditional_expansion_fatal: Cell<bool>,
+    /// rubash#1201: the exit status expand_conditional_word computed for
+    /// the fatal above. The wrapper must restore THIS status after
+    /// execute_conditional_command overwrites exit_code with the
+    /// conditional's own result: `[[ -z $UNSET ]]` under `set -u` evaluates
+    /// -z of the empty substitution to 0, and GNU's FORCE_EOF unwind keeps
+    /// the fatal status (1) instead of the predicate result.
+    pub(crate) conditional_fatal_status: Cell<Option<i32>>,
+    /// rubash#1422: a [[ ]] operand word hit a NON-fatal expansion
+    /// error (substring expression < 0 / bad substitution, status 1)
+    /// during cond_expand_word; the diagnostic and exit_code are
+    /// already in place and execute_conditional_command_with_redirects
+    /// converts the recorded status into the DISCARD unwind
+    /// (ExpansionFailure), mirroring the simple-command handling of
+    /// the same error class.
+    pub(crate) conditional_expansion_error_status: Cell<Option<i32>>,
     /// rubash#637: marks a pending evalerror abort as bad-subscript class.
     /// The eval boundary absorbs exactly this class (eval returns failure,
     /// the caller continues — GNU evalstring.c:365,422-442 swallowing
@@ -930,6 +971,17 @@ pub struct Executor {
     /// walk re-opens `>f` and would truncate the bytes the child already
     /// wrote live through the shared description (niubash#144).
     pipeline_stage_fds_pre_wired: Cell<bool>,
+    /// rubash#1342: set on the throwaway subshell clone in
+    /// execute_builtin_pipeline_stage, whose stage command the pipeline
+    /// driver already traced (execute_pipeline_stage_inner prints every
+    /// element's line once, execute_cmd.c:4649). The clone's re-dispatch
+    /// through execute_command would print the same line a second time
+    /// for every builtin routed there (set/export/declare/umask/...),
+    /// while inline stage arms never re-dispatch and traced once. The
+    /// dispatch trace site consumes the flag (replace(false)) so exactly
+    /// one trace — the driver's — survives; nested commands inside the
+    /// builtin (an eval body, say) trace normally.
+    pipeline_stage_pre_traced: Cell<bool>,
     /// Set by `restricted_command_error` when a sequential pipeline stage is
     /// refused (#804): the driver then skips `route_pipeline_stage_streams`
     /// for the stage, because the routing walk would OPEN the refused
@@ -1091,6 +1143,17 @@ pub struct Executor {
     /// A bounded read expired mid-line: GNU assigns the partial input and
     /// returns 128+SIGALRM=142 (read.def:539-562 `goto assign_vars`).
     pub(crate) read_timed_out: bool,
+    /// rubash#1250: an untrapped SIGINT aborted a blocking `read` — the
+    /// ForegroundBuiltinSigintGuard routed it to the pending-signal
+    /// mailbox and the read loop's slice poll consumed it. GNU read.def:
+    /// the interrupted read assigns NOTHING and returns 128+SIGINT.
+    /// Reset by arm_read_deadline at every `read` entry.
+    pub(crate) read_interrupted_signal: Option<i32>,
+    /// True while a `read` input acquisition holds the foreground
+    /// SIGINT guard (external_inner::ForegroundBuiltinSigintGuard), so
+    /// the blocking read loops know their slice polls may consume an
+    /// untrapped SIGINT from the mailbox.
+    pub(crate) read_sigint_guard_armed: bool,
     /// GNU read.def:949 `retval = eof ? EXECUTION_FAILURE : SUCCESS`: the
     /// record read exhausted its input before the delimiter (`read -d ''`
     /// over a NUL-free stream, `read v` without a trailing newline). The

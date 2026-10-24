@@ -1,0 +1,10 @@
++ eval 'echo from-eval'
+++ echo from-eval
++ eval 'eval '\''echo deep'\'''
+++ eval 'echo deep'
++++ echo deep
++ source src.sh
+++ echo from-source
++ . src.sh
+++ echo from-source
++ set +x

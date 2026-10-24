@@ -361,8 +361,13 @@ impl Executor {
             // functions, aliases, and shell-local state are NOT inherited.
             // Clear the parent's functions/aliases and import only the
             // exported ones from the child environment.
-            let (imported_funcs, imported_def_infos) =
+            let (imported_funcs, imported_def_infos, _failed_imports) =
                 import_exported_functions_from_env(&self.shell_state.env_vars);
+            // Imported functions keep att_exported, as at process
+            // startup (rubash#1275).
+            for name in imported_funcs.keys() {
+                mark_env_name(&mut self.shell_state.env_vars, EXPORTED_FUNCTIONS, name);
+            }
             self.shell_state.functions = imported_funcs;
             self.shell_state.function_definition_redirects = HashMap::new();
             self.shell_state.function_def_infos = imported_def_infos;

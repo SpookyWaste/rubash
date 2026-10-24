@@ -153,6 +153,11 @@ pub(in crate::executor) struct SubstitutionOutput {
     pub(in crate::executor) bytes: Vec<u8>,
     pub(in crate::executor) status: i32,
     pub(in crate::executor) context: SubstitutionQuoteContext,
+    /// True when the captured output contained NUL bytes that readback
+    /// discarded — GNU subst.c read_comsub warns once per such
+    /// substitution (`warning: command substitution: ignored null byte
+    /// in input`); the executor readback call sites emit it (rubash#1280).
+    pub(in crate::executor) dropped_nul_bytes: bool,
 }
 
 impl SubstitutionOutput {
@@ -162,6 +167,7 @@ impl SubstitutionOutput {
         context: SubstitutionQuoteContext,
     ) -> Self {
         // GNU read_comsub discards NUL bytes while reading the child pipe.
+        let dropped_nul_bytes = bytes.iter().any(|byte| *byte == 0);
         bytes.retain(|byte| *byte != 0);
         // Trailing line terminator(s), CRLF-aware: see
         // trim_capture_terminator_bytes and niubash #120.
@@ -170,6 +176,7 @@ impl SubstitutionOutput {
             bytes,
             status,
             context,
+            dropped_nul_bytes,
         }
     }
 

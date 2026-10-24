@@ -1,0 +1,9 @@
+plus: dc db da
+minus: da db dc
+bare: dc db
+suffix: db=>sub da=>sub
+assign: db dc
+oob: [~+9] [~-9] [~1abc]
+digits: db da
+colon: db db
+done

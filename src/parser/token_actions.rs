@@ -1660,6 +1660,22 @@ fn find_unquoted_ctrl_op(value: &str, extglob: bool) -> Option<char> {
                 word_start = false;
                 continue;
             }
+            // An element-LEADING `[` opens the subscript span GNU
+            // read_token_word consumes with parse_matched_pair
+            // (parse.y:5635-5651, P_ARRAYSUB): brackets nest, quotes and
+            // backticks are units, and every other byte — parens
+            // included — is span data, so `[(x)]=v` is a valid
+            // associative element whose key is the literal `(x)`
+            // (rubash#1346). Only the leading bracket gets the span;
+            // a mid-word `[` is ordinary text and a following `(` still
+            // hits the rejection below (rubash#360).
+            b'[' if !in_single && !in_double && word_start => {
+                i = skip_compound_subscript_span(bytes, i + 1);
+                prev_word_byte = b']';
+                prev_escaped = false;
+                word_start = false;
+                continue;
+            }
             b'&' | b'|' | b';' | b'<' | b'>' if !in_single && !in_double => {
                 return Some(c as char);
             }
@@ -1711,6 +1727,40 @@ fn find_unquoted_ctrl_op(value: &str, extglob: bool) -> Option<char> {
         i += 1;
     }
     None
+}
+
+/// Skip from just after an element-leading `[` in a compound assignment
+/// to the index just past the matching `]`. Mirrors the lexer's
+/// skip_compound_element_subscript (parse.y:3906 parse_matched_pair
+/// P_ARRAYSUB): `[`/`]` pairs nest, single/double quotes and backticks
+/// are consumed as units, backslash escapes the next byte, and every
+/// other byte (parens included) is span data. An unterminated span runs
+/// to end of input; that family is diagnosed elsewhere.
+fn skip_compound_subscript_span(bytes: &[u8], mut i: usize) -> usize {
+    let mut depth = 1i32;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    let mut escaped = false;
+    while i < bytes.len() && depth > 0 {
+        let c = bytes[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\\' if !in_single => escaped = true,
+            b'\'' if !in_double && !in_backtick => in_single = !in_single,
+            b'"' if !in_single && !in_backtick => in_double = !in_double,
+            b'`' if !in_single => in_backtick = !in_backtick,
+            b'[' if !in_single && !in_double && !in_backtick => depth += 1,
+            b']' if !in_single && !in_double && !in_backtick => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    i
 }
 
 /// Skip from just after `$(` to the matching `)`, respecting nested

@@ -73,6 +73,15 @@ struct OutputFdState {
     /// stream instead of escaping to real stdout.
     defer_stdout_writes: bool,
     deferred_stdout: std::cell::RefCell<Vec<u8>>,
+    /// True only for the buffered-builtin route (a builtin running in
+    /// THIS shell): GNU redir.c add_undo_redirect registers a move's
+    /// source close for undo only when the target fd was open at apply
+    /// time; when the target was closed the close is NOT undone, so
+    /// `echo x 5>&3-` with fd 5 closed leaves fd 3 closed after the
+    /// builtin (rubash#1235). Probe/diagnostic walks and pipeline-stage
+    /// routing leave this false — their state is discarded or belongs to
+    /// a child shell, so nothing may persist from them.
+    persist_move_closes: bool,
 }
 
 impl Executor {
@@ -508,6 +517,17 @@ impl Executor {
                 }
                 // Digit forms `&N` / `&N-` (possibly via expansion).
                 if let Some((fd, move_fd)) = redirect_target_fd_and_move(&target) {
+                    // GNU redir.c do_redirection_internal guards the
+                    // whole dup/move apply with `redir_fd != redirector`:
+                    // a self-dup/self-move never reaches the dup2, so it
+                    // succeeds even when the fd is closed, and a self-move
+                    // does not close anything (rubash#1236). It also
+                    // changes nothing, so the opened bookkeeping is left
+                    // exactly as it was (a closed fd stays closed for a
+                    // later dup in the same list).
+                    if fd == redirector {
+                        continue;
+                    }
                     if !dup_source_fd_open(&self.fd_table, fd, &opened) {
                         return self
                             .reject_with_dup_bad_fd(cmd, index, fd, move_fd, raw_word, redirector)
@@ -543,6 +563,13 @@ impl Executor {
                         .and_then(|value| u32::try_from(value).ok())
                     {
                         Some(fd) => {
+                            // Self-dup/self-move: never rejected and the
+                            // opened state is unchanged (see the digit-form
+                            // branch above; redir.c's
+                            // `redir_fd != redirector` guard).
+                            if fd == redirector {
+                                continue;
+                            }
                             if !dup_source_fd_open(&self.fd_table, fd, &opened) {
                                 return self
                                     .reject_with_dup_bad_fd(
@@ -690,10 +717,14 @@ impl Executor {
             {
                 let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
                 if let Err(error) = FileFd::open_readwrite_pair(path) {
+                    // posix_errors::path_error already renders the
+                    // `{target}: {errno text}` shape — pass it through
+                    // like the Input probe below instead of prefixing the
+                    // target a second time (rubash#1237).
                     let message = crate::posix_errors::path_error(&target, error);
                     let text = crate::posix_errors::message(&message);
                     return self
-                        .reject_redirect_at(cmd, index, &format!("{target}: {text}"))
+                        .reject_redirect_at(cmd, index, &text)
                         .map(|_| Some(RedirectRejection::Command));
                 }
             }
@@ -966,6 +997,10 @@ impl Executor {
     ) -> Result<bool, ExecuteError> {
         self.last_builtin_write_failed.set(false);
         let mut state = self.command_output_fd_state();
+        // This route serves builtins executing in the current shell, so a
+        // move-close whose target was closed persists past the command
+        // (GNU redir.c add_undo_redirect; rubash#1235).
+        state.persist_move_closes = true;
         if !self.apply_ordered_output_redirects(cmd, &mut state)? {
             // A persistent `exec >&N-` closes the shell fd without adding a
             // redirect to the current command. Buffered builtins still need
@@ -1106,6 +1141,7 @@ impl Executor {
             redirect_failed: false,
             defer_stdout_writes: false,
             deferred_stdout: std::cell::RefCell::new(Vec::new()),
+            persist_move_closes: false,
         };
         state.fds.insert(1, OutputTarget::Stdout);
         state.fds.insert(2, OutputTarget::Stderr);
@@ -1237,7 +1273,17 @@ impl Executor {
                         state.saw_output_redirect = true;
                         continue;
                     }
-                    if let Some(source_fd) = redirect_target_fd(&target) {
+                    // The dup shortcut below is for the `>&N` SPELLING
+                    // and for virtual source bindings (pipes, captures,
+                    // pipeline staging). A /dev/fd/N (or /dev/std*,
+                    // /proc/self/fd/N) target naming a DISK FILE source
+                    // is a FILENAME open in GNU (r_output_direction),
+                    // never a dup — it must reach
+                    // open_command_output_target, which owns the reopen
+                    // semantics (rubash#1373).
+                    if let Some(source_fd) = redirect_target_fd(&target)
+                        .filter(|_| !self.dev_stdio_target_reopens_disk(&target, state))
+                    {
                         let Some(source_target) = state.fd_target(source_fd).cloned() else {
                             self.write_bad_fd_redirect_diagnostic(
                                 state,
@@ -1297,12 +1343,18 @@ impl Executor {
                     }
                     // `>&N` and the move form `>&N-` (make_cmd.c:704-718 →
                     // redir.c r_move_output) both resolve fd N's write
-                    // target into the redirector. This state map is
-                    // per-command transient and GNU's move close is undone
-                    // when the command ends (RX_UNDOABLE), so a plain copy
-                    // matches the command's observable writes (`exec 5>&1;
-                    // echo x >&5-` writes stdout, fd 5 still open after).
-                    if let Some((source_fd, _move_source)) = redirect_target_fd_and_move(&target) {
+                    // target into the redirector.
+                    if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
+                        // GNU redir.c do_redirection_internal: the whole
+                        // r_duplicating/r_move apply is guarded by
+                        // `redir_fd != redirector`, so a self-dup or
+                        // self-move is a total no-op — it succeeds even
+                        // when the fd is closed (`echo hi 99>&99`), and a
+                        // self-move leaves the fd open (rubash#1236).
+                        if source_fd == target_fd {
+                            state.saw_output_redirect = true;
+                            continue;
+                        }
                         let Some(source_target) = state.fd_target(source_fd).cloned() else {
                             self.write_bad_fd_redirect_diagnostic(
                                 state,
@@ -1332,8 +1384,26 @@ impl Executor {
                             } else {
                                 source_target
                             };
+                        // GNU add_undo_redirect (redir.c) for r_move: the
+                        // source fd is saved for undo ONLY when the target
+                        // was open at apply time (fcntl(redirector) != -1);
+                        // a closed target means the move's close survives
+                        // the command. Judge openness from the state as it
+                        // stands BEFORE this redirect binds the target.
+                        let target_was_open = state
+                            .fd_target(target_fd)
+                            .is_some_and(|target| *target != OutputTarget::Closed);
                         state.fds.insert(target_fd, source_target);
                         state.saw_output_redirect = true;
+                        if move_source {
+                            state.fds.insert(source_fd, OutputTarget::Closed);
+                            if state.persist_move_closes && !target_was_open {
+                                self.close_persistent_output_fd(source_fd)?;
+                                self.shell_state
+                                    .env_vars
+                                    .insert(fd_closed_key(source_fd), "1".to_string());
+                            }
+                        }
                         continue;
                     }
 
@@ -1392,6 +1462,41 @@ impl Executor {
         Ok(state.saw_output_redirect)
     }
 
+    /// rubash#1373 gate for the ordered output walk: a dev-stdio target
+    /// (`/dev/fd/N`, `/dev/stdout`, `/proc/self/fd/N`) reopens only when
+    /// its source fd is bound to a regular disk file in the fd table.
+    /// Pipeline staging (deferred writes) and virtual bindings (pipes,
+    /// captures) keep the dup semantics GNU gets from opening a pipe's
+    /// /proc/self/fd entry.
+    fn dev_stdio_target_reopens_disk(
+        &self,
+        target: &str,
+        state: &OutputFdState,
+    ) -> bool {
+        if state.defer_stdout_writes {
+            return false;
+        }
+        let Some(source_fd) =
+            crate::executor::execution_misc::dev_stdio_redirect_fd(target)
+        else {
+            return false;
+        };
+        match self.fd_table.output_endpoint(source_fd) {
+            Some(FdWriteEndpoint::File(file)) => std::fs::metadata(&file.path)
+                .map(|meta| meta.is_file())
+                .unwrap_or(false),
+            Some(FdWriteEndpoint::Stdout) => {
+                crate::fd::disk_file_path(crate::fd::process_std_handle(1))
+                    .is_some()
+            }
+            Some(FdWriteEndpoint::Stderr) => {
+                crate::fd::disk_file_path(crate::fd::process_std_handle(2))
+                    .is_some()
+            }
+            _ => false,
+        }
+    }
+
     fn open_command_output_target(
         &mut self,
         state: &mut OutputFdState,
@@ -1417,6 +1522,33 @@ impl Executor {
             // handle. An fd with no write side is GNU's ENOENT
             // ("No such file or directory", see
             // write_bad_fd_redirect_diagnostic).
+            // rubash#1373: when the source fd's write endpoint is a regular
+            // disk file, GNU's open("/dev/fd/N") is a FRESH open of the
+            // underlying file — a new open-file description with its own
+            // offset (truncated at open unless the redirect appends) —
+            // not a dup of the source descriptor. Model it as a newly
+            // opened FileFd, whose writes go through its own OS handle,
+            // instead of the source's shared handle. Pipe/capture/procsub
+            // endpoints keep the shared-description match below (the
+            // cases that already agreed with GNU).
+            let reopened = match self.fd_table.output_endpoint(source_fd) {
+                Some(FdWriteEndpoint::File(file_fd)) => Some(file_fd.path.clone()),
+                Some(FdWriteEndpoint::Stdout) => {
+                    crate::fd::disk_file_path(crate::fd::process_std_handle(1))
+                }
+                Some(FdWriteEndpoint::Stderr) => {
+                    crate::fd::disk_file_path(crate::fd::process_std_handle(2))
+                }
+                _ => None,
+            }
+            .and_then(|path| {
+                crate::executor::fd_table::FileFd::open_write(path, redirect.append, false).ok()
+            });
+            if let Some(file_fd) = reopened {
+                state.fds.insert(fd, OutputTarget::SharedFile(file_fd));
+                state.saw_output_redirect = true;
+                return Ok(());
+            }
             match self.fd_table.output_endpoint(source_fd) {
                 Some(FdWriteEndpoint::ProcessSubstitution { path, .. }) => {
                     state.fds.insert(

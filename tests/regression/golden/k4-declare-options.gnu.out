@@ -1,0 +1,22 @@
+== declare --badflag
+rc=2
+== declare -badflag
+rc=2
+== declare -fin
+rc=1
+== declare -fai
+rc=1
+== declare -fZ
+rc=2
+== getopts --badflag
+rc=2
+== getopts -x missing args
+rc=2
+== kill --badflag
+rc=1
+== trap whole word
+rc=2
+== umask whole word
+rc=2
+== mapfile whole word
+rc=2

@@ -425,7 +425,10 @@ impl Executor {
                     index += 1;
                 }
                 word if word.starts_with('-') => {
-                    let option = word.trim_start_matches('-').chars().next().unwrap_or('-');
+                    // GNU sh_invalidopt names the first character after
+                    // exactly one dash (`--badflag` -> `--`), not the
+                    // first letter after all dashes (rubash#1259).
+                    let option = word[1..].chars().next().unwrap_or('-');
                     return self.mapfile_invalid_option(cmd, command_name, option, &mut stderr);
                 }
                 word if word.is_empty() => {
@@ -515,6 +518,19 @@ impl Executor {
                 name
             }
         };
+        // GNU builtins/mapfile.def mapfile_builtin -> builtin_find_indexed_
+        // array: the target must be an indexed array; an associative array
+        // is rejected with `mapfile: NAME: not an indexed array' and
+        // status 1 before any input is read (rubash#1297: rubash silently
+        // stored a debug-formatted blob under key 0 of the assoc).
+        if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, &name) {
+            let _ = writeln!(
+                stderr,
+                "{}{command_name}: {name}: not an indexed array",
+                self.diagnostic_prefix()
+            );
+            return self.finish_mapfile_error(cmd, &stderr, 1);
+        }
         if let Some(fd) = read_fd {
             if !self.mapfile_fd_is_available(cmd, fd) {
                 return self.mapfile_bad_file_descriptor(cmd, command_name, fd, &mut stderr);

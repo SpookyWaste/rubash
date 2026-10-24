@@ -1,0 +1,11 @@
+shift1 rc=0 n=1
+shift2 rc=0 n=1
+shift3 rc=0 n=1
+shift4 rc=2 n=2
+return1 rc=1
+return2 rc=2
+exit1 rc=1
+exit2 rc=3
+break rc=0 i=1
+continue rc=0 i=3
+done

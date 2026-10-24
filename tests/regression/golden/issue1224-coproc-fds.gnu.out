@@ -1,0 +1,5 @@
+alpha=63/60 beta=62/58
+[1]   Running                    coproc ALPHA { sleep 5; } &
+[2]-  Running                    coproc BETA { sleep 5; } &
+[3]+  Running                    coproc COPROC { sleep 5; } &
+done

@@ -264,6 +264,11 @@ fn forward_coproc_stderr(
     mut stderr: std::process::ChildStderr,
     mut target: CoprocStderrForwardTarget,
 ) -> Result<(), std::io::Error> {
+    // Forwarding into a closed stdout/stderr pipe must end this thread
+    // with an io error, not kill the shell (SIGPIPE is SIG_DFL
+    // process-wide since rubash#1333).
+    #[cfg(unix)]
+    crate::builtins::kill::block_sigpipe_on_this_thread();
     let mut buffer = [0_u8; 8192];
     loop {
         let count = stderr.read(&mut buffer)?;
@@ -366,23 +371,41 @@ impl Executor {
         }
     }
 
-    fn allocate_coproc_fd(&mut self, slot: usize) -> u32 {
-        let want = if slot == 0 { 63u32 } else { 60u32 };
-        let free = self.fd_table.entries.get(&want).map_or(true, |e| {
-            e.closed || (e.read.is_none() && e.write.is_none())
-        });
-        if free {
-            want
+    fn allocate_coproc_fds(&mut self) -> (u32, u32) {
+        // GNU sh_openpipe (execute_cmd.c/coproc) moves ALL FOUR pipe ends,
+        // in rpipe[0], rpipe[1], wpipe[0], wpipe[1] order, to the highest
+        // free fds below 64 (move_to_high_fd, general.c, maxfd 64). The
+        // parent keeps rpipe[0] as its read end and wpipe[1] as its write
+        // end; its copies of rpipe[1]/wpipe[0] are closed after the fork,
+        // but they still consume high slots during allocation. So with an
+        // empty table the pair is (63, 60); a second live coproc gets
+        // (62, 58), a third (61, 56): the scan must step over the slots
+        // the child ends of earlier coprocs consumed, not just the two
+        // parent ends. Reserving all four slots against the current
+        // fd_table reproduces that numbering exactly.
+        let mut reserved: Vec<u32> = Vec::with_capacity(4);
+        let mut candidate = 63u32;
+        while reserved.len() < 4 && candidate >= 10 {
+            let free = !reserved.contains(&candidate)
+                && self.fd_table.entries.get(&candidate).map_or(true, |e| {
+                    e.closed || (e.read.is_none() && e.write.is_none())
+                });
+            if free {
+                reserved.push(candidate);
+            }
+            candidate -= 1;
+        }
+        if reserved.len() == 4 {
+            (reserved[0], reserved[3])
         } else {
-            // GNU's fallback for a busy high fd is move_to_high_fd
-            // (general.c:681): it scans downward for a free slot with
-            // fcntl F_GETFD and then dup2()s the descriptor there — a
-            // different mechanism from redir.c:942's fcntl F_DUPFD that
-            // backs {var} allocation. Our fallback instead routes through
-            // the limit-aware low-first allocator, so it is bounded by
-            // the same RLIMIT_NOFILE soft limit (rubash#773) but picks
-            // the lowest free slot rather than GNU's high-side scan.
-            self.allocate_dynamic_fd().unwrap_or(want)
+            // High band exhausted: fall back to the limit-aware low-first
+            // allocator (bounded by RLIMIT_NOFILE, rubash#773). GNU's
+            // move_to_high_fd would keep scanning below 10; the fds there
+            // are the shell's own stdio, so this only diverges when more
+            // than ~13 coprocs/dynamic fds are already live.
+            let read = self.allocate_dynamic_fd().unwrap_or(63);
+            let write = self.allocate_dynamic_fd().unwrap_or(60);
+            (read, write)
         }
     }
 
@@ -1666,19 +1689,53 @@ impl Executor {
         &mut self,
         time_command: &TimeCommand,
     ) -> Result<(), ExecuteError> {
+        // rubash#1218: the parser folds `time` prefixes without knowing
+        // the posix-mode grammar rule — in posix mode a dash word right
+        // after `time` means `time` was never a keyword (GNU parse.y),
+        // so the reconstructed command (`time`, the prefix words, then
+        // the inner command's words) dispatches as an ordinary command
+        // named `time` (PATH-resolved; 127 when absent). Only the simple
+        // inner shape is rebuilt; pipeline/compound inners keep the
+        // timed path.
+        if self.posix_mode_enabled()
+            && time_command
+                .prefix_words
+                .first()
+                .is_some_and(|word| word.len() > 1 && word.starts_with('-'))
+            && time_command.command.pipeline_command.is_none()
+            && !time_command.command.words.is_empty()
+        {
+            let inner = &time_command.command;
+            let mut plain = CommandNode::new();
+            plain.line = inner.line;
+            plain.logical_line = inner.logical_line;
+            let mut words = vec![time_command.keyword.clone()];
+            words.extend(time_command.prefix_words.iter().cloned());
+            words.extend(inner.words.iter().cloned());
+            plain.words = words;
+            plain.redirects = inner.redirects.clone();
+            plain.redirect_in = inner.redirect_in.clone();
+            plain.redirect_out = inner.redirect_out.clone();
+            plain.append = inner.append.clone();
+            plain.redirect_err = inner.redirect_err.clone();
+            plain.redirect_err_append = inner.redirect_err_append.clone();
+            return self.execute_command(&plain);
+        }
         let started = time_command_started();
-        if let Some(coproc_cmd) = &time_command.command.coproc_command {
-            self.execute_coproc_command(&time_command.command, coproc_cmd)?;
+        let inner_result = if let Some(coproc_cmd) = &time_command.command.coproc_command {
+            self.execute_coproc_command(&time_command.command, coproc_cmd)
         } else if time_command.command.words.is_empty()
             && command_has_no_effect(&time_command.command)
         {
             self.exit_code = 0;
+            Ok(())
         } else if let Some(pipeline_command) = &time_command.command.pipeline_command {
-            self.execute_pipeline_command(pipeline_command)?;
+            self.execute_pipeline_command(pipeline_command)
         } else if time_command.command.brace_group.is_some() {
-            self.execute_brace_group_pipeline(&time_command.command)?;
+            self.execute_brace_group_pipeline(&time_command.command)
+                .map(|_| ())
         } else if time_command.command.words.first().map(String::as_str) == Some("coproc") {
-            self.execute_time_reparsed_coproc(&time_command.command)?;
+            self.execute_time_reparsed_coproc(&time_command.command)
         } else {
             // GNU execute_time_command dispatches the inner command through
             // execute_command, so a simple/`(( ))`/`[[ ]]` inner fires its own
@@ -1707,7 +1764,22 @@ impl Executor {
                 let inner_text = bash_command_source_text(inner);
                 let _ = self.run_debug_trap(&inner_text)?;
             }
-            self.execute_command(&time_command.command)?;
+            self.execute_command(&time_command.command)
+        };
+        match inner_result {
+            Ok(()) => {}
+            // GNU execute_cmd.c execute_time_command reports the timed
+            // command's status either way: a DISCARD-class expansion
+            // failure inside it (expr.c evalerror / failglob) is the
+            // command's failure status, not a shell unwind — time prints
+            // its report and returns that status, while the armed
+            // reader-level abandon still discards the rest of the line
+            // (rubash#753 case 5: the discard penetrates `time`;
+            // rubash#1240).
+            Err(ExecuteError::ExpansionFailure(code)) => {
+                self.exit_code = code;
+            }
+            Err(error) => return Err(error),
         }
         self.print_time_shell(time_command.posix_format, started);
         if time_command.inverted {
@@ -1740,7 +1812,7 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
-        let inverted = time_prefix_parts(&cmd.words)
+        let inverted = time_prefix_parts(&cmd.words, self.posix_mode_enabled())
             .map(|parts| parts.inverted)
             .unwrap_or(false);
         let started = time_command_started();
@@ -1764,7 +1836,8 @@ impl Executor {
             Ok(())
         };
         self.print_time_shell(
-            time_prefix_parts(&cmd.words).is_some_and(|parts| parts.posix_format),
+            time_prefix_parts(&cmd.words, self.posix_mode_enabled())
+                .is_some_and(|parts| parts.posix_format),
             started,
         );
         result?;
@@ -1787,7 +1860,7 @@ impl Executor {
         let Some(command) = commands.get(index) else {
             return Ok(None);
         };
-        let Some(prefix) = time_prefix_parts(&command.words) else {
+        let Some(prefix) = time_prefix_parts(&command.words, self.posix_mode_enabled()) else {
             return Ok(None);
         };
         if !matches!(
@@ -2871,9 +2944,11 @@ impl Executor {
     }
 
     fn execute_if_command(&mut self, if_command: &IfCommand) -> Result<(), ExecuteError> {
-        // GNU Bash 5.2 (probe f4, 2026-08-24): a word-expansion failure in
-        // an if/elif condition abandons the whole compound command instead
-        // of selecting the else branch.
+        // GNU 5.3.20 (rubash#1240/#1253): a word-expansion failure in
+        // an if/elif condition abandons the whole enclosing list
+        // (neither branch runs, and the commands after the `fi` on the
+        // same line are discarded) — if_condition_matches propagates
+        // the failure instead of selecting the else branch.
         let matched = match self.if_condition_matches(&if_command.condition)? {
             Some(matched) => matched,
             None => return Ok(()),
@@ -2921,8 +2996,11 @@ impl Executor {
         self.execute_ast_inner(body)
     }
 
-    /// Returns `None` when a word-expansion failure abandoned the whole
-    /// enclosing if command; `Some(true)` when the condition held.
+    /// Returns `Some(true)` when the condition held, `Some(false)` when
+    /// it did not. A fatal word-expansion failure in the condition is
+    /// NOT absorbed into a branch decision: it propagates as
+    /// ExecuteError::ExpansionFailure so the enclosing list is discarded
+    /// (GNU jump_to_top_level (DISCARD); rubash#1240/#1253).
     fn if_condition_matches(
         &mut self,
         condition: &[CommandNode],
@@ -2955,7 +3033,14 @@ impl Executor {
         match result {
             Err(ExecuteError::ExpansionFailure(code)) => {
                 self.exit_code = code;
-                Ok(None)
+                // GNU expr.c evalerror -> shell.c jump_to_top_level
+                // (DISCARD): a fatal expansion failure in a condition
+                // discards the whole enclosing list, not just the if
+                // command (rubash#1240/#1253, GNU 5.3.20: `if [ $((1/0))
+                // -eq 1 ]; then ...; fi; echo after` prints neither
+                // branch and never reaches `after`). Keep the error
+                // unwinding; the reader-level loop applies the discard.
+                Err(ExecuteError::ExpansionFailure(code))
             }
             other => {
                 other?;
@@ -3167,7 +3252,7 @@ impl Executor {
                         handle: crate::fd::into_handle(stdout_reader),
                         path: std::path::PathBuf::from(format!("coproc:{pid}:stdout")),
                     });
-                    let coproc_read_fd = self.allocate_coproc_fd(0);
+                    let (coproc_read_fd, coproc_write_fd) = self.allocate_coproc_fds();
                     self.fd_table.open_input(
                         coproc_read_fd,
                         FdReadEndpoint::CoprocStdout {
@@ -3176,7 +3261,6 @@ impl Executor {
                         },
                         true,
                     );
-                    let coproc_write_fd = self.allocate_coproc_fd(1);
                     self.fd_table.open_output(
                         coproc_write_fd,
                         FdWriteEndpoint::CoprocStdin {
@@ -3682,9 +3766,55 @@ impl Executor {
             return std::borrow::Cow::Owned(strip_surrounding_quotes(&restored));
         }
 
-        std::borrow::Cow::Owned(quote_aware_case_pattern(&pattern.raw_text, |word| {
-            self.expand_word_mut(word)
-        }))
+        let array_at = self.case_pattern_array_at_map(&pattern.raw_text);
+        std::borrow::Cow::Owned(quote_aware_case_pattern(
+            &pattern.raw_text,
+            |word| self.expand_word_mut(word),
+            &array_at,
+        ))
+    }
+
+    /// First element + element count for every `${name[@]}` unit in a
+    /// case pattern's raw text, in the engine's own `[@]` enumeration
+    /// order (hash-slot order for associative arrays, index order for
+    /// indexed ones — the order join_array_parameter_values joins in).
+    /// Precomputed because quote_aware_case_pattern walks the pattern
+    /// with only an expansion callback (rubash#1393).
+    fn case_pattern_array_at_map(
+        &self,
+        raw: &str,
+    ) -> std::collections::HashMap<String, (String, usize)> {
+        let mut map = std::collections::HashMap::new();
+        let mut rest = raw;
+        while let Some((_, end, name)) = find_case_pattern_array_at(rest) {
+            if !map.contains_key(&name) {
+                let entry = self.case_pattern_array_at_first(&name);
+                map.insert(name, entry);
+            }
+            rest = &rest[end..];
+        }
+        map
+    }
+
+    fn case_pattern_array_at_first(&self, name: &str) -> (String, usize) {
+        let Some(value) = self.shell_state.env_vars.get(name) else {
+            return (String::new(), 0);
+        };
+        if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, name) {
+            let values = super::assignment_helpers::assoc_hash_ordered_values(
+                value,
+                super::assignment_helpers::assoc_nbuckets(&self.shell_state.env_vars, name),
+            );
+            let count = values.len();
+            (values.into_iter().next().unwrap_or_default(), count)
+        } else {
+            let entries = super::indexed_array_entries_cached(value);
+            let count = entries.len();
+            (
+                entries.values().next().cloned().unwrap_or_default(),
+                count,
+            )
+        }
     }
 
     pub(in crate::executor) fn execute_case_command_with_redirects(
@@ -3809,8 +3939,14 @@ impl Executor {
     }
 }
 
-pub(in crate::executor) fn command_is_time_prefixed_compound(cmd: &CommandNode) -> bool {
-    cmd.words.first().map(String::as_str) == Some("time")
+pub(in crate::executor) fn command_is_time_prefixed_compound(
+    cmd: &CommandNode,
+    posix_mode: bool,
+) -> bool {
+    // rubash#1218: the posix dash-word rule applies to compounds too —
+    // `time -p ( ... )` in posix mode is not the time keyword.
+    !posix_time_dash_word(&cmd.words, posix_mode)
+        && cmd.words.first().map(String::as_str) == Some("time")
         && (cmd.for_command.is_some()
             || cmd.if_command.is_some()
             || cmd.loop_command.is_some()
@@ -4063,8 +4199,25 @@ struct TimePrefixParts {
     posix_format: bool,
 }
 
-fn time_prefix_parts(words: &[String]) -> Option<TimePrefixParts> {
+/// GNU parse.y, posix mode (rubash#1218): `time` is a reserved word
+/// only when the word after it does not begin with `-`. With a dash
+/// word (`time -p cmd`, `time -- cmd`, `time -x cmd`) the command is an
+/// ordinary external command named `time`, resolved through PATH —
+/// oracle-verified against GNU 5.3 (a fake `time` in PATH runs with
+/// those arguments; without one the report is `time: command not
+/// found`, status 127).
+pub(in crate::executor) fn posix_time_dash_word(words: &[String], posix_mode: bool) -> bool {
+    posix_mode
+        && words
+            .get(1)
+            .is_some_and(|word| word.len() > 1 && word.starts_with('-'))
+}
+
+fn time_prefix_parts(words: &[String], posix_mode: bool) -> Option<TimePrefixParts> {
     if words.first().map(String::as_str) != Some("time") {
+        return None;
+    }
+    if posix_time_dash_word(words, posix_mode) {
         return None;
     }
 
@@ -4336,7 +4489,103 @@ fn quote_aware_case_word(raw: &str, mut expand_word: impl FnMut(&str) -> String)
     output
 }
 
-fn quote_aware_case_pattern(raw: &str, mut expand_word: impl FnMut(&str) -> String) -> String {
+/// The first `${name[@]}` unit in `text`: (byte offset of the `$`, byte
+/// offset just past the closing `}`, array name). Braced and
+/// parenthesized units that are not exactly `${name[@]}` are skipped
+/// whole, so a `[@]` nested inside another expansion is not mistaken
+/// for a top-level one.
+fn find_case_pattern_array_at(text: &str) -> Option<(usize, usize, String)> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let plain: Vec<char> = chars.iter().map(|(_, c)| *c).collect();
+    let mut index = 0usize;
+    while index < plain.len() {
+        if plain[index] == '$' && plain.get(index + 1) == Some(&'(') {
+            if let Some(close) =
+                crate::lexer::skip_parenthesized_unit_corrected(&plain, index + 1)
+            {
+                index = close.min(plain.len());
+                continue;
+            }
+        }
+        if plain[index] == '$' && plain.get(index + 1) == Some(&'{') {
+            if let Some(close) = skip_braced_case_pattern_unit(&plain, index + 1) {
+                let unit: String = plain[index..=close].iter().collect();
+                let name = unit
+                    .strip_prefix("${")
+                    .and_then(|unit| unit.strip_suffix("[@]}"))
+                    .filter(|name| {
+                        !name.is_empty()
+                            && name
+                                .chars()
+                                .next()
+                                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    });
+                if let Some(name) = name {
+                    let start = chars[index].0;
+                    let end = if close + 1 < chars.len() {
+                        chars[close + 1].0
+                    } else {
+                        text.len()
+                    };
+                    return Some((start, end, name.to_string()));
+                }
+                index = close + 1;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+enum CasePatternSegment {
+    /// The segment's literal contribution; later segments still glue
+    /// onto the same pattern word.
+    Continues(String),
+    /// The pattern word is complete: a multi-element `${name[@]}`
+    /// produced a second field, so everything after it (the rest of
+    /// this segment and all later segments) is discarded.
+    Finished(String),
+}
+
+/// Expand one double-quoted case-pattern segment under GNU's field rule
+/// (rubash#1393): the pattern is a single word, but a quoted
+/// `"${name[@]}"` expands to a field LIST and only the first field
+/// belongs to the pattern — text before the expansion glues onto that
+/// field, text after it belongs to later fields. A one-element
+/// expansion glues whole; an empty one contributes nothing.
+fn case_pattern_quoted_segment(
+    body: &str,
+    expand_word: &mut impl FnMut(&str) -> String,
+    array_at: &std::collections::HashMap<String, (String, usize)>,
+) -> CasePatternSegment {
+    let mut literal = String::new();
+    let mut rest = body;
+    loop {
+        let Some((start, end, name)) = find_case_pattern_array_at(rest) else {
+            literal.push_str(&expand_word(rest));
+            return CasePatternSegment::Continues(literal);
+        };
+        let (first, count) = array_at.get(&name).cloned().unwrap_or_default();
+        literal.push_str(&expand_word(&rest[..start]));
+        if count == 0 {
+            rest = &rest[end..];
+            continue;
+        }
+        literal.push_str(&first);
+        if count >= 2 {
+            return CasePatternSegment::Finished(literal);
+        }
+        rest = &rest[end..];
+    }
+}
+
+fn quote_aware_case_pattern(
+    raw: &str,
+    mut expand_word: impl FnMut(&str) -> String,
+    array_at: &std::collections::HashMap<String, (String, usize)>,
+) -> String {
     let chars = raw.chars().collect::<Vec<_>>();
     let mut output = String::new();
     let mut index = 0usize;
@@ -4346,11 +4595,20 @@ fn quote_aware_case_pattern(raw: &str, mut expand_word: impl FnMut(&str) -> Stri
             let quote = chars[index + 1];
             if let Some(end) = quoted_case_pattern_end(&chars, index + 2, quote, quote == '\'') {
                 let body = chars[index + 2..end].iter().collect::<String>();
-                let literal = if quote == '\'' {
-                    decode_ansi_c_escapes(&body)
-                } else {
-                    expand_word(&body)
-                };
+                if quote == '"' {
+                    match case_pattern_quoted_segment(&body, &mut expand_word, array_at) {
+                        CasePatternSegment::Continues(literal) => {
+                            output.push_str(&escape_case_pattern_literal(&literal));
+                            index = end + 1;
+                            continue;
+                        }
+                        CasePatternSegment::Finished(literal) => {
+                            output.push_str(&escape_case_pattern_literal(&literal));
+                            return output;
+                        }
+                    }
+                }
+                let literal = decode_ansi_c_escapes(&body);
                 output.push_str(&escape_case_pattern_literal(&literal));
                 index = end + 1;
                 continue;
@@ -4367,9 +4625,7 @@ fn quote_aware_case_pattern(raw: &str, mut expand_word: impl FnMut(&str) -> Stri
             let quote = chars[index];
             if let Some(end) = quoted_case_pattern_end(&chars, index + 1, quote, false) {
                 let body = chars[index + 1..end].iter().collect::<String>();
-                let literal = if quote == '\'' {
-                    body
-                } else {
+                if quote == '"' {
                     // parse.y read_token_word's double-quote scanner never
                     // opens single-quote state: a `'` inside the body is
                     // literal data (GNU case patterns keep it, so
@@ -4381,10 +4637,21 @@ fn quote_aware_case_pattern(raw: &str, mut expand_word: impl FnMut(&str) -> Stri
                     // Quotes inside a `${...}`/`$(...)`/backtick unit stay
                     // raw (parse.y:3877 parse_matched_pair owns them;
                     // rubash#258 BUG_PSUBSQUOT).
-                    let body = crate::lexer::quotes::mark_data_squotes_around_substitutions(&body);
-                    expand_word(&body)
-                };
-                output.push_str(&escape_case_pattern_literal(&literal));
+                    let body =
+                        crate::lexer::quotes::mark_data_squotes_around_substitutions(&body);
+                    match case_pattern_quoted_segment(&body, &mut expand_word, array_at) {
+                        CasePatternSegment::Continues(literal) => {
+                            output.push_str(&escape_case_pattern_literal(&literal));
+                            index = end + 1;
+                            continue;
+                        }
+                        CasePatternSegment::Finished(literal) => {
+                            output.push_str(&escape_case_pattern_literal(&literal));
+                            return output;
+                        }
+                    }
+                }
+                output.push_str(&escape_case_pattern_literal(&body));
                 index = end + 1;
                 continue;
             } else {

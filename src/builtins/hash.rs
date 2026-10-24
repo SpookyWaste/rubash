@@ -29,6 +29,30 @@ where
     W: Write,
     E: Write,
 {
+    execute_with_io_and_functions(
+        args,
+        env_vars,
+        &std::collections::HashSet::new(),
+        stdout,
+        stderr,
+    )
+}
+
+/// Same as [`execute_with_io`], with the names GNU hash.def never
+/// hashes — shell builtins and shell functions — supplied by the
+/// executor: the bare builtin cannot see either set from the variable
+/// table alone (rubash#1215).
+pub(crate) fn execute_with_io_and_functions<W, E>(
+    args: &[String],
+    env_vars: &mut VarTable,
+    unhashable_names: &std::collections::HashSet<String>,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> io::Result<i32>
+where
+    W: Write,
+    E: Write,
+{
     // GNU builtins/hash.def:86-90: when hashing is disabled (set +h), the
     // entire `hash` builtin refuses with "hash: hashing disabled" and
     // returns failure, before any option parsing.
@@ -55,6 +79,13 @@ where
             parsing_options = false;
             index += 1;
             continue;
+        }
+        // GNU hash.def's getopt table maps --help to CASE_HELPOPT: long
+        // help to stdout, EX_USAGE status (rubash#1229). Only while still
+        // parsing options — after `--` it is a name to look up.
+        if parsing_options && arg == "--help" {
+            crate::builtins::help::print_builtin_help("hash", stdout)?;
+            return Ok(EX_USAGE);
         }
         if parsing_options && arg.starts_with('-') && *arg != "-" {
             let mut chars = arg[1..].char_indices();
@@ -310,6 +341,16 @@ where
             if name.contains('/') {
                 continue;
             }
+            // GNU builtins/hash.def hash_builtin: a name that resolves to
+            // a shell builtin or a shell function is skipped silently —
+            // builtins and functions are never hashed, so `hash echo`
+            // succeeds with no entry created and `hash -t echo` afterwards
+            // reports not found (rubash#1215). Reserved words are NOT
+            // skipped: GNU reports `hash: if: not found` for them, which
+            // the PATH search below produces naturally.
+            if unhashable_names.contains(name) {
+                continue;
+            }
             // Drop any stale remembered location so the PATH scan is
             // authoritative.
             crate::executor::path::remove_command_lookup_cache(name);
@@ -408,10 +449,7 @@ fn phash_search_target(path: &str) -> Option<String> {
 /// device+inode identity (hashcmd.c same_file); canonicalized-path
 /// comparison is close enough for the directory-identity test here.
 fn same_file(first: &str, second: &str) -> bool {
-    match (
-        std::fs::canonicalize(first),
-        std::fs::canonicalize(second),
-    ) {
+    match (std::fs::canonicalize(first), std::fs::canonicalize(second)) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
     }

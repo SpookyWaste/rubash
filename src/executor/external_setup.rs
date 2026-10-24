@@ -986,6 +986,11 @@ impl Executor {
         if let Some(mut stdin) = child.stdin.take() {
             std::thread::spawn(move || {
                 use std::io::Write as _;
+                // A child that exits early leaves a broken pipe; the
+                // feed must end as EPIPE, not kill the shell (SIGPIPE is
+                // SIG_DFL process-wide since rubash#1333).
+                #[cfg(unix)]
+                crate::builtins::kill::block_sigpipe_on_this_thread();
                 let _ = stdin.write_all(&input);
             });
         }

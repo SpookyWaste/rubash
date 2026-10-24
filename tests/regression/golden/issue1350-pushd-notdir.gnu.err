@@ -1,0 +1,2 @@
+issue1350-pushd-notdir.sh: line 13: pushd: regf: Not a directory
+issue1350-pushd-notdir.sh: line 14: pushd: missing: No such file or directory

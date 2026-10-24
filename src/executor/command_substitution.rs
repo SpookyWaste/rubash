@@ -692,11 +692,28 @@ impl Executor {
         // pairs for carrier/raw bytes). readback takes raw capture bytes, so
         // decode the markers once — into_bytes() would re-encode them as
         // literal PUA glyphs at the next bytes_to_shell_text boundary.
-        SubstitutionOutput::readback(
+        let readback = SubstitutionOutput::readback(
             crate::executor::substitution_metadata::shell_text_to_raw_bytes(&output),
             status,
             context,
-        )
+        );
+        if readback.dropped_nul_bytes {
+            self.warn_comsub_nul_bytes();
+        }
+        readback
+    }
+
+    /// GNU subst.c read_comsub: discarding a NUL byte from a command
+    /// substitution's captured output warns once per substitution
+    /// (rubash#1280).
+    pub(in crate::executor) fn warn_comsub_nul_bytes(&self) {
+        self.write_diagnostic_fd2(
+            format!(
+                "{}warning: command substitution: ignored null byte in input\n",
+                self.diagnostic_prefix()
+            )
+            .as_bytes(),
+        );
     }
 
     pub(in crate::executor) fn expand_command_substitution_inner(
@@ -1037,12 +1054,38 @@ impl Executor {
         }
 
         if words.first().map(String::as_str) == Some("umask") {
-            return self
-                .shell_state
-                .env_vars
-                .get("__RUBASH_UMASK")
-                .cloned()
-                .unwrap_or_else(|| "0022".to_string());
+            // Run the real builtin like the ulimit branch below (rubash#1251:
+            // the old canned lookup ignored the arguments entirely, so
+            // `$(umask -S)` printed the octal mask and `$(umask 077)` set
+            // nothing). A comsub is a fork: the env map is cloned, and on
+            // unix the builtin also applies the PROCESS umask, so snapshot
+            // and restore the process mask around the call or a set inside
+            // the substitution would leak into the parent shell.
+            let mut comsub_env = self.shell_state.env_vars.clone();
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            #[cfg(unix)]
+            let saved_mask = unsafe {
+                let mask = libc::umask(0);
+                libc::umask(mask);
+                mask
+            };
+            let status = crate::builtins::umask::execute_with_io(
+                &words[1..],
+                &mut comsub_env,
+                &mut out,
+                &mut err,
+            )
+            .unwrap_or_else(|_| 1); // Vec<u8> writes are infallible
+            #[cfg(unix)]
+            unsafe {
+                libc::umask(saved_mask);
+            }
+            let _ = std::io::stderr().write_all(&err);
+            self.last_command_substitution_status.set(Some(status));
+            return String::from_utf8_lossy(&out)
+                .trim_capture_terminator()
+                .to_string();
         }
 
         if words.first().map(String::as_str) == Some("ulimit") {
@@ -1486,6 +1529,9 @@ impl Executor {
         }
 
         let readback = SubstitutionOutput::readback(output, status, context);
+        if readback.dropped_nul_bytes {
+            self.warn_comsub_nul_bytes();
+        }
         self.last_command_substitution_status
             .set(Some(readback.status));
         Some(readback)
@@ -1583,6 +1629,9 @@ impl Executor {
             arithmetic_last_eval_input: std::cell::RefCell::new(String::new()),
             assignment_command_name: None,
             buffer_assignment_diagnostics: false,
+            getopts_optind_arith_fatal: false,
+            defer_stage_time_report: false,
+            pending_stage_time_report: None,
             pending_assignment_diagnostics: Vec::new(),
             parameter_assignment_failure: Cell::new(false),
             tempenv_names: Vec::new(),
@@ -1594,6 +1643,8 @@ impl Executor {
             evalerror_pending: Cell::new(false),
             nounset_force_eof: Cell::new(false),
             conditional_expansion_fatal: Cell::new(false),
+            conditional_fatal_status: Cell::new(None),
+            conditional_expansion_error_status: Cell::new(None),
             evalerror_subscript_pending: Cell::new(false),
             evalerror_failglob_pending: Cell::new(false),
             evalerror_exit_toomany_pending: Cell::new(false),
@@ -1624,6 +1675,7 @@ impl Executor {
             pending_scalar_assignment: false,
             suppress_errexit: self.suppress_errexit,
             command_builtin_depth: self.command_builtin_depth,
+            builtin_wrapper_depth: self.builtin_wrapper_depth,
             standard_path_scope: self.standard_path_scope.clone(),
             debug_trap_running: false,
             debug_trap_action_cache: std::cell::RefCell::new(None),
@@ -1654,6 +1706,7 @@ impl Executor {
             comsub_stdin_writeback: Cell::new(None),
             pipeline_stdin_consumed: Cell::new(None),
             pipeline_stage_fds_pre_wired: std::cell::Cell::new(false),
+            pipeline_stage_pre_traced: std::cell::Cell::new(false),
             pipeline_stage_restricted_refused: std::cell::Cell::new(false),
             last_heredoc_warning_source: RefCell::new(None),
             comsub_leading_newlines: Cell::new(0),
@@ -1679,6 +1732,8 @@ impl Executor {
             fd_var_external_undo: Vec::new(),
             read_deadline: None,
             read_timed_out: false,
+            read_interrupted_signal: None,
+            read_sigint_guard_armed: false,
             read_eof_no_delimiter: false,
             stdout_capture: None,
             stderr_capture: None,

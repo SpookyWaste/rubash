@@ -398,6 +398,14 @@ impl Executor {
                         continue;
                     }
                     if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
+                        // Self-dup/self-move is a no-op (redir.c
+                        // `redir_fd != redirector` guard; rubash#1236):
+                        // it succeeds even for a closed fd, so it must
+                        // not fall into the source resolution below,
+                        // which would decline the whole route.
+                        if source_fd == fd {
+                            continue;
+                        }
                         let Some(slot) =
                             resolve_dup_source(self, &slots, &tracked_high_fds, source_fd)
                         else {
@@ -408,7 +416,10 @@ impl Executor {
                         } else {
                             tracked_high_fds.insert(fd, slot);
                         }
-                        if move_source {
+                        // Self-move: GNU's `redir_fd != redirector`
+                        // guard makes it a no-op — the child keeps the
+                        // fd (rubash#1236).
+                        if move_source && source_fd != fd {
                             if source_fd <= 2 {
                                 slots.insert(source_fd, ExternalStdioSlot::Null);
                             } else {
@@ -451,6 +462,10 @@ impl Executor {
                         continue;
                     }
                     if let Some(source_fd) = redirect_target_fd(&target) {
+                        // Self-dup: no-op (rubash#1236).
+                        if source_fd == fd {
+                            continue;
+                        }
                         let Some(slot) =
                             resolve_dup_source(self, &slots, &tracked_high_fds, source_fd)
                         else {

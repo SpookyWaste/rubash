@@ -55,9 +55,13 @@ where
     }
 
     let amount = match args.first() {
-        Some(arg) => match arg.parse::<isize>() {
-            Ok(amount) if amount >= 0 => amount as usize,
-            Ok(_) => {
+        // GNU shift.def reads the count through get_numeric_arg
+        // (builtins/common.c:488), whose acceptance rule is
+        // general.c:248 valid_number: whitespace-padded numerics are
+        // legal (rubash#1339).
+        Some(arg) => match crate::builtins::exit::gnu_valid_number(arg) {
+            Some(amount) if amount >= 0 => amount as usize,
+            Some(_) => {
                 writeln!(
                     stderr,
                     "{}shift: {arg}: shift count out of range",
@@ -65,7 +69,7 @@ where
                 )?;
                 return Ok(ShiftAction::Complete(1));
             }
-            Err(_) => {
+            None => {
                 writeln!(
                     stderr,
                     "{}shift: {arg}: numeric argument required",

@@ -2,6 +2,46 @@ use super::types::FUNCTION_STDIN;
 use super::*;
 use crate::executor::glob::{pathname_expand_word, PathnameExpansion};
 
+/// Resolve a /dev/tcp|udp port word the way GNU netopen's getaddrinfo
+/// does: a numeric word is the port (an out-of-range numeric value is
+/// truncated into the 16-bit sin_port by the resolver — GNU connects
+/// somewhere for `99999` instead of failing), and a non-numeric word is
+/// a service name looked up in /etc/services (getservbyname). Returns
+/// None when the service name is unknown (EAI_SERVICE).
+fn resolve_net_service_port(port_text: &str, udp: bool) -> Option<u16> {
+    if let Ok(port) = port_text.parse::<u16>() {
+        return Some(port);
+    }
+    if !port_text.is_empty() && port_text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return port_text
+            .parse::<u32>()
+            .ok()
+            .map(|value| (value % 65536) as u16);
+    }
+    let proto = if udp { "udp" } else { "tcp" };
+    let services = std::fs::read_to_string("/etc/services").ok()?;
+    for line in services.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let (Some(name), Some(port_proto)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if name != port_text {
+            continue;
+        }
+        let Some((port, service_proto)) = port_proto.split_once('/') else {
+            continue;
+        };
+        if service_proto == proto {
+            return port.parse().ok();
+        }
+    }
+    None
+}
+
 impl Executor {
     pub(in crate::executor) fn open_input_redirect(&self, target: &str) -> io::Result<File> {
         self.open_input_redirect_impl(target, true)
@@ -41,8 +81,8 @@ impl Executor {
     /// `/dev/udp/host/port` are not filesystem paths: opening one
     /// connects a socket (TCP connect(2); UDP bind+connect, which
     /// succeeds even with no listener). Host may be a name (resolved by
-    /// the OS) or an address; the port must be numeric (GNU also accepts
-    /// service names via getservbyname — not ported).
+    /// the OS) or an address; the port may be numeric or a service name
+    /// resolved through /etc/services (getservbyname).
     pub(in crate::executor) fn is_net_redirect_target(&self, target: &str) -> bool {
         target.starts_with("/dev/tcp/") || target.starts_with("/dev/udp/")
     }
@@ -70,7 +110,22 @@ impl Executor {
         };
         let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "Invalid argument");
         let (host, port_text) = rest.rsplit_once('/').ok_or_else(invalid)?;
-        let port: u16 = port_text.parse().map_err(|_| invalid())?;
+        let port: u16 = match resolve_net_service_port(port_text, udp) {
+            Some(port) => port,
+            None => {
+                // GNU netopen's getaddrinfo failure is reported by
+                // sys_error BEFORE the redirection_error line the caller
+                // adds: `{name}: line {n}: {service}: Servname not
+                // supported for ai_socktype` (glibc's gai_strerror text
+                // for EAI_SERVICE), then `{target}: Invalid argument`
+                // (rubash#1237).
+                eprintln!(
+                    "{}{port_text}: Servname not supported for ai_socktype",
+                    self.error_prefix()
+                );
+                return Err(invalid());
+            }
+        };
         if host.is_empty() {
             return Err(invalid());
         }
@@ -84,7 +139,16 @@ impl Executor {
             socket.connect((host, port))?;
             udp_socket_file(socket)
         } else {
-            let stream = std::net::TcpStream::connect((host, port))?;
+            let stream = std::net::TcpStream::connect((host, port)).map_err(|error| {
+                // GNU netopen reports a refused connect through sys_error
+                // with the script name only (no line segment) BEFORE the
+                // redirection_error line the caller adds:
+                // `{name}: connect: Connection refused` (rubash#1237).
+                if error.kind() == io::ErrorKind::ConnectionRefused {
+                    eprintln!("{}connect: Connection refused", self.script_name_prefix());
+                }
+                error
+            })?;
             tcp_stream_file(stream)
         };
         Ok(file)

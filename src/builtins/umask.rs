@@ -48,12 +48,17 @@ where
     let mut mode = None;
     // GNU builtins/umask.def:83 `internal_getopt (list, "Sp")`: option
     // parsing stops at the first mode operand, so a trailing `-S`/`-p` is an
-    // ignored extra operand, not a flag (rubash#1381). `--`/first-wins stay
-    // owned by #1292.
+    // ignored extra operand, not a flag (rubash#1381). A bare `--` is the
+    // getopt end-of-options marker: it is consumed, sets nothing by itself,
+    // and the operand after it is the mode (rubash#1292). Extra operands
+    // after the first are ignored — the FIRST mode wins (rubash#1292).
     let mut parsing_options = true;
 
     for arg in args {
         match arg.as_str() {
+            value if parsing_options && value == "--" => {
+                parsing_options = false;
+            }
             value if parsing_options && value.starts_with('-') && value != "-" => {
                 for option in value[1..].chars() {
                     match option {
@@ -62,7 +67,7 @@ where
                         _ => {
                             writeln!(
                                 stderr,
-                                "{}umask: {value}: invalid option",
+                                "{}umask: -{option}: invalid option",
                                 diagnostic_prefix(env_vars)
                             )?;
                             writeln!(stderr, "umask: usage: umask [-p] [-S] [mode]")?;
@@ -83,9 +88,9 @@ where
             value => {
                 parsing_options = false;
                 // Dash-words after the mode are ignored operands (#1381);
-                // plain extra operands keep the existing last-wins until
-                // #1292 settles first-wins.
-                if !value.starts_with('-') {
+                // plain extra operands are likewise ignored — the first
+                // mode operand wins (rubash#1292).
+                if !value.starts_with('-') && mode.is_none() {
                     mode = Some(value);
                 }
             }
@@ -468,6 +473,50 @@ mod tests {
             assert!(stdout.is_empty());
             assert!(stderr.contains("invalid symbolic mode operator"));
         }
+    }
+
+    #[test]
+    fn extra_operands_first_wins_and_bare_double_dash_ends_options() {
+        // rubash#1292: GNU getopt semantics — the first mode operand wins
+        // (extras are ignored), and a bare `--` is end-of-options, not an
+        // invalid option.
+        let _guard = UmaskGuard::take();
+        let mut env = VarTable::from(HashMap::from([(
+            String::from("__RUBASH_UMASK"),
+            "000".to_string(),
+        )]));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = execute_with_io(
+            &["022".to_string(), "033".to_string()],
+            &mut env,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+        assert_eq!(status, EXECUTION_SUCCESS);
+        assert_eq!(env.get("__RUBASH_UMASK").map(String::as_str), Some("0022"));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = execute_with_io(
+            &["--".to_string(), "027".to_string()],
+            &mut env,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+        assert_eq!(status, EXECUTION_SUCCESS);
+        assert!(stderr.is_empty());
+        assert_eq!(env.get("__RUBASH_UMASK").map(String::as_str), Some("0027"));
+
+        // Bare `--` alone: no mode, prints the current mask, rc 0.
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status =
+            execute_with_io(&["--".to_string()], &mut env, &mut stdout, &mut stderr).unwrap();
+        assert_eq!(status, EXECUTION_SUCCESS);
+        assert_eq!(String::from_utf8(stdout).unwrap(), "0027\n");
     }
 
     #[test]

@@ -293,7 +293,9 @@ impl Executor {
                     if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
                         let _ = self.fd_table.dup_input(fd, source_fd);
                         self.shell_state.env_vars.remove(&fd_closed_key(fd));
-                        if move_source {
+                        // Self-move: GNU's `redir_fd != redirector`
+                        // guard makes it a no-op (rubash#1236).
+                        if move_source && source_fd != fd {
                             self.fd_table.close(source_fd);
                         }
                     }
@@ -513,7 +515,8 @@ impl Executor {
                             self.shell_state.env_vars.remove(&fd_closed_key(fd));
                         }
                         self.record_output_fd_ledger(fd);
-                        if move_source {
+                        // Self-move: no-op, never closes (rubash#1236).
+                        if move_source && source_fd != fd {
                             self.fd_table.close(source_fd);
                             self.shell_state
                                 .env_vars
@@ -1226,6 +1229,13 @@ impl Executor {
                         continue;
                     }
                     if let Some((source_fd, _move_source)) = redirect_target_fd_and_move(&target) {
+                        // Self-dup/self-move is a no-op that succeeds even
+                        // for a closed fd (redir.c `redir_fd !=
+                        // redirector` guard; rubash#1236) and leaves the
+                        // opened bookkeeping unchanged.
+                        if source_fd == fd {
+                            continue;
+                        }
                         if !dup_source_fd_open(&self.fd_table, source_fd, &opened) {
                             let raw_word = redirect
                                 .target_metadata

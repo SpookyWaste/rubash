@@ -237,6 +237,11 @@ impl Executor {
             (Ok(()), Ok(trap_status)) => trap_status,
             (Err(ExecuteError::ExitCode(code)), Ok(_)) => code,
             (Err(ExecuteError::ExpansionFailure(code)), Ok(_)) => code,
+            // rubash#1423: a pipeline element runs in a subshell, so a
+            // `return` raised by the element body ends the ELEMENT with
+            // that status — it must not unwind the enclosing function
+            // (GNU: `{ return 3; } | cat` inside f leaves f running).
+            (Err(ExecuteError::Return(code)), Ok(_)) => code,
             // niubash#345: the stage's fd-1 write hit a broken pipe (the
             // downstream consumer exited): the element is SIGPIPE-killed, so
             // report 141 rather than unwinding the whole pipeline.
@@ -376,6 +381,10 @@ impl Executor {
             (Ok(()), Ok(trap_status)) => trap_status,
             (Err(ExecuteError::ExitCode(code)), Ok(_))
             | (Err(ExecuteError::ExpansionFailure(code)), Ok(_)) => code,
+            // rubash#1423: the element runs in a subshell — a `return`
+            // raised by the element body ends the element with that
+            // status instead of unwinding the enclosing function.
+            (Err(ExecuteError::Return(code)), Ok(_)) => code,
             // niubash#345: a function pipeline element writing past the
             // consumer's exit is SIGPIPE-killed (status 141).
             (Err(ExecuteError::BrokenPipe), Ok(_)) => 141,
@@ -488,6 +497,10 @@ impl Executor {
         }
 
         subshell.stderr_capture = Some(Vec::new());
+        // rubash#1342: the pipeline driver already emitted this stage's
+        // xtrace line; mark the clone so its dispatch re-trace is
+        // suppressed once (nested commands still trace normally).
+        subshell.pipeline_stage_pre_traced.set(true);
         // rubash#815 profiler: this stage re-dispatches through
         // execute_command, whose own prepared-command seam confirms the
         // element — cancel the stage-level tentative frame so the element is
@@ -509,6 +522,10 @@ impl Executor {
             (Ok(()), Ok(trap_status)) => trap_status,
             (Err(ExecuteError::ExitCode(code)), Ok(_))
             | (Err(ExecuteError::ExpansionFailure(code)), Ok(_)) => code,
+            // rubash#1423: the element runs in a subshell — a `return`
+            // raised by the element body ends the element with that
+            // status instead of unwinding the enclosing function.
+            (Err(ExecuteError::Return(code)), Ok(_)) => code,
             // niubash#345: a builtin pipeline element writing past the
             // consumer's exit is SIGPIPE-killed (status 141).
             (Err(ExecuteError::BrokenPipe), Ok(_)) => 141,
@@ -794,6 +811,7 @@ impl Executor {
             Some(&expanded_name),
             &dev_args,
             &self.shell_state.env_vars,
+            self.bash_argv0_env_supplied(&[]),
         );
 
         self.apply_child_environment(&mut process);
@@ -1016,6 +1034,11 @@ impl Executor {
             // bytes the child already consumed (niubash#383 follow-up).
             self.pipeline_stdin_consumed.set(Some(input.len()));
             std::thread::spawn(move || {
+                // The payload write must survive a broken pipe as a plain
+                // EPIPE (see the spawn comment): SIGPIPE is SIG_DFL for
+                // the shell process since rubash#1333, so block it here.
+                #[cfg(unix)]
+                crate::builtins::kill::block_sigpipe_on_this_thread();
                 let _ = stdin.write_all(&payload);
             })
         });

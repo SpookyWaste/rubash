@@ -46,6 +46,7 @@ pub fn export(
         &mut stdout,
         &mut stderr,
         &mut oob_word,
+        None,
     )?;
     // No abort channel here (test-only path in practice): keep the bare
     // report_error diagnostic plus the failure status so a direct caller
@@ -103,6 +104,7 @@ pub fn readonly(
         &mut stderr,
         None,
         &mut oob_word,
+        None,
     )?;
     // Same direct-path diagnostic as export above (no Executor to abort).
     if let Some(word) = oob_word {
@@ -123,6 +125,7 @@ pub(crate) fn export_with_io<'a, I, W, E>(
     stdout: &mut W,
     stderr: &mut E,
     oob_word: &mut Option<String>,
+    traced: Option<&mut Vec<(String, bool, String)>>,
 ) -> io::Result<i32>
 where
     I: IntoIterator<Item = &'a str>,
@@ -214,9 +217,20 @@ where
     }
 
     let mut status = EXECUTION_SUCCESS;
+    // The traced-assignment sink is consumed by the first apply call;
+    // hand each call a reborrow so later operands keep recording.
+    let mut traced = traced;
     for arg in &args[index..] {
-        if apply_export_arg(arg, mode, array, assoc, env_vars, stderr, oob_word)?
-            != EXECUTION_SUCCESS
+        if apply_export_arg(
+            arg,
+            mode,
+            array,
+            assoc,
+            env_vars,
+            stderr,
+            oob_word,
+            traced.as_deref_mut(),
+        )? != EXECUTION_SUCCESS
         {
             status = EXECUTION_FAILURE;
         }
@@ -241,6 +255,7 @@ pub(crate) fn readonly_with_io<'a, I, W, E>(
     stderr: &mut E,
     context_name: Option<&str>,
     oob_word: &mut Option<String>,
+    traced: Option<&mut Vec<(String, bool, String)>>,
 ) -> io::Result<i32>
 where
     I: IntoIterator<Item = &'a str>,
@@ -307,9 +322,18 @@ where
     }
 
     let mut status = EXECUTION_SUCCESS;
+    let mut traced = traced;
     for arg in &args[index..] {
-        if apply_readonly_arg(arg, array, assoc, env_vars, stderr, context_name, oob_word)?
-            != EXECUTION_SUCCESS
+        if apply_readonly_arg(
+            arg,
+            array,
+            assoc,
+            env_vars,
+            stderr,
+            context_name,
+            oob_word,
+            traced.as_deref_mut(),
+        )? != EXECUTION_SUCCESS
         {
             status = EXECUTION_FAILURE;
         }

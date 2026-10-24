@@ -630,6 +630,29 @@ impl Executor {
                 *current = value.clone();
             }
         }
+        if name == "__RUBASH_IS_C" {
+            // GNU: a `-c` command string has no script file, so BASH_SOURCE
+            // starts as a set-but-EMPTY array; only function entry pushes
+            // the $0 operand (via current_bash_source's fallback). The
+            // __RUBASH_SCRIPT_NAME installed for the same invocation
+            // carries that $0 operand and seeded the stack when it was set
+            // (the name is set before IS_C at every startup site —
+            // invocation.rs / main.rs); the STORED array is emptied here
+            // (rubash#1306). The stack seed itself must SURVIVE: the
+            // BASH_SOURCE view pops the bottom seed when there is no main
+            // frame, and function entry reads the seed through
+            // current_bash_source — clearing the stack made the first
+            // function's own frame the bottom entry, so the view popped
+            // it and in-function BASH_SOURCE read empty (integration
+            // fixup; cli_tests function_call_stack_* encode the GNU
+            // shape). The SCRIPT_NAME branch below guards the reverse
+            // seeding order.
+            store_indexed_array_state(
+                &mut self.shell_state,
+                "BASH_SOURCE",
+                Vec::<String>::new(),
+            );
+        }
         if name == "__RUBASH_SCRIPT_NAME" {
             let source_value = if self
                 .shell_state
@@ -654,6 +677,19 @@ impl Executor {
             if self.shell_state.env_vars.contains_key("__RUBASH_IN_SOURCE") {
                 let values = self.shell_state.bash_source_stack.clone();
                 store_indexed_array_state(&mut self.shell_state, "BASH_SOURCE", values);
+                return;
+            }
+            if self.shell_state.env_vars.contains_key("__RUBASH_IS_C") {
+                // `-c` invocation (host seeded IS_C before the name):
+                // BASH_SOURCE stays the set-but-empty array (rubash#1306),
+                // but the stack still takes the $0 seed (see the IS_C
+                // branch above for why the seed must survive).
+                self.shell_state.bash_source_stack = vec![source_value.clone()];
+                store_indexed_array_state(
+                    &mut self.shell_state,
+                    "BASH_SOURCE",
+                    Vec::<String>::new(),
+                );
                 return;
             }
             self.shell_state.bash_source_stack = vec![source_value.clone()];
@@ -1748,6 +1784,16 @@ impl Executor {
     /// `script: eval:2: `, `bash: -c:2: ` under gnu_errfmt).
     pub fn parser_error_prefix_for_line(&self, line: usize) -> String {
         let is_c = self.shell_state.env_vars.contains_key("__RUBASH_IS_C");
+        // GNU trap.c:496: a trap action parses under the input name
+        // "trap" ("interrupt trap" for SIGINT), which parser_error
+        // (error.c:300-316) appends like the eval name below
+        // (rubash#1351).
+        if let Some(context) = self.shell_state.env_vars.get("__RUBASH_TRAP_CONTEXT") {
+            if let Some(script) = self.shell_state.env_vars.get("__RUBASH_SCRIPT_NAME") {
+                return self.gnu_error_line(&format!("{script}: {context}"), line);
+            }
+            return self.gnu_error_line(&format!("bash: {context}"), line);
+        }
         if self
             .shell_state
             .env_vars

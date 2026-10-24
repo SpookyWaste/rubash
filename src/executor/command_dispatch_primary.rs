@@ -241,7 +241,10 @@ impl Executor {
             // 5.3.0 baseline (probe D: `-c 'exit abc; echo AFTER'` prints
             // AFTER, $?=2).
             if let Some(status) = rest.first() {
-                if status.parse::<i128>().is_err() {
+                // get_exitstat's acceptance rule is general.c:248
+                // valid_number (intmax_t): whitespace-padded numerics
+                // pass (rubash#1339), out-of-range fails (rubash#1403).
+                if crate::builtins::exit::gnu_valid_number(status).is_none() {
                     let mut stderr = Vec::new();
                     writeln!(
                         &mut stderr,

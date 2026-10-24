@@ -1,0 +1,4 @@
+for rc=1
+case rc=1
+plain rc=1
+done

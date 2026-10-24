@@ -1,0 +1,23 @@
+== 1261 byte-carried char removal
+vlen=1
+prefix-rem len=0
+suffix-rem len=0
+substr is whole
+== 1262 printf unrecognized escape
+<\a b>
+<\one>
+<\two>
+== 1269 zero-param @A transforms
+argc=0
+argc=1
+argc=0
+argc=0
+argc=3
+== 1271 malformed transform, set var
+rc=127
+err:bad substitution
+== 1271 malformed transform, unset var
+[] ok
+rc=0
+== 1271 valid transform still works
+'x y'

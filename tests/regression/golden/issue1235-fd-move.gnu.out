@@ -1,0 +1,16 @@
+two
+move-to-closed: fd3 closed
+three
+move-to-open: fd6 open
+move-to-open: fd3 open
+selfdup-closed rc=0
+selfmove-closed rc=0
+selfmove: fd8 open
+capA:
+one
+capB:
+probe
+capC:
+probe
+capD:
+probe

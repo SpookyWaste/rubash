@@ -1,0 +1,5 @@
+dcl rc=1
+declare-integer-nameref.sh: line 4: declare: ref2: not found
+val=[] arith=0
+plain rc=0 ref2=[plain]
+done

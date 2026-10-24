@@ -1,0 +1,10 @@
+k4-getopts-state.sh: line 21: OPTIND: readonly variable
+k4-getopts-state.sh: line 21: OPTIND: readonly variable
+k4-getopts-state.sh: line 21: OPTIND: readonly variable
+k4-getopts-state.sh: line 28: OPTIND: readonly variable
+k4-getopts-state.sh: illegal option -- z
+k4-getopts-state.sh: line 29: OPTIND: readonly variable
+k4-getopts-state.sh: line 29: OPTIND: readonly variable
+k4-getopts-state.sh: line 35: OPTIND: readonly variable
+k4-getopts-state.sh: line 36: OPTIND: readonly variable
+k4-getopts-state.sh: line 36: OPTIND: readonly variable

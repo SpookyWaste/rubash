@@ -12,6 +12,7 @@ pub(super) enum SourceParseError {
     MissingFilename,
     MissingPathArgument,
     InvalidOption(char),
+    HelpRequested,
 }
 
 impl<'a> SourceInvocation<'a> {
@@ -23,6 +24,13 @@ impl<'a> SourceInvocation<'a> {
             if arg == "--" {
                 index += 1;
                 break;
+            }
+
+            // GNU source.def's getopt table maps --help to CASE_HELPOPT:
+            // long help to stdout, EX_USAGE status (rubash#1229). Only in
+            // option position — after `--` it is the filename.
+            if arg == "--help" {
+                return Err(SourceParseError::HelpRequested);
             }
 
             if arg == "-p" {

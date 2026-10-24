@@ -237,3 +237,23 @@ pub(super) fn quote_export_value(value: &str) -> String {
     }
     quoted
 }
+
+/// Display quoting for the no-arg `export -p` / `readonly -p` listings:
+/// GNU setattr.def show_var_attributes applies the same rule as
+/// `declare -p` (setattr.def:528-531) — strtrans.c ansic_quote ($'...')
+/// when the value holds non-printing bytes, sh_double_quote otherwise.
+/// The listings used to wrap quote_export_value in literal double quotes
+/// unconditionally, embedding raw control bytes (a value with a newline
+/// printed across two lines) where GNU prints $'x\ny' (rubash#1184
+/// finding 2). Mirrors builtins/declare/storage.rs quote_declare_value,
+/// including the raw-byte-marker byte view.
+pub(super) fn quote_listing_value(value: &str) -> String {
+    if crate::executor::substitution_metadata::has_raw_byte_marker_pair(value) {
+        return crate::executor::ansic_quote(value);
+    }
+    let visible = crate::locale::decode_to_visible_text(value);
+    if crate::executor::ansic_shouldquote(&visible) {
+        return crate::executor::ansic_quote(&visible);
+    }
+    format!("\"{}\"", quote_export_value(&visible))
+}

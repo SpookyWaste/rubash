@@ -1,0 +1,6 @@
+export1 rc=1
+export2 rc=1
+export3 rc=1
+readonly1 rc=1
+readonly2 rc=1
+done

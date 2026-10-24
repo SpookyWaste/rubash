@@ -45,30 +45,48 @@ pub fn execute_named_with_io<E>(
 where
     E: Write,
 {
-    execute_named_with_io_impl(executor, command_name, args, stderr, None)
+    execute_named_with_io_impl(
+        executor,
+        command_name,
+        args,
+        &mut crate::executor::GlobalStdout,
+        stderr,
+        None,
+    )
 }
 
-pub fn execute_named_with_io_and_redirects<E>(
+pub fn execute_named_with_io_and_redirects<W, E>(
     executor: &mut Executor,
     command_name: &str,
     args: &[String],
+    stdout: &mut W,
     stderr: &mut E,
     redirect_cmd: &CommandNode,
 ) -> Result<(), ExecuteError>
 where
+    W: Write,
     E: Write,
 {
-    execute_named_with_io_impl(executor, command_name, args, stderr, Some(redirect_cmd))
+    execute_named_with_io_impl(
+        executor,
+        command_name,
+        args,
+        stdout,
+        stderr,
+        Some(redirect_cmd),
+    )
 }
 
-fn execute_named_with_io_impl<E>(
+fn execute_named_with_io_impl<W, E>(
     executor: &mut Executor,
     command_name: &str,
     args: &[String],
+    stdout: &mut W,
     stderr: &mut E,
     redirect_cmd: Option<&CommandNode>,
 ) -> Result<(), ExecuteError>
 where
+    W: Write,
     E: Write,
 {
     // TODO(builtins/source.def): GNU Bash `source_builtin` uses unwind/trap
@@ -76,6 +94,15 @@ where
     let invocation = match SourceInvocation::parse(args) {
         Ok(invocation) => invocation,
         Err(error) => {
+            // GNU source.def CASE_HELPOPT: --help prints the long help to
+            // stdout and returns EX_USAGE, with no usage line on stderr
+            // (rubash#1229). Help topics are keyed by the invoked name
+            // ("source" and "." have separate texts in GNU).
+            if matches!(error, SourceParseError::HelpRequested) {
+                crate::builtins::help::print_builtin_help(command_name, &mut *stdout)?;
+                executor.set_exit_code(2);
+                return Ok(());
+            }
             match error {
                 SourceParseError::MissingFilename => {
                     writeln!(
@@ -98,6 +125,8 @@ where
                         executor.diagnostic_prefix()
                     )?;
                 }
+                // Handled by the early return above.
+                SourceParseError::HelpRequested => {}
             }
             writeln!(
                 stderr,
@@ -231,8 +260,11 @@ where
             // goes through file_error with the REAL strerror — an
             // unreadable file is `Permission denied`, not the blanket
             // `No such file or directory` this arm used to print for any
-            // error (rubash#1160).
-            if source_path.is_dir() {
+            // error (rubash#1160). An EACCES failure takes the file_error
+            // arm even when the target is a directory: the open itself
+            // was refused, so GNU prints `<file>: Permission denied`
+            // with no builtin-name segment (rubash#1307).
+            if error.kind() != std::io::ErrorKind::PermissionDenied && source_path.is_dir() {
                 writeln!(
                     stderr,
                     "{}{command_name}: {filename}: is a directory",

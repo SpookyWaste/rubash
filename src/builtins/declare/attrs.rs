@@ -247,6 +247,23 @@ where
         let name = name.strip_suffix('+').unwrap_or(name);
         if array {
             mark_array(variables, name);
+            // GNU arrayfunc.c convert_var_to_array (declare.def:959-962):
+            // applying att_array to a variable holding a scalar moves the
+            // value into element 0 — including an EMPTY scalar cell
+            // (rubash#1225: `w=; declare -a w` and `declare -a w=` both
+            // store [0]=""). A declared-but-unset name has no cell to
+            // convert and stays element-less. Mirrors the assoc conversion
+            // below so the storage is canonical for element reads.
+            if let Some(current) = variables.get(name) {
+                let is_storage = current.starts_with(STORAGE_WORD_PREFIX)
+                    || (current.starts_with('(') && current.ends_with(')'));
+                if !is_storage && !declared_unset.contains(name) {
+                    let mut entries = std::collections::BTreeMap::new();
+                    entries.insert(0, current.clone());
+                    let converted = super::storage::format_indexed_array_storage(entries);
+                    variables.insert(name.to_string(), converted);
+                }
+            }
         }
         if assoc {
             // GNU declare.def:810-823/953-958: `declare -A` on an unbound name
@@ -269,10 +286,14 @@ where
             // the assoc storage here so element reads, `${v[@]}`, and
             // compound appends all see the canonical form — including the
             // scalar a local inherits under localvar_inherit.
+            // rubash#1225: an EMPTY scalar cell converts too — GNU
+            // `v=; declare -A v` and `declare -A v=` both store [0]="".
+            // Only a declared-but-unset name (no real cell) stays
+            // element-less, like a bare `declare -A newvar`.
             if let Some(current) = variables.get(name) {
                 let is_storage = current.starts_with(STORAGE_WORD_PREFIX)
                     || (current.starts_with('(') && current.ends_with(')'));
-                if !current.is_empty() && !is_storage {
+                if !is_storage && !declared_unset.contains(name) {
                     let converted = super::storage::format_assoc_storage(vec![(
                         "0".to_string(),
                         current.clone(),

@@ -295,14 +295,22 @@ impl Executor {
     }
 
     fn external_mkdir(&mut self, cmd: &CommandNode) -> Result<bool, ExecuteError> {
-        // GNU mkdir (coreutils) parses options before operands: -p (parents,
-        // already implied by create_dir_all), -m MODE which consumes a value,
-        // -v verbose; `--` ends option parsing so a following `-p` is an
-        // operand. Without this the flag itself became a literal directory
-        // entry (`mkdir -p d` created `./-p`).
+        // GNU mkdir (coreutils) parses options before operands: -p creates
+        // parents (and only -p does — without it mkdir(2) is single-level
+        // and a missing parent is ENOENT), -m MODE consumes a value,
+        // -v is verbose; `--` ends option parsing so a following `-p` is
+        // an operand. Without this the flag itself became a literal
+        // directory entry (`mkdir -p d` created `./-p`).
         let mut mode_value_pending = false;
         let mut no_more_flags = false;
+        let mut parents = false;
         let mut failed = false;
+        // coreutils diagnostics are the emulated command's own stderr:
+        // they go through the command's redirections like any external
+        // command's output (rubash#1372: `mkdir ... >f 2>&1` must create
+        // f holding the message), never straight to the terminal, and
+        // they carry no shell diagnostic prefix.
+        let mut stderr: Vec<u8> = Vec::new();
         for word in &cmd.words[1..] {
             // cmd.words are the already-expanded argv: the simple-command
             // executor ran each word through expand_command_words once
@@ -324,6 +332,19 @@ impl Executor {
             {
                 if expanded == "-m" {
                     mode_value_pending = true;
+                } else if expanded == "-p" || expanded == "--parents" {
+                    parents = true;
+                } else if !expanded.starts_with("--")
+                    && expanded[1..].chars().all(|ch| "pvm".contains(ch))
+                {
+                    // Bundled short flags (-pv, -vp); a bundle carrying m
+                    // (-pm) takes its mode from the next word.
+                    if expanded.contains('p') {
+                        parents = true;
+                    }
+                    if expanded.contains('m') {
+                        mode_value_pending = true;
+                    }
                 }
                 continue;
             }
@@ -338,19 +359,29 @@ impl Executor {
             // propagating the io::Error with `?` printed a bare
             // `<script>: line N: Invalid argument` with no mkdir context
             // (an NTFS-invalid wildcard name such as `x*s' triggers it on
-            // Windows while ext4 accepts it).
-            if let Err(error) =
-                fs::create_dir_all(shell_path_to_windows(&expanded, &self.shell_state.env_vars))
-            {
-                eprintln!(
-                    "{}mkdir: cannot create directory '{}': {}",
-                    self.diagnostic_prefix(),
+            // Windows while ext4 accepts it). rubash#1372: the previous
+            // code also called create_dir_all unconditionally, which
+            // masked the single-level mkdir(2) semantics — a missing
+            // parent must fail ENOENT without -p, not silently create
+            // the whole chain (on the Android/Termux host it surfaced as
+            // a bogus EROFS instead).
+            let path = shell_path_to_windows(&expanded, &self.shell_state.env_vars);
+            let result = if parents {
+                fs::create_dir_all(&path)
+            } else {
+                fs::create_dir(&path)
+            };
+            if let Err(error) = result {
+                writeln!(
+                    stderr,
+                    "mkdir: cannot create directory '{}': {}",
                     expanded,
                     crate::posix_errors::message(&error)
-                );
+                )?;
                 failed = true;
             }
         }
+        self.write_buffered_builtin_output(cmd, &[], &stderr)?;
         self.exit_code = i32::from(failed);
         Ok(true)
     }
@@ -1570,12 +1601,9 @@ impl Executor {
                         Some(read) => output.extend(read.bytes),
                         None => {
                             let mut stderr = Vec::new();
-                            writeln!(
-                                &mut stderr,
-                                "{}cat: {}: No such file or directory",
-                                self.diagnostic_prefix(),
-                                target
-                            )?;
+                            // GNU cat.c reports its own errors bare, with
+                            // no shell diagnostic prefix (rubash#1309).
+                            writeln!(&mut stderr, "cat: {}: No such file or directory", target)?;
                             self.write_buffered_builtin_output(cmd, &[], &stderr)?;
                             status = 1;
                         }
@@ -1606,13 +1634,19 @@ impl Executor {
                 };
                 match read {
                     Ok(bytes) => output.extend(bytes),
-                    Err(_) => {
+                    Err(error) => {
                         let mut stderr = Vec::new();
+                        // GNU cat.c: cat reports its own operand errors
+                        // bare — `cat: <file>: <strerror>` with the REAL
+                        // strerror and no shell diagnostic prefix. The
+                        // discarded error flattened EACCES/EISDIR to a
+                        // blanket ENOENT text behind the script prefix
+                        // (rubash#1309).
                         writeln!(
                             &mut stderr,
-                            "{}cat: {}: No such file or directory",
-                            self.diagnostic_prefix(),
-                            target
+                            "cat: {}: {}",
+                            target,
+                            crate::posix_errors::message(&error)
                         )?;
                         self.write_buffered_builtin_output(cmd, &[], &stderr)?;
                         status = 1;
@@ -1645,7 +1679,7 @@ impl Executor {
         // No operands: plain stdin shapes (the operand loop above already
         // returned). This block keeps the original cascade order.
         {
-            if let Some(input) = self.read_function_stdin('\0', None, false) {
+            if let Some(input) = self.read_function_stdin('\0', None, false, false, false) {
                 self.write_cat_output(
                     cmd,
                     &filter(
@@ -1844,7 +1878,7 @@ impl Executor {
         }
         let Some(input) = self
             .stdin_string_for_command_mut(cmd)
-            .or_else(|| self.read_function_stdin('\0', None, false))
+            .or_else(|| self.read_function_stdin('\0', None, false, false, false))
             .or_else(|| self.read_inherited_process_stdin_to_string())
         else {
             return Ok(false);
@@ -2439,6 +2473,11 @@ impl Executor {
             return Ok(true);
         };
         let mut failures = 0usize;
+        // coreutils diagnostics are the emulated command's own stderr and
+        // must honor the command's redirections (rubash#1372:
+        // `chmod ... >f 2>&1` creates f holding the message); buffer them
+        // and flush through the builtin output router at the end.
+        let mut stderr: Vec<u8> = Vec::new();
         for file in &files {
             let windows =
                 crate::executor::path::shell_path_to_windows(file, &self.shell_state.env_vars)
@@ -2484,10 +2523,11 @@ impl Executor {
                             }
                             Err(_) => {
                                 failures += 1;
-                                eprintln!(
+                                writeln!(
+                                    stderr,
                                     "chmod: cannot access '{}': No such file or directory",
                                     file
-                                );
+                                )?;
                             }
                         }
                     }
@@ -2511,10 +2551,11 @@ impl Executor {
                             }
                             Err(_) => {
                                 failures += 1;
-                                eprintln!(
+                                writeln!(
+                                    stderr,
                                     "chmod: cannot access '{}': No such file or directory",
                                     file
-                                );
+                                )?;
                             }
                         }
                         // DrvFs does not support POSIX mode bits (GNU on WSL
@@ -2538,10 +2579,11 @@ impl Executor {
                 }
                 None => {
                     failures += 1;
-                    eprintln!("chmod: invalid mode: '{}'", mode);
+                    writeln!(stderr, "chmod: invalid mode: '{}'", mode)?;
                 }
             }
         }
+        self.write_buffered_builtin_output(cmd, &[], &stderr)?;
         self.exit_code = i32::from(failures > 0 || files.is_empty());
         Ok(true)
     }

@@ -1,0 +1,5 @@
+issue1348-invalid-ident.sh: line 10: export: `a[0]': not a valid identifier
+issue1348-invalid-ident.sh: line 11: export: `9bad=v': not a valid identifier
+issue1348-invalid-ident.sh: line 12: export: `9x[0]=v': not a valid identifier
+issue1348-invalid-ident.sh: line 13: readonly: `r[0]': not a valid identifier
+issue1348-invalid-ident.sh: line 14: readonly: `9bad=v': not a valid identifier

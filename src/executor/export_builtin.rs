@@ -40,13 +40,18 @@ impl Executor {
             self.raise_evalerror_abort();
         }
         let mut oob_word = None;
+        let mut traced_assignments = Vec::new();
         let status = crate::builtins::setattr::export_with_io(
             args.iter().map(String::as_str),
             &mut self.shell_state.env_vars,
             &mut stdout,
             &mut stderr,
             &mut oob_word,
+            Some(&mut traced_assignments),
         )?;
+        // GNU subst.c:3580: each performed assignment operand traced its
+        // own line as export performed it (rubash#1340).
+        self.xtrace_setattr_assignments(&traced_assignments);
         // rubash#616 (1a): `export -a name=(...)` rewrites the array mirror
         // inside the pure builtin (setattr/apply.rs `env_vars.insert`), so
         // refresh the structured cell for assignment operands — a previously

@@ -1,0 +1,19 @@
+k4-declare-options.sh: line 17: declare: --: invalid option
+declare: usage: declare [-aAfFgiIlnrtux] [name[=value] ...] or declare -p [-aAfFilnrtux] [name ...]
+k4-declare-options.sh: line 20: declare: -b: invalid option
+declare: usage: declare [-aAfFgiIlnrtux] [name[=value] ...] or declare -p [-aAfFilnrtux] [name ...]
+k4-declare-options.sh: line 23: declare: -n: invalid option
+k4-declare-options.sh: line 26: declare: -i: invalid option
+k4-declare-options.sh: line 29: declare: -Z: invalid option
+declare: usage: declare [-aAfFgiIlnrtux] [name[=value] ...] or declare -p [-aAfFilnrtux] [name ...]
+k4-declare-options.sh: line 32: getopts: --: invalid option
+getopts: usage: getopts optstring name [arg ...]
+k4-declare-options.sh: line 35: getopts: -x: invalid option
+getopts: usage: getopts optstring name [arg ...]
+k4-declare-options.sh: line 38: kill: -badflag: invalid signal specification
+k4-declare-options.sh: line 41: trap: -b: invalid option
+trap: usage: trap [-Plp] [[action] signal_spec ...]
+k4-declare-options.sh: line 44: umask: -b: invalid option
+umask: usage: umask [-p] [-S] [mode]
+k4-declare-options.sh: line 47: mapfile: -b: invalid option
+mapfile: usage: mapfile [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]

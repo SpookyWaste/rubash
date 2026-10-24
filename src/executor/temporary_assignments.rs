@@ -679,8 +679,17 @@ impl Executor {
         if self.buffer_assignment_diagnostics {
             self.pending_assignment_diagnostics
                 .extend_from_slice(line.as_bytes());
-        } else {
+        } else if !self.fd_table.is_closed(2) && self.fd_table.output_endpoint(2).is_none() {
+            // No fd-2 binding in the table: the process stderr is the
+            // destination, as with the raw write this replaces.
             let _ = std::io::stderr().write_all(line.as_bytes());
+        } else {
+            // GNU error.c report_error family: assignment diagnostics go
+            // to fd 2 AS BOUND by enclosing redirections — `( UID=5 )
+            // 2>err` must land in err and `{ UID=5; } 2>/dev/null` must
+            // stay silent. The raw process-stderr write bypassed every
+            // compound binding (rubash#1317; same class as rubash#167).
+            self.write_diagnostic_fd2(line.as_bytes());
         }
     }
 
@@ -761,6 +770,21 @@ impl Executor {
                     true,
                 );
             }
+        }
+        // GNU variables.c:5817 { "OPTIND", sv_optind }: a bind of
+        // OPTIND resets the getopt scan state from the variable's
+        // current value — POSIX's `OPTIND=1` restart, a reseek for
+        // values > 1. The hook fires for ANY bind attempt, including
+        // one refused as readonly (the value is unchanged, so the scan
+        // restarts from the frozen value). Rubash carries the live scan
+        // position in shadow keys while OPTIND is readonly
+        // (rubash#1268); dropping them makes the next getopts call
+        // re-derive its start from the variable itself, and dropping
+        // the char offset mirrors getopts_reset clearing nextchar
+        // (rubash#1270).
+        if base == "OPTIND" {
+            self.shell_state.env_vars.remove("__RUBASH_GETOPTS_OPTIND");
+            self.shell_state.env_vars.remove("__RUBASH_GETOPTS_OFFSET");
         }
         // GNU variables.c:5760 { "BASH_COMPAT", sv_shcompat }: assigning
         // BASH_COMPAT re-syncs the compatNN shopt flags (and resets the
@@ -1510,13 +1534,22 @@ impl Executor {
         // stores the value at key "0" via assign_func. Without this, a value
         // like `([a]=1)` is stored raw and later misinterpreted as assoc
         // storage format (assoc.tests:191 T='([a]=1)' -> ${T[@]} is `([a]=1)`,
-        // not `1`).
+        // not `1`). The bind MERGES into the existing entries like the
+        // indexed-array arm above (bind_variable_internal keeps the other
+        // elements): building a fresh `(["0"]=v)` storage here silently
+        // dropped every pre-existing key (rubash#1347).
         if !compound_assignment
             && !append
             && is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base_name)
             && !value.starts_with(STORAGE_WORD_PREFIX)
         {
-            let storage = format!("([\"0\"]={})", quote_assoc_storage_value(&value));
+            let current = self
+                .shell_state
+                .env_vars
+                .get(base_name)
+                .cloned()
+                .unwrap_or_default();
+            let storage = append_assoc_scalar_value(&current, &value);
             // Assoc scalar bind stores at key "0" — keep the structured cell
             // in lockstep from the same render.
             sync_typed_assoc_storage(&mut self.shell_state.variables, base_name, &storage);

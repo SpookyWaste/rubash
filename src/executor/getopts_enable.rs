@@ -19,13 +19,33 @@ impl Executor {
     where
         W: Write,
     {
+        self.getopts_optind_arith_fatal = false;
+        // getopts.def getopts_builtin: no_options rejects builtin-level
+        // options BEFORE the operand count is examined — bare
+        // `getopts --badflag` reports `--: invalid option` plus usage,
+        // not usage alone (rubash#1259). sh_invalidopt names `-` plus
+        // the first character after the dash, so `--badflag` gives `--`.
+        if cmd.words.len() >= 2
+            && cmd.words[1] != "--"
+            && cmd.words[1].starts_with('-')
+            && cmd.words[1].len() > 1
+        {
+            let option = cmd.words[1].chars().nth(1).unwrap_or('-');
+            let _ = writeln!(
+                stderr,
+                "{}getopts: -{option}: invalid option",
+                self.diagnostic_prefix()
+            );
+            let _ = writeln!(stderr, "getopts: usage: getopts optstring name [arg ...]");
+            return 2;
+        }
+
         if cmd.words.len() < 3 {
             let _ = writeln!(stderr, "getopts: usage: getopts optstring name [arg ...]");
             return 2;
         }
 
-        // getopts.def getopts_builtin: no_options rejects builtin-level
-        // options, then `list = loptend` skips over a leading `--`, so
+        // `list = loptend` skips over a leading `--`, so
         // `getopts -- optstring name ...` parses the next word as the
         // optstring instead of failing with a usage error.
         let mut word_index = 1usize;
@@ -35,15 +55,6 @@ impl Executor {
                 return 2;
             }
             word_index = 2;
-        } else if cmd.words[1].starts_with('-') && cmd.words[1].len() > 1 {
-            let option = cmd.words[1].chars().nth(1).unwrap_or('-');
-            let _ = writeln!(
-                stderr,
-                "{}getopts: -{option}: invalid option",
-                self.diagnostic_prefix()
-            );
-            let _ = writeln!(stderr, "getopts: usage: getopts optstring name [arg ...]");
-            return 2;
         }
 
         let optstring = cmd.words[word_index].clone();
@@ -61,13 +72,7 @@ impl Executor {
 
         let silent = optstring.starts_with(':');
         let optspec: &str = if silent { &optstring[1..] } else { &optstring };
-        let mut optind = self
-            .shell_state
-            .env_vars
-            .get("OPTIND")
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(1);
+        let mut optind = self.getopts_start_optind();
         let mut offset = self
             .shell_state
             .env_vars
@@ -106,24 +111,36 @@ impl Executor {
         }
 
         let Some(spec_index) = optspec.find(option) else {
-            // getopts.def G_INVALID_OPT: bind name "?" first (invalid
-            // identifiers report here and fail the call), then either bind
-            // OPTARG = option character (silent) or unbind OPTARG and print
-            // the diagnostic (unless OPTERR suppresses it).
+            // getopts.def G_INVALID_OPT: the OPTIND bind (line 243)
+            // precedes every outcome branch; bind name "?" next (invalid
+            // identifiers report here and fail the call), then either
+            // bind OPTARG = option character (silent) or unbind OPTARG.
+            // A name bind that died in the OPTIND arithmetic evaluation
+            // (name == "OPTIND", value "?") abandons the call before the
+            // OPTARG step runs (rubash#1270).
             self.shell_state
                 .env_vars
                 .insert("__RUBASH_GETOPTS_OFFSET".to_string(), offset.to_string());
-            self.set_optind(optind);
-            if silent {
-                let status = self.getopts_bind_name(&variable, "?", stderr);
-                self.getopts_bind_optarg_checked(&option.to_string(), stderr);
-                return status;
-            }
-            self.getopts_unbind_optarg();
-            if self.getopts_opterr_enabled() {
+            // The scan-time diagnostic comes out of sh_getopt itself,
+            // BEFORE dogetopts binds OPTIND (line 243) — with a readonly
+            // OPTIND the `illegal option` line precedes the readonly
+            // report (rubash#1268/#1270).
+            if !silent && self.getopts_opterr_enabled() {
                 let _ = writeln!(stderr, "{}", self.getopts_invalid_option_diagnostic(option));
             }
-            return self.getopts_bind_name(&variable, "?", stderr);
+            self.set_optind(optind, stderr);
+            if silent {
+                let status = self.getopts_bind_name(&variable, "?", stderr);
+                if !self.take_getopts_optind_arith_fatal() {
+                    self.getopts_bind_optarg_checked(&option.to_string(), stderr);
+                }
+                return status;
+            }
+            let status = self.getopts_bind_name(&variable, "?", stderr);
+            if !self.take_getopts_optind_arith_fatal() {
+                self.getopts_unbind_optarg();
+            }
+            return status;
         };
 
         let requires_arg = optspec[spec_index + option.len_utf8()..].starts_with(':');
@@ -145,48 +162,57 @@ impl Executor {
             };
 
             let Some(argument) = argument else {
-                // getopts.def G_ARG_MISSING: silent binds name ":" and
-                // OPTARG = option character; otherwise name "?" with OPTARG
-                // unbound and the "option requires an argument" diagnostic
-                // (suppressed when OPTERR is 0).
+                // getopts.def G_ARG_MISSING: the scan-time diagnostic
+                // comes first; silent then binds name ":" and OPTARG =
+                // option character, otherwise name "?" with OPTARG
+                // unbound. The OPTIND bind (line 243) precedes all of it,
+                // and an OPTIND arithmetic death at the name bind skips
+                // the OPTARG step (rubash#1270).
                 self.shell_state
                     .env_vars
                     .insert("__RUBASH_GETOPTS_OFFSET".to_string(), offset.to_string());
-                self.set_optind(optind);
-                if silent {
-                    let status = self.getopts_bind_name(&variable, ":", stderr);
-                    self.getopts_bind_optarg_checked(&option.to_string(), stderr);
-                    return status;
-                }
-                self.getopts_unbind_optarg();
-                if self.getopts_opterr_enabled() {
+                if !silent && self.getopts_opterr_enabled() {
                     let _ = writeln!(
                         stderr,
                         "{}: option requires an argument -- {option}",
                         self.script_name_value()
                     );
                 }
-                return self.getopts_bind_name(&variable, "?", stderr);
+                self.set_optind(optind, stderr);
+                if silent {
+                    let status = self.getopts_bind_name(&variable, ":", stderr);
+                    if !self.take_getopts_optind_arith_fatal() {
+                        self.getopts_bind_optarg_checked(&option.to_string(), stderr);
+                    }
+                    return status;
+                }
+                let status = self.getopts_bind_name(&variable, "?", stderr);
+                if !self.take_getopts_optind_arith_fatal() {
+                    self.getopts_unbind_optarg();
+                }
+                return status;
             };
 
-            // Success: bind OPTARG, then the option character into name. The
-            // return code is the name bind's result (getopts.def line 305).
-            self.getopts_bind_optarg_checked(&argument, stderr);
-            let status = self.getopts_bind_name(&variable, &option.to_string(), stderr);
+            // Success (getopts.def): the OPTIND bind (line 243) lands
+            // first, then OPTARG (line 301), then the option character
+            // into name (line 305); the return code is the name bind's.
+            // Binding the counter first is what lets a name of OPTIND be
+            // overwritten by the arith-evaluated option character
+            // (rubash#1270).
+            self.set_optind(optind, stderr);
             self.shell_state
                 .env_vars
                 .insert("__RUBASH_GETOPTS_OFFSET".to_string(), offset.to_string());
-            self.set_optind(optind);
-            return status;
+            self.getopts_bind_optarg_checked(&argument, stderr);
+            return self.getopts_bind_name(&variable, &option.to_string(), stderr);
         }
 
-        self.getopts_unbind_optarg();
-        let status = self.getopts_bind_name(&variable, &option.to_string(), stderr);
+        self.set_optind(optind, stderr);
         self.shell_state
             .env_vars
             .insert("__RUBASH_GETOPTS_OFFSET".to_string(), offset.to_string());
-        self.set_optind(optind);
-        status
+        self.getopts_unbind_optarg();
+        self.getopts_bind_name(&variable, &option.to_string(), stderr)
     }
 
     pub(in crate::executor) fn getopts_invalid_option_diagnostic(&self, option: char) -> String {
@@ -231,11 +257,54 @@ impl Executor {
             );
             return 2;
         }
+        if variable == "OPTIND" {
+            return self.getopts_bind_optind_name(value, stderr);
+        }
         if self.getopts_apply_bind("getopts", variable, value, stderr) {
             0
         } else {
             2
         }
+    }
+
+    /// The name bind for name == "OPTIND" (rubash#1270): GNU creates
+    /// OPTIND with att_integer, so bind_variable arith-evaluates the
+    /// option character on its way in. A letter evaluates as an
+    /// identifier (an unset name is 0; a set one's integer value is
+    /// used) and overwrites the counter bound moments earlier, while
+    /// `?`/`:` are evalexp syntax errors — the diagnostic prints, the
+    /// call fails with status 1, OPTIND keeps the counter value, and
+    /// the caller skips the pending OPTARG step.
+    fn getopts_bind_optind_name<W>(&mut self, value: &str, stderr: &mut W) -> i32
+    where
+        W: Write,
+    {
+        let evaluated: i64 = match value {
+            "?" | ":" => {
+                let _ = writeln!(
+                    stderr,
+                    "{}getopts: {value}: arithmetic syntax error: operand expected (error token is \"{value}\")",
+                    self.diagnostic_prefix()
+                );
+                self.getopts_optind_arith_fatal = true;
+                return 1;
+            }
+            _ if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
+                value.parse().unwrap_or(0)
+            }
+            _ if value.len() == 1
+                && (value.as_bytes()[0].is_ascii_alphabetic() || value.as_bytes()[0] == b'_') =>
+            {
+                self.shell_state
+                    .env_vars
+                    .get(value)
+                    .and_then(|current| current.trim().parse::<i64>().ok())
+                    .unwrap_or(0)
+            }
+            _ => 0,
+        };
+        self.write_optind_value(evaluated.to_string());
+        0
     }
 
     /// GNU getopts binds through bind_variable whose diagnostics go to the
@@ -309,16 +378,69 @@ impl Executor {
     where
         W: Write,
     {
+        // getopts.def: the OPTIND bind (line 243) precedes the G_EOF
+        // branch too — a readonly OPTIND reports on the EOF call as well
+        // (rubash#1268).
+        self.set_optind(optind, stderr);
         self.getopts_unbind_optarg();
         let _ = self.getopts_bind_name(variable, "?", stderr);
-        self.set_optind(optind);
+        let _ = self.take_getopts_optind_arith_fatal();
         self.shell_state
             .env_vars
             .insert("__RUBASH_GETOPTS_OFFSET".to_string(), "1".to_string());
     }
 
-    pub(in crate::executor) fn set_optind(&mut self, optind: usize) {
-        let value = optind.to_string();
+    fn take_getopts_optind_arith_fatal(&mut self) -> bool {
+        std::mem::take(&mut self.getopts_optind_arith_fatal)
+    }
+
+    /// The counter the next getopts call resumes from. GNU keeps it in
+    /// the internal sh_optind (getopts.def dogetopts reads the OPTIND
+    /// variable only through getopts_reset when the user assigns it);
+    /// when OPTIND is readonly the variable can never carry the counter,
+    /// so the advancing value rides in a shadow key instead
+    /// (rubash#1268).
+    fn getopts_start_optind(&self) -> usize {
+        if is_marked_var(&self.shell_state.env_vars, READONLY_VARS, "OPTIND") {
+            if let Some(shadow) = self
+                .shell_state
+                .env_vars
+                .get("__RUBASH_GETOPTS_OPTIND")
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+            {
+                return shadow;
+            }
+        }
+        self.shell_state
+            .env_vars
+            .get("OPTIND")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1)
+    }
+
+    pub(in crate::executor) fn set_optind<W>(&mut self, optind: usize, stderr: &mut W)
+    where
+        W: Write,
+    {
+        // GNU getopts.def:243: dogetopts binds OPTIND through
+        // bind_variable on every call. A readonly OPTIND reports
+        // `OPTIND: readonly variable`, keeps its value, and the internal
+        // counter still advances (rubash#1268) — the shadow key carries
+        // it to the next call (see getopts_start_optind).
+        if is_marked_var(&self.shell_state.env_vars, READONLY_VARS, "OPTIND") {
+            let _ = writeln!(stderr, "{}OPTIND: readonly variable", self.error_prefix());
+            self.shell_state
+                .env_vars
+                .insert("__RUBASH_GETOPTS_OPTIND".to_string(), optind.to_string());
+            return;
+        }
+        self.shell_state.env_vars.remove("__RUBASH_GETOPTS_OPTIND");
+        self.write_optind_value(optind.to_string());
+    }
+
+    fn write_optind_value(&mut self, value: String) {
         self.shell_state
             .env_vars
             .insert("OPTIND".to_string(), value.clone());

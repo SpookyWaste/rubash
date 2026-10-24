@@ -1,6 +1,37 @@
 use super::*;
 use crate::executor::markers::STORAGE_WORD_PREFIX;
 
+/// Scan a declare/typeset command line the way GNU's internal getopt
+/// scans it (declare.def DECLARE_OPTS "acfgilnprtuxAFGI"): every
+/// `-`/`+` word contributes its letters in order, up to a `--`
+/// terminator or the first letter outside the option set — getopt
+/// reports that letter and the scan goes no further. Returns the valid
+/// letters seen and the first invalid letter, if any. Substring tests
+/// like `word.contains('f')` mistake operand text for options — the
+/// word `--badflag` contains both `f` and `a`, which routed plain
+/// `declare --badflag` into the function path and reported `-a`
+/// (rubash#1259).
+fn scan_declare_options(args: &[String]) -> (Vec<char>, Option<char>) {
+    const VALID: &str = "acfgilnprtuxAFGI";
+    let mut letters = Vec::new();
+    for arg in args {
+        if arg == "--" {
+            break;
+        }
+        if !(arg.starts_with('-') || arg.starts_with('+')) || arg.len() <= 1 {
+            continue;
+        }
+        for ch in arg[1..].chars() {
+            if VALID.contains(ch) {
+                letters.push(ch);
+            } else {
+                return (letters, Some(ch));
+            }
+        }
+    }
+    (letters, None)
+}
+
 impl Executor {
     pub(in crate::executor) fn execute_declare_functions(
         &mut self,
@@ -13,32 +44,32 @@ impl Executor {
         // bodies, so render the simple function form used by builtins6.sub.
         // GNU declare.def declare_invalid_opts: att_function combined with
         // att_array/att_assoc/att_integer/att_nameref is a usage error.
-        let function_flag_on = args
-            .iter()
-            .any(|arg| arg.starts_with('-') && arg.contains('f'));
+        let (option_letters, invalid_letter) = scan_declare_options(args);
+        let function_flag_on = option_letters.contains(&'f');
         if function_flag_on {
-            let mut bad_opt: Option<&str> = None;
-            for arg in args {
-                if !arg.starts_with('-') {
-                    continue;
-                }
-                if arg.contains('n') {
-                    bad_opt = Some("-n");
-                    break;
-                }
-                if arg.contains('i') {
-                    bad_opt = Some("-i");
-                    break;
-                }
-                if arg.contains('A') {
-                    bad_opt = Some("-A");
-                    break;
-                }
-                if arg.contains('a') {
-                    bad_opt = Some("-a");
-                    break;
-                }
+            // A getopt-level invalid letter is reported (with usage,
+            // EX_USAGE) before the attribute-combination check below:
+            // `declare -fZ x` names `-Z`, never a combination
+            // (rubash#1259).
+            if let Some(invalid) = invalid_letter {
+                writeln!(
+                    stderr,
+                    "{}declare: -{invalid}: invalid option",
+                    self.diagnostic_prefix()
+                )?;
+                writeln!(
+                    stderr,
+                    "declare: usage: declare [-aAfFgiIlnrtux] [name[=value] ...] or declare -p [-aAfFilnrtux] [name ...]"
+                )?;
+                return Ok(2);
             }
+            // GNU declare.def declare_invalid_opts checks the conflicting
+            // attributes in a fixed n/i/A/a priority, independent of the
+            // order the letters appear in the command line.
+            let bad_opt: Option<String> = ['n', 'i', 'A', 'a']
+                .iter()
+                .find(|letter| option_letters.contains(letter))
+                .map(|letter| format!("-{letter}"));
             if let Some(opt) = bad_opt {
                 writeln!(
                     stderr,
@@ -70,7 +101,14 @@ impl Executor {
             .filter(|arg| !arg.starts_with('-') && !arg.starts_with('+'))
             .map(String::as_str)
             .collect();
-        let print_not_found = args.iter().any(|arg| arg == "-p");
+        // GNU declare.def: the -p flag may arrive inside a cluster
+        // (`declare -pf NAME`), so test for a `p` in any `-` option word,
+        // exactly like the `print` scan below — an exact "-p" match left
+        // `declare -pf NOPE` silent (rubash#1327). Bare `-f`/`-F` without
+        // -p stays silent on both shells.
+        let print_not_found = args
+            .iter()
+            .any(|arg| arg.starts_with('-') && arg.contains('p'));
         let function_names_only = args
             .iter()
             .any(|arg| arg.starts_with('-') && arg.contains('F'));
@@ -517,6 +555,17 @@ impl Executor {
                     // "cannot assign list to array member" before the
                     // subscript is ever evaluated — leave it alone.
                     if is_compound {
+                        return Ok(arg.clone());
+                    }
+                    // GNU builtins/setattr.def: export/readonly NEVER
+                    // treat `name[sub]=value` as an element assignment —
+                    // the operand is rejected as not a valid identifier
+                    // with the subscript text verbatim, evaluated never
+                    // (rubash#1421: `export 'a[i+1]=Q'` must not become
+                    // `a[2]=Q`, and `a[i++]` must not increment i).
+                    // Pass the operand through untouched; setattr's own
+                    // identifier validation reports it.
+                    if !declare_family {
                         return Ok(arg.clone());
                     }
                     // GNU declare.def:592-600 + tokenize_array_reference
@@ -1132,10 +1181,8 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
-        if cmd.words[1..].iter().any(|word| {
-            (word.starts_with('-') || word.starts_with('+'))
-                && (word.contains('f') || word.contains('F'))
-        }) {
+        let (option_letters, _) = scan_declare_options(&cmd.words[1..]);
+        if option_letters.contains(&'f') || option_letters.contains(&'F') {
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             self.exit_code =

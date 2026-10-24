@@ -11,6 +11,22 @@ use super::value::{
 use super::{ExportMode, EXECUTION_FAILURE, EXECUTION_SUCCESS, READONLY_VARS};
 use crate::executor::local_helpers::sync_shell_assignment_process_env;
 
+/// The subject GNU's sh_invalidid names for a bad assignment operand
+/// (rubash#1348): when the name portion parses as an array-element
+/// reference — a valid identifier base followed by a `[...]` subscript —
+/// the subject is that name portion (`a[0]` for `a[0]=x`); otherwise the
+/// whole operand word is named (`9bad=v`, `9x[0]=v`, `a-b=v`).
+fn invalid_id_subject<'a>(arg: &'a str, name: &'a str) -> &'a str {
+    if name.ends_with(']') {
+        if let Some((base, _)) = name.split_once('[') {
+            if valid_identifier(base) {
+                return name;
+            }
+        }
+    }
+    arg
+}
+
 pub(super) fn apply_export_arg<W>(
     arg: &str,
     mode: ExportMode,
@@ -19,16 +35,28 @@ pub(super) fn apply_export_arg<W>(
     env_vars: &mut crate::shell::var_table::VarTable,
     stderr: &mut W,
     oob_word: &mut Option<String>,
+    traced: Option<&mut Vec<(String, bool, String)>>,
 ) -> io::Result<i32>
 where
     W: Write,
 {
     let (name, append, value) = split_assignment(arg);
+    // The operand as written: GNU's per-assignment xtrace line
+    // (subst.c:3580 xtrace_print_assignment via setattr.def's
+    // do_assignment_no_expand) names the written name, even when the
+    // bind lands on a nameref's resolved cell (rubash#1340).
+    let written_name = name.to_string();
+    let rhs_text = value.map(str::to_string);
     if !valid_identifier(name) {
+        // GNU sh_invalidid's subject: for a word that parses as an
+        // array-element assignment (valid identifier base + `[...]`),
+        // the name-with-subscript is reported (`a[0]=x' complains about
+        // `a[0]'); anything else reports the whole operand word
+        // (`9bad=v', `9x[0]=v', `a-b=v') — rubash#1348.
         let diagnostic = format!(
             "{}export: `{}': not a valid identifier\n",
             diagnostic_prefix(),
-            arg
+            invalid_id_subject(arg, name)
         );
         stderr.write_all(diagnostic.as_bytes())?;
         return Ok(EXECUTION_FAILURE);
@@ -107,6 +135,14 @@ where
             if oob_word.is_some() {
                 return Ok(EXECUTION_FAILURE);
             }
+            // The bind happened: record it for the caller's xtrace line
+            // (subst.c:3580 — one line per performed assignment operand,
+            // export/readonly only; declare/typeset/local do not trace
+            // theirs). Compound operands are skipped by the emitter: the
+            // declaration expansion phase already traced them (rubash#1340).
+            if let (Some(traced), Some(rhs)) = (traced, rhs_text) {
+                traced.push((written_name, append, rhs));
+            }
             // GNU variables.c make_env_array_from_var_list: array and
             // associative variables never cross the child env boundary
             // (ARRAY_EXPORT off), so `export A` / `export -a A=(x y)` on an
@@ -119,6 +155,41 @@ where
             mark_exported(env_vars, name);
         }
         ExportMode::Unset => {
+            // GNU setattr.def set_or_show_attributes: an assignment
+            // operand is bound FIRST (bind_variable) and only then is
+            // att_exported removed, so `export -n name=value` keeps the
+            // new value as a plain shell variable (rubash#1330). Dropping
+            // the operand entirely lost the value.
+            if let Some(assigned) = value {
+                if env_vars.is_marked(READONLY_VARS, name) {
+                    writeln!(
+                        stderr,
+                        "{}{}: readonly variable",
+                        readonly_error_prefix(env_vars),
+                        name
+                    )?;
+                    return Ok(EXECUTION_FAILURE);
+                }
+                let converted = env_vars.contains_key(name);
+                let (new_value, bound_array) = array_attribute_assignment_value(
+                    assigned,
+                    array,
+                    assoc,
+                    append,
+                    env_vars,
+                    name,
+                    oob_word,
+                );
+                env_vars.insert(name.to_string(), new_value);
+                if assoc {
+                    mark_assoc(env_vars, name, converted);
+                } else if array || bound_array {
+                    mark_array(env_vars, name);
+                }
+                if oob_word.is_some() {
+                    return Ok(EXECUTION_FAILURE);
+                }
+            }
             // Existence-gated process-env removal (#916/#917): the name
             // gate only applies to writes; an inherited copy must be
             // dropped so table-miss fallbacks do not resurrect it.
@@ -138,29 +209,24 @@ pub(super) fn apply_readonly_arg<W>(
     stderr: &mut W,
     context_name: Option<&str>,
     oob_word: &mut Option<String>,
+    traced: Option<&mut Vec<(String, bool, String)>>,
 ) -> io::Result<i32>
 where
     W: Write,
 {
     let (name, append, value) = split_assignment(arg);
+    // Written operand name + RHS for the xtrace record (rubash#1340, see
+    // apply_export_arg).
+    let written_name = name.to_string();
+    let rhs_text = value.map(str::to_string);
     if !valid_identifier(name) {
-        if name.ends_with(']') {
-            if let Some((base, _)) = name.split_once('[') {
-                if valid_identifier(base) {
-                    let diagnostic = format!(
-                        "{}readonly: `{}': not a valid identifier\n",
-                        diagnostic_prefix(),
-                        arg
-                    );
-                    stderr.write_all(diagnostic.as_bytes())?;
-                    return Ok(EXECUTION_FAILURE);
-                }
-            }
-        }
+        // Same sh_invalidid subject rule as apply_export_arg
+        // (rubash#1348): name-with-subscript for a valid-base element
+        // form, the whole operand word otherwise.
         let diagnostic = format!(
             "{}readonly: `{}': not a valid identifier\n",
             diagnostic_prefix(),
-            arg
+            invalid_id_subject(arg, name)
         );
         stderr.write_all(diagnostic.as_bytes())?;
         return Ok(EXECUTION_FAILURE);
@@ -237,6 +303,11 @@ where
     // fail here, diagnostic + DISCARD abort at the Executor layer.
     if oob_word.is_some() {
         return Ok(EXECUTION_FAILURE);
+    }
+    // The bind happened: record it for the caller's xtrace line
+    // (subst.c:3580, rubash#1340 — see apply_export_arg).
+    if let (Some(traced), Some(rhs)) = (traced, rhs_text) {
+        traced.push((written_name, append, rhs));
     }
     // Same array-export contract as apply_export_arg above (GNU variables.c
     // make_env_array_from_var_list, rubash#534): a readonly array keeps the

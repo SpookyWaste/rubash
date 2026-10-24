@@ -1,0 +1,10 @@
+cur: 0022
+sym: u=rwx,g=rx,o=rx
+reuse: umask 0022
+in-sub: 0077
+after-sub: 0022
+padded: 0000
+symset: u=rwx,g=,o=
+0077
+after-all: 0022
+done

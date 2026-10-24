@@ -103,6 +103,7 @@ where
     let mut clean_env = false;
     let mut login = false;
     let mut argv0 = None;
+    let mut help = false;
     let Some(index) = parse_options(
         args,
         stderr,
@@ -110,8 +111,12 @@ where
         &mut clean_env,
         &mut login,
         &mut argv0,
+        &mut help,
     )?
     else {
+        if help {
+            crate::builtins::help::print_builtin_help("exec", stdout)?;
+        }
         return Ok(EX_BADUSAGE);
     };
 
@@ -215,6 +220,7 @@ where
         return match child_stdio {
             Some((child_stdout, child_stderr)) => run_external_exec_with_stdio(
                 &program,
+                command,
                 operands,
                 env_vars,
                 clean_env,
@@ -226,6 +232,7 @@ where
             ),
             None => run_external_exec(
                 &program,
+                command,
                 operands,
                 env_vars,
                 clean_env,
@@ -244,6 +251,7 @@ pub(crate) fn command_operand_index(args: &[String]) -> Option<usize> {
     let mut clean_env = false;
     let mut login = false;
     let mut argv0 = None;
+    let mut help = false;
     parse_options(
         args,
         &mut io::sink(),
@@ -251,6 +259,7 @@ pub(crate) fn command_operand_index(args: &[String]) -> Option<usize> {
         &mut clean_env,
         &mut login,
         &mut argv0,
+        &mut help,
     )
     .ok()
     .flatten()
@@ -264,6 +273,7 @@ fn parse_options<W>(
     clean_env: &mut bool,
     login: &mut bool,
     argv0: &mut Option<String>,
+    help: &mut bool,
 ) -> io::Result<Option<usize>>
 where
     W: Write,
@@ -273,6 +283,14 @@ where
     while let Some(arg) = args.get(index) {
         if arg == "--" {
             return Ok(Some(index + 1));
+        }
+        // GNU exec.def's getopt table maps --help to CASE_HELPOPT: print
+        // the long help to stdout and fail with EX_USAGE (rubash#1229).
+        // Checked only in option position: after `--`, or consumed as
+        // -a's argument, "--help" is data, exactly as under getopt.
+        if arg == "--help" {
+            *help = true;
+            return Ok(None);
         }
         let Some(options) = arg.strip_prefix('-') else {
             break;
@@ -315,6 +333,7 @@ where
 
 fn run_external_exec<W, E>(
     program: &std::path::Path,
+    command_name: &str,
     operands: &[String],
     env_vars: &crate::shell::var_table::VarTable,
     clean_env: bool,
@@ -327,7 +346,8 @@ where
     W: Write,
     E: Write,
 {
-    let mut process = external_exec_process(program, operands, env_vars, clean_env, argv0);
+    let mut process =
+        external_exec_process(program, command_name, operands, env_vars, clean_env, argv0);
     process.stdout(Stdio::piped()).stderr(Stdio::piped());
     // std's Command::output() defaults stdin to Stdio::null() when .stdin()
     // is never called — a capture-path `$(exec cat)` then reads EOF on a
@@ -364,6 +384,7 @@ where
 
 fn run_external_exec_with_stdio<E>(
     program: &std::path::Path,
+    command_name: &str,
     operands: &[String],
     env_vars: &crate::shell::var_table::VarTable,
     clean_env: bool,
@@ -376,7 +397,8 @@ fn run_external_exec_with_stdio<E>(
 where
     E: Write,
 {
-    let mut process = external_exec_process(program, operands, env_vars, clean_env, argv0);
+    let mut process =
+        external_exec_process(program, command_name, operands, env_vars, clean_env, argv0);
     process.stdout(child_stdout).stderr(child_stderr);
     // Explicit for symmetry with run_external_exec: `.status()` would
     // inherit by default, but every spawn site of the exec builtin must
@@ -405,6 +427,7 @@ where
 
 fn external_exec_process(
     program: &std::path::Path,
+    command_name: &str,
     operands: &[String],
     env_vars: &crate::shell::var_table::VarTable,
     clean_env: bool,
@@ -423,11 +446,18 @@ fn external_exec_process(
     ) {
         command
     } else {
+        // Non-script targets get the command word as typed for argv[0]
+        // (shell_execve via external_command_for_named_program), NOT the
+        // resolved program's file stem: `exec /usr/bin/bash -c 'echo $0'`
+        // reports /usr/bin/bash in GNU (rubash#1227).
         let (command, _) = crate::executor::path::external_command_for_named_program(
             program,
-            program.file_stem().and_then(|stem| stem.to_str()),
+            Some(command_name),
             operands,
             env_vars,
+            env_vars
+                .get("BASH_ARGV0")
+                .is_some_and(|value| !value.is_empty()),
         );
         command
     };

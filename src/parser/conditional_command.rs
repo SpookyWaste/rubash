@@ -143,6 +143,10 @@ enum CondOffending {
     VirtualNewline(usize),
     Eof,
     End,
+    /// A pre-shaped near token (rubash#1353's IO_NUMBER form): the text
+    /// is the exact `syntax error near' payload and the index names the
+    /// argument whose line the report uses.
+    Fixed(String, usize),
     /// parse_matched_pair's EOF inside the `=~` regex word: the specific
     /// messages carry everything and PST_NOERROR suppresses the
     /// report_syntax_error tail — messages only, no echo, no `from [[` line.
@@ -208,6 +212,9 @@ impl CondFail {
                 args[*index].3,
                 args[*index].3,
             ),
+            CondOffending::Fixed(text, index) => {
+                (text.clone(), args[*index].3, args[*index].3)
+            }
             CondOffending::End => ("]]".to_string(), last_line, last_line),
             CondOffending::VirtualNewline(anchor) => {
                 let last = (*anchor).min(args.len()).saturating_sub(1);
@@ -282,8 +289,19 @@ fn walk_back_near_token(args: &[CondArg], index: usize) -> String {
     // `\<'', not `<').
     let orig = index;
     let mut start = index;
-    while start > 0 && args[start].2.is_empty() {
-        start -= 1;
+    // rubash#1353: an offending fragment that itself starts with a break
+    // character (a single `&' or `|') BEGINS GNU's reported token — the
+    // error_token_from_text scan cannot cross a break character
+    // backwards, so glued predecessors stay out (`a&b' reports `&b',
+    // not `a&b'; `-n x&y' reports `&y').
+    let offender_raw = &args[orig].1;
+    let break_led = (offender_raw.starts_with('&') || offender_raw.starts_with('|'))
+        && offender_raw != "&&"
+        && offender_raw != "||";
+    if !break_led {
+        while start > 0 && args[start].2.is_empty() {
+            start -= 1;
+        }
     }
     // GNU's scan (parse.y:6787-6793) is anchored at the end of the token
     // the reader consumed and walks back over non-break characters
@@ -304,10 +322,22 @@ fn walk_back_near_token(args: &[CondArg], index: usize) -> String {
     {
         end += 1;
     }
-    (start..=end)
+    let mut near: String = (start..=end)
         .filter_map(|i| args.get(i))
         .map(|(_, raw, _, _)| raw.as_str())
-        .collect()
+        .collect();
+    // rubash#1353: the final collected fragment can carry the `]]'
+    // closer glued onto it (`5&3]]' collects one fragment `&3]]');
+    // GNU's reader always tokenizes `]]' separately, so it is never
+    // part of the reported token (`&3', not `&3]]').
+    if end == args.len().saturating_sub(1) {
+        if let Some(stripped) = near.strip_suffix("]]") {
+            if !stripped.is_empty() {
+                near = stripped.to_string();
+            }
+        }
+    }
+    near
 }
 
 /// The GNU yacc-level token for one collected argument. Shell metacharacters
@@ -456,6 +486,36 @@ fn etext(tok: &CondTok) -> &'static str {
     }
 }
 
+/// rubash#1353: the IO_NUMBER error shape. When the primary word is an
+/// unquoted digit run glued to `<'/`>' characters (`1<', `12>>'), GNU's
+/// cond reader has lexed it as IO_NUMBER + redirection operator, and
+/// cond_error (parse.y:5010-5013) reports `unexpected token `DIGITS' in
+/// conditional command' with a near of the digits plus ONE operator
+/// character. Returns None for every other primary shape.
+fn io_number_cond_fail(args: &[CondArg], word_index: usize, line: usize) -> Option<CondFail> {
+    let (value, raw, _, _) = &args[word_index];
+    if raw != value {
+        return None;
+    }
+    let digits_len = raw.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits_len == 0 || digits_len == raw.len() {
+        return None;
+    }
+    let rest = &raw[digits_len..];
+    if !rest.chars().all(|c| c == '<' || c == '>') {
+        return None;
+    }
+    let digits = &raw[..digits_len];
+    let op = rest.chars().next()?;
+    Some(CondFail {
+        messages: vec![(
+            line,
+            format!("unexpected token `{digits}' in conditional command"),
+        )],
+        offending: CondOffending::Fixed(format!("{digits}{op}"), word_index),
+    })
+}
+
 /// cond_term (parse.y:5074-5247). `Err` carries the printed parser_error
 /// messages and the offending token — equivalent to COND_RETURN_ERROR.
 fn cond_term(cursor: &mut CondCursor) -> Result<(), CondFail> {
@@ -500,7 +560,8 @@ fn cond_term(cursor: &mut CondCursor) -> Result<(), CondFail> {
         }
         CondTok::Bang => cond_term(cursor),
         CondTok::Word => {
-            let word = cursor.args[index.unwrap()].0.clone();
+            let word_index = index.unwrap();
+            let word = cursor.args[word_index].0.clone();
             // GNU parse.y:5125 tests the parser's word text, which still
             // carries quote characters (quote removal is deferred to
             // expansion, subst.c dequote_string) — a quoted `"-a"` starts
@@ -608,7 +669,27 @@ fn cond_term(cursor: &mut CondCursor) -> Result<(), CondFail> {
                     Ok(())
                 }
                 _ => {
+                    // rubash#1353: a primary word of the form DIGITS+</>
+                    // (`1<', `12>') is GNU's IO_NUMBER token — the cond
+                    // reader lexes digit runs before a redirection
+                    // operator as IO_NUMBER, which is illegal at term
+                    // position, and cond_error reports the DIGITS with
+                    // the `in conditional command' wording and a near of
+                    // digits + the single operator character (`1<').
+                    if let Some(fail) = io_number_cond_fail(cursor.args, word_index, line) {
+                        return Err(fail);
+                    }
                     let text = cond_offending_text(cursor, &tok, index);
+                    // rubash#1353: an offending fragment LED by a single
+                    // `&' or `|' names just that character in GNU's
+                    // report (`unexpected token `&'' for `&3]]'), not the
+                    // whole glued fragment.
+                    let text = match text.chars().next() {
+                        Some(c @ ('&' | '|')) if text != "&&" && text != "||" => {
+                            c.to_string()
+                        }
+                        _ => text,
+                    };
                     Err(CondFail {
                         messages: vec![(
                             line,

@@ -1,0 +1,15 @@
+source rc=2
+eval rc=2
+command rc=2
+builtin rc=2
+type rc=2
+hash rc=2
+exec rc=2
+printf rc=2
+source: source [-p path] filename [arguments]
+type: type [-afptP] name [name ...]
+hash: hash [-lr] [-p pathname] [-dt] [name ...]
+eval: eval [arg ...]
+command: command [-pVv] command [arg ...]
+builtin: builtin [shell-builtin [arg ...]]
+exec: exec [-cl] [-a name] [command [argument ...]] [redirection ...]

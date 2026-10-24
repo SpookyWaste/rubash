@@ -180,6 +180,12 @@ impl Executor {
         if self.shell_state.arithmetic_nounset_error.get() {
             return;
         }
+        // rubash#1238: a readonly bind failure already printed its one
+        // diagnostic (`name: readonly variable`); GNU emits no evalerror
+        // after it, so suppress the synthesized syntax error.
+        if self.shell_state.arithmetic_readonly_error.get() {
+            return;
+        }
         if self.report_subscript_eval_failure() {
             return;
         }
@@ -190,6 +196,13 @@ impl Executor {
         if let Some(record) = record_opt {
             let rendered = record.render();
             self.arith_diag(&format!("{}((: {}\n", self.error_prefix(), rendered));
+            return;
+        }
+        // A fatal NESTED expansion error (`((i<$((1/0))))`) already
+        // printed its own diagnostic during expand_arith_string and the
+        // evaluation was abandoned before parsing (evalerror); do not
+        // synthesize a second message from the raw text.
+        if self.shell_state.arithmetic_fatal_error.get() {
             return;
         }
         let display = raw_display.trim_start_matches([' ', '\t']);
@@ -217,6 +230,10 @@ impl Executor {
         // reported the unbound variable and jumped out — no evalerror
         // follows (rubash#1150, `let u++` double-reported).
         if self.shell_state.arithmetic_nounset_error.get() {
+            return;
+        }
+        // rubash#1238: same single-diagnostic rule for readonly binds.
+        if self.shell_state.arithmetic_readonly_error.get() {
             return;
         }
         // GNU expr.c: a failed array SUBSCRIPT eval (nested evalexp inside
@@ -292,10 +309,22 @@ impl Executor {
             .or_else(|| cmd.words.get(1).map(String::as_str))
             .unwrap_or_default();
         // GNU execute_cmd.c:3940-3945: if `set -x` is on, print `(( expr ))`
-        // before evaluating the arithmetic command.  Use the raw expression to
-        // preserve original whitespace.
-        let xtrace_expr = raw_expression.unwrap_or(expression);
-        self.xtrace_print_arith_cmd(xtrace_expr);
+        // before evaluating the arithmetic command. print_cmd.c:986
+        // xtrace_print_arith_cmd renders the EXPANDED expression
+        // (expand_arith_string output) with its whitespace verbatim,
+        // wrapped as `(( <text> ))` — `(( 1 + 1 ))` traces
+        // `+ ((  1 + 1  ))`, `((1+1))` traces `+ (( 1+1 ))`. The old call
+        // used the arith-for renderer, whose leading-blank trim fits the
+        // for-loop sections (their word lists drop the blanks) but eats
+        // a plain (( )) body's leading blanks (rubash#1344).
+        // arith_display_expand applies the parameter part of
+        // expand_arith_string to the raw capture; a command substitution
+        // in the body still renders literally here (residual).
+        if self.xtrace_enabled() {
+            let raw = raw_expression.unwrap_or(expression);
+            let display = self.arith_display_expand(raw);
+            self.xtrace_print_arith_cmd_raw(&display);
+        }
         // GNU parse.y parse_arith_cmd captures the text between `((` and `))`
         // verbatim (whitespace included) and execute_arith_command hands it to
         // evalexp after expand_arith_string. The parser's joined `expression`
@@ -323,6 +352,7 @@ impl Executor {
             }
             return 1;
         }
+        self.shell_state.arithmetic_readonly_error.set(false);
         let eval_result = self.eval_arithmetic_command_value(raw_expression.unwrap_or(expression));
         // An invalid nameref-cell assignment inside `((` fails the command
         // with status 1 even though the expression itself evaluated.
@@ -499,6 +529,7 @@ impl Executor {
     }
 
     pub(in crate::executor) fn execute_let(&mut self, expressions: &[String]) -> i32 {
+        self.shell_state.arithmetic_readonly_error.set(false);
         // GNU let.def:85: a leading `--` argument is skipped (ISOPTION),
         // so `let -- 'expr'` evaluates expr, not `--` as an operand.
         let expressions = if expressions.first().map(String::as_str) == Some("--") {
@@ -510,8 +541,11 @@ impl Executor {
             // GNU execute_cmd.c: the diagnostic goes to the shell's
             // CURRENTLY BOUND fd 2 (redir.c) — an enclosing
             // `exec 2>/dev/null` contains it (rubash#218/#222-era leak).
+            // builtins/let.def: the message is a full line — the trailing
+            // newline is part of it (rubash#1242: the missing '\n' glued
+            // the next prompt/diagnostic onto the same line).
             let _ = self.write_default_stderr(
-                format!("{}let: expression expected", self.diagnostic_prefix()).as_bytes(),
+                format!("{}let: expression expected\n", self.diagnostic_prefix()).as_bytes(),
             );
             return 1;
         }

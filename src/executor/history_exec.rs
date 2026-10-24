@@ -236,6 +236,21 @@ pub(in crate::executor) fn execute_history_session(
                     Some(0)
                 }
             };
+            // rubash#1210: the SINGLE-offset delete follows history.def
+            // delete_history_offset -> history_offset_arg: a bare 0 (or -0)
+            // names no entry — GNU errors `history: 0: history position
+            // out of range` — while a RANGE may legitimately start at 0
+            // (remove_history_range maps it to the first entry). Keep the
+            // range arms on parse_pos; the single-offset arm uses this
+            // strict variant where 0 parses to no position.
+            let parse_single = |text: &str| -> Option<i128> {
+                let value: i128 = text.parse().ok()?;
+                if value == 0 {
+                    None
+                } else {
+                    parse_pos(text)
+                }
+            };
             if let Some(arg) = delete_offset.as_deref() {
                 let search_from = if arg.starts_with('-') { 1 } else { 0 };
                 let range_pos = arg[search_from..].find('-').map(|pos| pos + search_from);
@@ -289,7 +304,7 @@ pub(in crate::executor) fn execute_history_session(
                         }
                     }
                 } else {
-                    match parse_pos(arg) {
+                    match parse_single(arg) {
                         Some(index) if index >= 0 && (index as usize) < shell.entries.len() => {
                             shell.entries.remove(index as usize);
                             shell.timestamps.remove(index as usize);
@@ -385,6 +400,7 @@ pub(in crate::executor) fn execute_history_session(
         HistoryMode::Append | HistoryMode::Write | HistoryMode::Read | HistoryMode::ReadNew => {
             // history.def:159,273: filename is the first non-option argument
             // (loptend); fall back to $HISTFILE when none is given.
+            let from_histfile = operands.is_empty();
             let Some(path) = operands
                 .first()
                 .cloned()
@@ -397,6 +413,16 @@ pub(in crate::executor) fn execute_history_session(
                 );
                 return Ok(2);
             };
+            // GNU history.def: a null $HISTFILE is its own diagnostic
+            // (rubash#1289 B3), for both -w and -a.
+            if from_histfile && path.is_empty() {
+                let _ = writeln!(
+                    stderr,
+                    "{}history: HISTFILE: parameter null or not set",
+                    executor.diagnostic_prefix()
+                );
+                return Ok(1);
+            }
             // Translate Git-Bash/POSIX spellings (/c/..., /dev/null) to the
             // Windows forms the file APIs need; children see the same file.
             let path =
@@ -418,11 +444,33 @@ pub(in crate::executor) fn execute_history_session(
                 _ => Ok(0),
             };
             if let Err(err) = outcome {
-                let _ = writeln!(
-                    stderr,
-                    "{}history: {path}: cannot open: {err}",
-                    executor.diagnostic_prefix()
-                );
+                // GNU's diagnostic surface for -w/-a file errors is
+                // narrow (rubash#1289, verified on GNU bash 5.3.20):
+                // -w failures are silent; -a prints exactly one
+                // `cannot create' line and only when the open fails
+                // with ENOENT (missing parent) — a directory target
+                // (EISDIR) stays silent there too. Read modes keep the
+                // existing `cannot open' report.
+                match mode {
+                    HistoryMode::Write => {}
+                    HistoryMode::Append => {
+                        if err.raw_os_error() == Some(2) {
+                            let _ = writeln!(
+                                stderr,
+                                "{}history: {path}: cannot create: {}",
+                                executor.diagnostic_prefix(),
+                                crate::posix_errors::message(&err)
+                            );
+                        }
+                    }
+                    _ => {
+                        let _ = writeln!(
+                            stderr,
+                            "{}history: {path}: cannot open: {err}",
+                            executor.diagnostic_prefix()
+                        );
+                    }
+                }
                 return Ok(1);
             }
         }

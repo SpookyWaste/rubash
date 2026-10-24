@@ -288,8 +288,18 @@ fn read_scalar_fields_internal(
         // line 19: ` x  y\ \` -> x = `x  y`).
         let tail = trim_trailing_ifs_ws(lead, &ifs_chars).to_string();
         let tail = if interpret_backslashes {
-            // the escape-blind strip can leave a dangling backslash
-            tail.strip_suffix('\\').map(str::to_string).unwrap_or(tail)
+            // The escape-blind strip can leave a dangling backslash when
+            // the character it escaped was itself stripped as IFS
+            // whitespace — drop that one introducer. Only an ODD trailing
+            // run dangles: an even run is complete `\\` pairs, i.e. real
+            // record data that unescape folds to literal backslashes
+            // (rubash#1300: `printf 'a\\\\:b:c' | read -d: x` -> `a\`).
+            let run = tail.bytes().rev().take_while(|&b| b == b'\\').count();
+            if run % 2 == 1 {
+                tail.strip_suffix('\\').map(str::to_string).unwrap_or(tail)
+            } else {
+                tail
+            }
         } else {
             tail
         };

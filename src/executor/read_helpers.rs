@@ -7,24 +7,71 @@ pub(in crate::executor) struct TimeCommandMetrics {
     sys: std::time::Duration,
 }
 
+/// Start snapshot for a `time` measurement: wall clock plus the process
+/// CPU counters. GNU execute_cmd.c print_time_info reports the deltas of
+/// getrusage(RUSAGE_SELF) + getrusage(RUSAGE_CHILDREN) between the start
+/// and end of the timed command; rubash used to leave user/sys at zero
+/// unconditionally (rubash#1212).
+#[derive(Clone, Copy, Debug)]
+pub(in crate::executor) struct TimeCommandStart {
+    instant: std::time::Instant,
+    rusage: RusageCounters,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::executor) struct RusageCounters {
+    user: std::time::Duration,
+    sys: std::time::Duration,
+}
+
+#[cfg(unix)]
+fn read_rusage(who: libc::c_int) -> (std::time::Duration, std::time::Duration) {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(who, &mut usage) } != 0 {
+        return (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    }
+    let to_duration =
+        |tv: libc::timeval| std::time::Duration::new(tv.tv_sec as u64, (tv.tv_usec as u32) * 1_000);
+    (to_duration(usage.ru_utime), to_duration(usage.ru_stime))
+}
+
+#[cfg(unix)]
+fn rusage_counters() -> RusageCounters {
+    let (self_user, self_sys) = read_rusage(libc::RUSAGE_SELF);
+    let (child_user, child_sys) = read_rusage(libc::RUSAGE_CHILDREN);
+    RusageCounters {
+        user: self_user + child_user,
+        sys: self_sys + child_sys,
+    }
+}
+
+#[cfg(not(unix))]
+fn rusage_counters() -> RusageCounters {
+    RusageCounters::default()
+}
+
 impl TimeCommandMetrics {
-    pub(in crate::executor) fn from_start(started: std::time::Instant) -> Self {
+    pub(in crate::executor) fn from_start(started: TimeCommandStart) -> Self {
+        let now = rusage_counters();
         Self {
-            real: started.elapsed(),
-            user: std::time::Duration::ZERO,
-            sys: std::time::Duration::ZERO,
+            real: started.instant.elapsed(),
+            user: now.user.saturating_sub(started.rusage.user),
+            sys: now.sys.saturating_sub(started.rusage.sys),
         }
     }
 }
 
-pub(in crate::executor) fn time_command_started() -> std::time::Instant {
-    std::time::Instant::now()
+pub(in crate::executor) fn time_command_started() -> TimeCommandStart {
+    TimeCommandStart {
+        instant: std::time::Instant::now(),
+        rusage: rusage_counters(),
+    }
 }
 
 pub(in crate::executor) fn print_time(
     env_vars: &HashMap<String, String>,
     posix_format: bool,
-    started: std::time::Instant,
+    started: TimeCommandStart,
 ) {
     let metrics = TimeCommandMetrics::from_start(started);
     if let Some(report) = format_time_report(env_vars, posix_format, metrics) {
@@ -351,8 +398,17 @@ pub(in crate::executor) fn read_delimiter_needle(delimiter: char) -> String {
 /// marker pair (normalized records), the single-byte marker form a
 /// byte-locale delimiter takes (the delimiter char then stands for one
 /// raw byte), or the literal char (raw mirror texts such as
-/// FUNCTION_STDIN, which stores raw pipe bytes).
-pub(in crate::executor) fn record_contains_delimiter(text: &str, delimiter: char) -> bool {
+/// FUNCTION_STDIN, which stores raw pipe bytes). With `escape_aware`
+/// (a non-raw read with a non-newline delimiter), an occurrence whose
+/// character is backslash-escaped does not count (rubash#1300).
+pub(in crate::executor) fn record_contains_delimiter(
+    text: &str,
+    delimiter: char,
+    escape_aware: bool,
+) -> bool {
+    if escape_aware {
+        return unescaped_delimiter_index(text, delimiter).is_some();
+    }
     if text.contains(delimiter) || text.contains(&read_delimiter_needle(delimiter)) {
         return true;
     }
@@ -362,6 +418,39 @@ pub(in crate::executor) fn record_contains_delimiter(text: &str, delimiter: char
         return text.contains(&single);
     }
     false
+}
+
+/// Byte index of the first UNESCAPED delimiter occurrence in `text`,
+/// for non-raw reads (GNU builtins/read.def: a backslash consumes the
+/// following character as an escaped literal, and an escaped character
+/// can never be the delimiter — rubash#1300). Matches the same forms
+/// as record_contains_delimiter: the marker needle, the literal char,
+/// and the single-byte marker form of a U+0080..=U+00FF delimiter.
+pub(in crate::executor) fn unescaped_delimiter_index(text: &str, delimiter: char) -> Option<usize> {
+    let needle = read_delimiter_needle(delimiter);
+    let code = delimiter as u32;
+    let single = (0x80..=0xFF)
+        .contains(&code)
+        .then(|| substitution_metadata::bytes_to_shell_text(&[code as u8]));
+    let mut escaped = false;
+    for (index, ch) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        let rest = &text[index..];
+        if rest.starts_with(&needle)
+            || rest.starts_with(delimiter)
+            || single.as_deref().is_some_and(|form| rest.starts_with(form))
+        {
+            return Some(index);
+        }
+    }
+    None
 }
 
 /// Normalize a served `read` record into the shell's storage domain: every
@@ -429,15 +518,48 @@ pub(in crate::executor) fn stdin_unit_is_delimiter(unit: &StdinUnit, delimiter: 
     delimiter_byte_matches(byte, delimiter)
 }
 
+/// rubash#1250: poll the pending-signal mailbox for an untrapped
+/// SIGINT held by the foreground guard (the caller's `poll_sigint_abort`
+/// is the guard's armed state). Consumes the SIGINT, re-queues any
+/// other signal for its own boundary handling. Mirrors
+/// ForegroundBuiltinSigintGuard::take_sigint_abort for this free
+/// function's loops.
+fn take_untrapped_sigint() -> bool {
+    #[cfg(unix)]
+    {
+        let pending =
+            crate::builtins::kill::take_pending_signals_now(std::process::id()).unwrap_or_default();
+        if pending.is_empty() {
+            return false;
+        }
+        let mut rest = Vec::new();
+        let mut interrupted = false;
+        for signal in pending {
+            if signal == libc::SIGINT && crate::builtins::kill::kernel_handler_installed(signal) {
+                interrupted = true;
+            } else {
+                rest.push(signal);
+            }
+        }
+        crate::builtins::kill::requeue_pending_signals(rest);
+        return interrupted;
+    }
+    #[cfg(not(unix))]
+    false
+}
+
 pub(in crate::executor) fn read_stdin_until(
     deadline: Option<std::time::Instant>,
     silent: bool,
     delimiter: char,
     char_limit: Option<usize>,
     exact_char_limit: bool,
-) -> std::io::Result<(usize, String, bool, bool)> {
+    poll_sigint_abort: bool,
+    escape_aware: bool,
+    raw: bool,
+) -> std::io::Result<(usize, String, bool, bool, bool)> {
     if char_limit == Some(0) {
-        return Ok((0, String::new(), false, false));
+        return Ok((0, String::new(), false, false, false));
     }
 
     // GNU builtins/read.def reads fd 0 through zread (lib/sh/zread.c) — one
@@ -504,20 +626,60 @@ pub(in crate::executor) fn read_stdin_until(
     let mut read = 0;
     let mut decoder = StdinCharDecoder::new();
     let mut units = 0usize;
+    // GNU read.def escape state for the -n/-N budget (rubash#1328).
+    let mut escaped = false;
     let mut eof = false;
     let mut timed_out = false;
+    let mut interrupted = false;
+    // rubash#1300: in a non-raw read an escaped unit is literal data,
+    // never the delimiter (read.def zread escape consumption).
+    let mut escaped = false;
     loop {
         if !decoder.has_queued() {
             // read.def check_read_timeout (read.def:659) runs at the top of
             // every read-loop iteration: wait out the remaining deadline for
             // the handle to become readable before the blocking read.
+            // rubash#1250: the wait runs in slices polling for an
+            // untrapped SIGINT, and with no deadline an armed guard
+            // gates the blocking read on sliced readability (a canonical
+            // tty reports readable only with a complete line buffered,
+            // so the record shape is unchanged).
             if let Some(deadline) = deadline {
-                let now = std::time::Instant::now();
-                if now >= deadline
-                    || crate::fd::wait_readable(stdin_handle, deadline - now)
-                        == crate::fd::ReadWait::Timeout
-                {
-                    timed_out = true;
+                let mut ready = false;
+                loop {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        timed_out = true;
+                        break;
+                    }
+                    if poll_sigint_abort && take_untrapped_sigint() {
+                        interrupted = true;
+                        break;
+                    }
+                    let slice = (deadline - now).min(std::time::Duration::from_millis(50));
+                    if crate::fd::wait_readable(stdin_handle, slice) != crate::fd::ReadWait::Timeout
+                    {
+                        ready = true;
+                        break;
+                    }
+                }
+                if timed_out || interrupted {
+                    break;
+                }
+                let _ = ready;
+            } else if poll_sigint_abort && crate::fd::is_console_handle(stdin_handle) {
+                loop {
+                    if take_untrapped_sigint() {
+                        interrupted = true;
+                        break;
+                    }
+                    if crate::fd::wait_readable(stdin_handle, std::time::Duration::from_millis(50))
+                        != crate::fd::ReadWait::Timeout
+                    {
+                        break;
+                    }
+                }
+                if interrupted {
                     break;
                 }
             }
@@ -556,18 +718,44 @@ pub(in crate::executor) fn read_stdin_until(
         if manual_echo {
             echo_unit(&unit);
         }
-        if !exact_char_limit && stdin_unit_is_delimiter(&unit, delimiter) {
+        // rubash#1300: the escape introducer itself is consumed as an
+        // escape, never as the delimiter — with `-d '\\'` a non-raw read
+        // can therefore never match (GNU read.def/zread consumes the
+        // backslash first), it reads to EOF and fails. rubash#1328: an
+        // escaped unit is likewise data, never the delimiter — the check
+        // uses the un-gated escape state, so a `\\<newline>` continuation
+        // does not end a newline-delimited record either.
+        let is_introducer = escape_aware && matches!(unit, StdinUnit::Char('\\'));
+        if !exact_char_limit
+            && !escaped
+            && !is_introducer
+            && stdin_unit_is_delimiter(&unit, delimiter)
+        {
             break;
         }
+        let unit_char = match &unit {
+            StdinUnit::Char(ch) => Some(*ch),
+            StdinUnit::RawByte { .. } => None,
+        };
         match unit {
             StdinUnit::Char(ch) => {
                 output.push(ch);
-                units += 1;
             }
             StdinUnit::RawByte { text } => {
                 output.push_str(&text);
+            }
+        }
+        // Post-escape counting, as in read_inherited_process_stdin
+        // (rubash#1328).
+        if escaped {
+            if unit_char != Some('\n') {
                 units += 1;
             }
+            escaped = false;
+        } else if !raw && unit_char == Some('\\') {
+            escaped = true;
+        } else {
+            units += 1;
         }
         if char_limit.is_some_and(|limit| units >= limit) {
             break;
@@ -579,13 +767,59 @@ pub(in crate::executor) fn read_stdin_until(
     // Third element: read.def:949 eof — the handle closed before the
     // delimiter (a char-limit break or timeout is not EOF). Fourth element:
     // read.def:553 — the deadline expired; the caller maps it to
-    // 128+SIGALRM while still assigning the partial record.
+    // 128+SIGALRM while still assigning the partial record. Fifth element
+    // (rubash#1250): an untrapped SIGINT aborted the read; the caller
+    // assigns NOTHING and returns 128+SIGINT.
     Ok((
         read,
-        trim_read_input(output, delimiter, char_limit, exact_char_limit),
+        trim_read_input(
+            output,
+            delimiter,
+            char_limit,
+            exact_char_limit,
+            escape_aware,
+            raw,
+        ),
         eof,
         timed_out,
+        interrupted,
     ))
+}
+
+/// First UNESCAPED occurrence of the read delimiter: the needle form
+/// wins over the literal char (the priority the split_once chain gave
+/// it), and a position is unescaped when it is not quoted by an odd run
+/// of backslashes — a `\` quotes the next character, `\\` is itself
+/// quoted. Returns the record text before the delimiter (rubash#1328).
+fn find_unescaped_read_delimiter<'a>(
+    input: &'a str,
+    needle: &str,
+    delimiter: char,
+) -> Option<&'a str> {
+    let scan = |needle_mode: bool| -> Option<usize> {
+        let mut escaped = false;
+        for (index, ch) in input.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if needle_mode {
+                if input[index..].starts_with(needle) {
+                    return Some(index);
+                }
+            } else if ch == delimiter {
+                return Some(index);
+            }
+        }
+        None
+    };
+    scan(true)
+        .or_else(|| scan(false))
+        .map(|index| &input[..index])
 }
 
 pub(in crate::executor) fn trim_read_input(
@@ -593,11 +827,14 @@ pub(in crate::executor) fn trim_read_input(
     delimiter: char,
     char_limit: Option<usize>,
     exact_char_limit: bool,
+    escape_aware: bool,
+    raw: bool,
 ) -> String {
     // Trimming and limit math below run on the literal-char form (the
     // delimiter needle handles both transports); the storage-domain tagging
     // is the last step so every served record leaves this fn normalized.
-    let trimmed = trim_read_input_literal(input, delimiter, char_limit, exact_char_limit);
+    let trimmed =
+        trim_read_input_literal(input, delimiter, char_limit, exact_char_limit, escape_aware, raw);
     tag_read_carrier_text(&trimmed)
 }
 
@@ -606,6 +843,8 @@ fn trim_read_input_literal(
     delimiter: char,
     char_limit: Option<usize>,
     exact_char_limit: bool,
+    escape_aware: bool,
+    raw: bool,
 ) -> String {
     if !exact_char_limit {
         // GNU builtins/read.def read_builtin: only the delimiter itself is
@@ -615,15 +854,26 @@ fn trim_read_input_literal(
         // emit CRLF); on unix it would eat legal filename bytes.
         // The needle covers the raw-byte transport form; a multibyte
         // delimiter character (rubash#1062) travels as the literal char,
-        // so fall back to it when the needle form is absent.
-        if let Some((before, _)) = input
-            .split_once(&read_delimiter_needle(delimiter))
-            .or_else(|| input.split_once(delimiter))
-        {
+        // so fall back to it when the needle form is absent. In a
+        // non-raw read the split point is the first UNESCAPED delimiter:
+        // an escaped one is record data — for a custom delimiter
+        // (rubash#1300) and for the newline continuation alike
+        // (rubash#1328: the naive split cut `a\\<LF>zz<LF>` to `a\\`).
+        let needle = read_delimiter_needle(delimiter);
+        let split_at = if raw {
+            input
+                .split_once(&needle)
+                .or_else(|| input.split_once(delimiter))
+                .map(|(before, _)| before.len())
+        } else {
+            find_unescaped_read_delimiter(&input, &needle, delimiter)
+                .map(|before| before.len())
+        };
+        if let Some(at) = split_at {
             input = if cfg!(windows) {
-                before.trim_end_matches('\r').to_string()
+                input[..at].trim_end_matches('\r').to_string()
             } else {
-                before.to_string()
+                input[..at].to_string()
             };
         } else if delimiter == '\n' {
             // NOTE (Windows): this also drops a lone trailing '\r' that is
@@ -642,6 +892,15 @@ fn trim_read_input_literal(
     }
 
     if let Some(limit) = char_limit {
+        if !raw {
+            // GNU builtins/read.def counts the -n/-N budget in
+            // POST-ESCAPE characters: the read loop processes `\x` inline
+            // and increments nr per character it APPENDS, so an escape
+            // pair costs one unit and a backslash-newline continuation
+            // costs zero (rubash#1328). Truncating the raw record by raw
+            // units both stops early and cuts pairs in half.
+            return truncate_read_post_escape(&input, limit);
+        }
         if crate::locale::is_multi_byte() {
             return truncate_read_units(&input, limit);
         }
@@ -649,6 +908,43 @@ fn trim_read_input_literal(
     }
 
     input
+}
+
+/// Truncate a record to `limit` POST-ESCAPE units (see the call site):
+/// a `\x` pair is one unit and stays whole, a `\<newline>` continuation
+/// is zero units, a dangling trailing `\` counts as one unit, and a
+/// raw-byte marker pair is one unit as in truncate_read_units
+/// (rubash#1328, rubash#714).
+fn truncate_read_post_escape(input: &str, limit: usize) -> String {
+    let mut units = 0usize;
+    let mut chars = input.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if units == limit {
+            return input[..index].to_string();
+        }
+        if ch == '\\' {
+            match chars.next() {
+                // Line continuation: appends nothing, costs nothing.
+                Some((_, '\n')) => {}
+                // Escaped character (or marker payload byte): the pair
+                // is one stored character.
+                Some(_) => units += 1,
+                // Dangling backslash at end of record: stored as-is.
+                None => units += 1,
+            }
+            continue;
+        }
+        if ch as u32 == RAW_BYTE_MARKER_ESCAPE {
+            if let Some(&(_, payload)) = chars.peek() {
+                let code = payload as u32;
+                if (RAW_BYTE_MARKER_FIRST..=RAW_BYTE_MARKER_LAST).contains(&code) {
+                    chars.next();
+                }
+            }
+        }
+        units += 1;
+    }
+    input.to_string()
 }
 
 /// Truncate transport text to `limit` decoded units. One raw-byte marker

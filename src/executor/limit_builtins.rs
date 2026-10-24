@@ -185,33 +185,34 @@ impl Executor {
                 // signal delivery).
                 continue;
             }
-            if request.signal == 18 {
-                self.shell_state.job_table.mark_running(pid);
-            } else if matches!(request.signal, 19 | 20) {
-                self.shell_state.job_table.mark_stopped(pid);
-            } else if operand.starts_with('%') && self.jobspec_death_is_unreported(request.signal) {
-                // rubash#796: a jobspec kill of a DONT_REPORT signal is the
-                // kill builtin's own doing, and GNU's non-interactive reader
-                // suppresses its completion notice outright (jobs.c
-                // notify_of_job_status, the DONT_REPORT_SIGINT/SIGTERM/
-                // SIGPIPE + trapped arm: nothing printed, the dead job is
-                // cleaned up). Stash the signal status and drop the entry
-                // with the status-preserving variant: `kill %1; jobs` lists
-                // nothing, no `[1]+ Exit 143` notice fires at the reap
-                // boundary, and a later pid-shaped `wait $!` still resolves
-                // 143 through completed_statuses (#737's contract). Other
-                // signals keep the entry so the async reap announces the
-                // death (`kill -9 %1` still surfaces `Killed`); pid
-                // operands always keep it for the #737 wrapper-death flow.
-                self.shell_state
-                    .job_table
-                    .mark_completed(pid, 128 + request.signal);
-                self.close_coproc_endpoints(pid);
-                self.fd_table.close(pid);
-                self.shell_state
-                    .job_table
-                    .remove_job_by_pid_preserve_status(pid);
+            // GNU: the shell learns that a background job stopped from
+            // waitchld's WUNTRACED report, which only exists under job
+            // control — a non-monitor shell never notices, so `jobs` keeps
+            // reporting the job as Running even after the shell's OWN kill
+            // sent SIGSTOP (nojobs.c; rubash#1247). Rubash has no WUNTRACED
+            // poller, so the kill path's marking is its only stop detector;
+            // gate it on monitor mode or a `set +m` shell would report its
+            // jobs Stopped where GNU reports Running.
+            if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "monitor") {
+                if request.signal == 18 {
+                    self.shell_state.job_table.mark_running(pid);
+                } else if matches!(request.signal, 19 | 20) {
+                    self.shell_state
+                        .job_table
+                        .mark_stopped(pid, Some(request.signal));
+                }
             }
+            // A terminating signal changes nothing in the table here:
+            // the boundary reap marks the job Completed when the process
+            // actually dies. rubash#796 used to mark + remove the entry
+            // at delivery time for the DONT_REPORT signals (TERM/INT/
+            // PIPE), conflating the suppressed reader-boundary NOTICE
+            // (report_pending_signal_notices already stays silent for
+            // background TERM deaths) with the job's lifetime — GNU
+            // keeps the job, and the next `jobs` lists it once as
+            // `Terminated` before cleaning it up (rubash#1256). The old
+            // code also lied for a process that ignores TERM: it
+            // vanished from the table while still running.
             continue;
         }
 
@@ -226,27 +227,6 @@ impl Executor {
             i32::from(!any_succeeded)
         };
         Ok(Some(status))
-    }
-
-    /// rubash#796: does this signal's death go unannounced for a background
-    /// job? GNU jobs.c notify_of_job_status suppresses the notice when the
-    /// termsig is SIGINT, or SIGPIPE/SIGTERM under config-top.h's
-    /// DONT_REPORT_SIGPIPE/DONT_REPORT_SIGTERM, or when the signal is
-    /// trapped — the same set report_pending_signal_notices
-    /// (job_builtins.rs) already implements for boundary notices. Signal
-    /// numbers are the invariant Linux/MSVC values (libc is a unix-only
-    /// dependency, and this file compiles on both).
-    fn jobspec_death_is_unreported(&self, signal: i32) -> bool {
-        const SIGINT: i32 = 2;
-        const SIGPIPE: i32 = 13;
-        const SIGTERM: i32 = 15;
-        if matches!(signal, SIGINT | SIGPIPE | SIGTERM) {
-            return true;
-        }
-        super::trap_exec::signal_trap_name(signal).is_some_and(|name| {
-            crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, &name)
-                .is_some_and(|action| !action.is_empty())
-        })
     }
 
     pub(in crate::executor) fn execute_ulimit(

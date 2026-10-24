@@ -421,6 +421,15 @@ impl Executor {
         }
 
         let values = if transform == ParameterTransform::Assignment {
+            // GNU subst.c @A form: with zero positional parameters there
+            // is no `set --` header at all — "${@@A}" expands to zero
+            // words and "${*@A}" to a single empty word (rubash#1269).
+            if self.shell_state.positional_window().is_empty() {
+                if var_name == "*" && quoted {
+                    return Some(vec![String::new()]);
+                }
+                return Some(vec![]);
+            }
             let mut values = vec!["set".to_string(), "--".to_string()];
             values.extend(
                 self.shell_state
@@ -823,6 +832,7 @@ impl Executor {
             Some(&stdio.expanded_words[0]),
             &dev_args,
             &self.shell_state.env_vars,
+            self.bash_argv0_env_supplied(&[]),
         );
 
         self.apply_child_environment(&mut process);
@@ -1008,35 +1018,25 @@ impl Executor {
     }
 
     pub(in crate::executor) fn expand_dirstack_tilde(&self, word: &str) -> Option<String> {
-        // TODO(subst.c/builtins/pushd.def): Bash performs directory-stack
-        // tilde expansion during word expansion. This implements ~N and ~-N
-        // for upstream dstack2.tests.
-        let rest = word.strip_prefix('~')?;
-        if rest.is_empty() || rest.starts_with('/') {
-            return None;
+        // GNU general.c:1120 bash_special_tilde_expansions +
+        // builtins/pushd.def:620 get_dirstack_from_string. The shared
+        // implementation lives in expand/tilde (the plain-word and
+        // assignment paths resolve the same prefixes there): `~+N` and
+        // bare `~N` count from the stack top, `~-N` from the bottom, and
+        // a `/tail` glues onto the resolved directory (rubash#1244: this
+        // copy handled only `~N`/`~-N` with no tail, so `~+1` and
+        // `~-0/sub` stayed literal). Some(word) verbatim when the prefix
+        // is a special form that does not resolve (out of range); None
+        // when it is not a special prefix at all, so the caller falls
+        // through to the `~user` lookup.
+        match crate::expand::tilde::tilde::special_tilde_expansion(
+            word,
+            &self.shell_state.env_vars,
+        ) {
+            Some(Some(value)) => Some(value),
+            Some(None) => Some(word.to_string()),
+            None => None,
         }
-
-        let (from_right, digits) = if let Some(digits) = rest.strip_prefix('-') {
-            (true, digits)
-        } else {
-            (false, rest)
-        };
-        if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
-            return None;
-        }
-
-        let value = digits.parse::<usize>().ok()?;
-        let stack = crate::builtins::pushd::load_stack(&self.shell_state.env_vars);
-        let index = if from_right {
-            if value < stack.len() {
-                stack.len() - 1 - value
-            } else {
-                return Some(word.to_string());
-            }
-        } else {
-            value
-        };
-        stack.get(index).cloned().or_else(|| Some(word.to_string()))
     }
 
     pub(in crate::executor) fn dirstack_subscript(&self, index: &str) -> Option<usize> {

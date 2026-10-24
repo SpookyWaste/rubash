@@ -17,6 +17,38 @@ use crate::history_expand::{
     history_expand, HistCtx, HistEngineState, HistExpandResult, HistLookup,
 };
 
+/// GNU histfile.c (history_write / history_append open path): when the
+/// history file exists but carries no write-permission bits, it is
+/// unlinked so the create below makes a fresh file (mode 0600) instead
+/// of failing with EACCES and losing the session history (rubash#1288:
+/// chmod-000 HISTFILE, GNU rc=0 with a recreated -rw------- file).
+#[cfg(unix)]
+fn recreate_unwritable_history_file(path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.is_file() && meta.permissions().mode() & 0o222 == 0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn history_create_options() -> fs::OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = fs::OpenOptions::new();
+    // histfile.c opens with mode 0600; it only takes effect on creation,
+    // so an existing writable file keeps its current mode.
+    options.mode(0o600);
+    options
+}
+
+#[cfg(not(unix))]
+fn recreate_unwritable_history_file(_path: &str) {}
+
+#[cfg(not(unix))]
+fn history_create_options() -> fs::OpenOptions {
+    fs::OpenOptions::new()
+}
 /// A host-owned command history used by Rubash's history-facing builtins.
 pub trait HistoryProvider: Debug {
     /// Return commands in oldest-to-newest order.
@@ -262,7 +294,13 @@ impl SessionHistory {
             out.push_str(entry);
             out.push('\n');
         }
-        fs::write(path, out)?;
+        recreate_unwritable_history_file(path);
+        let mut file = history_create_options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        io::Write::write_all(&mut file, out.as_bytes())?;
         Ok(self.entries.len())
     }
 
@@ -274,7 +312,8 @@ impl SessionHistory {
         let n = self.lines_this_session.min(self.entries.len());
         let start = self.entries.len() - n;
         if n > 0 {
-            let mut file = fs::OpenOptions::new()
+            recreate_unwritable_history_file(path);
+            let mut file = history_create_options()
                 .create(true)
                 .append(true)
                 .open(path)?;

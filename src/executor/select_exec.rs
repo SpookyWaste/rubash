@@ -340,6 +340,21 @@ impl Executor {
         has_stdin: bool,
         stdin_offset: &mut usize,
     ) -> Option<(String, bool)> {
+        // GNU select_query's read_builtin zreads fd 0 exactly as bound
+        // (read.def:294): a CLOSED fd 0 fails with EBADF and read.def
+        // reports `0: read error: Bad file descriptor`, after which the
+        // read fails as EOF (REPLY empty, stdout newline, status 1).
+        // Rubash fell through to the raw process stdin — blocking on a
+        // live pipe, or a silent EOF where the descriptor model lost
+        // the closure (rubash#1299).
+        if self.fd_table.is_closed(0) {
+            let message = format!(
+                "{}0: read error: Bad file descriptor\n",
+                self.diagnostic_prefix()
+            );
+            let _ = self.write_default_stderr(message.as_bytes());
+            return None;
+        }
         // Returns the raw physical line WITHOUT the trailing newline plus
         // whether it is an unterminated EOF tail; None is clean EOF with
         // no bytes.
@@ -355,7 +370,7 @@ impl Executor {
         // tail.
         if self.fd_table.fd0_bound_away_from_process_stdin() {
             self.fd_table.read_eof_no_delimiter = false;
-            return match self.fd_table.read_text(0, '\n', None, false) {
+            return match self.fd_table.read_text(0, '\n', None, false, false, false) {
                 Some(line) => Some((line, self.fd_table.read_eof_no_delimiter)),
                 None => None,
             };

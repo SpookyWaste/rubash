@@ -380,10 +380,12 @@ impl Executor {
         // name is unchanged).
         let pre_attrs = self.shell_state.env_vars.attr_of(name);
         let owned: String;
+        let mut resolved_via_nameref = false;
         let (name, attrs): (&str, crate::shell::var_table::VarAttrs) = if pre_attrs.nameref {
             match self.nameref_resolution(name) {
                 NamerefResolution::Target(target) => {
                     owned = target;
+                    resolved_via_nameref = true;
                     let attrs = self.shell_state.env_vars.attr_of(&owned);
                     (&owned, attrs)
                 }
@@ -416,6 +418,19 @@ impl Executor {
         } else {
             (name, pre_attrs)
         };
+        // GNU variables.c: find_variable_nameref hands the resolved
+        // target to the ordinary variable read, whose dynamic get-hooks
+        // (variables.c: the RANDOM/SECONDS/BASHPID/... dynamic variables)
+        // fire for the TARGET name. The direct-read callers layer
+        // dynamic_parameter_value over the WRITTEN name, so a nameref to
+        // a dynamic variable fell through to the target's never-bound
+        // stored cell and expanded empty (rubash#1352). Consult the
+        // dynamic table for the resolved target before the stored reads.
+        if resolved_via_nameref {
+            if let Some(value) = self.dynamic_parameter_value(name) {
+                return Some(value);
+            }
+        }
         // GNU find_variable_nameref -> find_variable_internal resolves an
         // `arr[@]`/`arr[*]` cell to the array; scalar `${ref}` then reads
         // array_value's all-elements join (nameref18.sub `s=${ref}` yields
@@ -434,6 +449,18 @@ impl Executor {
                     array_values(&storage)
                 };
                 return Some(values.join(&self.ifs_first_char_separator()));
+            }
+        }
+        // rubash#1282: BASH_ARGC/BASH_ARGV/BASH_LINENO are live views,
+        // not storage — an unsubscripted read is element 0 of the view
+        // (GNU variables.c: scalar array read == element 0). Falling
+        // through to the env store leaked the raw storage repr
+        // ("\x1d()" / "\x1d([0]=\"0\")") parked there by the startup /
+        // materialization writes, while indexed reads (which divert to
+        // the view) were correct.
+        if matches!(name, "BASH_ARGC" | "BASH_ARGV" | "BASH_LINENO") && !attrs.assoc {
+            if let Some(values) = self.dynamic_stack_array_values(name) {
+                return Some(values.into_iter().next().unwrap_or_default());
             }
         }
         if let Some(value) = self.array_element_parameter_value(name) {

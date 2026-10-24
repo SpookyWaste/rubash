@@ -48,6 +48,26 @@ thread_local! {
     /// on a hit-fallback).
     static ARITH_PARSE_CACHE: std::cell::RefCell<ArithParseCache> =
         const { std::cell::RefCell::new(ArithParseCache::EMPTY) };
+
+    /// rubash#1202: when armed, `report_indexed_subscript_error` collects
+    /// its rendered diagnostic lines here instead of writing them to the
+    /// raw process stderr, so a builtin whose output is redirectable
+    /// (`test -v name[sub] 2>file`) can route them through the buffered
+    /// output path like every other builtin diagnostic. Disarmed (None)
+    /// is the historical raw-stderr behavior for expansion-time errors,
+    /// which GNU also leaves unredirected.
+    static OPERAND_SUBSCRIPT_DIAG_CAPTURE: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arm the operand-subscript diagnostic capture (see the thread-local).
+pub(in crate::executor) fn arm_operand_subscript_diag_capture() {
+    OPERAND_SUBSCRIPT_DIAG_CAPTURE.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+}
+
+/// Disarm the capture and return the collected diagnostic lines.
+pub(in crate::executor) fn take_operand_subscript_diag_capture() -> Vec<String> {
+    OPERAND_SUBSCRIPT_DIAG_CAPTURE.with(|slot| slot.borrow_mut().take().unwrap_or_default())
 }
 
 /// Take (and clear) the evalerror record of the last evaluation.
@@ -610,6 +630,16 @@ impl Executor {
             };
             std::borrow::Cow::Owned(normalize_arithmetic_quotes(&expanded).into_owned())
         };
+        // GNU expr.c: a fatal error inside a NESTED expansion of the
+        // expression (`((i<$((1/0))))`, an arith-for header) raises
+        // evalerror while expand_arith_string runs — the evaluation is
+        // abandoned before the mangled remainder (`i<`) is ever parsed.
+        // The nested expansion already printed its diagnostic; parsing
+        // on would synthesize a second, bogus one (`((: i<: arithmetic
+        // syntax error: operand expected`) from the hollowed text.
+        if self.shell_state.arithmetic_fatal_error.get() {
+            return None;
+        }
         // GNU expr.c's expr_string/lasttp only matter once evalerror
         // records a diagnostic — success paths never consult them, so the
         // diagnostic input slot is written lazily: the unbound-variable
@@ -944,6 +974,42 @@ impl Executor {
         self.evalerror_pending.set(true);
     }
 
+    /// rubash#1318: arm the reader-level DISCARD for a standalone
+    /// assignment failure (GNU subst.c bash_variable_assignment_error ->
+    /// exp_jump_to_top_level(DISCARD): the rest of the current list is
+    /// abandoned, the script resumes at the next line). The
+    /// Err(ExpansionFailure) the caller returns is absorbed into a plain
+    /// status by the brace-group and function-frame boundaries it
+    /// crosses, which used to let the enclosing list continue on the
+    /// SAME line (`{ z=1; }; echo after` printed `after`); the armed
+    /// pending makes every enclosing list loop skip the rest of the
+    /// failing logical line through the standard abandon check. The
+    /// boundary line is pinned here rather than left to the lazy
+    /// reader_command_line capture so the abandon check does not
+    /// rewrite the status the failure already chose (1 for a bind
+    /// failure, EX_BADUSAGE 2 for the ${:=} readonly class, rubash#402).
+    /// The pinned line is the READER's current list line: a failing
+    /// assignment inside a function body carries the body's own
+    /// re-based line number, but GNU abandons the caller's list — the
+    /// line the depth-1 loop is executing (the call site). The node
+    /// line is only the fallback for contexts with no reader line yet.
+    pub(in crate::executor) fn raise_assignment_discard(&self, line: Option<usize>) {
+        // Sourced files and eval strings carry their own top_level catch
+        // (evalstring.c): the Err propagation alone already reproduces
+        // GNU there (the sourced reader resumes at its next line and the
+        // caller keeps the status), and this executor's reader line
+        // still points at the CALLER's list, so arming would corrupt
+        // both readers' boundaries.
+        if self.in_source_context() || self.eval_list_depth.get().is_some() {
+            return;
+        }
+        self.evalerror_pending.set(true);
+        let boundary = self.reader_command_line.get().or(line);
+        if let Some(line) = boundary.filter(|line| *line != 0) {
+            self.evalerror_line.set(Some(line));
+        }
+    }
+
     /// rubash#753: absorb a pending failglob-class discard at a containment
     /// boundary (the `eval` and `source` builtins — GNU evalstring.c:365,
     /// 422-442 installs a local top_level catch for the text they run, so
@@ -1019,19 +1085,33 @@ impl Executor {
         self.raise_evalerror_abort();
         // The subscript's nested evalexp recorded the real evalerror state —
         // its frame expression IS the subscript text, with lasttp inside it.
-        if let Some(record) = take_arith_eval_error() {
-            eprintln!("{}{}", self.error_prefix(), record.render());
+        let line = if let Some(record) = take_arith_eval_error() {
+            format!("{}{}", self.error_prefix(), record.render())
         } else {
             let token = indexed_noexpand_error_token(resolved);
-            eprintln!(
+            format!(
                 "{}{}: arithmetic syntax error: operand expected (error token is \"{}\")",
                 self.error_prefix(),
                 resolved,
                 token
-            );
+            )
+        };
+        // rubash#1202: an armed capture (test -v's subscript rewrite)
+        // collects the line for the builtin's buffered, redirectable
+        // stderr; otherwise it goes to the raw process stderr as before.
+        let captured = OPERAND_SUBSCRIPT_DIAG_CAPTURE.with(|slot| {
+            if let Some(lines) = slot.borrow_mut().as_mut() {
+                lines.push(line.clone());
+                true
+            } else {
+                false
+            }
+        });
+        if !captured {
+            eprintln!("{line}");
+            use std::io::Write;
+            let _ = std::io::stderr().flush();
         }
-        use std::io::Write;
-        let _ = std::io::stderr().flush();
     }
 
     /// Evaluate a `$(( ... ))` expansion embedded in a word. This is the
@@ -1131,6 +1211,10 @@ impl Executor {
         else {
             return;
         };
+        // rubash#1238: remember the diagnostic was printed so the
+        // (( ))/let reporters don't add a synthesized syntax error after
+        // it (GNU's bind failure produces exactly one diagnostic line).
+        self.shell_state.arithmetic_readonly_error.set(true);
         if !self.shell_state.arithmetic_expansion_error.replace(true) {
             eprintln!("{}{}: readonly variable", self.error_prefix(), name);
             use std::io::Write;
@@ -1937,6 +2021,22 @@ pub(super) fn arithmetic_unbound_variable(
             chars.next();
             skip_subscript_chars(&mut chars);
             previous = Some(']');
+            // rubash#1239: GNU treats an associative array with no
+            // elements as UNSET for nounset purposes (variables.c: the
+            // variable has no value until an element exists), so a
+            // subscripted READ (`h[k]`, `h[k]++`, `h[k]+=1`) traps
+            // `h: unbound variable`, while a pure `h[k]=value`
+            // assignment is a write and stays legal.
+            if !arithmetic_subscript_is_pure_assignment(&chars)
+                && env_vars
+                    .get(&name)
+                    .map(|value| {
+                        crate::executor::assignment_helpers::assoc_entries(value).is_empty()
+                    })
+                    .unwrap_or(true)
+            {
+                return Some(name);
+            }
             continue;
         }
         // An identifier that is the left-hand side of an assignment
@@ -2046,6 +2146,18 @@ fn arithmetic_identifier_is_assignment_lhs(
         chars.next();
     }
     true
+}
+
+/// True when the text following a consumed array subscript is a pure
+/// `= value` assignment (blanks allowed). `==` is a comparison, and the
+/// op-assignments (`+=`, ...) read the old element, so neither counts —
+/// only the plain `=` form is write-only (rubash#1239).
+fn arithmetic_subscript_is_pure_assignment(chars: &std::iter::Peekable<std::str::Chars>) -> bool {
+    let mut clone = chars.clone();
+    while clone.peek().is_some_and(|next| matches!(next, ' ' | '\t')) {
+        clone.next();
+    }
+    clone.next() == Some('=') && clone.peek() != Some(&'=')
 }
 
 fn rest_assignment_operator_len(chars: &std::iter::Peekable<std::str::Chars>) -> usize {
@@ -2980,6 +3092,16 @@ fn eval_mutable_arith_result(
                 tok_start: tok,
                 display_end: normalized.len(),
             });
+        } else if value.is_none()
+            && parser
+                .env_vars
+                .get("__RUBASH_ARITH_READONLY_ERROR")
+                .is_some()
+        {
+            // rubash#1238: the parse failed on a readonly bind; the
+            // Executor layer prints the `readonly variable` diagnostic
+            // from the marker. GNU raises no evalerror here, so record
+            // none — synthesizing "operand expected" would double-report.
         } else if value.is_none() {
             // The parser returned no value without recording a cause —
             // GNU exp0's operand-expected (expr.c:1120) with lasttp at the

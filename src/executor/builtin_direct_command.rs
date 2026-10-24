@@ -6,6 +6,18 @@ impl Executor {
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
         let args = &cmd.words[1..];
+        // GNU builtins/builtin.def: internal_getopt maps a leading
+        // --help to CASE_HELPOPT (long help to stdout, EX_USAGE) before
+        // no_options() rejects the other options (rubash#1229). Checked
+        // before the `--` skip below: after a `--`, --help is the name
+        // of the builtin to run, not an option.
+        if args.first().map(String::as_str) == Some("--help") {
+            let mut stdout = Vec::new();
+            crate::builtins::help::print_builtin_help("builtin", &mut stdout)?;
+            self.write_buffered_builtin_output(cmd, &stdout, &[])?;
+            self.exit_code = 2;
+            return Ok(());
+        }
         // GNU builtins/builtin.def: no_options() + `list = loptend`: a bare
         // `--` ends option parsing and is skipped, so `builtin -- CMD` runs
         // CMD (rubash#1376); a lone `--` is a silent success.
@@ -24,9 +36,13 @@ impl Executor {
         // builtin_usage.
         if name.starts_with('-') && name != "--" && name != "-" {
             let mut stderr = Vec::new();
+            // GNU bashgetopt sh_invalidopt names `-` plus the first
+            // invalid option character, not the whole word (rubash#1259:
+            // `builtin --badflag` reports `--`, not `--badflag`).
+            let option = name.chars().nth(1).unwrap_or('-');
             writeln!(
                 &mut stderr,
-                "{}builtin: {name}: invalid option",
+                "{}builtin: -{option}: invalid option",
                 self.diagnostic_prefix()
             )?;
             writeln!(
@@ -161,13 +177,23 @@ impl Executor {
                 self.exit_code = self.execute_enable(&builtin_cmd)?;
                 Ok(())
             }
-            "exec" => self.execute_exec_command(&builtin_cmd),
+            "exec" => {
+                self.builtin_wrapper_depth += 1;
+                let result = self.execute_exec_command(&builtin_cmd);
+                self.builtin_wrapper_depth -= 1;
+                result
+            }
             "logout" => {
                 self.exit_code = self.execute_logout(&builtin_cmd)?;
                 Ok(())
             }
             "eval" => self.execute_eval(&builtin_cmd),
-            "command" => self.execute_command_without_aliases(&builtin_cmd),
+            "command" => {
+                self.builtin_wrapper_depth += 1;
+                let result = self.execute_command_without_aliases(&builtin_cmd);
+                self.builtin_wrapper_depth -= 1;
+                result
+            }
             // GNU Bash has no `sudo` builtin (issue #759 item 4): the
             // host-capability builtin only exists while an embedding host
             // registered an elevation handler; otherwise `builtin sudo`

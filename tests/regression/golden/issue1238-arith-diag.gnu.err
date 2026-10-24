@@ -1,0 +1,3 @@
+issue1238-arith-diag.sh: line 8: ro: readonly variable
+issue1238-arith-diag.sh: line 12: ri: readonly variable
+issue1238-arith-diag.sh: line 13: h: unbound variable

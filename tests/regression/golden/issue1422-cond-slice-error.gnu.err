@@ -1,0 +1,2 @@
+issue1422-cond-slice-error.sh: line 8: -1: substring expression < 0
+issue1422-cond-slice-error.sh: line 10: -1: substring expression < 0

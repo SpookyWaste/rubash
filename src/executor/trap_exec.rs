@@ -260,15 +260,17 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let args = cmd.words[1..].to_vec();
         match crate::builtins::eval::execute_with_io(
             args.iter().map(String::as_str),
             &self.diagnostic_prefix(),
+            &mut stdout,
             &mut stderr,
         )? {
             crate::builtins::eval::EvalAction::Complete(status) => {
-                self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
                 self.exit_code = status;
                 Ok(())
             }
@@ -706,8 +708,13 @@ impl Executor {
         let saved_eval_list_depth = self
             .eval_list_depth
             .replace(Some(self.evalerror_exec_depth.get() + 1));
-        let result =
-            self.with_compound_output_redirects(cmd, |executor| executor.execute_ast(&ast));
+        // GNU builtins/evalstring.c:348: parse_and_execute raises
+        // indirection_level around the eval'd list, so under `set -x`
+        // the body's traces render one PS4 level deeper than the eval
+        // line itself (`++ echo ...`) — rubash#1341.
+        let result = self.with_compound_output_redirects(cmd, |executor| {
+            executor.with_xtrace_indirection(|executor| executor.execute_ast(&ast))
+        });
         self.eval_list_depth.set(saved_eval_list_depth);
 
         self.resume_alias_streamed(saved_alias_streamed);
@@ -1341,11 +1348,34 @@ impl Executor {
                     "BASH_TRAPSIG",
                 );
             }
+            // GNU trap.c:496 runs the action through parse_and_execute
+            // with the input name "trap" ("interrupt trap" for SIGINT):
+            // parser_error's prolog becomes `<script>: trap: line N:`.
+            // Mirror the __RUBASH_EVAL_CONTEXT marker for the duration
+            // of the action.
+            let old_trap_context = self.shell_state.env_vars.insert(
+                "__RUBASH_TRAP_CONTEXT".to_string(),
+                if signal == 2 {
+                    "interrupt trap".to_string()
+                } else {
+                    "trap".to_string()
+                },
+            );
             let tokens = crate::lexer::tokenize(&action);
             let ast = crate::parser::parse(&tokens);
             // trap.c:496 runs the action through parse_and_execute: the
             // xtrace indirection level rises by one for the action.
             let result = self.with_xtrace_indirection(|executor| executor.execute_ast(&ast));
+            match old_trap_context {
+                Some(value) => {
+                    self.shell_state
+                        .env_vars
+                        .insert("__RUBASH_TRAP_CONTEXT".to_string(), value);
+                }
+                None => {
+                    self.shell_state.env_vars.remove("__RUBASH_TRAP_CONTEXT");
+                }
+            }
             if !bash_trapsig_was_exported {
                 unmark_env_name(
                     &mut self.shell_state.env_vars,
@@ -1388,7 +1418,22 @@ impl Executor {
                 }
             }
             self.signal_trap_running = false;
+            // GNU trap.c:496 (parse_and_execute inside _run_trap_internal)
+            // contains a syntax error in the action: the diagnostic
+            // stands, the action yields its failure, and the shell goes
+            // on with the pre-trap $? — the parse error must not unwind
+            // the whole script the way a top-level syntax error does
+            // (rubash#1351). Consume the flag either way so it cannot
+            // leak into the script driver; a parse error that already
+            // exit_shell(2)ed under live errexit (parser_error_errexited)
+            // is a real shell exit and keeps propagating.
+            let parse_error_raised = self.take_parse_error();
+            let parser_error_errexited = self.parser_error_errexited.take();
             match result {
+                Err(ExecuteError::ExitCode(2)) if parse_error_raised && !parser_error_errexited => {
+                    self.take_exit_jump_pending();
+                    self.exit_code = saved_exit;
+                }
                 Ok(()) => self.exit_code = saved_exit,
                 Err(error @ ExecuteError::Return(_)) => return Err(error),
                 Err(error @ ExecuteError::ExitCode(_)) => return Err(error),
@@ -2116,16 +2161,24 @@ impl Executor {
         cmd: &CommandNode,
     ) -> Result<i32, ExecuteError> {
         if exec_has_only_redirects(cmd) {
-            if let Some(status) = self.execute_stdio_only_exec_redirect(cmd)? {
+            if let Some(status) = self.execute_stdio_only_exec_redirect_scoped(cmd)? {
                 return Ok(status);
             }
         }
 
-        // Bash applies redirections before `exec` parses its options.  This
-        // matters when an expanded option is invalid: the diagnostic is still
-        // emitted, but a stdout redirection remains in effect afterwards.
+        // GNU applies the redirections to a temporary undo scope while
+        // `exec` parses its options (redir.c do_redirections with
+        // REDIRECTIONS_UNDOABLE for a builtin that may fail): the option
+        // diagnostics land in the redirected targets, but when option
+        // parsing fails (EX_BADUSAGE) the redirections are undone and the
+        // shell keeps its original stdout/stderr (rubash#1230). Only a
+        // bare `exec` whose options parse cleanly (the redirects-only
+        // branch above) makes them permanent. Snapshot both persistence
+        // stores and roll back on EX_BADUSAGE.
         if self.exec_has_no_command_operand_after_expansion(cmd) {
-            self.execute_stdio_only_exec_redirect(cmd)?;
+            let saved_env_vars = self.shell_state.env_vars.clone();
+            let saved_fd_table = self.fd_table.clone();
+            self.execute_stdio_only_exec_redirect_scoped(cmd)?;
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             let status = crate::builtins::exec::execute_with_io(
@@ -2153,7 +2206,14 @@ impl Executor {
                     );
                 }
             }
+            // Route the buffered output while the temporary redirections
+            // are still in effect (the diagnostics belong in the redirect
+            // targets), then undo them if the exec failed.
             self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+            if status == 2 {
+                self.shell_state.env_vars = saved_env_vars;
+                self.fd_table = saved_fd_table;
+            }
             return Ok(status);
         }
 
@@ -2647,6 +2707,69 @@ impl Executor {
         }
     }
 
+    /// The no-operand exec forms (redirects only, or operands that expand
+    /// to nothing) with the `builtin`-wrapper scoping of rubash#1412:
+    /// plain `exec >f` persists its redirections, but `builtin exec >f`
+    /// applies them for that command only — the target file is still
+    /// created/truncated, yet the shell's fd state afterwards is the
+    /// pre-command one (GNU: `builtin exec >f; echo x` writes x to the
+    /// original stdout and f stays empty). Snapshot the fd table plus
+    /// the env-side fd records (the closed-fd keys and any `{var}`
+    /// bindings) and restore them after the persistent path runs.
+    fn execute_stdio_only_exec_redirect_scoped(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<Option<i32>, ExecuteError> {
+        if self.builtin_wrapper_depth == 0 {
+            return self.execute_stdio_only_exec_redirect(cmd);
+        }
+        let saved_fd_table = self.fd_table.clone();
+        let mut saved_env: Vec<(String, Option<String>)> = Vec::new();
+        let mut fds: Vec<u32> = cmd
+            .redirects
+            .iter()
+            .map(|r| {
+                r.fd.unwrap_or(if r.operator.starts_with('<') { 0 } else { 1 })
+            })
+            .collect();
+        fds.sort_unstable();
+        fds.dedup();
+        for fd in fds {
+            let key = super::command_text::fd_closed_key(fd);
+            let value = self.shell_state.env_vars.get(&key).cloned();
+            saved_env.push((key, value));
+        }
+        let mut var_names: Vec<String> = cmd
+            .redirects
+            .iter()
+            .filter_map(|r| r.fd_var.clone())
+            .collect();
+        var_names.extend(
+            cmd.heredoc_redirects
+                .iter()
+                .filter_map(|r| r.fd_var.clone()),
+        );
+        var_names.sort();
+        var_names.dedup();
+        for name in var_names {
+            let value = self.shell_state.env_vars.get(&name).cloned();
+            saved_env.push((name, value));
+        }
+        let result = self.execute_stdio_only_exec_redirect(cmd);
+        self.fd_table = saved_fd_table;
+        for (key, value) in saved_env {
+            match value {
+                Some(value) => {
+                    self.shell_state.env_vars.insert(key, value);
+                }
+                None => {
+                    self.shell_state.env_vars.remove(&key);
+                }
+            }
+        }
+        result
+    }
+
     fn execute_stdio_only_exec_redirect(
         &mut self,
         cmd: &CommandNode,
@@ -2739,6 +2862,13 @@ impl Executor {
                         continue;
                     }
                     if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
+                        // GNU redir.c: the dup/move apply is guarded by
+                        // `redir_fd != redirector` — a self-dup/self-move
+                        // is a no-op even for a closed fd, and a self-move
+                        // must not close the fd (rubash#1236).
+                        if source_fd == fd {
+                            continue;
+                        }
                         self.copy_exec_output_fd_resolving_ambient(fd, source_fd, &ambient);
                         if move_source {
                             self.close_persistent_output_fd(source_fd)?;
@@ -2797,6 +2927,11 @@ impl Executor {
                         continue;
                     }
                     if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
+                        // Self-dup/self-move: no-op (see the output arm
+                        // above; rubash#1236).
+                        if source_fd == fd {
+                            continue;
+                        }
                         self.copy_exec_output_fd_resolving_ambient(fd, source_fd, &ambient);
                         if move_source {
                             self.close_persistent_output_fd(source_fd)?;
@@ -2838,6 +2973,10 @@ impl Executor {
                         continue;
                     }
                     if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
+                        // Self-dup/self-move: no-op (rubash#1236).
+                        if source_fd == fd {
+                            continue;
+                        }
                         self.copy_persistent_input_fd(fd, source_fd);
                         if move_source {
                             self.close_persistent_input_fd(source_fd);
@@ -2919,6 +3058,12 @@ impl Executor {
                 crate::parser::RedirectKind::DuplicateInput => {
                     let fd = redirect.fd.unwrap_or(0);
                     if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
+                        // Self-dup/self-move: no-op, succeeds even when
+                        // the fd is closed (rubash#1236) — judge it before
+                        // the is_open check below.
+                        if source_fd == fd {
+                            continue;
+                        }
                         if self.fd_table.is_open(source_fd) {
                             self.copy_persistent_input_fd(fd, source_fd);
                             if move_source {
@@ -2979,6 +3124,23 @@ impl Executor {
             }
         }
 
+        if cmd.here_string.is_some() || cmd.here_string_carrier.is_some() {
+            // `exec <<<word`: a plain here-string lives in the command's
+            // stdin mirror fields, not in heredoc_redirects
+            // (parser/redirections.rs assign_here_string_redirect_raw), so
+            // the heredoc path below never sees it. Materialize it exactly
+            // like a command's staged stdin (command_input_redirect) and
+            // bind it persistently to fd 0 (rubash#1413).
+            let mut input = if cmd.here_string_carrier.is_some() {
+                self.expand_here_string_mut_from_carrier(&cmd.here_string_carrier)
+            } else {
+                self.expand_here_string_mut(cmd.here_string.as_deref().unwrap_or_default())
+            };
+            input.push('\n');
+            self.set_fd_input_text(0, input, false);
+            return Ok(Some(0));
+        }
+
         if let Some((fd, input)) = self.exec_heredoc_fd_input(cmd) {
             self.set_fd_input_text(fd, input, fd != 0);
             return Ok(Some(0));
@@ -2998,8 +3160,15 @@ impl Executor {
             .heredoc_redirects
             .iter()
             .rev()
-            .find(|redirect| redirect.fd.is_some() && redirect.body.is_some())?;
-        let fd = redirect.fd?;
+            // `{var}` heredocs are bound by the fd_var loop above; every
+            // other heredoc/here-string with a body belongs to its explicit
+            // fd, or to fd 0 when the redirect names no fd. The old
+            // `fd.is_some()` gate silently dropped `exec <<EOF` and
+            // `exec <<<word`, whose persistence is the whole point of the
+            // no-operand exec form (GNU redir.c: a redirect-only exec makes
+            // the redirection permanent; rubash#1413).
+            .find(|redirect| redirect.fd_var.is_none() && redirect.body.is_some())?;
+        let fd = redirect.fd.unwrap_or(0);
         let body = redirect.body.as_deref()?;
         let input = if let Some(carrier) = &redirect.body_carrier {
             if let crate::parser::StdinBody::Preexpanded(text) = carrier {
@@ -3302,7 +3471,10 @@ impl Executor {
         Ok(true)
     }
 
-    fn close_persistent_output_fd(&mut self, fd: u32) -> Result<(), ExecuteError> {
+    pub(in crate::executor) fn close_persistent_output_fd(
+        &mut self,
+        fd: u32,
+    ) -> Result<(), ExecuteError> {
         let coproc_pid = self
             .fd_table
             .entries
@@ -4247,6 +4419,64 @@ impl Executor {
         self.apply_shell_assignment(name, fd.to_string())
     }
 
+    /// GNU exec.def hands shell_execve an environment built from the
+    /// full export list, exported functions included (variables.c
+    /// make_env_array_from_var_list renders them as BASH_FUNC_*%%
+    /// entries). Rubash's exec spawn arms build the child environment
+    /// from env_vars alone (builtins/exec.rs apply_exported_environment
+    /// walks the EXPORTED_VARS marks), and env_vars never carries the
+    /// function entries — plain spawns add them per-process in
+    /// apply_exported_functions_to_child — so `exec` silently dropped
+    /// every exported function (rubash#1274). Materialize them for the
+    /// duration of the exec attempt; the caller restores the prior
+    /// state, which matters when the exec fails and the shell continues
+    /// (execfail / interactive). Returns (env key, prior value, prior
+    /// exported mark) triples for restore.
+    fn materialize_exported_functions_for_exec(&mut self) -> Vec<(String, Option<String>, bool)> {
+        let mut saved = Vec::new();
+        for name in marked_env_names(&self.shell_state.env_vars, EXPORTED_FUNCTIONS) {
+            let Some(body) = self.shell_state.functions.get(&name) else {
+                continue;
+            };
+            let def_redirects = self
+                .shell_state
+                .function_def_infos
+                .get(&name)
+                .map(|info| info.def_redirects.as_slice())
+                .unwrap_or(&[])
+                .to_vec();
+            let env_name = exported_function_env_name(&name);
+            let prior_value = self.shell_state.env_vars.get(&env_name).cloned();
+            let prior_marked = marked_env_names(&self.shell_state.env_vars, EXPORTED_VARS)
+                .iter()
+                .any(|marked| marked == &env_name);
+            saved.push((env_name.clone(), prior_value, prior_marked));
+            let value = exported_function_env_value(&body.commands, &def_redirects);
+            self.shell_state.env_vars.insert(env_name.clone(), value);
+            mark_env_name(&mut self.shell_state.env_vars, EXPORTED_VARS, &env_name);
+        }
+        saved
+    }
+
+    fn restore_exported_functions_after_exec(
+        &mut self,
+        saved: Vec<(String, Option<String>, bool)>,
+    ) {
+        for (env_name, prior_value, prior_marked) in saved {
+            match prior_value {
+                Some(value) => {
+                    self.shell_state.env_vars.insert(env_name.clone(), value);
+                }
+                None => {
+                    self.shell_state.env_vars.remove(&env_name);
+                }
+            }
+            if !prior_marked {
+                unmark_env_name(&mut self.shell_state.env_vars, EXPORTED_VARS, &env_name);
+            }
+        }
+    }
+
     pub(in crate::executor) fn execute_exec_command(
         &mut self,
         cmd: &CommandNode,
@@ -4262,13 +4492,27 @@ impl Executor {
         // profile that is the extensionless ~/.local/bin/env POSIX shim,
         // which ignores its operands and exits 0, so the whole exec chain
         // silently no-ops (rubash#172).
-        if let Some(status) = self.execute_exec_env_command(cmd)? {
-            self.exit_code = status;
-            return self.finish_exec_replacement(cmd, status);
-        }
-        let status = self.execute_exec(cmd)?;
-        self.exit_code = status;
-        self.finish_exec_replacement(cmd, status)
+        let saved = self.materialize_exported_functions_for_exec();
+        let status_result = match self.execute_exec_env_command(cmd) {
+            Ok(Some(status)) => {
+                self.exit_code = status;
+                Ok(status)
+            }
+            Ok(None) => match self.execute_exec(cmd) {
+                Ok(status) => {
+                    self.exit_code = status;
+                    Ok(status)
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        let result = match status_result {
+            Ok(status) => self.finish_exec_replacement(cmd, status),
+            Err(error) => Err(error),
+        };
+        self.restore_exported_functions_after_exec(saved);
+        result
     }
 
     /// The exit contract of `exec_builtin` (exec.def:248-260): with a

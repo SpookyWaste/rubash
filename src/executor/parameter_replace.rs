@@ -485,10 +485,38 @@ pub(in crate::executor) fn invalid_at_transform_base(inner: &str) -> Option<&str
             }
         }
     }
-    let (head, tail) = inner.rsplit_once('@')?;
-    if head.starts_with('#') {
-        return None;
+    // GNU parameter_brace_transform reads the transform introducer as
+    // the FIRST `@` outside any [...] subscript — for the special
+    // parameters `@`/`*` themselves, the second character — and requires
+    // everything after it to be exactly one valid transform character.
+    // Splitting at the LAST `@` (rsplit_once) misread a chained form
+    // like `v@Q@L` as variable `v@Q` with transform L and expanded it
+    // silently empty; GNU reports a bad substitution (rubash#1271).
+    // Another operator character at bracket depth 0 (`/`, `#`, `%`,
+    // the `:-` family, `^`/`,`) ends the parameter name first, so the
+    // `@` behind it is operand text, not an introducer.
+    let scan_from = if inner.starts_with(['@', '*']) { 1 } else { 0 };
+    let mut depth = 0usize;
+    let mut at = None;
+    for (index, ch) in inner.char_indices() {
+        if index < scan_from {
+            continue;
+        }
+        match ch {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            '@' if depth == 0 => {
+                at = Some(index);
+                break;
+            }
+            '/' | '#' | '%' | '-' | '+' | '=' | '?' | '^' | ',' | ':' if depth == 0 => {
+                return None;
+            }
+            _ => {}
+        }
     }
+    let (head, tail) = inner.split_at(at?);
+    let tail = &tail[1..];
     let bracketed = head.ends_with(']') && head.contains('[');
     let valid_head = is_shell_name(head)
         || matches!(head, "@" | "*" | "!" | "?" | "-" | "$")
@@ -496,10 +524,11 @@ pub(in crate::executor) fn invalid_at_transform_base(inner: &str) -> Option<&str
         || head
             .strip_prefix('!')
             .is_some_and(|h: &str| is_shell_name(h) || (h.ends_with(']') && h.contains('[')));
-    let valid_tail = matches!(
-        tail,
-        "a" | "A" | "K" | "k" | "E" | "P" | "Q" | "U" | "u" | "L"
-    );
+    let valid_tail = tail.len() == 1
+        && matches!(
+            tail,
+            "a" | "A" | "K" | "k" | "E" | "P" | "Q" | "U" | "u" | "L"
+        );
     if !(valid_head || bracketed) || valid_tail {
         return None;
     }

@@ -1,8 +1,8 @@
 //! suspend module.
 //!
 //! GNU Bash source ownership:
-// - builtins/suspend.def suspend_builtin (`killpg (shell_pgrp, SIGSTOP)`
-//   on -f; `sh_nojobs` failure without job control otherwise)
+//! - builtins/suspend.def suspend_builtin (`killpg (shell_pgrp, SIGSTOP)`
+//!   on -f; `sh_nojobs` failure without job control otherwise)
 
 use std::io::{self, Write};
 
@@ -10,17 +10,25 @@ const EXECUTION_SUCCESS: i32 = 0;
 const EXECUTION_FAILURE: i32 = 1;
 const EX_USAGE: i32 = 2;
 
+/// Returns the builtin status plus a `too_many_arguments` flag. GNU
+/// suspend.def reports an operand with `suspend: too many arguments` —
+/// the builtins/common.c no_args shape, whose DISCARD jump (exit class,
+/// rubash#705) the Executor arms when it sees the flag: the rest of the
+/// current list is abandoned with $?=2, and under `-c` the shell exits 1.
+/// A bad OPTION is different: plain EX_USAGE and the shell continues.
 pub fn execute_with_io<E>(
     args: &[String],
     diagnostic_prefix: &str,
     stderr: &mut E,
-) -> io::Result<i32>
+) -> io::Result<(i32, bool)>
 where
     E: Write,
 {
     let mut force = false;
-    for arg in args {
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
         if arg == "--" {
+            index += 1;
             break;
         }
         if !arg.starts_with('-') || arg == "-" {
@@ -35,10 +43,16 @@ where
                         "{diagnostic_prefix}suspend: -{other}: invalid option"
                     )?;
                     writeln!(stderr, "suspend: usage: suspend [-f]")?;
-                    return Ok(EX_USAGE);
+                    return Ok((EX_USAGE, false));
                 }
             }
         }
+        index += 1;
+    }
+
+    if index < args.len() {
+        writeln!(stderr, "{diagnostic_prefix}suspend: too many arguments")?;
+        return Ok((EX_USAGE, true));
     }
 
     if force {
@@ -60,12 +74,12 @@ where
                 }
             }
         }
-        return Ok(EXECUTION_SUCCESS);
+        return Ok((EXECUTION_SUCCESS, false));
     }
 
     writeln!(
         stderr,
         "{diagnostic_prefix}suspend: cannot suspend: no job control"
     )?;
-    Ok(EXECUTION_FAILURE)
+    Ok((EXECUTION_FAILURE, false))
 }

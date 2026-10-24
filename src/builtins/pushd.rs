@@ -12,7 +12,8 @@ use crate::executor::types::READONLY_VARS;
 use crate::shell::var_table::VarTable;
 use parse::{parse_popd_operand, parse_pushd_operand, PopdOperand, PushdOperand};
 use stack::{
-    is_stack_index, logical_dir_exists, normalize_stack_dir, resolved_index, stack_index,
+    dir_operand_error_text, is_stack_index, logical_dir_exists, normalize_stack_dir,
+    resolved_index, stack_index,
 };
 use std::io::{self, Write};
 
@@ -149,7 +150,11 @@ where
                     flag_end += 1;
                 }
             }
-            let rest = if parsing_options { &args[flag_end..] } else { &[] };
+            let rest = if parsing_options {
+                &args[flag_end..]
+            } else {
+                &[]
+            };
             if let Some(arg) = rest.first().copied() {
                 if arg.starts_with('+') || arg.starts_with('-') {
                     if !is_stack_index(arg) {
@@ -348,7 +353,8 @@ where
                         if !logical_dir_exists(&resolved, env_vars) {
                             writeln!(
                                 stderr,
-                                "{diagnostic_prefix}pushd: {oldpwd}: No such file or directory"
+                                "{diagnostic_prefix}pushd: {oldpwd}: {}",
+                                dir_operand_error_text(&resolved, env_vars)
                             )?;
                             return Ok(EXECUTION_FAILURE);
                         }
@@ -368,7 +374,8 @@ where
                         if !logical_dir_exists(&resolved, env_vars) {
                             writeln!(
                                 stderr,
-                                "{diagnostic_prefix}pushd: {dir}: No such file or directory"
+                                "{diagnostic_prefix}pushd: {dir}: {}",
+                                dir_operand_error_text(&resolved, env_vars)
                             )?;
                             return Ok(EXECUTION_FAILURE);
                         }

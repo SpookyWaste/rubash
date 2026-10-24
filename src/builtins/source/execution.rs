@@ -99,18 +99,26 @@ fn run_source_groups(
                 .shell_state
                 .env_vars
                 .insert("__RUBASH_ALIAS_STREAMED".to_string(), "1".to_string());
-            let status = crate::script_driver::run_source_with_line_offset(
-                executor,
-                &exec_text,
-                false,
-                line_offset,
-                redirect_cmd,
-                if exec_text == pre_alias_text {
-                    None
-                } else {
-                    Some(pre_alias_text.as_str())
-                },
-            );
+            let saved_list_boundary = executor.enter_discard_boundary_list();
+            // GNU builtins/evalfile.c runs the sourced text through
+            // parse_and_execute (builtins/evalstring.c:348), which bumps
+            // indirection_level: under `set -x` the file's commands trace
+            // one PS4 level deeper than the `.` line (rubash#1341).
+            let status = executor.with_xtrace_indirection(|executor| {
+                crate::script_driver::run_source_with_line_offset(
+                    executor,
+                    &exec_text,
+                    false,
+                    line_offset,
+                    redirect_cmd,
+                    if exec_text == pre_alias_text {
+                        None
+                    } else {
+                        Some(pre_alias_text.as_str())
+                    },
+                )
+            });
+            executor.leave_discard_boundary_list(saved_list_boundary);
             executor.absorb_failglob_discard();
             match old_streamed {
                 Some(value) => executor
@@ -227,7 +235,11 @@ fn run_source_groups(
             .shell_state
             .env_vars
             .insert("__RUBASH_ALIAS_STREAMED".to_string(), "1".to_string());
-        let group_result = executor.execute_ast(&ast);
+        let saved_list_boundary = executor.enter_discard_boundary_list();
+        // Same parse_and_execute indirection bump as the incomplete-group
+        // arm above (builtins/evalstring.c:348; rubash#1341).
+        let group_result = executor.with_xtrace_indirection(|executor| executor.execute_ast(&ast));
+        executor.leave_discard_boundary_list(saved_list_boundary);
         executor.absorb_failglob_discard();
         match old_streamed {
             Some(value) => executor

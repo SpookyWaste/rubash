@@ -1,0 +1,4 @@
+rc=0 n=3 a=[1] b=[2] zero=[b]
+n2=1 zero2=[([x]=9)]
+n3=2 k=[v] zero3=[direct]
+done

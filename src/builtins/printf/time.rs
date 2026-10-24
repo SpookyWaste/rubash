@@ -38,6 +38,22 @@ pub(super) fn format_time_value(
             .unwrap_or_else(current_epoch_seconds),
         other => other,
     };
+    // GNU printf.def getintmax clamps an out-of-range operand to
+    // INTMAX_MAX/MIN and chk_converror raises ERANGE; the subsequent
+    // localtime() on the clamped value fails, and bash renders the
+    // conversion against the zeroed tm — the epoch (rubash#1286:
+    // `printf '%(%F)T' 99999999999999999999` prints 1970-01-01 in GNU
+    // 5.3.20, both signs; rubash wrapped the value through its civil
+    // conversion and printed year 219250468). The ERANGE diagnostic
+    // itself is unchanged (invalid_number_error).
+    let seconds = if invalid
+        .as_deref()
+        .is_some_and(|marker| marker.starts_with("__rubash_printf_overflow__:"))
+    {
+        0
+    } else {
+        seconds
+    };
     let timezone = TimeZoneRule::from_env(env_vars.get("TZ").map(String::as_str));
     let local = timezone.local_time(seconds);
     let format = spec.time_format.as_deref().unwrap_or_default();
