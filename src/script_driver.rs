@@ -25,29 +25,64 @@ use crate::parser::CommandNode;
 /// bashhist.c: does this script turn history on? Detects the long-form
 /// option (set -o history / -o histexpand) and the short flag cluster
 /// containing -H, which is how the histexp tests enable expansion.
+///
+/// The scan is a whitelist admission like script_uses_aliases: it may
+/// over-admit (a `set -o history` inside a string takes the grouped
+/// driver too — slower, never wrong), but it must not under-admit.
+/// GNU's reader is incremental, so a `set` in ANY command position —
+/// line start, or after `;`/`&`/`|`/`(` — enables history for every
+/// later line. The old line-initial-only scan missed
+/// `shopt -s histverify; set -o history; set -H` (rubash#1072): the
+/// script fell to the whole-file fast path, which does no history
+/// processing at all, so `!!` stayed literal and histverify was moot.
 pub fn script_uses_history(contents: &str) -> bool {
-    for line in contents.lines() {
-        let Some(rest) = line.trim_start().strip_prefix("set ") else {
-            continue;
-        };
-        let mut expecting_option = false;
-        for token in rest.split_whitespace() {
-            if expecting_option {
-                if token == "history" || token == "histexpand" {
-                    return true;
-                }
-                expecting_option = false;
-                continue;
-            }
-            if token == "-o" {
-                expecting_option = true;
-            } else if token.len() >= 2
-                && token.starts_with('-')
-                && !token.starts_with("--")
-                && token[1..].contains('H')
-            {
+    contents.lines().any(line_enables_history)
+}
+
+fn line_enables_history(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i + 3 <= bytes.len() {
+        if &bytes[i..i + 3] == b"set"
+            && (i == 0
+                || matches!(
+                    bytes[i - 1],
+                    b' ' | b'\t' | b';' | b'&' | b'|' | b'(' | b'{'
+                ))
+            && (i + 3 == bytes.len() || matches!(bytes[i + 3], b' ' | b'\t'))
+        {
+            if set_args_enable_history(&line[i + 3..]) {
                 return true;
             }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+fn set_args_enable_history(args: &str) -> bool {
+    let mut expecting_option = false;
+    for token in args.split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|')) {
+        if token.is_empty() {
+            continue;
+        }
+        if expecting_option {
+            if token == "history" || token == "histexpand" {
+                return true;
+            }
+            expecting_option = false;
+            continue;
+        }
+        if token == "-o" {
+            expecting_option = true;
+        } else if token.len() >= 2
+            && token.starts_with('-')
+            && !token.starts_with("--")
+            && token[1..].contains('H')
+        {
+            return true;
         }
     }
     false
