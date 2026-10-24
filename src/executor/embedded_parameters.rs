@@ -712,6 +712,38 @@ impl Executor {
                             }
                         }
                     }
+                    // GNU subst.c parameter_brace_expand: the extquote
+                    // decode of a `$'...'` parameter name applies only in
+                    // a quoted context (double quotes, heredoc body,
+                    // command-substitution body — the gate
+                    // parameter_words.rs applies to whole-word fragments).
+                    // In an unquoted segment the form hits the
+                    // bad-substitution default (rubash#1483:
+                    // `pre${$'x'}post` used to decode silently). Only a
+                    // name the decoder would ACCEPT needs the verdict
+                    // here; undecodable forms fall through to the
+                    // bad-name gates inside the fragment expansion.
+                    if !double_quoted
+                        && !in_double
+                        && !heredoc
+                        && !self
+                            .shell_state
+                            .env_vars
+                            .contains_key("__RUBASH_COMSUB_BODY")
+                        && crate::executor::expand_word::resolve_dollar_quoted_parameter_name(&name)
+                            .is_some()
+                    {
+                        self.write_diagnostic_fd2(
+                            format!(
+                                "{}{}: bad substitution\n",
+                                self.diagnostic_prefix(),
+                                crate::executor::expand_word::bad_substitution_display(word)
+                            )
+                            .as_bytes(),
+                        );
+                        self.shell_state.parameter_bad_substitution.set(true);
+                        continue;
+                    }
                     // A bad-substitution diagnostic inside this fragment must
                     // name the whole enclosing word (GNU subst.c:10278),
                     // not just the `${...}` span (rubash#758).
