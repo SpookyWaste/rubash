@@ -1825,9 +1825,19 @@ pub(super) fn push_unexpected_token_error_named(
     // GNU's parser aborts the input line at the error, so commands already
     // parsed from the same line never run (`{ a; } { b; }' does not run
     // `a').  Drop the trailing commands parsed from the offending line.
+    // rubash#1481: "the same line" is the same PARSE UNIT — a compound
+    // command spanning several physical lines is one command of the unit
+    // whose terminator the offending token failed to be, so a command
+    // whose span ENDS on the error line (a multi-line `if' whose `fi'
+    // shares the line with the trailing word) is discarded too, even
+    // though its start line is earlier. GNU parse.y shifts the whole
+    // compound before yyerror, so its body never executes.
     let error_line = tokens[i].position;
     while state.ast.commands.last().is_some_and(|command| {
         command.line == Some(error_line)
+            || command.line.is_some_and(|start| {
+                start < error_line && command.end_line.is_some_and(|end| end >= error_line)
+            })
             // rubash#385: the failed command may SPAN lines — the pipeline
             // whose first stage opened on an earlier line (`case x in\n
             // esac|y) ...`: yyerror discards the whole in-progress command,
