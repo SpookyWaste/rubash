@@ -1516,18 +1516,30 @@ impl Executor {
     /// observe_signals_while_blocked between slices.
     ///
     /// rubash#1034: the emulation has one gap a real child does not —
-    /// a group-delivered terminating signal (^C, `kill` of the job)
-    /// kills GNU's real sleep instantly, wait_for returns, and the
-    /// shell's trap dispatches at once; the virtual child cannot die,
-    /// so the trap used to sit queued for the sleep's whole remainder.
-    /// When a pending delivery is a trapped signal from the kernel-
-    /// managed terminating set (HUP/INT/QUIT/TERM/USR1/USR2 — the set
-    /// a default-disposition child dies from), model the child as
-    /// killed by it: dispatch the pending traps now and end the sleep,
-    /// reporting the killing signal so the caller records 128+sig as
-    /// the command's status, exactly like a reaped signal death.
-    /// Non-terminating trapped signals (WINCH, CHLD...) keep GNU's
-    /// defer-to-completion semantics untouched.
+    /// a group-delivered terminating signal (^C) kills GNU's real
+    /// sleep instantly, wait_for returns, and the shell's trap
+    /// dispatches at once; the virtual child cannot die, so without a
+    /// model the trap sits queued for the sleep's whole remainder.
+    /// But the model must key on WHO the delivery could have killed:
+    /// a kill(2) addressed to the shell alone (`kill -INT $$` from a
+    /// background job) leaves GNU's real sleep untouched, and GNU
+    /// defers the trap until the sleep completes — the first port of
+    /// this model aborted on ANY trapped terminating delivery and
+    /// fired the trap immediately there too, the mirror-image bug.
+    /// The observable boundary is the delivery's origin (siginfo
+    /// si_code, recorded by the kernel backend's drain): a
+    /// KERNEL-caused delivery is the terminal driver's group signal
+    /// (^C/^\\), which a real foreground child in the group dies
+    /// from — model the child as killed by it: dispatch the pending
+    /// traps now and end the sleep, reporting the killing signal so
+    /// the caller records 128+sig as the command's status, exactly
+    /// like a reaped signal death. Kill(2)-caused deliveries (any
+    /// sender process, including this shell's own kill builtin) keep
+    /// GNU's defer-to-completion semantics untouched, as do
+    /// non-terminating trapped signals (WINCH, CHLD...). A kill(2)
+    /// addressed to the whole process group still defers: the queues
+    /// cannot distinguish its addressing from a pid-addressed kill,
+    /// and no real child exists whose death could report it.
     pub(crate) fn sleep_interruptibly(
         &mut self,
         seconds: f64,
@@ -1586,6 +1598,7 @@ impl Executor {
                 #[cfg(unix)]
                 {
                     crate::builtins::kill::kernel_handler_installed(signal)
+                        && crate::builtins::kill::last_delivery_kernel_caused(signal)
                         && signal_trap_name(signal).is_some_and(|name| {
                             crate::builtins::trap::get_trap_action(
                                 &self.shell_state.env_vars,
