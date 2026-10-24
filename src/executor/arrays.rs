@@ -1116,7 +1116,12 @@ pub(super) fn append_array_value(
         let token = if scalar_append {
             token
         } else {
-            unquote_storage_value(&token)
+            // A whole-token `$'...'` here is the compound walker's own
+            // serialization of an expansion result (or a storage-form
+            // element): it is final data, so decode it plain instead of
+            // through the transport arm that re-marks decoded blanks with
+            // the U+E401 guard (rubash#1505).
+            crate::executor::unquote_stored_element_value(&token)
         };
         // GNU dequote_string (subst.c:4807) strips the CTLESC pairs from
         // every word pathname expansion did not consume, so a stored
@@ -1338,7 +1343,7 @@ pub(crate) fn dequote_compound_element_rhs(rhs: &str) -> String {
         // storage forms): unquote_storage_value performs the one removal —
         // ANSI-C decoding for `$'...'` (issue #109) and the unquoted
         // `\x` -> x escape drop for bare text (parse.y:5368-5397).
-        decode_compound_expansion_carriers(&unquote_storage_value(
+        decode_compound_expansion_carriers(&crate::executor::unquote_stored_element_value(
             &crate::executor::markers::dequote_ctlesc_pairs(rhs),
         ))
     }
