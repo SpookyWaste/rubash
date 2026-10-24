@@ -1369,8 +1369,20 @@ impl Executor {
                         .map_or(true, |name| !local_blocked.iter().any(|b| b == name))
                 });
             }
+            // GNU builtins/declare.def (local is declare with
+            // variable_context forced): `-g` suppresses the local creation
+            // and makes the builtin operate on the global variable
+            // (declare.def's -g handling in variable context). rubash#1471:
+            // execute_local used to localize every operand even with -g,
+            // so `local -g V=1` inside a function created a plain local
+            // that vanished at return. Mirror execute_declare: skip the
+            // frame save under -g and bracket the builtin call with the
+            // global-declare unshadow/restore pair so a same-named OUTER
+            // local stays in view for reads while the write lands on the
+            // global cell.
+            let force_global = declare_args_force_global(&args);
             let mut frame_locals: Vec<String> = Vec::new();
-            if !declare_args_request_print(&args) {
+            if !declare_args_request_print(&args) && !force_global {
                 let prefix_assignment_names = cmd
                     .assignment_keys()
                     .map(|name| assignment_name_and_append(name).0.to_string())
@@ -1412,6 +1424,10 @@ impl Executor {
                     self.diagnostic_prefix()
                 )?;
             }
+            // rubash#1471: under -g, unshadow same-named outer locals for
+            // the duration of the builtin call (the declare path's
+            // begin/finish pair); a no-op vec when -g is absent.
+            let global_local_values = self.begin_global_declare_for_local_names(&args);
             let (status, builtin_status) = if local_names(&args).is_empty()
                 && (had_dash_operand
                     || dash_printed
@@ -1532,6 +1548,11 @@ impl Executor {
                     }
                 }
             }
+            // rubash#1471: restore the outer locals begin unshadowed —
+            // the scope slots now hold the NEW global values (so a later
+            // frame exit restores the globals as declare -g left them),
+            // and the visible cells hold the outer locals again.
+            self.finish_global_declare_for_local_names(global_local_values);
             status
         };
         let stderr = local_stderr_from_declare(stderr);
