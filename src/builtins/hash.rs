@@ -261,6 +261,14 @@ where
     if delete {
         let mut status = EXECUTION_SUCCESS;
         for name in names {
+            // GNU builtins/hash.def hash_builtin name loop: the
+            // absolute_program(w) → continue check is the loop's first
+            // statement, ahead of the delete branch — a slash name is
+            // silently skipped by `hash -d` too, never reported and never
+            // removed (rubash#1362 delete facet).
+            if name.contains('/') {
+                continue;
+            }
             if table.remove(name).is_none() {
                 writeln!(stderr, "{}hash: {name}: not found", script_prefix(env_vars))?;
                 status = EXECUTION_FAILURE;
