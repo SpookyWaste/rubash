@@ -97,7 +97,13 @@ where
             }
         }
         if depth != 0 {
-            return ParsedFormat::Missing(raw);
+            // GNU printf.def:598-614: the scan for the closing paren ran
+            // off the end of the format (*fmt == '\0'), so the warning
+            // names '\0' and the directive is rescanned as literal text
+            // (rubash#1490).
+            return ParsedFormat::InvalidTime {
+                rescan: raw[1..].to_string(),
+            };
         }
         spec.time_format = Some(time_format);
     }
@@ -114,6 +120,16 @@ where
     }
 
     let Some(specifier) = chars.next() else {
+        // A `%(...)` directive whose format ends right after the closing
+        // paren hits the same GNU printf.def:609 arm as the unterminated
+        // scan (*fmt == '\0' after the paren): warning naming '\0', `%`
+        // printed, rest rescanned (rubash#1490). Any other truncated
+        // directive is the printf.def:483 missing-format-character error.
+        if spec.time_format.is_some() {
+            return ParsedFormat::InvalidTime {
+                rescan: raw[1..].to_string(),
+            };
+        }
         return ParsedFormat::Missing(raw);
     };
     raw.push(specifier);
