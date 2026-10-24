@@ -589,15 +589,17 @@ impl Executor {
                     index += 1;
                 }
                 "-d" => {
-                    delimiter = cmd
-                        .words
-                        .get(index + 1)
-                        .map(|word| read_delimiter_char(word))
-                        .unwrap_or('\u{0}');
+                    let Some(delimiter_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'd');
+                    };
+                    delimiter = read_delimiter_char(delimiter_word);
                     index += 2;
                 }
                 "-n" => {
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'n');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -612,7 +614,10 @@ impl Executor {
                     index += 2;
                 }
                 "-N" => {
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'N');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -650,7 +655,10 @@ impl Executor {
                     index += 2;
                 }
                 "-i" => {
-                    initial_text = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'i');
+                    };
+                    initial_text = Some(next_word.clone());
                     index += 2;
                 }
                 "-t" => {
@@ -680,7 +688,10 @@ impl Executor {
                     index += 2;
                 }
                 "-p" => {
-                    prompt = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'p');
+                    };
+                    prompt = Some(next_word.clone());
                     index += 2;
                 }
                 "-e" => {
@@ -700,7 +711,10 @@ impl Executor {
                     index += 1;
                 }
                 "-sn" => {
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'n');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -730,7 +744,10 @@ impl Executor {
                     index += 1;
                 }
                 "-sN" => {
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'N');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -760,7 +777,10 @@ impl Executor {
                     index += 1;
                 }
                 "-en" => {
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'n');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -791,7 +811,10 @@ impl Executor {
                 }
                 "-ren" | "-ern" => {
                     raw = true;
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'n');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -824,7 +847,10 @@ impl Executor {
                     index += 1;
                 }
                 "-eN" => {
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'N');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -855,7 +881,10 @@ impl Executor {
                 }
                 "-reN" | "-erN" => {
                     raw = true;
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'N');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -888,7 +917,10 @@ impl Executor {
                     index += 1;
                 }
                 "-sp" => {
-                    prompt = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'p');
+                    };
+                    prompt = Some(next_word.clone());
                     index += 2;
                 }
                 word if word.starts_with("-sp") && word.len() > 3 => {
@@ -896,7 +928,10 @@ impl Executor {
                     index += 1;
                 }
                 "-ep" => {
-                    prompt = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'p');
+                    };
+                    prompt = Some(next_word.clone());
                     index += 2;
                 }
                 word if word.starts_with("-ep") && word.len() > 3 => {
@@ -905,7 +940,10 @@ impl Executor {
                 }
                 "-rep" | "-erp" => {
                     raw = true;
-                    prompt = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'p');
+                    };
+                    prompt = Some(next_word.clone());
                     index += 2;
                 }
                 word if (word.starts_with("-rep") || word.starts_with("-erp"))
@@ -917,7 +955,10 @@ impl Executor {
                 }
                 "-ersp" | "-esrp" | "-resp" | "-rsep" | "-serp" | "-srep" => {
                     raw = true;
-                    prompt = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'p');
+                    };
+                    prompt = Some(next_word.clone());
                     index += 2;
                 }
                 word if (word.starts_with("-ersp")
@@ -933,7 +974,10 @@ impl Executor {
                     index += 1;
                 }
                 "-ei" => {
-                    initial_text = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'i');
+                    };
+                    initial_text = Some(next_word.clone());
                     index += 2;
                 }
                 word if word.starts_with("-ei") && word.len() > 3 => {
@@ -942,7 +986,10 @@ impl Executor {
                 }
                 "-rei" | "-eri" => {
                     raw = true;
-                    initial_text = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'i');
+                    };
+                    initial_text = Some(next_word.clone());
                     index += 2;
                 }
                 word if (word.starts_with("-rei") || word.starts_with("-eri"))
@@ -954,7 +1001,10 @@ impl Executor {
                 }
                 "-ersi" | "-esri" | "-resi" | "-rsei" | "-seri" | "-srei" => {
                     raw = true;
-                    initial_text = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'i');
+                    };
+                    initial_text = Some(next_word.clone());
                     index += 2;
                 }
                 word if (word.starts_with("-ersi")
@@ -1168,7 +1218,10 @@ impl Executor {
                     index += 1;
                 }
                 "-si" => {
-                    initial_text = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'i');
+                    };
+                    initial_text = Some(next_word.clone());
                     index += 2;
                 }
                 word if word.starts_with("-si") && word.len() > 3 => {
@@ -1254,11 +1307,10 @@ impl Executor {
                     index += 1;
                 }
                 "-ed" => {
-                    delimiter = cmd
-                        .words
-                        .get(index + 1)
-                        .map(|word| read_delimiter_char(word))
-                        .unwrap_or('\u{0}');
+                    let Some(delimiter_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'd');
+                    };
+                    delimiter = read_delimiter_char(delimiter_word);
                     index += 2;
                 }
                 word if word.starts_with("-ed") && word.len() > 3 => {
@@ -1267,11 +1319,10 @@ impl Executor {
                 }
                 "-red" | "-erd" => {
                     raw = true;
-                    delimiter = cmd
-                        .words
-                        .get(index + 1)
-                        .map(|word| read_delimiter_char(word))
-                        .unwrap_or('\u{0}');
+                    let Some(delimiter_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'd');
+                    };
+                    delimiter = read_delimiter_char(delimiter_word);
                     index += 2;
                 }
                 word if (word.starts_with("-red") || word.starts_with("-erd"))
@@ -1364,11 +1415,10 @@ impl Executor {
                     index += 1;
                 }
                 "-sd" => {
-                    delimiter = cmd
-                        .words
-                        .get(index + 1)
-                        .map(|word| read_delimiter_char(word))
-                        .unwrap_or('\u{0}');
+                    let Some(delimiter_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'd');
+                    };
+                    delimiter = read_delimiter_char(delimiter_word);
                     index += 2;
                 }
                 word if word.starts_with("-sd") && word.len() > 3 => {
@@ -1390,11 +1440,10 @@ impl Executor {
                 }
                 "-rd" => {
                     raw = true;
-                    delimiter = cmd
-                        .words
-                        .get(index + 1)
-                        .map(|word| read_delimiter_char(word))
-                        .unwrap_or('\u{0}');
+                    let Some(delimiter_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'd');
+                    };
+                    delimiter = read_delimiter_char(delimiter_word);
                     index += 2;
                 }
                 word if word.starts_with("-rd") && word.len() > 3 => {
@@ -1404,11 +1453,10 @@ impl Executor {
                 }
                 "-rsd" | "-srd" => {
                     raw = true;
-                    delimiter = cmd
-                        .words
-                        .get(index + 1)
-                        .map(|word| read_delimiter_char(word))
-                        .unwrap_or('\u{0}');
+                    let Some(delimiter_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'd');
+                    };
+                    delimiter = read_delimiter_char(delimiter_word);
                     index += 2;
                 }
                 word if (word.starts_with("-rsd") || word.starts_with("-srd"))
@@ -1420,11 +1468,10 @@ impl Executor {
                 }
                 "-ersd" | "-esrd" | "-resd" | "-rsed" | "-serd" | "-sred" => {
                     raw = true;
-                    delimiter = cmd
-                        .words
-                        .get(index + 1)
-                        .map(|word| read_delimiter_char(word))
-                        .unwrap_or('\u{0}');
+                    let Some(delimiter_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'd');
+                    };
+                    delimiter = read_delimiter_char(delimiter_word);
                     index += 2;
                 }
                 word if (word.starts_with("-ersd")
@@ -1441,7 +1488,10 @@ impl Executor {
                 }
                 "-rsn" | "-srn" => {
                     raw = true;
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'n');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -1476,7 +1526,10 @@ impl Executor {
                 }
                 "-ersn" | "-esrn" | "-resn" | "-rsen" | "-sern" | "-sren" => {
                     raw = true;
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'n');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -1516,7 +1569,10 @@ impl Executor {
                 }
                 "-rsN" | "-srN" => {
                     raw = true;
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'N');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -1551,7 +1607,10 @@ impl Executor {
                 }
                 "-ersN" | "-esrN" | "-resN" | "-rseN" | "-serN" | "-sreN" => {
                     raw = true;
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'N');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -1591,7 +1650,10 @@ impl Executor {
                 }
                 "-rn" => {
                     raw = true;
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'n');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -1623,7 +1685,10 @@ impl Executor {
                 }
                 "-rN" => {
                     raw = true;
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'N');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -1786,7 +1851,10 @@ impl Executor {
                 }
                 "-rp" => {
                     raw = true;
-                    prompt = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'p');
+                    };
+                    prompt = Some(next_word.clone());
                     index += 2;
                 }
                 word if word.starts_with("-rp") && word.len() > 3 => {
@@ -1796,7 +1864,10 @@ impl Executor {
                 }
                 "-rsp" | "-srp" => {
                     raw = true;
-                    prompt = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'p');
+                    };
+                    prompt = Some(next_word.clone());
                     index += 2;
                 }
                 word if (word.starts_with("-rsp") || word.starts_with("-srp"))
@@ -1808,6 +1879,10 @@ impl Executor {
                 }
                 "-ri" => {
                     raw = true;
+                    let Some(initial_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'i');
+                    };
+                    initial_text = Some(initial_word.clone());
                     index += 2;
                 }
                 word if word.starts_with("-ri") && word.len() > 3 => {
@@ -1816,6 +1891,10 @@ impl Executor {
                 }
                 "-rsi" | "-sri" => {
                     raw = true;
+                    let Some(initial_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'i');
+                    };
+                    initial_text = Some(initial_word.clone());
                     index += 2;
                 }
                 word if (word.starts_with("-rsi") || word.starts_with("-sri"))
@@ -2785,6 +2864,29 @@ impl Executor {
             self.diagnostic_prefix()
         );
         self.finish_read_error(cmd, &stderr, 127)
+    }
+
+    /// GNU builtins/read.def: an argument-taking option letter appearing
+    /// last in its word with no following word is a usage error —
+    /// `read: -X: option requires an argument` plus the usage line,
+    /// status 2 (the shape the -a/-t/-u arms already emit). rubash#1470:
+    /// the -d/-n/-N/-i/-p arms used to swallow the missing argument
+    /// silently (delimiter defaulted to NUL, char limit and prompt and
+    /// initial text to none) and start reading — a trailing `read -n` in
+    /// a script hung on stdin instead of failing.
+    fn read_missing_argument(
+        &mut self,
+        cmd: &CommandNode,
+        stderr: &mut Vec<u8>,
+        letter: char,
+    ) -> i32 {
+        let _ = writeln!(
+            stderr,
+            "{}read: -{letter}: option requires an argument",
+            self.diagnostic_prefix()
+        );
+        let _ = writeln!(stderr, "{READ_USAGE}");
+        self.finish_read_error(cmd, stderr, 2)
     }
 
     fn read_prompt_should_display(&self, cmd: &CommandNode, read_fd: Option<u32>) -> bool {
