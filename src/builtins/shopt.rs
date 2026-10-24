@@ -277,6 +277,19 @@ where
                     stdout,
                 )?;
             }
+            // GNU shopt.def list_some_o_options: `shopt -s -o` with no
+            // names lists only the options currently SET (the -s filter),
+            // in the plain display format — it is not the full table
+            // (rubash#1487).
+            ShoptMode::Set => {
+                crate::builtins::set::print_shell_options_by_state(
+                    env_vars,
+                    true,
+                    false,
+                    MINUS_O_PRINT_WIDTH,
+                    stdout,
+                )?;
+            }
             ShoptMode::Unset => {
                 crate::builtins::set::print_shell_options_by_state(
                     env_vars,
