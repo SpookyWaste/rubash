@@ -1111,7 +1111,7 @@ impl Executor {
         Some(values)
     }
 
-    fn array_pattern_word_values(
+    pub(in crate::executor) fn array_pattern_word_values(
         &self,
         word: &str,
         quoted_array_word: bool,
