@@ -263,8 +263,14 @@ impl Executor {
         if read_fd.is_none() {
             if cmd.heredoc_body.is_some() {
                 let input = self.expand_heredoc_body_mut_from_carrier(&cmd.heredoc_body);
-                self.read_eof_no_delimiter |=
-                    !record_contains_delimiter(&input, delimiter, escape_aware);
+                self.read_eof_no_delimiter |= slurped_record_eof_no_delimiter(
+                    &input,
+                    delimiter,
+                    char_limit,
+                    exact_char_limit,
+                    escape_aware,
+                    raw,
+                );
                 return Some(trim_read_input(
                     input,
                     delimiter,
@@ -276,8 +282,14 @@ impl Executor {
             }
             if let Some(heredoc) = &cmd.heredoc {
                 let input = self.expand_heredoc_body_mut(heredoc);
-                self.read_eof_no_delimiter |=
-                    !record_contains_delimiter(&input, delimiter, escape_aware);
+                self.read_eof_no_delimiter |= slurped_record_eof_no_delimiter(
+                    &input,
+                    delimiter,
+                    char_limit,
+                    exact_char_limit,
+                    escape_aware,
+                    raw,
+                );
                 return Some(trim_read_input(
                     input,
                     delimiter,
@@ -419,8 +431,14 @@ impl Executor {
                 .and_then(|target| target.strip_suffix(')'))
             {
                 if let Some(output) = self.process_substitution_output(source) {
-                    self.read_eof_no_delimiter |=
-                        !record_contains_delimiter(&output, delimiter, escape_aware);
+                    self.read_eof_no_delimiter |= slurped_record_eof_no_delimiter(
+                        &output,
+                        delimiter,
+                        char_limit,
+                        exact_char_limit,
+                        escape_aware,
+                        raw,
+                    );
                     return Some(trim_read_input(
                         output,
                         delimiter,
@@ -565,8 +583,14 @@ impl Executor {
             if input.is_empty() {
                 return None;
             }
-            self.read_eof_no_delimiter |=
-                !record_contains_delimiter(&input, delimiter, escape_aware);
+            self.read_eof_no_delimiter |= slurped_record_eof_no_delimiter(
+                &input,
+                delimiter,
+                char_limit,
+                exact_char_limit,
+                escape_aware,
+                raw,
+            );
             return Some(trim_read_input(
                 input,
                 delimiter,
@@ -582,8 +606,14 @@ impl Executor {
         // does not advance the shared fd cursor.
         if cmd.here_string.is_some() {
             if let Some(line) = self.stdin_string_for_command_mut(cmd) {
-                self.read_eof_no_delimiter |=
-                    !record_contains_delimiter(&line, delimiter, escape_aware);
+                self.read_eof_no_delimiter |= slurped_record_eof_no_delimiter(
+                    &line,
+                    delimiter,
+                    char_limit,
+                    exact_char_limit,
+                    escape_aware,
+                    raw,
+                );
                 return Some(trim_read_input(
                     line,
                     delimiter,
