@@ -1291,8 +1291,7 @@ impl Executor {
                     "recursive" => recursive = true,
                     "dir" => remove_empty_dir = true,
                     "verbose" => verbose = true,
-                    "interactive" | "one-file-system" | "preserve-root"
-                    | "no-preserve-root" => {}
+                    "interactive" | "one-file-system" | "preserve-root" | "no-preserve-root" => {}
                     other => {
                         eprintln!("rm: unrecognized option '--{other}'");
                         usage_error = true;
@@ -1351,7 +1350,10 @@ impl Executor {
                         fs::remove_dir(&target)
                     } else {
                         status = 1;
-                        writeln!(&mut stderr, "rm: cannot remove '{expanded}': Is a directory")?;
+                        writeln!(
+                            &mut stderr,
+                            "rm: cannot remove '{expanded}': Is a directory"
+                        )?;
                         continue;
                     }
                 }
@@ -2504,7 +2506,7 @@ impl Executor {
             #[cfg(not(unix))]
             let base = crate::builtins::test::emulated_file_mode(file, &self.shell_state.env_vars)
                 .unwrap_or_else(|| self.default_emulated_mode(&windows));
-            match apply_chmod_mode(base, mode) {
+            match apply_chmod_mode(base, mode, current_umask(&self.shell_state.env_vars)) {
                 Some(new_mode) => {
                     #[cfg(unix)]
                     {
@@ -2612,8 +2614,30 @@ impl Executor {
     }
 }
 
+/// The shell's current umask for applet mode computations: the tracked
+/// `__RUBASH_UMASK` when the builtin set one, else the live process mask
+/// (the builtin keeps the two in sync on unix).
+fn current_umask(env_vars: &HashMap<String, String>) -> u32 {
+    if let Some(mask) = env_vars
+        .get("__RUBASH_UMASK")
+        .and_then(|value| u32::from_str_radix(value, 8).ok())
+    {
+        return mask & 0o777;
+    }
+    #[cfg(unix)]
+    {
+        let mask = unsafe { libc::umask(0) };
+        unsafe { libc::umask(mask) };
+        (mask as u32) & 0o777
+    }
+    #[cfg(not(unix))]
+    {
+        0o022
+    }
+}
+
 /// Apply one chmod MODE operand (octal or symbolic clauses) to BASE.
-fn apply_chmod_mode(base: u32, mode: &str) -> Option<u32> {
+fn apply_chmod_mode(base: u32, mode: &str, umask: u32) -> Option<u32> {
     let trimmed = mode.trim();
     if !trimmed.is_empty() && trimmed.chars().all(|ch| ch.is_ascii_digit()) && trimmed.len() <= 4 {
         return u32::from_str_radix(trimmed, 8)
@@ -2663,15 +2687,22 @@ fn apply_chmod_mode(base: u32, mode: &str) -> Option<u32> {
         if chars.next().is_some() {
             return None;
         }
+        // coreutils modechange.c (the omitted-who rule, POSIX chmod):
+        // a clause that names no who is masked by the umask — its
+        // permission bits are ANDed with ~umask before the operator
+        // applies, for '+', '-' and '=' alike (rubash#1478: umask 007
+        // `chmod +x` on 0660 must yield 0770, not 0771; measured
+        // coreutils: `-w` on 0777 yields 0557, `=r` yields 0440).
+        let effective = if who_seen { perms } else { perms & !umask };
         match op {
             '+' => {
-                current |= who & perms;
+                current |= who & effective;
             }
             '-' => {
-                current &= !(who & perms);
+                current &= !(who & effective);
             }
             '=' => {
-                current = (current & !who) | (who & perms);
+                current = (current & !who) | (who & effective);
             }
             _ => return None,
         }
