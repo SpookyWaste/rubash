@@ -419,7 +419,13 @@ impl Executor {
             ""
         };
         match name {
-            "RANDOM" | "SECONDS" | "SRANDOM" | "BASHPID" => {
+            // GNU variables.c:1858-1875 initialize_dynamic_variables:
+            // RANDOM/SRANDOM/BASHPID each get VSETATTR(att_integer), and
+            // HISTCMD's INIT_DYNAMIC_VAR (variables.c:1873) is likewise
+            // followed by VSETATTR(v, att_integer) — `declare -p HISTCMD`
+            // is `declare -i HISTCMD="..."`, not `declare --`
+            // (rubash#1492).
+            "RANDOM" | "SECONDS" | "SRANDOM" | "BASHPID" | "HISTCMD" => {
                 Some(format!("declare -i{readonly}{exported} {name}={quoted}"))
             }
             "GROUPS" => {
@@ -461,7 +467,7 @@ impl Executor {
                 }
             }
             "EPOCHSECONDS" | "EPOCHREALTIME" | "LINENO" | "BASH_SUBSHELL" | "BASH_ARGV0"
-            | "BASH_COMMAND" | "HISTCMD" => {
+            | "BASH_COMMAND" => {
                 let flags = format!("{readonly}{exported}");
                 let flags = if flags.is_empty() { "--".to_string() } else { format!("-{flags}") };
                 Some(format!("declare {flags} {name}={quoted}"))
