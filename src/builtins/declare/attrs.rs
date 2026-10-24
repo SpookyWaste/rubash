@@ -353,8 +353,22 @@ where
     let eff_capcase = capcase && !unset_capcase;
     if eff_uppercase || eff_lowercase || eff_capcase {
         for name in names {
+            let raw = name;
             let name = name.split_once('=').map(|(name, _)| name).unwrap_or(name);
             let name = name.strip_suffix('+').unwrap_or(name);
+            // GNU applies the case modification at bind time
+            // (variables.c bind_variable_value), never as a rewrite of
+            // an existing value when an attribute is merely set:
+            // `s=abc; declare -u s` leaves "abc" (and likewise for
+            // indexed/associative elements) until the next assignment.
+            // The post-pass below therefore runs only for operands
+            // that assign in THIS command (`h=...`, `h[k]=...`,
+            // `h+=...`); a bare `declare -u h` only sets the mark.
+            let lhs = raw.split('=').next().unwrap_or("");
+            let assigned = raw.contains('=')
+                && (lhs == name
+                    || lhs.strip_suffix('+') == Some(name)
+                    || lhs.starts_with(&format!("{name}[")));
             if eff_uppercase {
                 mark_typed(variables, UPPERCASE_VARS, name);
                 unmark_typed(variables, LOWERCASE_VARS, name);
@@ -369,58 +383,60 @@ where
                 unmark_typed(variables, UPPERCASE_VARS, name);
                 unmark_typed(variables, LOWERCASE_VARS, name);
             }
-            if let Some(value) = variables.get(name).cloned() {
-                let convert = |value: &str| -> String {
-                    if eff_uppercase {
-                        value.to_uppercase()
-                    } else if eff_lowercase {
-                        value.to_lowercase()
-                    } else {
-                        // GNU capitalize: first character uppercased, rest
-                        // lowercased (variables.c capcase, casemod.tests:99-103).
-                        let mut chars = value.chars();
-                        match chars.next() {
-                            Some(first) => {
-                                first.to_uppercase().collect::<String>()
-                                    + &chars.as_str().to_lowercase()
-                            }
-                            None => value.to_string(),
-                        }
-                    }
-                };
-                // GNU variables.c apply_varcasemod converts each array
-                // ELEMENT VALUE; an associative array's keys are never
-                // case-folded (`declare -uA h=([k]=v)` stores ([k]="V"),
-                // rubash#1398). The storage string holds keys inline, so
-                // folding the whole string would corrupt the keys —
-                // convert per entry and re-render instead. The stored
-                // form may carry the STORAGE_WORD_PREFIX byte before the
-                // `(`; strip it for the parse and restore it after.
-                let value = if variables.is_marked(ASSOC_VARS, name) {
-                    let storage = value.strip_prefix(STORAGE_WORD_PREFIX).unwrap_or(&value);
-                    if storage.starts_with('(') {
-                        let entries = super::storage::parse_assoc_words(storage)
-                            .into_iter()
-                            .map(|(key, element)| (key, convert(&element)))
-                            .collect::<Vec<_>>();
-                        let rendered = super::storage::format_assoc_storage(entries);
-                        if value.starts_with(STORAGE_WORD_PREFIX) {
-                            format!("{STORAGE_WORD_PREFIX}{rendered}")
+            if assigned {
+                if let Some(value) = variables.get(name).cloned() {
+                    let convert = |value: &str| -> String {
+                        if eff_uppercase {
+                            value.to_uppercase()
+                        } else if eff_lowercase {
+                            value.to_lowercase()
                         } else {
-                            rendered
+                            // GNU capitalize: first character uppercased, rest
+                            // lowercased (variables.c capcase, casemod.tests:99-103).
+                            let mut chars = value.chars();
+                            match chars.next() {
+                                Some(first) => {
+                                    first.to_uppercase().collect::<String>()
+                                        + &chars.as_str().to_lowercase()
+                                }
+                                None => value.to_string(),
+                            }
+                        }
+                    };
+                    // GNU variables.c apply_varcasemod converts each array
+                    // ELEMENT VALUE; an associative array's keys are never
+                    // case-folded (`declare -uA h=([k]=v)` stores ([k]="V"),
+                    // rubash#1398). The storage string holds keys inline, so
+                    // folding the whole string would corrupt the keys —
+                    // convert per entry and re-render instead. The stored
+                    // form may carry the STORAGE_WORD_PREFIX byte before the
+                    // `(`; strip it for the parse and restore it after.
+                    let value = if variables.is_marked(ASSOC_VARS, name) {
+                        let storage = value.strip_prefix(STORAGE_WORD_PREFIX).unwrap_or(&value);
+                        if storage.starts_with('(') {
+                            let entries = super::storage::parse_assoc_words(storage)
+                                .into_iter()
+                                .map(|(key, element)| (key, convert(&element)))
+                                .collect::<Vec<_>>();
+                            let rendered = super::storage::format_assoc_storage(entries);
+                            if value.starts_with(STORAGE_WORD_PREFIX) {
+                                format!("{STORAGE_WORD_PREFIX}{rendered}")
+                            } else {
+                                rendered
+                            }
+                        } else {
+                            convert(&value)
                         }
                     } else {
                         convert(&value)
-                    }
-                } else {
-                    convert(&value)
-                };
-                variables.insert(name.to_string(), value.clone());
-                // Same gate as plain assignments (#916): mirror to the
-                // process env only when exported or special (children get
-                // the table explicitly; an unconditional mirror paid a
-                // locked O(n) environ scan per call).
-                sync_shell_assignment_process_env(variables, name, &value);
+                    };
+                    variables.insert(name.to_string(), value.clone());
+                    // Same gate as plain assignments (#916): mirror to the
+                    // process env only when exported or special (children get
+                    // the table explicitly; an unconditional mirror paid a
+                    // locked O(n) environ scan per call).
+                    sync_shell_assignment_process_env(variables, name, &value);
+                }
             }
         }
     }
