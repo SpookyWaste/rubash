@@ -82,6 +82,10 @@ impl Executor {
         // reported inline — GNU read.def validates the plain names
         // first and the -a argument only after all of them pass.
         let mut invalid_array_name: Option<String> = None;
+        // Whether a plain (non-option) name word has been scanned yet.
+        // GNU's option phase ends at the first plain name; an option
+        // letter after it is a NAME, not an option (see the -a arms).
+        let mut seen_plain_name = false;
         let mut stop_scalar_names = false;
         let mut prompt: Option<String> = None;
         let mut initial_text: Option<String> = None;
@@ -148,7 +152,16 @@ impl Executor {
                         // rubash#1301: deferred — reported after the
                         // plain names, only if they all pass (see the
                         // post-parse validation below).
-                        invalid_array_name = Some(name.to_string());
+                        if seen_plain_name {
+                            // An option letter after the first plain name is a
+                            // name in GNU (the option phase has ended), so its
+                            // invalid argument folds into the plain-name failure
+                            // instead of the deferred -a path.
+                            invalid_name = true;
+                            stop_scalar_names = true;
+                        } else {
+                            invalid_array_name = Some(name.to_string());
+                        }
                         array_name = None;
                     }
                     index += 2;
@@ -176,7 +189,16 @@ impl Executor {
                         // rubash#1301: deferred — reported after the
                         // plain names, only if they all pass (see the
                         // post-parse validation below).
-                        invalid_array_name = Some(name.to_string());
+                        if seen_plain_name {
+                            // An option letter after the first plain name is a
+                            // name in GNU (the option phase has ended), so its
+                            // invalid argument folds into the plain-name failure
+                            // instead of the deferred -a path.
+                            invalid_name = true;
+                            stop_scalar_names = true;
+                        } else {
+                            invalid_array_name = Some(name.to_string());
+                        }
                         array_name = None;
                     }
                     index += 2;
@@ -195,7 +217,16 @@ impl Executor {
                         // rubash#1301: deferred — reported after the
                         // plain names, only if they all pass (see the
                         // post-parse validation below).
-                        invalid_array_name = Some(name.to_string());
+                        if seen_plain_name {
+                            // An option letter after the first plain name is a
+                            // name in GNU (the option phase has ended), so its
+                            // invalid argument folds into the plain-name failure
+                            // instead of the deferred -a path.
+                            invalid_name = true;
+                            stop_scalar_names = true;
+                        } else {
+                            invalid_array_name = Some(name.to_string());
+                        }
                         array_name = None;
                     }
                     index += 1;
@@ -223,7 +254,16 @@ impl Executor {
                         // rubash#1301: deferred — reported after the
                         // plain names, only if they all pass (see the
                         // post-parse validation below).
-                        invalid_array_name = Some(name.to_string());
+                        if seen_plain_name {
+                            // An option letter after the first plain name is a
+                            // name in GNU (the option phase has ended), so its
+                            // invalid argument folds into the plain-name failure
+                            // instead of the deferred -a path.
+                            invalid_name = true;
+                            stop_scalar_names = true;
+                        } else {
+                            invalid_array_name = Some(name.to_string());
+                        }
                         array_name = None;
                     }
                     index += 2;
@@ -244,7 +284,16 @@ impl Executor {
                         // rubash#1301: deferred — reported after the
                         // plain names, only if they all pass (see the
                         // post-parse validation below).
-                        invalid_array_name = Some(name.to_string());
+                        if seen_plain_name {
+                            // An option letter after the first plain name is a
+                            // name in GNU (the option phase has ended), so its
+                            // invalid argument folds into the plain-name failure
+                            // instead of the deferred -a path.
+                            invalid_name = true;
+                            stop_scalar_names = true;
+                        } else {
+                            invalid_array_name = Some(name.to_string());
+                        }
                         array_name = None;
                     }
                     index += 1;
@@ -272,7 +321,16 @@ impl Executor {
                         // rubash#1301: deferred — reported after the
                         // plain names, only if they all pass (see the
                         // post-parse validation below).
-                        invalid_array_name = Some(name.to_string());
+                        if seen_plain_name {
+                            // An option letter after the first plain name is a
+                            // name in GNU (the option phase has ended), so its
+                            // invalid argument folds into the plain-name failure
+                            // instead of the deferred -a path.
+                            invalid_name = true;
+                            stop_scalar_names = true;
+                        } else {
+                            invalid_array_name = Some(name.to_string());
+                        }
                         array_name = None;
                     }
                     index += 2;
@@ -298,7 +356,16 @@ impl Executor {
                         // rubash#1301: deferred — reported after the
                         // plain names, only if they all pass (see the
                         // post-parse validation below).
-                        invalid_array_name = Some(name.to_string());
+                        if seen_plain_name {
+                            // An option letter after the first plain name is a
+                            // name in GNU (the option phase has ended), so its
+                            // invalid argument folds into the plain-name failure
+                            // instead of the deferred -a path.
+                            invalid_name = true;
+                            stop_scalar_names = true;
+                        } else {
+                            invalid_array_name = Some(name.to_string());
+                        }
                         array_name = None;
                     }
                     index += 1;
@@ -324,7 +391,16 @@ impl Executor {
                         // rubash#1301: deferred — reported after the
                         // plain names, only if they all pass (see the
                         // post-parse validation below).
-                        invalid_array_name = Some(name.to_string());
+                        if seen_plain_name {
+                            // An option letter after the first plain name is a
+                            // name in GNU (the option phase has ended), so its
+                            // invalid argument folds into the plain-name failure
+                            // instead of the deferred -a path.
+                            invalid_name = true;
+                            stop_scalar_names = true;
+                        } else {
+                            invalid_array_name = Some(name.to_string());
+                        }
                         array_name = None;
                     }
                     index += 2;
@@ -342,7 +418,16 @@ impl Executor {
                         // rubash#1301: deferred — reported after the
                         // plain names, only if they all pass (see the
                         // post-parse validation below).
-                        invalid_array_name = Some(name.to_string());
+                        if seen_plain_name {
+                            // An option letter after the first plain name is a
+                            // name in GNU (the option phase has ended), so its
+                            // invalid argument folds into the plain-name failure
+                            // instead of the deferred -a path.
+                            invalid_name = true;
+                            stop_scalar_names = true;
+                        } else {
+                            invalid_array_name = Some(name.to_string());
+                        }
                         array_name = None;
                     }
                     index += 1;
@@ -368,7 +453,16 @@ impl Executor {
                         // rubash#1301: deferred — reported after the
                         // plain names, only if they all pass (see the
                         // post-parse validation below).
-                        invalid_array_name = Some(name.to_string());
+                        if seen_plain_name {
+                            // An option letter after the first plain name is a
+                            // name in GNU (the option phase has ended), so its
+                            // invalid argument folds into the plain-name failure
+                            // instead of the deferred -a path.
+                            invalid_name = true;
+                            stop_scalar_names = true;
+                        } else {
+                            invalid_array_name = Some(name.to_string());
+                        }
                         array_name = None;
                     }
                     index += 2;
@@ -386,7 +480,16 @@ impl Executor {
                         // rubash#1301: deferred — reported after the
                         // plain names, only if they all pass (see the
                         // post-parse validation below).
-                        invalid_array_name = Some(name.to_string());
+                        if seen_plain_name {
+                            // An option letter after the first plain name is a
+                            // name in GNU (the option phase has ended), so its
+                            // invalid argument folds into the plain-name failure
+                            // instead of the deferred -a path.
+                            invalid_name = true;
+                            stop_scalar_names = true;
+                        } else {
+                            invalid_array_name = Some(name.to_string());
+                        }
                         array_name = None;
                     }
                     index += 1;
@@ -414,7 +517,16 @@ impl Executor {
                         // rubash#1301: deferred — reported after the
                         // plain names, only if they all pass (see the
                         // post-parse validation below).
-                        invalid_array_name = Some(name.to_string());
+                        if seen_plain_name {
+                            // An option letter after the first plain name is a
+                            // name in GNU (the option phase has ended), so its
+                            // invalid argument folds into the plain-name failure
+                            // instead of the deferred -a path.
+                            invalid_name = true;
+                            stop_scalar_names = true;
+                        } else {
+                            invalid_array_name = Some(name.to_string());
+                        }
                         array_name = None;
                     }
                     index += 2;
@@ -435,7 +547,16 @@ impl Executor {
                         // rubash#1301: deferred — reported after the
                         // plain names, only if they all pass (see the
                         // post-parse validation below).
-                        invalid_array_name = Some(name.to_string());
+                        if seen_plain_name {
+                            // An option letter after the first plain name is a
+                            // name in GNU (the option phase has ended), so its
+                            // invalid argument folds into the plain-name failure
+                            // instead of the deferred -a path.
+                            invalid_name = true;
+                            stop_scalar_names = true;
+                        } else {
+                            invalid_array_name = Some(name.to_string());
+                        }
                         array_name = None;
                     }
                     index += 1;
@@ -453,7 +574,16 @@ impl Executor {
                         // rubash#1301: deferred — reported after the
                         // plain names, only if they all pass (see the
                         // post-parse validation below).
-                        invalid_array_name = Some(name.to_string());
+                        if seen_plain_name {
+                            // An option letter after the first plain name is a
+                            // name in GNU (the option phase has ended), so its
+                            // invalid argument folds into the plain-name failure
+                            // instead of the deferred -a path.
+                            invalid_name = true;
+                            stop_scalar_names = true;
+                        } else {
+                            invalid_array_name = Some(name.to_string());
+                        }
                         array_name = None;
                     }
                     index += 1;
@@ -1947,6 +2077,7 @@ impl Executor {
                     return self.finish_read_error(cmd, &stderr, 2);
                 }
                 word if !stop_scalar_names => {
+                    seen_plain_name = true;
                     if is_valid_read_name(
                         word,
                         self.word_is_arrayref(cmd, index),
@@ -1977,21 +2108,31 @@ impl Executor {
             }
         }
 
-        // GNU read.def: every name is validated BEFORE any input is
-        // read or anything is assigned — the plain names first (the
-        // scan above reported the first bad one), then the -a
-        // argument. One failure aborts the builtin with
-        // EXECUTION_FAILURE: the input line stays unread and no
-        // variable is touched. Rubash used to report an invalid -a
-        // argument inline (a spurious second diagnostic when a plain
-        // name was also invalid — rubash#1301) and to read/assign
-        // despite an invalid name.
-        if invalid_name {
+        // GNU read.def, as measured against bash 5.3.20: the FIRST
+        // plain name is validated before any input is read — an
+        // invalid first plain name fails the builtin with the record
+        // unread and nothing assigned. Later plain names are validated
+        // during assignment: the record is read and earlier names keep
+        // their values. The -a argument is validated last of all: its
+        // diagnostic is deferred behind the plain names (rubash#1301),
+        // and when it fails the record is still read but nothing is
+        // assigned (the fail_after_read path below: the name lists are
+        // emptied and the scalar read runs for consumption only).
+        // k6's #1301 aborted before the read for EVERY invalid name,
+        // which lost the earlier assignments GNU keeps (`read ok 1bad
+        // later` left ok unset) and skipped the record GNU consumes
+        // for an invalid -a argument.
+        if invalid_name && scalar_names.is_empty() {
             return self.finish_read_error(cmd, &stderr, 1);
         }
-        if let Some(bad) = &invalid_array_name {
-            report_read_invalid_identifier(&mut stderr, &self.diagnostic_prefix(), bad);
-            return self.finish_read_error(cmd, &stderr, 1);
+        let fail_after_read = invalid_array_name.is_some();
+        if fail_after_read {
+            if !invalid_name {
+                let bad = invalid_array_name.as_deref().unwrap_or_default();
+                report_read_invalid_identifier(&mut stderr, &self.diagnostic_prefix(), bad);
+            }
+            scalar_names.clear();
+            scalar_field_count = 0;
         }
 
         // rubash#1300: without -r and with a non-newline delimiter, a
@@ -2112,17 +2253,24 @@ impl Executor {
             .any(|word| word.starts_with('-') && word.contains('s'));
 
         if timeout_zero {
+            // A -t 0 read consumes no input by definition, so the
+            // deferred -a failure resolves here: nothing is assigned.
+            if fail_after_read {
+                return self.finish_read_error(cmd, &stderr, 1);
+            }
             let status = self.read_timeout_zero_status(cmd, read_fd);
             if let Some(name) = array_name {
-                let _ = replace_typed_indexed_array(
-                    &mut self.shell_state.variables,
-                    &name,
-                    std::iter::empty::<String>(),
-                );
-                self.shell_state
-                    .env_vars
-                    .insert(name.clone(), read_array_storage(&[]));
-                mark_env_name(&mut self.shell_state.env_vars, "__RUBASH_ARRAY_VARS", &name);
+                if !invalid_name {
+                    let _ = replace_typed_indexed_array(
+                        &mut self.shell_state.variables,
+                        &name,
+                        std::iter::empty::<String>(),
+                    );
+                    self.shell_state
+                        .env_vars
+                        .insert(name.clone(), read_array_storage(&[]));
+                    mark_env_name(&mut self.shell_state.env_vars, "__RUBASH_ARRAY_VARS", &name);
+                }
                 return if invalid_name {
                     self.finish_read_error(cmd, &stderr, 1)
                 } else {
@@ -2172,16 +2320,22 @@ impl Executor {
                 return self.finish_read_error(cmd, &stderr, 1);
             }
             if char_limit == Some(0) {
-                let _ = replace_typed_indexed_array(
-                    &mut self.shell_state.variables,
-                    &name,
-                    std::iter::empty::<String>(),
-                );
-                self.shell_state
-                    .env_vars
-                    .insert(name.clone(), read_array_storage(&[]));
-                mark_env_name(&mut self.shell_state.env_vars, "__RUBASH_ARRAY_VARS", &name);
-                return 0;
+                if !invalid_name {
+                    let _ = replace_typed_indexed_array(
+                        &mut self.shell_state.variables,
+                        &name,
+                        std::iter::empty::<String>(),
+                    );
+                    self.shell_state
+                        .env_vars
+                        .insert(name.clone(), read_array_storage(&[]));
+                    mark_env_name(&mut self.shell_state.env_vars, "__RUBASH_ARRAY_VARS", &name);
+                }
+                return if invalid_name {
+                    self.finish_read_error(cmd, &stderr, 1)
+                } else {
+                    0
+                };
             }
 
             self.arm_read_deadline(cmd, read_fd, timeout_secs);
@@ -2214,15 +2368,21 @@ impl Executor {
                 (Some(line), _) => line.clone(),
                 (None, Some(text)) => text.clone(),
                 (None, None) => {
-                    let _ = replace_typed_indexed_array(
-                        &mut self.shell_state.variables,
-                        &name,
-                        std::iter::empty::<String>(),
-                    );
-                    self.shell_state
-                        .env_vars
-                        .insert(name.clone(), read_array_storage(&[]));
-                    mark_env_name(&mut self.shell_state.env_vars, "__RUBASH_ARRAY_VARS", &name);
+                    if !invalid_name {
+                        let _ = replace_typed_indexed_array(
+                            &mut self.shell_state.variables,
+                            &name,
+                            std::iter::empty::<String>(),
+                        );
+                        self.shell_state
+                            .env_vars
+                            .insert(name.clone(), read_array_storage(&[]));
+                        mark_env_name(
+                            &mut self.shell_state.env_vars,
+                            "__RUBASH_ARRAY_VARS",
+                            &name,
+                        );
+                    }
                     return if read_timed_out { 142 } else { 1 };
                 }
             };
@@ -2237,10 +2397,16 @@ impl Executor {
                     self.shell_state.env_vars.get("IFS").map(String::as_str),
                 )
             };
-            let value = read_array_storage(&values);
-            let _ = replace_typed_indexed_array(&mut self.shell_state.variables, &name, values);
-            self.shell_state.env_vars.insert(name.clone(), value);
-            mark_env_name(&mut self.shell_state.env_vars, "__RUBASH_ARRAY_VARS", &name);
+            // An invalid plain name anywhere in the list keeps the
+            // array unassigned too (GNU validates every name before
+            // the array store; see the post-scan validation comment).
+            if !invalid_name {
+                let value = read_array_storage(&values);
+                let _ =
+                    replace_typed_indexed_array(&mut self.shell_state.variables, &name, values);
+                self.shell_state.env_vars.insert(name.clone(), value);
+                mark_env_name(&mut self.shell_state.env_vars, "__RUBASH_ARRAY_VARS", &name);
+            }
             return if invalid_name {
                 self.finish_read_error(cmd, &stderr, 1)
             } else if read_timed_out {
@@ -2254,7 +2420,11 @@ impl Executor {
             };
         }
 
-        let scalar_names = if scalar_names.is_empty() {
+        let scalar_names = if fail_after_read {
+            // The record is still read below (for consumption, as GNU
+            // does), but the emptied name list assigns nothing.
+            Vec::new()
+        } else if scalar_names.is_empty() {
             if invalid_name {
                 Vec::new()
             } else {
@@ -2264,13 +2434,13 @@ impl Executor {
         } else {
             scalar_names
         };
-        if !scalar_names.is_empty() {
+        if !scalar_names.is_empty() || fail_after_read {
             if char_limit == Some(0) {
                 let assign_status = self.assign_read_scalar_names(&scalar_names, "", raw);
                 if assign_status != 0 {
                     return self.finish_read_error(cmd, &stderr, assign_status);
                 }
-                return if invalid_name {
+                return if invalid_name || fail_after_read {
                     self.finish_read_error(cmd, &stderr, 1)
                 } else {
                     0
@@ -2529,13 +2699,13 @@ impl Executor {
             } else {
                 status
             };
-            return if invalid_name {
+            return if invalid_name || fail_after_read {
                 self.finish_read_error(cmd, &stderr, 1)
             } else {
                 status
             };
         }
-        if invalid_name {
+        if invalid_name || fail_after_read {
             return self.finish_read_error(cmd, &stderr, 1);
         }
         let _ = writeln!(
