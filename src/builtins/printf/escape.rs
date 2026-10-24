@@ -394,7 +394,15 @@ pub(super) fn shell_quote_form(value: &str, altform: bool) -> String {
         return ansi_c_shell_quote_bytes(&bytes);
     }
 
-    if value.chars().any(|ch| ch.is_control()) {
+    // GNU printf.def:695-698: %q uses ansic_quote whenever
+    // ansic_shouldquote (strtrans.c:341-361) fires — any character
+    // non-printable IN THE LOCALE. Under a non-UTF-8 locale every byte
+    // >= 0x80 is non-printing, so a value like café takes the $'...'
+    // form with per-byte octal escapes under LC_ALL=C even though it
+    // contains no control characters (rubash#1464).
+    if value.chars().any(|ch| ch.is_control())
+        || (!crate::locale::is_utf8() && value.chars().any(|ch| !ch.is_ascii()))
+    {
         return ansi_c_shell_quote(value);
     }
 
@@ -523,6 +531,16 @@ fn push_ansic_escaped_chars(quoted: &mut String, chars: impl Iterator<Item = cha
             '\t' => quoted.push_str("\\t"),
             '\x0b' => quoted.push_str("\\v"),
             ch if ch.is_ascii_control() => quoted.push_str(&format!("\\{:03o}", ch as u32)),
+            // strtrans.c ansic_quote copies a whole character verbatim
+            // only on the UTF-8-locale multibyte branch (266-282); under
+            // a non-UTF-8 locale its bytes are escaped one at a time
+            // (rubash#1464).
+            ch if !ch.is_ascii() && !crate::locale::is_utf8() => {
+                let mut buffer = [0u8; 4];
+                for byte in ch.encode_utf8(&mut buffer).as_bytes() {
+                    quoted.push_str(&format!("\\{byte:03o}"));
+                }
+            }
             ch => quoted.push(ch),
         }
     }
@@ -543,6 +561,14 @@ fn ansi_c_shell_quote(value: &str) -> String {
             '\t' => quoted.push_str("\\t"),
             '\x0b' => quoted.push_str("\\v"),
             ch if ch.is_ascii_control() => quoted.push_str(&format!("\\{:03o}", ch as u32)),
+            // Same non-UTF-8-locale per-byte rule as
+            // push_ansic_escaped_chars (rubash#1464).
+            ch if !ch.is_ascii() && !crate::locale::is_utf8() => {
+                let mut buffer = [0u8; 4];
+                for byte in ch.encode_utf8(&mut buffer).as_bytes() {
+                    quoted.push_str(&format!("\\{byte:03o}"));
+                }
+            }
             ch => quoted.push(ch),
         }
     }
