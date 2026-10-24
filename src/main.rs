@@ -109,7 +109,11 @@ fn run_main() -> i32 {
         // form within one shell.
         let path =
             rubash::executor::shell_pwd_display_path(&path.to_string_lossy().replace('\\', "/"));
-        executor.export_env("BASH", &path);
+        // rubash#1325: GNU seeds $BASH WITHOUT the export attribute
+        // (variables.c: BASH is a plain shell variable; `export -p` in a
+        // clean env lists only OLDPWD/PWD/SHLVL). export_env here made
+        // `env -i rubash -c 'export -p'` diverge by leaking BASH.
+        executor.set_env("BASH", &path);
     }
     // GNU variables.c:1547-1555 (set_argv0, called from
     // initialize_shell_variables:608 via assign_bash_argv0:1528-1545): a
