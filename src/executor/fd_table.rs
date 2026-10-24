@@ -187,6 +187,13 @@ pub(crate) struct FdTable {
     /// EXECUTION_SUCCESS` fails the builtin while still assigning the
     /// partial record.
     pub(crate) read_eof_no_delimiter: bool,
+    /// The strerror text of the first hard read(2) failure since the
+    /// current record read began (e.g. EISDIR "Is a directory" when the
+    /// descriptor names a directory). GNU read.def:911 reports it as
+    /// `read: <fd>: read error: <strerror>` and fails the builtin;
+    /// treating it as plain EOF made `read x < dir` silent
+    /// (rubash#1495). Cleared at the top of every record read.
+    pub(crate) read_error: Option<String>,
     /// dup2 snapshots for `FdWriteEndpoint::Stdout` markers (rubash#223):
     /// `N>&1` hands fd N the stdout OBJECT fd 1 held at dup time — the
     /// active capture buffer's generation when one was active, or the real
@@ -313,6 +320,7 @@ impl FdTable {
             read_deadline: None,
             read_timed_out: false,
             read_eof_no_delimiter: false,
+            read_error: None,
             stdout_alias_generation: std::collections::HashMap::new(),
         };
         table.entries.insert(
@@ -598,6 +606,7 @@ impl FdTable {
         escape_aware: bool,
         raw: bool,
     ) -> Option<Vec<u8>> {
+        self.read_error = None;
         let endpoint = self.entries.get(&fd)?.read.clone()?;
         let file = match &endpoint {
             FdReadEndpoint::File(file) | FdReadEndpoint::CoprocStdout { fd: file, .. } => {
@@ -740,7 +749,19 @@ impl FdTable {
             let byte = match crate::fd::read_some(file.handle, 1) {
                 Ok(buf) if buf.is_empty() => break, // EOF
                 Ok(buf) => buf[0],
-                Err(_) => break,
+                Err(error) => {
+                    // A hard read failure (EISDIR on a directory
+                    // descriptor, EIO, ...) is NOT EOF: GNU read.def:911
+                    // reports it (`read: 0: read error: Is a directory`)
+                    // and fails the builtin. Record the first such
+                    // failure for the read builtin's None handling
+                    // (rubash#1495); bytes already consumed keep the
+                    // plain partial-record path.
+                    if result.is_empty() && self.read_error.is_none() {
+                        self.read_error = Some(crate::posix_errors::message(&error));
+                    }
+                    break;
+                }
             };
             consumed = true;
             let lead = byte & 0xc0 != 0x80;

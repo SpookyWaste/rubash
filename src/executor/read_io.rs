@@ -165,6 +165,10 @@ impl Executor {
             escape_aware,
             raw,
         )?;
+        // A record WAS served (possibly by a fallback transport after a
+        // probed endpoint failed): any recorded hard read error belongs
+        // to the abandoned probe, not to this read (rubash#1495).
+        self.fd_table.read_error = None;
         Some(if line.contains('\0') {
             line.replace('\0', "")
         } else {
