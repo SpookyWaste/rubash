@@ -2279,6 +2279,23 @@ impl Executor {
             self.restore_command_fd0_input(guard);
         }
         self.restore_compound_numbered_input_redirects(saved_numbered);
+        // rubash#1493: an `exec`ed command that died by a signal inside a
+        // subshell — GNU's forked subshell was replaced by the command,
+        // and the PARENT shell's waitchld reports the job's death at the
+        // next notification point (jobs.c:4625 notify_of_job_status:
+        // `<pid> File size limit exceeded ( <subshell text> )`). The exec
+        // spawn helpers flatten the wait status to 128+signal, so the
+        // death is handed back through the builtin's record. At the top
+        // level there is nothing to report (GNU's shell is gone — it WAS
+        // the exec'd process), hence the subshell gate. The command text
+        // follows signal_notice_command_text's existing subshell
+        // convention (last member's text inside the parens).
+        if let Some((pid, signal)) = crate::builtins::exec::take_last_exec_signal_death() {
+            if self.shell_state.subshell_depth.get() > 0 {
+                let text = self.signal_notice_command_text(cmd);
+                self.note_child_signal_death(pid, signal, text, true);
+            }
+        }
         status
     }
 

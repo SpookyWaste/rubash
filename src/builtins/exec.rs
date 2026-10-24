@@ -26,6 +26,40 @@ fn diagnostic_prefix(env_vars: &HashMap<String, String>) -> String {
     "rubash: ".to_string()
 }
 
+thread_local! {
+    /// The (pid, signal) of the most recent `exec`-spawned child that
+    /// died by a signal, recorded by the spawn helpers below
+    /// (rubash#1493). The builtin layer returns only a flattened exit
+    /// status, which erases the signal-death fact the executor needs to
+    /// queue the jobs.c notify_of_job_status notice — a plain external
+    /// command's death is noted in external_inner, but an `exec` inside
+    /// a subshell went through here and produced NO notice at all, where
+    /// GNU's parent shell reports the forked subshell's death
+    /// (`<pid> File size limit exceeded ( ... )`).
+    static LAST_EXEC_SIGNAL_DEATH: std::cell::RefCell<Option<(u32, i32)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Take the recorded `exec` signal death, if any (see
+/// [`LAST_EXEC_SIGNAL_DEATH`]).
+pub(crate) fn take_last_exec_signal_death() -> Option<(u32, i32)> {
+    LAST_EXEC_SIGNAL_DEATH.with(|cell| cell.borrow_mut().take())
+}
+
+fn record_exec_signal_death(pid: u32, status: &std::process::ExitStatus) {
+    if let Some(signal) = crate::executor::wait_status::exit_status_signal(status) {
+        LAST_EXEC_SIGNAL_DEATH.with(|cell| {
+            *cell.borrow_mut() = Some((pid, signal));
+        });
+    }
+}
+
+fn clear_exec_signal_death() {
+    LAST_EXEC_SIGNAL_DEATH.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
+
 pub fn execute(args: &[String], env_vars: &crate::shell::var_table::VarTable) -> io::Result<i32> {
     // Route through the capture-aware stdout: the exec builtin's direct
     // process-stdout writes (env dumps, printenv fallback) must land in the
@@ -218,6 +252,7 @@ where
     // replace the image (replace_process_image, rubash#1175); this
     // spawn-and-wait simulation serves every other context (library
     // hosts, fork-copy clones, redirected or captured fds).
+    clear_exec_signal_death();
     let mut clean_env = false;
     let mut login = false;
     let mut argv0 = None;
@@ -475,12 +510,16 @@ where
     // endpoint 0.
     process.stdin(child_stdin);
 
+    let mut spawned_pid = 0;
     match process
         .spawn()
         .inspect(|child| crate::executor::path::adopt_orphan_console(child.id()))
-        .and_then(|child| child.wait_with_output())
-    {
+        .and_then(|child| {
+            spawned_pid = child.id();
+            child.wait_with_output()
+        }) {
         Ok(output) => {
+            record_exec_signal_death(spawned_pid, &output.status);
             stdout.write_all(&output.stdout)?;
             stderr.write_all(&output.stderr)?;
             Ok(crate::executor::wait_status::process_exit_status(
@@ -524,12 +563,18 @@ where
     // never the std default (rubash#575).
     process.stdin(child_stdin);
 
+    let mut spawned_pid = 0;
     match process
         .spawn()
         .inspect(|child| crate::executor::path::adopt_orphan_console(child.id()))
-        .and_then(|mut child| child.wait())
-    {
-        Ok(status) => Ok(crate::executor::wait_status::process_exit_status(&status)),
+        .and_then(|mut child| {
+            spawned_pid = child.id();
+            child.wait()
+        }) {
+        Ok(status) => {
+            record_exec_signal_death(spawned_pid, &status);
+            Ok(crate::executor::wait_status::process_exit_status(&status))
+        }
         Err(error) => {
             writeln!(
                 stderr,
