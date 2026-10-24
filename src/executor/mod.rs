@@ -705,7 +705,7 @@ pub struct Executor {
     defer_stage_time_report: bool,
     /// A deferred time report's (start, posix_format), stashed by the
     /// stage executor for the pipeline executor (rubash#1263).
-    pending_stage_time_report: Option<(std::time::Instant, bool)>,
+    pending_stage_time_report: Option<(read_helpers::TimeCommandStart, bool)>,
     /// GNU subst.c: an assignment performed by `${var:=word}`/`${var=word}`
     /// that fails (invalid nameref target value, readonly, ...) is a word
     /// expansion error — expand_word_error -> exp_jump_to_top_level(DISCARD)

@@ -870,7 +870,7 @@ impl Executor {
         let time_prefix_started = time_prefix.as_ref().map(|_| time_command_started());
         let mut time_report_routed = false;
         let mut hoisted_time_inverted = false;
-        let mut deferred_time_report: Option<(std::time::Instant, bool)> = None;
+        let mut deferred_time_report: Option<(super::read_helpers::TimeCommandStart, bool)> = None;
         let mut input = String::new();
         let mut statuses = Vec::new();
         let mut first_stage = 0usize;
