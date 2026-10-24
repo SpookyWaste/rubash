@@ -370,21 +370,50 @@ where
                 unmark_typed(variables, LOWERCASE_VARS, name);
             }
             if let Some(value) = variables.get(name).cloned() {
-                let value = if eff_uppercase {
-                    value.to_uppercase()
-                } else if eff_lowercase {
-                    value.to_lowercase()
-                } else {
-                    // GNU capitalize: first character uppercased, rest
-                    // lowercased (variables.c capcase, casemod.tests:99-103).
-                    let mut chars = value.chars();
-                    match chars.next() {
-                        Some(first) => {
-                            first.to_uppercase().collect::<String>()
-                                + &chars.as_str().to_lowercase()
+                let convert = |value: &str| -> String {
+                    if eff_uppercase {
+                        value.to_uppercase()
+                    } else if eff_lowercase {
+                        value.to_lowercase()
+                    } else {
+                        // GNU capitalize: first character uppercased, rest
+                        // lowercased (variables.c capcase, casemod.tests:99-103).
+                        let mut chars = value.chars();
+                        match chars.next() {
+                            Some(first) => {
+                                first.to_uppercase().collect::<String>()
+                                    + &chars.as_str().to_lowercase()
+                            }
+                            None => value.to_string(),
                         }
-                        None => value,
                     }
+                };
+                // GNU variables.c apply_varcasemod converts each array
+                // ELEMENT VALUE; an associative array's keys are never
+                // case-folded (`declare -uA h=([k]=v)` stores ([k]="V"),
+                // rubash#1398). The storage string holds keys inline, so
+                // folding the whole string would corrupt the keys —
+                // convert per entry and re-render instead. The stored
+                // form may carry the STORAGE_WORD_PREFIX byte before the
+                // `(`; strip it for the parse and restore it after.
+                let value = if variables.is_marked(ASSOC_VARS, name) {
+                    let storage = value.strip_prefix(STORAGE_WORD_PREFIX).unwrap_or(&value);
+                    if storage.starts_with('(') {
+                        let entries = super::storage::parse_assoc_words(storage)
+                            .into_iter()
+                            .map(|(key, element)| (key, convert(&element)))
+                            .collect::<Vec<_>>();
+                        let rendered = super::storage::format_assoc_storage(entries);
+                        if value.starts_with(STORAGE_WORD_PREFIX) {
+                            format!("{STORAGE_WORD_PREFIX}{rendered}")
+                        } else {
+                            rendered
+                        }
+                    } else {
+                        convert(&value)
+                    }
+                } else {
+                    convert(&value)
                 };
                 variables.insert(name.to_string(), value.clone());
                 // Same gate as plain assignments (#916): mirror to the

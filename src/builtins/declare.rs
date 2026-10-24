@@ -130,6 +130,34 @@ pub(crate) fn sync_typed_attributes(
     let uppercase = marked_vars(variables, UPPERCASE_VARS);
     let lowercase = marked_vars(variables, LOWERCASE_VARS);
     let namerefs = marked_vars(variables, NAMEREF_VARS);
+    // A case attribute in THIS command rewrites stored values in the
+    // mirror (attrs.rs apply_varcasemod pass), not just the marks: an
+    // already-shaped typed cell must be refreshed from the mirror or
+    // the two owners disagree (rubash#1398: `declare -A h=([k]=v)` in
+    // an earlier command, then `declare -u h`, left the cell holding
+    // the unfolded values).
+    let case_touched = {
+        let mut parse_options = true;
+        let mut found = false;
+        for arg in args {
+            if parse_options && arg == "--" {
+                parse_options = false;
+                continue;
+            }
+            if parse_options
+                && arg.starts_with('-')
+                && arg.len() > 1
+                && arg[1..].chars().all(|c| c.is_ascii_alphabetic())
+            {
+                if arg[1..].contains(['u', 'l', 'c']) {
+                    found = true;
+                }
+                continue;
+            }
+            break;
+        }
+        found
+    };
 
     for arg in args {
         let raw_name = arg.split_once('=').map(|(name, _)| name).unwrap_or(arg);
@@ -141,6 +169,21 @@ pub(crate) fn sync_typed_attributes(
         if store.get(base).is_none() {
             let value = variables.get(base).cloned().unwrap_or_default();
             let _ = store.set_scalar(base, value);
+        } else if case_touched
+            && !arrays.contains(base)
+            && !assocs.contains(base)
+            && matches!(
+                store.get(base).map(|v| &v.value),
+                Some(crate::shell::ShellValue::Scalar(_))
+            )
+        {
+            // Case conversion rewrote the scalar's mirror value without
+            // an assignment operand (rubash#1398 scalar leg).
+            if let Some(value) = variables.get(base) {
+                if let Some(variable) = store.get_mut(base) {
+                    variable.value = crate::shell::ShellValue::Scalar(value.clone());
+                }
+            }
         } else if arg.contains('=') {
             // When there's an assignment in a declare/typed command and the
             // variable already exists in the typed store, update its value
@@ -153,10 +196,11 @@ pub(crate) fn sync_typed_attributes(
             }
         }
         if arrays.contains(base)
-            && !matches!(
-                store.get(base).map(|v| &v.value),
-                Some(crate::shell::ShellValue::IndexedArray(_))
-            )
+            && (case_touched
+                || !matches!(
+                    store.get(base).map(|v| &v.value),
+                    Some(crate::shell::ShellValue::IndexedArray(_))
+                ))
         {
             // GNU arrayfunc.c convert_var_to_array: a scalar's value moves to
             // element 0 when the variable gains att_array — with
@@ -186,10 +230,11 @@ pub(crate) fn sync_typed_attributes(
                 crate::executor::replace_typed_indexed_array(store, base, elements);
             }
         } else if assocs.contains(base)
-            && !matches!(
-                store.get(base).map(|v| &v.value),
-                Some(crate::shell::ShellValue::AssociativeArray(_))
-            )
+            && (case_touched
+                || !matches!(
+                    store.get(base).map(|v| &v.value),
+                    Some(crate::shell::ShellValue::AssociativeArray(_))
+                ))
         {
             // GNU arrayfunc.c:111-140 convert_var_to_assoc: a scalar's value
             // moves to element "0" when the variable gains att_assoc —
