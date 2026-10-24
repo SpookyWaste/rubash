@@ -2074,7 +2074,13 @@ impl Executor {
             // iteration, after the test succeeds and before the body.
             self.reap_dead_jobs_after_loop_body();
             ran_body = true;
-            self.shell_state.loop_depth += 1;
+            // rubash#1390: NO second loop_depth increment for the body —
+            // the entry increment above already spans the whole arith-for
+            // (GNU execute_arith_for_command bumps loop_level once,
+            // before init). Counting the body again made the body see
+            // depth 2 for a single loop, so `break 2`/`continue 2` were
+            // not clamped to the real depth and escaped as a spurious
+            // Break(1)/Continue(1) that aborted the script.
             let _t = super::exec_profile::PhaseTimer::new(&super::exec_profile::P_FOR_BODY);
             // execute_cmd.c:3236: line_number = arith_for_command->line is
             // the ambient for the body's non-line-setting commands. GNU
@@ -2085,18 +2091,25 @@ impl Executor {
             let result =
                 self.with_ambient_line(for_line, |executor| executor.execute_ast_inner(body));
             drop(_t);
-            self.shell_state.loop_depth -= 1;
             match result {
                 Ok(()) => {}
                 Err(ExecuteError::Break(level)) if level <= 1 => {
                     self.exit_code = self.take_break_failure_status().unwrap_or(0);
                     break;
                 }
-                Err(ExecuteError::Break(level)) => return Err(ExecuteError::Break(level - 1)),
+                // Propagating past this loop: balance the ENTRY
+                // increment before returning (the function tail's
+                // decrement is skipped by the early return), or the
+                // leaked depth makes later `break`s look in-loop.
+                Err(ExecuteError::Break(level)) => {
+                    self.shell_state.loop_depth -= 1;
+                    return Err(ExecuteError::Break(level - 1));
+                }
                 Err(ExecuteError::Continue(level)) if level <= 1 => {
                     self.exit_code = 0;
                 }
                 Err(ExecuteError::Continue(level)) => {
+                    self.shell_state.loop_depth -= 1;
                     return Err(ExecuteError::Continue(level - 1));
                 }
                 Err(error) => return Err(error),
