@@ -1890,16 +1890,26 @@ impl Executor {
         // The old function-scoped gate (__RUBASH_RETURN_TRAP_FUNCTION:
         // outer-must-match) dropped the outer fire.
         //
-        // A `return N` inside the RETURN action would recurse forever in GNU
-        // (trap.c _run_trap_internal rethrows through return_catch and
-        // execute_cmd.c:5377 refires because the from_return_trap setter is
-        // #if 0'd out — probe p1106 hangs bash 5.3.20): absorb it once as
-        // the function's status instead of hanging (rubash#1106).
-        match self.run_return_trap() {
-            Err(ExecuteError::Return(status)) => Ok(Some(status)),
-            Ok(()) => Ok(None),
-            Err(error) => Err(error),
+        // A `return N` inside the RETURN action REFIRES the trap in GNU:
+        // trap.c _run_trap_internal rethrows through return_catch and
+        // execute_cmd.c:5377 runs the trap again because the
+        // from_return_trap suppression setter is #if 0'd out, so
+        // `trap 'return 9' RETURN` spins forever (oracle: timeout kill,
+        // rubash#1106). Mirror it: a Return out of the action restarts
+        // the fire with that status as the pending return value; when a
+        // fire completes without returning, the function returns the
+        // LAST thrown status (finite-chain oracle: fires that return 9
+        // while n<3, then complete, leave rc=9 with n=3 — not the body's
+        // original status and not the completing fire's $?).
+        let mut trap_status = None;
+        loop {
+            match self.run_return_trap() {
+                Err(ExecuteError::Return(status)) => trap_status = Some(status),
+                Ok(()) => break,
+                Err(error) => return Err(error),
+            }
         }
+        Ok(trap_status)
     }
 
     pub(crate) fn apply_command_output_redirects(
