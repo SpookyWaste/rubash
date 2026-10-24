@@ -485,33 +485,90 @@ impl Executor {
                 ))
             }
             // GNU: `declare -p PIPESTATUS` renders the live array as
-            // `declare -a PIPESTATUS=([0]="1" [1]="0")` (rubash#1363).
-            // A scalar cell renders through the ordinary cell path
-            // (`declare -- PIPESTATUS="99"`), and a valueless or absent
-            // cell through the attribute fallback (`declare -r
-            // PIPESTATUS` for a readonly declaration, not found when
-            // there is no cell at all) — both are the print fallback's
-            // job, so only the live-array shape is rendered here
-            // (rubash#1364).
+            // `declare -a PIPESTATUS=([0]="1" [1]="0")` (rubash#1363),
+            // a scalar cell as `declare -- PIPESTATUS="99"`, and a
+            // valueless cell as its attribute string (`declare -r
+            // PIPESTATUS` for a readonly declaration, `declare -a
+            // PIPESTATUS` when created with -a). An absent cell is
+            // not found. Every non-absent shape renders here: the
+            // print fallback consults the table's static array mark
+            // and would emit `-a` for all of them (rubash#1364).
             "PIPESTATUS" => {
-                if self.shell_state.pipestatus_shape
-                    != crate::shell::state::PipestatusShape::LiveArray
-                {
-                    return None;
+                // Attribute flags in declaration_scalar_attrs order
+                // (builtins/declare/output.rs): the static ARRAY mark
+                // init sets names PIPESTATUS's nominal type, so the
+                // table fallback would render `-a` for every shape —
+                // only a live array (or the att_array valueless cell)
+                // carries it in GNU (rubash#1363/#1364).
+                let flag = |key: &str, letter: &str| {
+                    if is_marked_var(&self.shell_state.env_vars, key, "PIPESTATUS") {
+                        letter
+                    } else {
+                        ""
+                    }
+                };
+                let iflag = flag(INTEGER_VARS, "i");
+                let nflag = flag(NAMEREF_VARS, "n");
+                let rflag = flag(READONLY_VARS, "r");
+                let tflag = flag(TRACE_VARS, "t");
+                let lflag = flag(LOWERCASE_VARS, "l");
+                let uflag = flag(UPPERCASE_VARS, "u");
+                let cflag = flag(CAPCASE_VARS, "c");
+                match self.shell_state.pipestatus_shape {
+                    crate::shell::state::PipestatusShape::LiveArray => {
+                        let elements = self
+                            .pipestatus_values()
+                            .iter()
+                            .enumerate()
+                            .map(|(index, status)| {
+                                format!("[{index}]={}", sh_double_quote_text(status))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        Some(format!(
+                            "declare -a{rflag}{exported} PIPESTATUS=({elements})"
+                        ))
+                    }
+                    crate::shell::state::PipestatusShape::Scalar => {
+                        let flags =
+                            format!("{iflag}{nflag}{rflag}{tflag}{exported}{lflag}{uflag}{cflag}");
+                        let flags = if flags.is_empty() {
+                            "--".to_string()
+                        } else {
+                            format!("-{flags}")
+                        };
+                        let value = self
+                            .shell_state
+                            .env_vars
+                            .get("PIPESTATUS")
+                            .cloned()
+                            .unwrap_or_default();
+                        Some(format!(
+                            "declare {flags} PIPESTATUS={}",
+                            sh_double_quote_text(&value)
+                        ))
+                    }
+                    crate::shell::state::PipestatusShape::Valueless
+                    | crate::shell::state::PipestatusShape::ValuelessArray => {
+                        let aflag = if self.shell_state.pipestatus_shape
+                            == crate::shell::state::PipestatusShape::ValuelessArray
+                        {
+                            "a"
+                        } else {
+                            ""
+                        };
+                        let flags = format!(
+                            "{aflag}{iflag}{nflag}{rflag}{tflag}{exported}{lflag}{uflag}{cflag}"
+                        );
+                        let flags = if flags.is_empty() {
+                            "--".to_string()
+                        } else {
+                            format!("-{flags}")
+                        };
+                        Some(format!("declare {flags} PIPESTATUS"))
+                    }
+                    crate::shell::state::PipestatusShape::Absent => None,
                 }
-                let readonly =
-                    is_marked_var(&self.shell_state.env_vars, READONLY_VARS, "PIPESTATUS");
-                let rflag = if readonly { "r" } else { "" };
-                let elements = self
-                    .pipestatus_values()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, status)| format!("[{index}]={}", sh_double_quote_text(status)))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                Some(format!(
-                    "declare -a{rflag}{exported} PIPESTATUS=({elements})"
-                ))
             }
             "EPOCHSECONDS" | "EPOCHREALTIME" | "LINENO" | "BASH_SUBSHELL" | "BASH_ARGV0"
             | "BASH_COMMAND" => {

@@ -1603,8 +1603,22 @@ impl Executor {
         let Ok(text) = std::str::from_utf8(stdout) else {
             return;
         };
+        // A live array's table line is only ever the valueless form.
+        // Any other shape (scalar / valueless) renders through the
+        // table with the static array mark baked in — `declare -ax
+        // PIPESTATUS=([0]="99")` for a scalar cell — so every
+        // PIPESTATUS line is the dynamic view's to replace.
+        let live =
+            self.shell_state.pipestatus_shape == crate::shell::state::PipestatusShape::LiveArray;
         let valueless_pipestatus_line = |line: &str| {
-            line.starts_with("declare -") && line.ends_with(" PIPESTATUS") && !line.contains('=')
+            if !line.starts_with("declare -") {
+                return false;
+            }
+            if live {
+                line.ends_with(" PIPESTATUS") && !line.contains('=')
+            } else {
+                line.ends_with(" PIPESTATUS") || line.contains(" PIPESTATUS=")
+            }
         };
         if !text.lines().any(valueless_pipestatus_line) {
             return;
