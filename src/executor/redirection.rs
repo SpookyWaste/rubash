@@ -1297,8 +1297,21 @@ impl Executor {
                     // redirect is already realized when the seeded fd holds
                     // the group's shared File binding (the seeded state maps
                     // fd-table File endpoints to SharedFile one-to-one).
+                    // The pipeline routing walks (route_pipeline_stage_streams,
+                    // pipeline_stage_stdio_targets) re-seed fd 1 as the stage
+                    // pipe (OutputTarget::Stdout, defer_stdout_writes) BEFORE
+                    // the ordered walk — the binding is still the group's
+                    // File in the fd table, so the skip must hold there too:
+                    // falling through to open_command_output_target replaced
+                    // the shared description with a Path target whose writes
+                    // reopen in append mode on a second offset, and the
+                    // body's later writes through the bound handle overwrote
+                    // the pipeline's contribution (niubash#532:
+                    // `( echo A; printf B | cat; echo C ) > f` lost B).
                     if self.injected_redirect_fd_is_bound(redirect, fd)
-                        && matches!(state.fds.get(&fd), Some(OutputTarget::SharedFile(_)))
+                        && (matches!(state.fds.get(&fd), Some(OutputTarget::SharedFile(_)))
+                            || (state.defer_stdout_writes
+                                && matches!(state.fds.get(&fd), Some(OutputTarget::Stdout))))
                     {
                         state.saw_output_redirect = true;
                         continue;
