@@ -521,7 +521,11 @@ where
             continue;
         }
         if value.starts_with('-') && value != "-" && !saw_signal {
-            let sigspec = value.trim_start_matches('-');
+            // GNU kill.def takes the signal spec as the word after
+            // exactly one leading dash, so `--badflag` reports
+            // `-badflag` in the diagnostic (rubash#1259); stripping all
+            // dashes printed the bare `badflag`.
+            let sigspec = value.strip_prefix('-').unwrap_or(value);
             if !sigspec_accepted(sigspec, posix) {
                 writeln!(
                     stderr,
