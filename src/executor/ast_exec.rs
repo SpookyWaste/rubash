@@ -107,14 +107,18 @@ impl Executor {
         // for its duration, so a spawn inside can never mistake itself
         // for the -c string's last top-level command.
         let saved_exec_replace_stamp = self.exec_replace_dispatch_stamp.get();
+        let saved_exec_replace_shlvl = self.exec_replace_shlvl_snapshot.get();
         if self.exec_replace_stamp_hold.replace(0) == 0
             && !(self.exec_replace_final_frame.get() && self.evalerror_exec_depth.get() == 1)
         {
             self.exec_replace_dispatch_stamp.set(0);
+            self.exec_replace_shlvl_snapshot.set(None);
         }
         let result = self.execute_ast_inner_body(commands);
         self.exec_replace_dispatch_stamp
             .set(saved_exec_replace_stamp);
+        self.exec_replace_shlvl_snapshot
+            .set(saved_exec_replace_shlvl);
         self.err_trap_armed_sample.set(saved_err_trap_sample);
         self.evalerror_exec_depth
             .set(self.evalerror_exec_depth.get().saturating_sub(1));
@@ -461,8 +465,15 @@ impl Executor {
                     let stamp = self.exec_replace_stamp_counter.get() + 1;
                     self.exec_replace_stamp_counter.set(stamp);
                     self.exec_replace_dispatch_stamp.set(stamp);
+                    // rubash#1497: freeze the SHLVL the spawn-site
+                    // adjustment must read (see
+                    // exec_replace_shlvl_snapshot) before this command's
+                    // own prefix assignments are committed.
+                    self.exec_replace_shlvl_snapshot
+                        .set(Some(self.current_shlvl_value()));
                 } else {
                     self.exec_replace_dispatch_stamp.set(0);
+                    self.exec_replace_shlvl_snapshot.set(None);
                 }
             }
             // GNU parse.y/eval.c: a syntax error inside a command

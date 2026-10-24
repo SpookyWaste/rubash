@@ -992,14 +992,28 @@ impl Executor {
     /// committed when execute_disk_command runs), clamps at 0, and the
     /// variable is (re)created in the child environment even when the
     /// shell variable is absent or unexported.
-    #[cfg(unix)]
-    fn exec_replace_adjusted_shlvl(&self) -> String {
-        let current: i64 = self
-            .shell_state
+    /// rubash#1497: the shell's current SHLVL as a number — an absent
+    /// or unparseable value counts as 0 (GNU adjust_shell_level works
+    /// on the variable's numeric value; see execute_cmd.c:5819).
+    pub(in crate::executor) fn current_shlvl_value(&self) -> i64 {
+        self.shell_state
             .env_vars
             .get("SHLVL")
             .and_then(|value| value.trim().parse().ok())
-            .unwrap_or(0);
+            .unwrap_or(0)
+    }
+
+    #[cfg(unix)]
+    fn exec_replace_adjusted_shlvl(&self) -> String {
+        // GNU reads the CURRENT variable, which never includes the
+        // tail command's own prefix temp assignments; this port has
+        // committed them into env_vars by spawn time, so the value
+        // frozen at dispatch (exec_replace_shlvl_snapshot) is the one
+        // to adjust. The live read remains as a defensive fallback.
+        let current = self
+            .exec_replace_shlvl_snapshot
+            .get()
+            .unwrap_or_else(|| self.current_shlvl_value());
         (current - 1).max(0).to_string()
     }
 

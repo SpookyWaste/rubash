@@ -962,6 +962,17 @@ pub struct Executor {
     /// (GNU execute_cmd.c:2886 execute_connection walks operands in the
     /// caller's frame; this port wraps each operand in execute_ast).
     pub(crate) exec_replace_stamp_hold: Cell<u32>,
+    /// rubash#1497: SHLVL as the tail dispatch began — captured when the
+    /// dispatch is stamped and refreshed when an and_or_list hands the
+    /// stamp to its last operand. GNU execute_cmd.c:5813
+    /// execute_disk_command reads the CURRENT SHLVL variable for
+    /// adjust_shell_level; the command's own prefix temp assignments
+    /// are applied to the child environment only and never enter that
+    /// value. This port commits prefix assignments into env_vars on
+    /// the way to the spawn (the fork path's child env depends on it),
+    /// so the spawn-site read must use this pre-commit snapshot, not
+    /// the live variable.
+    pub(crate) exec_replace_shlvl_snapshot: Cell<Option<i64>>,
     /// rubash#353: locale in effect when each SOURCE LINE was first reached
     /// at reader level — the locale GNU's parser would decode that line's
     /// `$'...'` backslash-u escapes under (GNU reads a newline-terminated

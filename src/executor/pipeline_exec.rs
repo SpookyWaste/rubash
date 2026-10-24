@@ -389,6 +389,12 @@ impl Executor {
                 // command for should_suppress_fork purposes.
                 if self.exec_replace_dispatch_stamp.get() != 0 {
                     self.exec_replace_stamp_hold.set(1);
+                    // rubash#1497: earlier operands of the list have
+                    // executed by now, so refresh the SHLVL snapshot to
+                    // the value the tail operand's dispatch begins with
+                    // (its own prefix assignments are not yet committed).
+                    self.exec_replace_shlvl_snapshot
+                        .set(Some(self.current_shlvl_value()));
                 }
                 self.execute_ast(&commands)?;
             }

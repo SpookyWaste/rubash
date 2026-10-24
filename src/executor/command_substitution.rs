@@ -1669,6 +1669,7 @@ impl Executor {
             exec_replace_dispatch_stamp: Cell::new(0),
             exec_replace_stamp_counter: Cell::new(0),
             exec_replace_stamp_hold: Cell::new(0),
+            exec_replace_shlvl_snapshot: Cell::new(None),
             line_lex_locales: std::cell::RefCell::new(HashMap::new()),
             unit_lex_locale: std::cell::RefCell::new(None),
             ambient_line: Cell::new(None),
