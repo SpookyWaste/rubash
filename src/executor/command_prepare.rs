@@ -3840,6 +3840,23 @@ pub(in crate::executor) fn expand_braces_with_optional_raw(
     if let Some(raw) = raw {
         if raw != word {
             let braced = crate::expand::braces::expand_braces(raw);
+            // GNU braces.c brace_expand is a textual rewrite of the word;
+            // when it returns the raw word byte-identical there IS no
+            // expansion product, so the pass must be transparent: the word
+            // continues into expand_word_internal (subst.c:11229) in its
+            // original cooked form, quotes and parser markers intact.
+            // Quote removal (subst.c:4807 dequote_string) is a late step
+            // of that pass, never a pre-pass — flattening the raw text
+            // here destroys the W_QUOTED structure that
+            // expand_compound_array_assignment (arrayfunc.c:557) reads
+            // from the raw body, so `a=('{}' "a $v")` field-split the
+            // quoted element (rubash#1504). A quoted or invalid brace
+            // group (`'{}'`, `{y}`) makes brace expansion a no-op exactly
+            // like an escaped one; only real expansion products (len > 1,
+            // or a rewritten single word) take the strip below.
+            if braced.len() == 1 && braced[0] == raw {
+                return vec![word.to_string()];
+            }
             if braced.len() > 1 || word_contains_brace_group(raw) {
                 // The raw-based expansion kept backslash escapes that the
                 // lexer would otherwise strip. Strip them so escaped chars
@@ -3891,6 +3908,16 @@ fn word_contains_brace_group(word: &str) -> bool {
     // by the raw re-expansion path. Skip each `$`-opened body through its
     // matching close, tracking nested opens.
     //
+    // Braces inside quotes are literal text, never a brace group:
+    // brace_gobbler (braces.c) walks the word with quoting state and
+    // find_first_valid_brace only accepts an UNQUOTED `{`. A quote-blind
+    // scan made `a=('{}' "a $v")` look brace-bearing, so the raw
+    // re-expansion path quote-removed the whole operand before parameter
+    // expansion and the quoted element field-split (rubash#1504; same
+    // false-positive class as the DATA_DOLLAR body case, rubash#416).
+    // Single-quoted spans are fully literal; inside double quotes braces
+    // are literal too, while `$`-opened bodies stay skipped as above.
+    //
     // Fast reject (rubash#437): a brace group needs a literal `{`; without
     // one there is nothing to find and the Vec<char> collection is wasted.
     // (DATA_DOLLAR is multi-byte UTF-8, its bytes >= 0x80, so the byte test
@@ -3900,6 +3927,8 @@ fn word_contains_brace_group(word: &str) -> bool {
     }
     let chars: Vec<char> = word.chars().collect();
     let mut escaped = false;
+    let mut in_single = false;
+    let mut in_double = false;
     let mut open = false;
     let mut index = 0usize;
     while index < chars.len() {
@@ -3909,8 +3938,19 @@ fn word_contains_brace_group(word: &str) -> bool {
             index += 1;
             continue;
         }
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            }
+            index += 1;
+            continue;
+        }
         if ch == '\\' {
             escaped = true;
+        } else if ch == '\'' && !in_double {
+            in_single = true;
+        } else if ch == '"' {
+            in_double = !in_double;
         } else if (ch == '$' || ch == crate::executor::markers::DATA_DOLLAR)
             && matches!(chars.get(index + 1), Some(&next) if next == '{' || next == '(')
         {
@@ -3934,9 +3974,9 @@ fn word_contains_brace_group(word: &str) -> bool {
             }
             index = inner;
             continue;
-        } else if ch == '{' {
+        } else if !in_double && ch == '{' {
             open = true;
-        } else if ch == '}' && open {
+        } else if !in_double && ch == '}' && open {
             return true;
         }
         index += 1;
