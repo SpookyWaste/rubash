@@ -637,9 +637,16 @@ impl Executor {
             // __RUBASH_SCRIPT_NAME installed for the same invocation
             // carries that $0 operand and seeded the stack when it was set
             // (the name is set before IS_C at every startup site —
-            // invocation.rs / main.rs); clear both here (rubash#1306). The
-            // SCRIPT_NAME branch below guards the reverse seeding order.
-            self.shell_state.bash_source_stack.clear();
+            // invocation.rs / main.rs); the STORED array is emptied here
+            // (rubash#1306). The stack seed itself must SURVIVE: the
+            // BASH_SOURCE view pops the bottom seed when there is no main
+            // frame, and function entry reads the seed through
+            // current_bash_source — clearing the stack made the first
+            // function's own frame the bottom entry, so the view popped
+            // it and in-function BASH_SOURCE read empty (integration
+            // fixup; cli_tests function_call_stack_* encode the GNU
+            // shape). The SCRIPT_NAME branch below guards the reverse
+            // seeding order.
             store_indexed_array_state(
                 &mut self.shell_state,
                 "BASH_SOURCE",
@@ -674,8 +681,10 @@ impl Executor {
             }
             if self.shell_state.env_vars.contains_key("__RUBASH_IS_C") {
                 // `-c` invocation (host seeded IS_C before the name):
-                // BASH_SOURCE stays the set-but-empty array (rubash#1306).
-                self.shell_state.bash_source_stack.clear();
+                // BASH_SOURCE stays the set-but-empty array (rubash#1306),
+                // but the stack still takes the $0 seed (see the IS_C
+                // branch above for why the seed must survive).
+                self.shell_state.bash_source_stack = vec![source_value.clone()];
                 store_indexed_array_state(
                     &mut self.shell_state,
                     "BASH_SOURCE",
