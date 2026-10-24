@@ -1142,6 +1142,11 @@ impl Executor {
     /// command's redirects, so a dead coproc's `name`/`name_PID` are gone
     /// before that command expands.
     pub(in crate::executor) fn refresh_background_jobs(&mut self) -> Result<(), ExecuteError> {
+        // rubash#1494: job-state transitions the shell's own kill sent
+        // become visible only after a full intervening reader command
+        // (GNU waitchld notification lag) — apply the ripe ones here, at
+        // the same per-command boundary that reaps finished children.
+        self.shell_state.job_table.apply_deferred_state_marks();
         let mut finished = Vec::new();
         for (pid, child) in &mut self.background_children {
             if let Some(status) = child.try_wait()? {

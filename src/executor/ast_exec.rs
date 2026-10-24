@@ -560,6 +560,11 @@ impl Executor {
                 self.evalerror_line.set(None);
             }
             if self.evalerror_exec_depth.get() == 1 {
+                // rubash#1494: one tick of the notification-lag clock per
+                // top-level reader command; the refresh below applies
+                // deferred job-state marks once they are a full command
+                // old (GNU waitchld lag).
+                self.shell_state.job_table.note_reader_command();
                 self.reader_command_line
                     .set(command.logical_line.or(command.line));
                 // rubash#353: record the locale in effect when this SOURCE
