@@ -1021,14 +1021,29 @@ impl Executor {
                 // a plain declare draws never).
                 let print_requested = declare_args_request_print(&args);
                 let dynamic_views: Vec<(String, String)> = if print_requested {
-                    args.iter()
+                    let mut views: Vec<(String, String)> = args
+                        .iter()
                         .filter(|arg| !arg.starts_with('-') && !arg.starts_with('+'))
                         .filter_map(|arg| {
                             let name = arg.split('=').next().unwrap_or(arg);
                             self.dynamic_declaration_view(name)
                                 .map(|text| (name.to_string(), text))
                         })
-                        .collect()
+                        .collect();
+                    // Listing mode (no operands): GNU's full `declare -p`
+                    // includes a materialized PIPESTATUS array even though
+                    // its value lives outside the variable table
+                    // (rubash#1363) — pass its view so print_declare_names
+                    // can merge the name into the listing.
+                    let listing = args
+                        .iter()
+                        .all(|arg| arg.starts_with('-') || arg.starts_with('+'));
+                    if listing {
+                        if let Some(text) = self.dynamic_declaration_view("PIPESTATUS") {
+                            views.push(("PIPESTATUS".to_string(), text));
+                        }
+                    }
+                    views
                 } else {
                     Vec::new()
                 };
