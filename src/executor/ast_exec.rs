@@ -1489,6 +1489,28 @@ impl Executor {
                             }
                         }
                     }
+                    // The absorb must END this command's dispatch.
+                    // Falling through to the simple/execution dispatches
+                    // re-runs the group through execute_command; with the
+                    // DISCARD armed (rubash#1318, and the evalerror arming
+                    // generally), the re-run's body list silently skips
+                    // the failing line and completes with status 0,
+                    // clobbering the failure status recorded above
+                    // (`{ z=1; }` left $? = 0 for the next line; GNU 1).
+                    // Mirror the plain-command arm's errexit promotion,
+                    // then consume the command like the Ok(true) arm.
+                    if self.errexit_enabled()
+                        && self.errexit_is_active()
+                        && self.suppress_errexit == 0
+                        && self.exit_code != 0
+                        && !command.inverted
+                        && command.and_or().is_none()
+                    {
+                        return Err(ExecuteError::ExitCode(self.exit_code));
+                    }
+                    close_subshell_region_if_ended!(command);
+                    index += 1;
+                    continue;
                 }
                 Err(ExecuteError::IoError(error)) => {
                     // rubash#440: a closed output (SIGPIPE analogue) is this
