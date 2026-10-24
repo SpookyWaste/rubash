@@ -1152,13 +1152,13 @@ mod tests {
         let mut table = FdTable::new();
         table.open_input(10, FdReadEndpoint::text("one\ntwo\n"), true);
         assert_eq!(
-            table.read_text(10, '\n', None, false, false).as_deref(),
+            table.read_text(10, '\n', None, false, false, false).as_deref(),
             Some("one")
         );
         table.move_input(11, 10).unwrap();
         assert!(table.is_closed(10));
         assert_eq!(
-            table.read_text(11, '\n', None, false, false).as_deref(),
+            table.read_text(11, '\n', None, false, false, false).as_deref(),
             Some("two")
         );
     }
