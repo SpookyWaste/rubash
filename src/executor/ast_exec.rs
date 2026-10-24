@@ -820,6 +820,25 @@ impl Executor {
                 crate::builtins::trap::reset_for_subshell_child(&mut self.shell_state.env_vars);
                 let old_depth = self.shell_state.subshell_depth.get();
                 self.shell_state.subshell_depth.set(old_depth + 1);
+                // rubash#1493: record the region's whole `( ... )` text
+                // for the exec signal-death notice (jobs.c:4625 names
+                // the whole job command) — a node-form region renders
+                // its own node, a flat region renders its command span
+                // the way flat_subshell_region_source_text does for the
+                // ERR-trap stamp above. The region's saved state clone
+                // (taken just above) holds the parent's value, so the
+                // boundary restore reverts this automatically.
+                self.shell_state.subshell_source_text =
+                    Some(if command.subshell_command.is_some() {
+                        crate::executor::command_text::bash_command_source_text(command)
+                    } else {
+                        let close_index = (index..commands.len())
+                            .find(|candidate| commands[*candidate].subshell_end)
+                            .unwrap_or(index);
+                        crate::executor::command_text::flat_subshell_region_source_text(
+                            &commands[index..=close_index],
+                        )
+                    });
                 // rubash#1115: the forked child reseeds RANDOM
                 // (variables.c:1418-1423 get_random_number); the saved
                 // parent state above keeps the parent's sequence intact.

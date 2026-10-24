@@ -2287,12 +2287,20 @@ impl Executor {
         // spawn helpers flatten the wait status to 128+signal, so the
         // death is handed back through the builtin's record. At the top
         // level there is nothing to report (GNU's shell is gone — it WAS
-        // the exec'd process), hence the subshell gate. The command text
-        // follows signal_notice_command_text's existing subshell
-        // convention (last member's text inside the parens).
+        // the exec'd process), hence the subshell gate. The notice text
+        // is the WHOLE subshell command recorded at subshell entry
+        // (shell_state.subshell_source_text) — GNU's dead job IS the
+        // parens command, so pretty_print_job renders all of it. The
+        // last-member convention of signal_notice_command_text remains
+        // as the fallback for entries that recorded no text (respawned
+        // child executors).
         if let Some((pid, signal)) = crate::builtins::exec::take_last_exec_signal_death() {
             if self.shell_state.subshell_depth.get() > 0 {
-                let text = self.signal_notice_command_text(cmd);
+                let text = self
+                    .shell_state
+                    .subshell_source_text
+                    .clone()
+                    .unwrap_or_else(|| self.signal_notice_command_text(cmd));
                 self.note_child_signal_death(pid, signal, text, true);
             }
         }

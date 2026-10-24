@@ -130,6 +130,16 @@ pub struct ShellState {
     pub(crate) random_state: RandomGen,
     /// execute_cmd.c subshell_level.
     pub(crate) subshell_depth: Cell<usize>,
+    /// print_cmd.c make_command_string of the innermost enclosing
+    /// `( )` subshell, rendered at subshell entry (executor
+    /// execute_subshell_command_with_redirects / the ast_exec region
+    /// open). GNU's waitchld death notice names the WHOLE job command
+    /// (jobs.c:4625), so an `exec`ed command dying by signal inside
+    /// the parens is reported against this text, not its own
+    /// last-member text (rubash#1493). Set only after the entry
+    /// clone_for_child_save, so the wholesale boundary restore
+    /// reverts it to the parent's value like every other field here.
+    pub(crate) subshell_source_text: Option<String>,
     /// execute_cmd.c subshell_environment & SUBSHELL_COMSUB — set while a
     /// `$( )`/backtick body runs (shared-executor and cloned-executor
     /// paths). jobs.c:3837-3843 start_job refuses fg/bg inside it.
@@ -444,6 +454,7 @@ impl Clone for ShellState {
             dollar_vars_changed_by_set: self.dollar_vars_changed_by_set,
             random_state: self.random_state.clone_state(),
             subshell_depth: Cell::new(self.subshell_depth.get()),
+            subshell_source_text: self.subshell_source_text.clone(),
             xtrace_indirection_level: Cell::new(self.xtrace_indirection_level.get()),
             xtrace_suspended: Cell::new(self.xtrace_suspended.get()),
             in_command_substitution: Cell::new(self.in_command_substitution.get()),

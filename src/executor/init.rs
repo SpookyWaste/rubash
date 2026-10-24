@@ -365,6 +365,7 @@ impl Executor {
                 // (rubash#1074) covers coproc/other respawns where BG_DEPTH
                 // is absent.
                 subshell_depth: Cell::new(bg_depth.unwrap_or(respawned_subshell_depth)),
+                subshell_source_text: None,
                 in_command_substitution: Cell::new(false),
                 stdin_redir: Cell::new(false),
                 xtrace_indirection_level: Cell::new(0),
