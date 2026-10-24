@@ -713,11 +713,6 @@ pub fn translate_signal(value: &str) -> Option<&'static str> {
         return Some("EXIT");
     }
 
-    // DSIG_NOCASE: the EXIT pseudo-signal folds case too.
-    if value.eq_ignore_ascii_case("EXIT") || value.eq_ignore_ascii_case("SIGEXIT") {
-        return Some("0");
-    }
-
     if let Ok(mut number) = value.parse::<i32>() {
         if number > 128 {
             number -= 128;
@@ -725,8 +720,54 @@ pub fn translate_signal(value: &str) -> Option<&'static str> {
         return signal_name(number);
     }
 
-    let name = value.strip_prefix("SIG").unwrap_or(value);
-    signal_number(name)
+    decode_signal_name(value, true)
+}
+
+/// GNU general.c valid_number: leading whitespace is skipped, an
+/// optional sign follows, then digits, then trailing whitespace, and
+/// the whole word must be consumed. Returns the parsed value.
+fn valid_number(value: &str) -> Option<i64> {
+    let trimmed = value.trim();
+    let digits = trimmed
+        .strip_prefix('+')
+        .or_else(|| trimmed.strip_prefix('-'))
+        .unwrap_or(trimmed);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    trimmed.parse::<i64>().ok()
+}
+
+/// The `SIG` prefix of a signal spec, folded case-insensitively (GNU
+/// trap.c:236 decode_signal compares with strcasecmp under DSIG_NOCASE,
+/// which kill.def:103 sets unconditionally).
+fn strip_sig_prefix(value: &str) -> Option<&str> {
+    (value.len() >= 3 && value[..3].eq_ignore_ascii_case("SIG")).then(|| &value[3..])
+}
+
+/// GNU trap.c:236 decode_signal, name half, with the kill.def:103 /
+/// common.c:823 dflags (DSIG_NOCASE always; DSIG_SIGPREFIX unless POSIX
+/// mode): signal_names[] entries are `SIG<name>` — the bare name compares
+/// first and the prefixed spelling second — except slot 0, whose entry
+/// is `EXIT` with NO `SIG` in it, so `EXIT` (any case) decodes to 0 but
+/// a prefixed `SIGEXIT` (any case) is NO_SIG in every mode. Returns the
+/// signal number as a string. The previous implementation stripped only
+/// an exact-uppercase `SIG` and special-cased `SIGEXIT` as valid, so
+/// mixed/lowercase prefixed spellings (`SigTerm`, `sigterm`, `sighup`)
+/// were rejected by `kill -l` (rubash#1386) and the `-s` validator.
+fn decode_signal_name(value: &str, allow_sig_prefix: bool) -> Option<&'static str> {
+    if value.eq_ignore_ascii_case("EXIT") {
+        return Some("0");
+    }
+    let bare = if allow_sig_prefix {
+        strip_sig_prefix(value).unwrap_or(value)
+    } else {
+        value
+    };
+    if bare.eq_ignore_ascii_case("EXIT") {
+        return None;
+    }
+    signal_number(bare)
 }
 
 /// The kill signal-spec validator for the `-s`/`-n`/`-SPEC` forms. GNU
@@ -3420,5 +3461,31 @@ mod posix_sigspec_tests {
         assert!(sigspec_accepted("KILL", true));
         assert!(sigspec_accepted("15", true));
         assert!(sigspec_accepted("TERM", false));
+    }
+
+    /// rubash#1386: `kill -l` name lookup folds case on the whole spec —
+    /// the SIG prefix included — so mixed/lowercase prefixed spellings
+    /// print their number like the uppercase ones.
+    #[test]
+    fn mixed_case_prefixed_names_translate() {
+        for spec in ["SigTerm", "sigterm", "SIGTERM", "sIgTeRm", "Term", "term"] {
+            assert_eq!(translate_signal(spec), Some("15"), "{spec}");
+        }
+        assert_eq!(translate_signal("sighup"), Some("1"));
+        assert_eq!(translate_signal("SigHup"), Some("1"));
+        assert_eq!(translate_signal("sigusr1"), Some("10"));
+    }
+
+    /// rubash#1386: the EXIT pseudo-signal takes no SIG prefix in GNU
+    /// (signal_names[0] is "EXIT", not "SIGEXIT") — bare EXIT folds case
+    /// and translates to 0; every prefixed spelling is invalid.
+    #[test]
+    fn exit_takes_no_sig_prefix_in_translation() {
+        for spec in ["EXIT", "Exit", "exit"] {
+            assert_eq!(translate_signal(spec), Some("0"), "{spec}");
+        }
+        for spec in ["SIGEXIT", "SigExit", "sigexit"] {
+            assert_eq!(translate_signal(spec), None, "{spec}");
+        }
     }
 }
