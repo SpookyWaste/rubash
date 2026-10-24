@@ -376,8 +376,28 @@ fn push_ansi_c_codepoint(output: &mut String, value: u32) {
     // E000-escape them at this entry so the decode boundary restores the
     // char instead of reading it as a marker (governance 3.1 user_reachable
     // rule; the E1xx byte-pair/UTF-8 mixed-decoding ambiguity).
-    for ch in decoded.chars() {
-        crate::executor::markers::push_literal_char(output, ch);
+    //
+    // rubash#1234: that protection applies ONLY when `decoded` is the
+    // genuine scalar char itself. For non-scalar values (surrogates,
+    // > U+10FFFF) and carrier-control values, u32cconv_utf8_text returns
+    // RAW-BYTE marker pairs — the transport form every single-layer
+    // decoder (echo's decode_raw_byte_markers, pipeline serialization)
+    // already restores to bytes, exactly like the `\x` byte path below.
+    // Running those pairs through push_literal_char demoted them to
+    // literal PUA text (U+E400-prefixed), which only printf's two-layer
+    // accessor unwrapped again; echo/pipelines then emitted the marker
+    // chars themselves as UTF-8 garbage. Push the pair form verbatim so
+    // `\u`/`\U` raw bytes are indistinguishable from `\x` raw bytes.
+    let is_genuine_scalar = match char::from_u32(value) {
+        Some(ch) => decoded == String::from(ch),
+        None => false,
+    };
+    if is_genuine_scalar {
+        for ch in decoded.chars() {
+            crate::executor::markers::push_literal_char(output, ch);
+        }
+    } else {
+        output.push_str(&decoded);
     }
 }
 
