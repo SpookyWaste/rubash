@@ -1879,7 +1879,17 @@ pub(crate) fn slash_command_execve_error_message(
     name: &str,
     env_vars: &HashMap<String, String>,
 ) -> Option<(&'static str, i32)> {
-    if !name.contains('/') && !name.contains('\\') {
+    // Mirror path.rs has_path_separator (general.c:843 absolute_program):
+    // the backslash is a separator only on Windows/MSYS hosts; on unix
+    // `a\b` is an ordinary name that goes through the PATH search and
+    // earns "command not found", not the execve classification
+    // (rubash#1482).
+    let has_separator = if cfg!(windows) {
+        name.contains('/') || name.contains('\\')
+    } else {
+        name.contains('/')
+    };
+    if !has_separator {
         return None;
     }
     let candidate = crate::executor::path::shell_path_to_windows(name, env_vars);
