@@ -1003,6 +1003,12 @@ impl Executor {
             if hoist_stage_time {
                 self.defer_stage_time_report = true;
             }
+            // rubash#1454: mark the final stage's dispatch so the stage
+            // spawner can hand an external final member the shell's own
+            // stdout instead of a capture pipe (cleared right after the
+            // dispatch; every stage sets it afresh, so an aborted
+            // pipeline cannot leak it into a later stage).
+            self.pipeline_final_stage.set(last_stage);
             let Some((mut next_input, mut next_stderr, mut next_status)) = (if pipeline_inverted {
                 self.with_errexit_suppressed(|executor| {
                     if last_stage && executor.lastpipe_enabled() {
@@ -1033,6 +1039,7 @@ impl Executor {
                 self.defer_stage_time_report = false;
                 return Ok(None);
             };
+            self.pipeline_final_stage.set(false);
             // GNU: each element's own redirections run inside the element's
             // subshell after the pipe is bound to fd 1 (execute_cmd.c
             // execute_pipeline + redir.c do_redirection_internal). Compound
@@ -2178,7 +2185,10 @@ impl Executor {
     /// before any member is reaped — nothing in the wait mutates these
     /// bindings.
     #[cfg(any(windows, unix))]
-    fn final_member_stdout_streams_to_host(&self, command: &CommandNode) -> bool {
+    pub(in crate::executor) fn final_member_stdout_streams_to_host(
+        &self,
+        command: &CommandNode,
+    ) -> bool {
         // write_pipeline_output runs route_pipeline_stage_streams first
         // whenever the member carries an output-side redirect; that walk
         // opens `>f`, resolves `1>&2`/`>&-`, and reports write failures, so
@@ -2273,6 +2283,14 @@ impl Executor {
         let mut stage_dev_ops = Vec::with_capacity(commands.len());
         let capture_intermediate_stderr =
             self.fd_table.write_endpoint(2) == Some(FdWriteEndpoint::Stdout);
+        // rubash#1454: when the caller streams the final payload to the
+        // host (allow_stream_stdout) and that payload resolves to the
+        // shell's own stdout, the last member inherits the stdout at
+        // spawn (GNU execute_cmd.c:2620) instead of a capture pipe the
+        // drain forwards — computed here because the spawn precedes the
+        // drain decision below, which reuses the same value.
+        let stream_stdout = allow_stream_stdout
+            && self.final_member_stdout_streams_to_host(commands[commands.len() - 1]);
         let mut intermediate_stderr = Vec::new();
         for (index, (program, expanded_name, args)) in specs.iter().enumerate() {
             // The stage's fd 0/1 are OS pipes owned by this loop, not fd
@@ -2369,7 +2387,11 @@ impl Executor {
                     process.stderr(Stdio::piped());
                 }
             } else {
-                process.stdout(Stdio::piped());
+                if stream_stdout {
+                    process.stdout(Stdio::inherit());
+                } else {
+                    process.stdout(Stdio::piped());
+                }
                 process.stderr(Stdio::piped());
             }
 
@@ -2444,8 +2466,6 @@ impl Executor {
         // parent drains that capture concurrently with the members —
         // subst.c:7428 close(fildes[1]) then subst.c:7437 read_comsub(fildes[0])
         // BEFORE subst.c:7441 wait_for(pid).
-        let stream_stdout =
-            allow_stream_stdout && self.final_member_stdout_streams_to_host(commands[last_index]);
         let stdout_target = if stream_stdout {
             PipelineDrainTarget::StreamHostStdout
         } else {
@@ -2985,6 +3005,21 @@ impl Executor {
         let mut processes: Vec<std::process::Child> = Vec::with_capacity(commands.len());
         let capture_intermediate_stderr =
             self.fd_table.write_endpoint(2) == Some(FdWriteEndpoint::Stdout);
+        // rubash#1454: GNU execute_cmd.c:2620 leaves the rightmost
+        // element's fd 1 (and fd 2) on the shell's own descriptors. When
+        // this pipeline's final payload resolves to the host stdout, the
+        // last member inherits both instead of writing capture pipes the
+        // shell forwards after every member exits — a pager at the end
+        // then sees the terminal itself. Evaluated once, before the
+        // spawn loop: spawning mutates none of the bindings the
+        // predicates read (same argument as the Windows drain below).
+        let last_index = commands.len() - 1;
+        let inherit_last_stdout = self.final_member_stdout_streams_to_host(commands[last_index]);
+        let inherit_last_stderr = !capture_intermediate_stderr
+            && matches!(
+                self.fd_table.output_endpoint(2),
+                Some(FdWriteEndpoint::Stderr)
+            );
         let mut intermediate_stderr = Vec::new();
         let mut previous_stdout: Option<std::process::ChildStdout> = None;
         let mut first_stdin: Option<std::process::ChildStdin> = None;
@@ -3015,11 +3050,17 @@ impl Executor {
 
             if index + 1 < commands.len() {
                 process.stdout(Stdio::piped());
+            } else if inherit_last_stdout {
+                process.stdout(Stdio::inherit());
             } else {
                 process.stdout(Stdio::piped());
             }
             if capture_intermediate_stderr || index + 1 == commands.len() {
-                process.stderr(Stdio::piped());
+                if index == last_index && inherit_last_stderr {
+                    process.stderr(Stdio::inherit());
+                } else {
+                    process.stderr(Stdio::piped());
+                }
             }
 
             suppress_orphan_console(&mut process);

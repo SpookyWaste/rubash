@@ -971,6 +971,15 @@ pub struct Executor {
     /// walk re-opens `>f` and would truncate the bytes the child already
     /// wrote live through the shared description (niubash#144).
     pipeline_stage_fds_pre_wired: Cell<bool>,
+    /// rubash#1454: set by the sequential pipeline driver around the LAST
+    /// stage's dispatch only. The stage spawner may then hand an external
+    /// final member the shell's own stdout (Stdio::inherit) instead of a
+    /// capture pipe when final_member_stdout_streams_to_host agrees —
+    /// GNU execute_cmd.c:2620 leaves the rightmost element's fd 1 on the
+    /// shell's stdout, so a pager there sees the terminal. Non-final
+    /// stages never observe this flag: their fd 1 is the inter-member
+    /// pipe whose payload the driver routes onward.
+    pipeline_final_stage: Cell<bool>,
     /// rubash#1342: set on the throwaway subshell clone in
     /// execute_builtin_pipeline_stage, whose stage command the pipeline
     /// driver already traced (execute_pipeline_stage_inner prints every

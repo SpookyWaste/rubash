@@ -1706,6 +1706,7 @@ impl Executor {
             comsub_stdin_writeback: Cell::new(None),
             pipeline_stdin_consumed: Cell::new(None),
             pipeline_stage_fds_pre_wired: std::cell::Cell::new(false),
+            pipeline_final_stage: std::cell::Cell::new(false),
             pipeline_stage_pre_traced: std::cell::Cell::new(false),
             pipeline_stage_restricted_refused: std::cell::Cell::new(false),
             last_heredoc_warning_source: RefCell::new(None),
