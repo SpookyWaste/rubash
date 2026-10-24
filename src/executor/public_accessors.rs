@@ -444,10 +444,11 @@ impl Executor {
     /// `HistoryProvider` keeps storage on the host.
     ///
     /// Dynamic compspec actions `-C` (external command) and `-F` (shell function
-    /// filling `COMPREPLY`) are resolved by the executor and merged here in a
-    /// follow-up; the static-action engine already covers file/path/command/
-    /// wordlist completion.
-    pub fn complete_line(&self, line: &str, cursor: usize) -> Vec<String> {
+    /// filling `COMPREPLY`) are resolved by the executor before candidate
+    /// generation (`completion_dynamic_for_line` runs the governing
+    /// compspec's hook with the live COMP_* context bound) and merged by
+    /// `complete_line_candidates_with_dynamic` (niubash#520).
+    pub fn complete_line(&mut self, line: &str, cursor: usize) -> Vec<String> {
         let function_names: Vec<String> = self.shell_state.functions.keys().cloned().collect();
         // Job completion names are the command's first word only
         // (rubash#1052; same rule as the compgen path in job_builtins).
@@ -465,7 +466,8 @@ impl Executor {
                     .to_string()
             })
             .collect();
-        crate::builtins::complete::complete_line_candidates(
+        let dynamic = self.completion_dynamic_for_line(line, cursor);
+        crate::builtins::complete::complete_line_candidates_with_dynamic(
             line,
             cursor,
             &self.shell_state.completion_specs,
@@ -473,6 +475,7 @@ impl Executor {
             &self.shell_state.aliases,
             &function_names,
             &job_names,
+            dynamic,
         )
     }
 
@@ -486,9 +489,13 @@ impl Executor {
     /// Whether a compspec is registered for `command` (via the `complete`
     /// builtin). Hosts use this as a cheap gate before calling
     /// [`Executor::complete_line`], so they only pay for GNU-engine candidate
-    /// generation when a compspec actually applies.
+    /// generation when a compspec actually applies. The `-D` default and
+    /// `-E` empty-line compspecs govern lines whose command has no own
+    /// registration (niubash#520), so their presence also opens the gate.
     pub fn has_compspec(&self, command: &str) -> bool {
         self.shell_state.completion_specs.get(command).is_some()
+            || self.shell_state.completion_specs.get("-D").is_some()
+            || self.shell_state.completion_specs.get("-E").is_some()
     }
 
     pub fn set_external_file_builtins_enabled(&mut self, enabled: bool) {
