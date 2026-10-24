@@ -2320,6 +2320,20 @@ impl Executor {
                 return self.finish_read_error(cmd, &stderr, 1);
             }
             if char_limit == Some(0) {
+                // GNU read.def assign_vars runs even for -n 0 (zero
+                // characters read, then the array is located and the
+                // assignment attempted), so a readonly -a target fails
+                // here too (rubash#1457; see the post-read guard below).
+                if !invalid_name
+                    && is_marked_var(&self.shell_state.env_vars, READONLY_VARS, &name)
+                {
+                    let _ = writeln!(
+                        &mut stderr,
+                        "{}{name}: readonly variable",
+                        self.diagnostic_prefix()
+                    );
+                    return self.finish_read_error(cmd, &stderr, 1);
+                }
                 if !invalid_name {
                     let _ = replace_typed_indexed_array(
                         &mut self.shell_state.variables,
@@ -2364,6 +2378,29 @@ impl Executor {
                 };
             }
             let read_eof = self.take_read_eof_no_delimiter();
+            // GNU read.def assign_vars (post-read): the -a target is
+            // located through builtins/common.c:988
+            // builtin_find_indexed_array -> arrayfunc.c:454
+            // find_or_make_array_variable, whose assignment flag makes a
+            // readonly target fail with err_readonly AFTER the input has
+            // been consumed; the array keeps its old value and the
+            // builtin returns EXECUTION_FAILURE. The scalar path already
+            // refuses through the assignment machinery. This guard covers
+            // the EOF-without-line store and the main store below; the
+            // -t 0 branch above is deliberately NOT covered
+            // (read.def:395-398 returns the input-availability result
+            // before the array is ever located, so `read -t 0 -a
+            // readonly` stays silent) and -n 0 has its own guard at its
+            // early return (rubash#1457).
+            if !invalid_name && is_marked_var(&self.shell_state.env_vars, READONLY_VARS, &name)
+            {
+                let _ = writeln!(
+                    &mut stderr,
+                    "{}{name}: readonly variable",
+                    self.diagnostic_prefix()
+                );
+                return self.finish_read_error(cmd, &stderr, 1);
+            }
             let final_line = match (&line, &initial_text) {
                 (Some(line), _) => line.clone(),
                 (None, Some(text)) => text.clone(),
