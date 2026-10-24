@@ -102,6 +102,10 @@ where
                         // with rc 0; GNU clears the table, then rehashes
                         // the name and reports `hash: name: not found`
                         // (rc 1) when it does not resolve (rubash#1489).
+                        // The flush itself is applied below, after the
+                        // needarg/usage checks, so `hash -r ls` still
+                        // hashes `ls` and `hash -r -d` still reports the
+                        // -d needarg error (rubash#1382).
                         reset = true;
                     }
                     'd' => delete = true,
@@ -167,9 +171,11 @@ where
     }
 
     // GNU builtins/hash.def:131-135: `hash -p pathname` with no name is a
-    // usage error (EX_USAGE) — and it is reported BEFORE the -r expunge
-    // below (hash.def's checks precede phash_flush), so the table
-    // survives a malformed `hash -r -p path`.
+    // usage error (EX_USAGE), not a table print (rubash#1360) — and it
+    // is reported BEFORE the -r expunge below (hash.def's checks precede
+    // phash_flush), so the table survives a malformed `hash -r -p path`;
+    // it also precedes the restricted-shell pathname checks, matching
+    // hash_builtin's order (rubash#1382).
     if pathname.is_some() && names.is_empty() {
         writeln!(
             stderr,
@@ -181,7 +187,8 @@ where
     // GNU builtins/hash.def:150-151: with expunge set, the whole table is
     // flushed before the name loop (and before -t target listing); with
     // no names at all the builtin then ends silently at rc 0 — the table
-    // print above-all is skipped whenever expunge was requested.
+    // print above-all is skipped whenever expunge was requested
+    // (rubash#1489; ordering cross-checked for rubash#1382).
     if reset {
         env_vars.remove(HASH_TABLE);
         // The internal lookup cache holds the same remembered locations,
@@ -193,6 +200,52 @@ where
     }
 
     let mut table = hash_table(env_vars);
+    // GNU builtins/hash.def hash_builtin: list_targets is handled
+    // before the pathname/delete/add name loop (and before the
+    // restricted-shell pathname checks), so `hash -t -p /bin/ls n`
+    // looks `n` up instead of inserting it, and `hash -d -t ls`
+    // prints the target instead of deleting it (rubash#1382).
+    if translate {
+        let mut status = EXECUTION_SUCCESS;
+        // GNU builtins/hash.def list_hashed_filename_targets: with several
+        // names each line is prefixed with `name\t`.
+        let multiple = names.len() > 1;
+        for name in names {
+            // GNU phash_search -> hash_search bumps times_found on a hit
+            // (hashlib.c:254).
+            if let Some((path, hits, seq)) = table.get_mut(name) {
+                *hits += 1;
+                let path = path.clone();
+                let _ = (hits, seq);
+                // GNU hashcmd.c phash_search: a stored relative path prints
+                // `./`-prefixed when that form is executable, and reports
+                // not-found when it resolves to `.` itself unexecutably
+                // (rubash#1361).
+                match phash_search_target(&path) {
+                    Some(target) => {
+                        if reusable {
+                            writeln!(stdout, "builtin hash -p {target} {name}")?;
+                        } else {
+                            if multiple {
+                                write!(stdout, "{name}\t")?;
+                            }
+                            writeln!(stdout, "{target}")?;
+                        }
+                    }
+                    None => {
+                        writeln!(stderr, "{}hash: {name}: not found", script_prefix(env_vars))?;
+                        status = EXECUTION_FAILURE;
+                    }
+                }
+            } else {
+                writeln!(stderr, "{}hash: {name}: not found", script_prefix(env_vars))?;
+                status = EXECUTION_FAILURE;
+            }
+        }
+        store_hash_table(env_vars, &table);
+        return Ok(status);
+    }
+
     if let Some(pathname) = pathname {
         // GNU builtins/hash.def:156-176: in a restricted shell `hash -p`
         // refuses an absolute pathname (sh_restricted -> "hash: <path>:
@@ -216,16 +269,9 @@ where
                 return Ok(EXECUTION_FAILURE);
             }
         }
-        // GNU builtins/hash.def:131-135: `hash -p pathname` with no name is a
-        // usage error (EX_USAGE), not a table print (rubash#1360).
-        if names.is_empty() {
-            writeln!(
-                stderr,
-                "hash: usage: hash [-lr] [-p pathname] [-dt] [name ...]"
-            )?;
-            return Ok(EX_USAGE);
-        }
-        // (The directory check itself lives in the insert loop below:
+        // (The no-name usage check for `-p` now lives above, before the
+        // expunge flush, in hash_builtin's order — rubash#1382. The
+        // directory check itself lives in the insert loop below:
         // GNU tests file_isdir(pathname) per name, after the
         // absolute_program skip — rubash#1360.)
         // GNU builtins/hash.def:190-196: with `-p`, every name is inserted
@@ -294,47 +340,6 @@ where
         return Ok(status);
     }
 
-    if translate {
-        let mut status = EXECUTION_SUCCESS;
-        // GNU builtins/hash.def list_hashed_filename_targets: with several
-        // names each line is prefixed with `name\t`.
-        let multiple = names.len() > 1;
-        for name in names {
-            // GNU phash_search -> hash_search bumps times_found on a hit
-            // (hashlib.c:254).
-            if let Some((path, hits, seq)) = table.get_mut(name) {
-                *hits += 1;
-                let path = path.clone();
-                let _ = (hits, seq);
-                // GNU hashcmd.c phash_search: a stored relative path prints
-                // `./`-prefixed when that form is executable, and reports
-                // not-found when it resolves to `.` itself unexecutably
-                // (rubash#1361).
-                match phash_search_target(&path) {
-                    Some(target) => {
-                        if reusable {
-                            writeln!(stdout, "builtin hash -p {target} {name}")?;
-                        } else {
-                            if multiple {
-                                write!(stdout, "{name}\t")?;
-                            }
-                            writeln!(stdout, "{target}")?;
-                        }
-                    }
-                    None => {
-                        writeln!(stderr, "{}hash: {name}: not found", script_prefix(env_vars))?;
-                        status = EXECUTION_FAILURE;
-                    }
-                }
-            } else {
-                writeln!(stderr, "{}hash: {name}: not found", script_prefix(env_vars))?;
-                status = EXECUTION_FAILURE;
-            }
-        }
-        store_hash_table(env_vars, &table);
-        return Ok(status);
-    }
-
     // GNU builtins/hash.def:138-146: the table print happens only when no
     // names were given (`list == 0`) and the table was not just expunged;
     // `-l` with names goes through the name loop above (rubash#1368).
@@ -360,7 +365,18 @@ where
                 }
                 return Ok(EXECUTION_SUCCESS);
             }
-            for (name, (path, _, _)) in table {
+            // GNU print_hashed_commands walks the same bucket order for
+            // the portable (-l) form (hash_walk over bucket_array); the
+            // raw HashMap order is process-random and scrambles the
+            // listing (rubash#1382, whose repro diffs `hash -l` output
+            // for the two entries `n` and `-l`).
+            let mut entries: Vec<_> = table.into_iter().collect();
+            entries.sort_by(|left, right| {
+                gnu_hash_bucket(&left.0)
+                    .cmp(&gnu_hash_bucket(&right.0))
+                    .then(right.1 .2.cmp(&left.1 .2))
+            });
+            for (name, (path, _, _)) in entries {
                 writeln!(stdout, "builtin hash -p {path} {name}")?;
             }
             return Ok(EXECUTION_SUCCESS);
