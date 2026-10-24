@@ -447,6 +447,28 @@ impl Executor {
         self.compound_redirect_failed.replace(false)
     }
 
+    /// rubash#1256: GNU prints the async start notice `[<job>] <pid>`
+    /// when a background job launches in an INTERACTIVE shell
+    /// (execute_cmd.c async launch -> jobs.c pretty_print_job; verified
+    /// against GNU 5.3.20: printed with `monitor` on or off, and never
+    /// in a non-interactive shell — not even with `set -m`). The
+    /// termination notices already run at the reader boundary
+    /// (job_builtins notify path); the start notice was the missing half.
+    pub(in crate::executor) fn notify_async_job_started(
+        &mut self,
+        job_id: crate::jobs::JobId,
+        pid: u32,
+    ) {
+        if !self
+            .shell_state
+            .env_vars
+            .contains_key("__RUBASH_INTERACTIVE")
+        {
+            return;
+        }
+        let _ = self.write_default_stderr(format!("[{job_id}] {pid}\n").as_bytes());
+    }
+
     pub(in crate::executor) fn execute_background_ast_command(
         &mut self,
         background_command: &BackgroundCommand,
@@ -577,7 +599,7 @@ impl Executor {
                         &self.shell_state.env_vars,
                         "monitor",
                     );
-                    self.shell_state.job_table.register_process_with_stages(
+                    let job_id = self.shell_state.job_table.register_process_with_stages(
                         pid,
                         display_source.clone(),
                         true,
@@ -586,6 +608,7 @@ impl Executor {
                     );
                     self.shell_state.job_table.set_job_control(pid, job_control);
                     self.shell_state.last_background_pid = Some(pid);
+                    self.notify_async_job_started(job_id, pid);
                     // GNU expands the async simple command's words in the
                     // exec'd child; no substitution status may leak into the
                     // parent's bands (the next command must see the state it
@@ -970,7 +993,7 @@ impl Executor {
         self.background_children.insert(pid, child);
         let job_control =
             crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "monitor");
-        self.shell_state.job_table.register_process_with_stages(
+        let job_id = self.shell_state.job_table.register_process_with_stages(
             pid,
             display_source.clone(),
             true,
@@ -979,6 +1002,7 @@ impl Executor {
         );
         self.shell_state.job_table.set_job_control(pid, job_control);
         self.shell_state.last_background_pid = Some(pid);
+        self.notify_async_job_started(job_id, pid);
         self.exit_code = 0;
         Ok(())
     }
