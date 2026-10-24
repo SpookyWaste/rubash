@@ -2699,6 +2699,19 @@ impl Executor {
                         Err(error) => return Err(error),
                     };
                     body_status = Some(status);
+                    // rubash#1461: this layer was killed by a signal (a
+                    // `kill` to its fake BASHPID, intercepted in
+                    // execute_kill). A GNU process killed by a signal runs
+                    // no EXIT trap; consume the death mark here and let
+                    // the code after the state restore queue the parent's
+                    // jobs.c notice instead.
+                    if executor.subshell_signal_death
+                        == Some((saved_depth + 1, status - 128))
+                        && status >= 128
+                    {
+                        trap_result = None;
+                        return Ok(());
+                    }
                     // GNU execute_cmd.c runs the subshell's own EXIT trap
                     // (trap.c run_exit_trap) while the subshell state is
                     // still live: `( trap "echo T" EXIT; echo body )` prints
@@ -2750,6 +2763,21 @@ impl Executor {
         self.fd_table = saved_fd_table;
         self.command_expansion_failed.set(saved_expansion_failed);
         self.exec_replaced = saved_exec_replaced;
+        // rubash#1461: this layer died by a signal (see the trap skip in
+        // the body closure above) — queue the parent-side death notice
+        // with the layer's fake BASHPID, like a reaped job's (jobs.c:4625
+        // notify_of_job_status via note_child_signal_death).
+        if let Some((depth, signal)) = self.subshell_signal_death {
+            if depth == saved_depth + 1 {
+                self.subshell_signal_death = None;
+                let layer_pid = std::process::id().saturating_add(
+                    u32::try_from(depth.saturating_sub(self.bashpid_origin_depth))
+                        .unwrap_or(u32::MAX),
+                );
+                let text = self.signal_notice_command_text(cmd);
+                self.note_child_signal_death(layer_pid, signal, text, true);
+            }
+        }
         let finish_result = self.finish_compound_output_process_substitutions(group_outputs);
         // rubash#846 (GNU execute_cmd.c:1808-1833 execute_in_subshell): the
         // forked child lifts CMD_INVERT_RETURN off the direct body and flips

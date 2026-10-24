@@ -1693,6 +1693,7 @@ impl Executor {
             // exec-replacement latch never propagates (a post-reset exec
             // always exits its own frame, so a live parent cannot carry it).
             exec_replaced: false,
+            subshell_signal_death: None,
             // rubash#1175: a fork copy shares the parent shell's process;
             // it must never execve that process away.
             owns_process_image: false,

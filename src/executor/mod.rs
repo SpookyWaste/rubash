@@ -646,6 +646,13 @@ pub struct Executor {
     /// its status; this latch tells the exit-trap choke point to skip the
     /// action on that unwind (rubash#1012).
     exec_replaced: bool,
+    /// rubash#1461: an in-process subshell layer was killed by a signal
+    /// (a `kill` to that layer's fake BASHPID, intercepted in
+    /// execute_kill): (subshell_depth of the dead layer, signal). The
+    /// subshell boundary that owns the depth consumes it — it skips the
+    /// layer's EXIT trap (a signal-killed GNU process runs none) and
+    /// queues the parent-side death notice.
+    subshell_signal_death: Option<(usize, i32)>,
     /// rubash#1175: true only on the executor that IS this OS process's
     /// shell (constructed by Executor::new for a real process root).
     /// Fork-copy clones (command_substitution_executor) construct with
