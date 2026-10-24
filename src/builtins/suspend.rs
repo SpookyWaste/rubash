@@ -72,6 +72,23 @@ where
                 unsafe {
                     libc::killpg(pgrp, libc::SIGSTOP);
                 }
+                // rubash#1474: the group stop is process-directed — in
+                // this multithreaded executor another thread can field it
+                // first, and the executing thread then runs several more
+                // commands before the stop lands on it (observed: a whole
+                // `e1..e5; sleep` tail executed after `suspend -f`). GNU's
+                // single-threaded killpg (builtins/suspend.def
+                // suspend_builtin) stops the shell before the next command
+                // runs. Stop THIS thread thread-directed as well: a
+                // pending SIGSTOP on the calling thread takes effect on
+                // the tgkill return-to-userspace path, before any further
+                // command executes. On SIGCONT both stops release and the
+                // builtin returns success as before.
+                let pid = unsafe { libc::getpid() };
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
+                unsafe {
+                    libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGSTOP);
+                }
             }
         }
         return Ok((EXECUTION_SUCCESS, false));
