@@ -185,7 +185,15 @@ pub(crate) fn pathname_expand_word(
         return PathnameExpansion::NoMatch;
     }
 
-    if word.contains("**") && globstar {
+    // GNU glob (glob.c glob_filename / pathexp.c): globstar recursion is
+    // a property of a WHOLE path segment — a `**` that is only part of a
+    // segment (`**.txt`, `a**`, `sub**/x`) is exactly equivalent to `*`
+    // and must take the ordinary segment engines below, whose matchers
+    // already treat consecutive stars as one. Routing every `**`-
+    // containing word into the textual globstar splitter passed those
+    // words through literally or misread them as recursive
+    // (rubash#1466).
+    if word.contains("**") && globstar && word.split('/').any(|segment| segment == "**") {
         return globstar_expand(
             word,
             nullglob,
@@ -569,6 +577,25 @@ fn globstar_expand(
         );
     }
     let prefix = parts[0];
+    // rubash#1466: the single-** walk below treats the prefix as a
+    // LITERAL directory (`sub/**/*.txt`). A prefix carrying a pattern
+    // segment (`*/**/*.txt`) must be matched segment-by-segment first —
+    // the multi walk's collector is segment-driven and handles a `**`
+    // segment at any position, so delegate those words to it. Literal
+    // prefixes (``, `/`, `./`, `sub/`) stay on the single path.
+    if prefix.split('/').any(|segment| {
+        !segment.is_empty() && unquoted_glob_pattern_p(segment, shopt_enabled(env_vars, "extglob"))
+    }) {
+        return expand_multi_globstar(
+            word,
+            nullglob,
+            failglob,
+            nocaseglob,
+            dotglob,
+            globskipdots,
+            env_vars,
+        );
+    }
     // GNU globstar forms (parse.y/glob.c GLOBSTAR): a bare `**` matches every
     // file and directory at any depth (empty remainder), `**/` matches
     // directories only with a trailing slash in the output, and `**/pattern`
