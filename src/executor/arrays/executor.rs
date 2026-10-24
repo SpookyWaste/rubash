@@ -635,6 +635,8 @@ impl Executor {
         // bypasses the read entirely (Q4 escape hatch). Like the element
         // read path, the cell is only trusted when no unsynced builtin
         // write happened since the last executor sync.
+        // rubash#914 (F3): the per-name freshness protocol also admits
+        // the cell, as at the element read gates above.
         if array_store_enabled(&self.shell_state.env_vars)
             && (!self.shell_state.env_vars.array_cells_dirty()
                 || self.shell_state.env_vars.cell_is_fresh(name))
