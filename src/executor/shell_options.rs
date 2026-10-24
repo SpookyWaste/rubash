@@ -643,6 +643,7 @@ impl Executor {
                         stdout_capture_write(output)?;
                     } else if let Some(capture) = &mut self.stdout_capture {
                         capture.write_all(output)?;
+                        capture_timing_note_field(output, capture.len());
                     } else {
                         write_stdout_bytes(output)?;
                     }
@@ -866,6 +867,7 @@ impl Executor {
                             stdout_capture_write(output)?;
                         } else if let Some(capture) = &mut self.stdout_capture {
                             capture.write_all(output)?;
+                            capture_timing_note_field(output, capture.len());
                         } else {
                             write_stdout_bytes(output)?;
                         }
@@ -1628,6 +1630,67 @@ thread_local! {
     /// `STDOUT_CAPTURE_PARKED`).
     static STDOUT_STREAM_PARKED: std::cell::RefCell<Vec<Option<crate::fd::HANDLE>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// rubash#1141: the armed production-timing recorder (timed_input.rs)
+    /// for the producer currently executing on this thread — a pipeline
+    /// stage or a process-substitution body. Capture appends note their
+    /// arrival against it; nested producers park the outer recorder.
+    static CAPTURE_TIMING: std::cell::RefCell<Option<super::timed_input::SharedCaptureTiming>> =
+        const { std::cell::RefCell::new(None) };
+    static CAPTURE_TIMING_PARKED: std::cell::RefCell<
+        Vec<Option<super::timed_input::SharedCaptureTiming>>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// rubash#1141: arm a fresh production-timing recorder for the producer
+/// about to run (a pipeline stage in the sequential driver, or a
+/// process-substitution body), parking any outer one. Returns the
+/// recorder the caller finishes into a `TimedInput` once production
+/// completes; pair with `end_capture_timing`.
+pub(in crate::executor) fn begin_capture_timing() -> super::timed_input::SharedCaptureTiming {
+    let recorder = std::rc::Rc::new(std::cell::RefCell::new(
+        super::timed_input::CaptureTiming::new(),
+    ));
+    CAPTURE_TIMING.with(|slot| {
+        let previous = slot.borrow_mut().replace(recorder.clone());
+        CAPTURE_TIMING_PARKED.with(|parked| parked.borrow_mut().push(previous));
+    });
+    recorder
+}
+
+/// rubash#1141: disarm the current timing recorder, restoring the
+/// parked outer one (counterpart of `begin_capture_timing`).
+pub(in crate::executor) fn end_capture_timing() {
+    CAPTURE_TIMING.with(|slot| {
+        let previous = CAPTURE_TIMING_PARKED.with(|parked| parked.borrow_mut().pop());
+        *slot.borrow_mut() = previous.flatten();
+    });
+}
+
+fn capture_timing_with(f: impl FnOnce(&mut super::timed_input::CaptureTiming)) {
+    CAPTURE_TIMING.with(|slot| {
+        let recorder = slot.borrow().clone();
+        if let Some(recorder) = recorder {
+            f(&mut recorder.borrow_mut());
+        }
+    });
+}
+
+/// rubash#1141: note one append to the thread-local capture against the
+/// armed timing recorder (no-op when none is armed).
+pub(in crate::executor) fn capture_timing_note_thread(appended: &[u8], new_raw_len: usize) {
+    capture_timing_with(|timing| timing.note_thread(appended, new_raw_len));
+}
+
+/// rubash#1141: note one append to an executor's field capture against
+/// the armed timing recorder (no-op when none is armed).
+pub(in crate::executor) fn capture_timing_note_field(appended: &[u8], new_raw_len: usize) {
+    capture_timing_with(|timing| timing.note_field(appended, new_raw_len));
+}
+
+/// rubash#1141: snapshot the field (prefix) sink's totals at a
+/// field++thread capture assembly merge point.
+pub(in crate::executor) fn capture_timing_set_prefix(field_bytes: &[u8]) {
+    capture_timing_with(|timing| timing.set_prefix(field_bytes));
 }
 
 /// niubash#345: the active capture frame's pipeline-pipe target, if this
@@ -1774,6 +1837,7 @@ pub(in crate::executor) fn stdout_capture_write(output: &[u8]) -> io::Result<()>
     STDOUT_CAPTURE.with(|capture| {
         if let Some(buffer) = capture.borrow_mut().as_mut() {
             buffer.write_all(output)?;
+            capture_timing_note_thread(output, buffer.len());
         }
         Ok(())
     })

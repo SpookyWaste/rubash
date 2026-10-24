@@ -14,6 +14,10 @@ use crate::executor::substitution_metadata::bytes_to_shell_text;
 pub(crate) struct TextInput {
     data: Vec<u8>,
     offset: usize,
+    /// rubash#1141: production schedule of this materialized stream
+    /// (process-substitution bodies), judged against the armed read
+    /// deadline in `read_bytes` — see timed_input.rs.
+    timing: Option<super::timed_input::SharedTimedInput>,
 }
 
 /// A real kernel object behind a file-backed fd. `Rc`-shared across dup'd
@@ -622,55 +626,95 @@ impl FdTable {
             _ => return None,
         };
         let mut input = input.borrow_mut();
+        // rubash#1141: a materialized stream (process substitution) whose
+        // production was timed is judged against the armed read deadline
+        // exactly like a real pipe: GNU's consumer blocks in zread
+        // (read.def) and the alarm fires at the deadline, so a record
+        // whose bytes — or the EOF itself — only "arrive" after the
+        // deadline is a timeout (128+SIGALRM at the read builtin), and
+        // only the prefix that arrived in time may be served. The
+        // schedule is consulted on every read (deadline or not) so the
+        // virtual clock keeps accounting untimed consumption.
+        let timing = input.timing.clone();
         if input.offset >= input.data.len() {
+            if let Some(timing) = &timing {
+                let mut timing = timing.borrow_mut();
+                if timing.matches_len(input.data.len())
+                    && matches!(
+                        timing.judge(None, input.offset, self.read_deadline),
+                        super::timed_input::TimedVerdict::Timeout { .. }
+                    )
+                {
+                    self.read_timed_out = true;
+                }
+            }
             return None;
         }
         if char_limit == Some(0) {
             return Some(Vec::new());
         }
-        let slice = &input.data[input.offset..];
-        let seqs = read_delimiter_seqs(delimiter);
-        let mut consumed = 0;
-        let mut chars = 0;
-        let mut delimiter_found = false;
-        let mut delimiter_len = 0usize;
-        let mut limit_reached = false;
-        let mut escapes = ReadEscapeTracker::new(escape_aware && !exact);
-        // Post-escape counting state (rubash#1328), shared with the other
-        // readers: an unquoted backslash itself is not a stored character;
-        // the character it quotes completes one unit (zero for a newline
-        // continuation), and a delimiter byte ending an escape pair is
-        // data, not a terminator.
-        let mut escaped = false;
-        for (index, byte) in slice.iter().copied().enumerate() {
-            let lead = byte & 0xc0 != 0x80;
-            let was_escaped = escaped;
-            if lead {
-                if escaped {
-                    if byte != b'\n' {
+        // One scan of a byte window, returning (consumed, delimiter
+        // found, delimiter length, char limit reached, payload length).
+        // Runs once on the full remaining slice and, on a timing timeout,
+        // once more on the in-time prefix.
+        let scan = |slice: &[u8]| -> (usize, bool, usize, bool, usize) {
+            let seqs = read_delimiter_seqs(delimiter);
+            let mut consumed = 0;
+            let mut chars = 0;
+            let mut delimiter_found = false;
+            let mut delimiter_len = 0usize;
+            let mut limit_reached = false;
+            let mut escapes = ReadEscapeTracker::new(escape_aware && !exact);
+            // Post-escape counting state (rubash#1328), shared with the
+            // other readers: an unquoted backslash itself is not a stored
+            // character; the character it quotes completes one unit (zero
+            // for a newline continuation), and a delimiter byte ending an
+            // escape pair is data, not a terminator.
+            let mut escaped = false;
+            for (index, byte) in slice.iter().copied().enumerate() {
+                let lead = byte & 0xc0 != 0x80;
+                let was_escaped = escaped;
+                if lead {
+                    if escaped {
+                        if byte != b'\n' {
+                            chars += 1;
+                        }
+                        escaped = false;
+                    } else if !raw && byte == b'\\' {
+                        escaped = true;
+                    } else {
                         chars += 1;
                     }
-                    escaped = false;
-                } else if !raw && byte == b'\\' {
-                    escaped = true;
-                } else {
-                    chars += 1;
                 }
-            }
-            consumed = index + 1;
-            let suppressed = escapes.suppresses_match(byte);
-            if !exact && !suppressed {
-                if let Some(len) = delimiter_seq_ending_at(&seqs, slice, consumed) {
-                    delimiter_found = true;
-                    delimiter_len = len;
+                consumed = index + 1;
+                let suppressed = escapes.suppresses_match(byte);
+                if !exact && !suppressed {
+                    if let Some(len) = delimiter_seq_ending_at(&seqs, slice, consumed) {
+                        delimiter_found = true;
+                        delimiter_len = len;
+                        break;
+                    }
+                }
+                if char_limit.is_some_and(|limit| chars >= limit) {
+                    limit_reached = true;
                     break;
                 }
             }
-            if char_limit.is_some_and(|limit| chars >= limit) {
-                limit_reached = true;
-                break;
-            }
-        }
+            let result_len = if delimiter_found {
+                consumed - delimiter_len
+            } else {
+                consumed
+            };
+            (
+                consumed,
+                delimiter_found,
+                delimiter_len,
+                limit_reached,
+                result_len,
+            )
+        };
+        let slice = &input.data[input.offset..];
+        let (consumed, delimiter_found, _delimiter_len, limit_reached, result_len) = scan(slice);
         // read.def:949 eof rule: the slice ran out without the delimiter
         // (and without a -n/-N limit ending the record). Served-record
         // invariant: only a returned record may set the eof flag (see
@@ -678,15 +722,71 @@ impl FdTable {
         if consumed == 0 {
             return None;
         }
+        if let Some(timing) = &timing {
+            let mut timing = timing.borrow_mut();
+            if timing.matches_len(input.data.len()) {
+                // A record that runs to the end of the materialized data
+                // without delimiter or limit is bounded by the EOF, whose
+                // arrival is the production duration.
+                let record_end = if delimiter_found || limit_reached {
+                    Some(input.offset + consumed)
+                } else {
+                    None
+                };
+                if let super::timed_input::TimedVerdict::Timeout { available_end } =
+                    timing.judge(record_end, input.offset, self.read_deadline)
+                {
+                    let prefix = &input.data[input.offset..available_end];
+                    let (p_consumed, _, _, _, p_result_len) = scan(prefix);
+                    self.read_timed_out = true;
+                    self.read_eof_no_delimiter = false;
+                    let result = prefix[..p_result_len].to_vec();
+                    input.offset += p_consumed;
+                    return Some(result);
+                }
+            }
+        }
         self.read_eof_no_delimiter = !delimiter_found && !limit_reached;
-        let result_len = if delimiter_found {
-            consumed - delimiter_len
-        } else {
-            consumed
-        };
         let result = slice[..result_len].to_vec();
         input.offset += consumed;
         Some(result)
+    }
+
+    /// rubash#1141: preset a materialized endpoint's read offset (an
+    /// fd-0 binding serving a process-substitution stream starts at the
+    /// stream's shared offset, not at 0). No-op for other endpoint
+    /// kinds.
+    pub(crate) fn set_input_offset(&mut self, fd: u32, offset: usize) {
+        if let Some(entry) = self.entries.get(&fd) {
+            if let Some(read) = &entry.read {
+                if let FdReadEndpoint::Text(input) | FdReadEndpoint::ProcessSubstitution(input) =
+                    read
+                {
+                    let mut input = input.borrow_mut();
+                    input.offset = offset.min(input.data.len());
+                }
+            }
+        }
+    }
+
+    /// rubash#1141: attach a production schedule to a materialized
+    /// Text/ProcessSubstitution endpoint (registered after the endpoint
+    /// is opened, e.g. for a process-substitution fd). No-op for other
+    /// endpoint kinds.
+    pub(crate) fn set_input_timing(
+        &mut self,
+        fd: u32,
+        timing: super::timed_input::SharedTimedInput,
+    ) {
+        if let Some(entry) = self.entries.get(&fd) {
+            if let Some(read) = &entry.read {
+                if let FdReadEndpoint::Text(input) | FdReadEndpoint::ProcessSubstitution(input) =
+                    read
+                {
+                    input.borrow_mut().timing = Some(timing);
+                }
+            }
+        }
     }
 
     pub(crate) fn read_all_text(&mut self, fd: u32) -> Option<String> {
@@ -722,7 +822,14 @@ impl FdTable {
         // O(bytes/chunk). Deadline reads stay byte-wise (per-byte
         // wait_readable, read.def check_read_timeout).
         if self.read_deadline.is_none() && crate::fd::is_disk_file(file.handle) {
-            return self.read_file_bytes_buffered(file, delimiter, char_limit, exact, escape_aware, raw);
+            return self.read_file_bytes_buffered(
+                file,
+                delimiter,
+                char_limit,
+                exact,
+                escape_aware,
+                raw,
+            );
         }
         let mut result = Vec::new();
         let mut chars = 0usize;
@@ -1126,6 +1233,7 @@ impl FdReadEndpoint {
         Self::Text(Rc::new(RefCell::new(TextInput {
             data: input,
             offset: 0,
+            timing: None,
         })))
     }
 
@@ -1137,6 +1245,7 @@ impl FdReadEndpoint {
         Self::ProcessSubstitution(Rc::new(RefCell::new(TextInput {
             data: input.into().into_bytes(),
             offset: 0,
+            timing: None,
         })))
     }
 
@@ -1146,6 +1255,7 @@ impl FdReadEndpoint {
         Self::ProcessSubstitution(Rc::new(RefCell::new(TextInput {
             data: input,
             offset: 0,
+            timing: None,
         })))
     }
 }
@@ -1173,13 +1283,17 @@ mod tests {
         let mut table = FdTable::new();
         table.open_input(10, FdReadEndpoint::text("one\ntwo\n"), true);
         assert_eq!(
-            table.read_text(10, '\n', None, false, false, false).as_deref(),
+            table
+                .read_text(10, '\n', None, false, false, false)
+                .as_deref(),
             Some("one")
         );
         table.move_input(11, 10).unwrap();
         assert!(table.is_closed(10));
         assert_eq!(
-            table.read_text(11, '\n', None, false, false, false).as_deref(),
+            table
+                .read_text(11, '\n', None, false, false, false)
+                .as_deref(),
             Some("two")
         );
     }

@@ -264,6 +264,10 @@ pub struct ShellState {
 pub(crate) struct ProcSubStream {
     pub(crate) data: Vec<u8>,
     pub(crate) offset: usize,
+    /// rubash#1141: production schedule of the substitution body, so
+    /// in-shell consumers of the stream observe GNU's pipe arrival
+    /// times for read/select deadlines (see executor::timed_input).
+    pub(crate) timing: Option<crate::executor::timed_input::SharedTimedInput>,
 }
 
 /// Typed snapshot of the interior-mutable slice of ShellState.

@@ -896,6 +896,14 @@ impl Executor {
         let mut input = String::new();
         let mut statuses = Vec::new();
         let mut first_stage = 0usize;
+        // rubash#1141: production timing of the stream each stage reads.
+        // `timed_stdin` on entry times the enclosing input this pipeline
+        // itself consumes (stage 0); every stage's production is recorded
+        // by the capture timing hooks and becomes the next stage's
+        // `input_timing`. Restored on exit — a pipeline is a consumer of
+        // the enclosing stream, not a producer of it.
+        let entry_timed_stdin = self.timed_stdin.clone();
+        let prefix_started = std::time::Instant::now();
         // GNU execute_cmd.c:2620 execute_pipeline connects the left
         // elements with real pipes before the rightmost command runs, so a
         // producer is never fully materialized inside the shell (issue
@@ -928,6 +936,24 @@ impl Executor {
                 first_stage = prefix_len;
             }
         }
+        // rubash#1141: the concurrent prefix ran as one burst on real
+        // pipes — model its whole (bounded) output as arriving when the
+        // prefix finished. Without a prefix, stage 0 consumes the
+        // enclosing stream whose timing is the entry value.
+        let mut input_timing: Option<super::timed_input::SharedTimedInput> = if first_stage > 0 {
+            let elapsed = prefix_started.elapsed();
+            Some(
+                super::timed_input::TimedInput::new(
+                    prefix_started,
+                    elapsed,
+                    vec![(input.len(), elapsed)],
+                    input.len(),
+                )
+                .shared(),
+            )
+        } else {
+            entry_timed_stdin.clone()
+        };
         for (stage_index, command) in commands.iter().enumerate().skip(first_stage) {
             let stage = time_prefix
                 .as_ref()
@@ -988,6 +1014,9 @@ impl Executor {
                 if let Some(skip_status) = self.run_debug_trap(&stage_text)? {
                     statuses.push(skip_status);
                     input = String::new();
+                    // rubash#1141: a skipped element is an instant empty
+                    // stream — no production schedule for the next stage.
+                    input_timing = None;
                     continue;
                 }
             }
@@ -1025,6 +1054,11 @@ impl Executor {
             // dispatch; every stage sets it afresh, so an aborted
             // pipeline cannot leak it into a later stage).
             self.pipeline_final_stage.set(last_stage);
+            // rubash#1141: this stage consumes the stream timed by
+            // `input_timing`; its own production is recorded so the next
+            // stage's reads can be judged against real arrival times.
+            self.timed_stdin = input_timing.clone();
+            let stage_timing = super::shell_options::begin_capture_timing();
             let Some((mut next_input, mut next_stderr, mut next_status)) = (if pipeline_inverted {
                 self.with_errexit_suppressed(|executor| {
                     if last_stage && executor.lastpipe_enabled() {
@@ -1052,10 +1086,13 @@ impl Executor {
                     executor.execute_pipeline_stage(stage, &input, stage0_stdin_inherit)
                 })?
             }) else {
+                super::shell_options::end_capture_timing();
+                self.timed_stdin = entry_timed_stdin.clone();
                 self.defer_stage_time_report = false;
                 return Ok(None);
             };
             self.pipeline_final_stage.set(false);
+            super::shell_options::end_capture_timing();
             // GNU: each element's own redirections run inside the element's
             // subshell after the pipe is bound to fd 1 (execute_cmd.c
             // execute_pipeline + redir.c do_redirection_internal). Compound
@@ -1163,8 +1200,16 @@ impl Executor {
                     }
                 }
             }
+            // rubash#1141: freeze this stage's production schedule (in
+            // FUNCTION_STDIN text units, against the final assembled
+            // input) as the next stage's read-timing evidence.
+            input_timing = std::mem::take(&mut *stage_timing.borrow_mut())
+                .finish(input.len(), true, input.len())
+                .map(|timing| timing.shared());
         }
 
+        // rubash#1141: hand the enclosing stream's timing back.
+        self.timed_stdin = entry_timed_stdin;
         let final_command = commands.last().expect("pipeline has at least one stage");
         self.write_pipeline_output(final_command, &input, true)?;
         if !time_report_routed {

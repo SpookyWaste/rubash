@@ -170,6 +170,7 @@ pub(in crate::executor) use subscript_expansion::{
     is_plain_literal_subscript, IndexedSubscript, OperandSubscriptMode, SubscriptSource,
 };
 mod temporary_assignments;
+pub(crate) mod timed_input;
 mod trap_exec;
 mod trap_stack_builtins;
 mod type_builtin;
@@ -1235,6 +1236,14 @@ pub struct Executor {
     /// partial record is still assigned; only the status becomes 1. Merged
     /// with the fd-table copy by `take_read_eof_no_delimiter`.
     pub(crate) read_eof_no_delimiter: bool,
+    /// rubash#1141: production timing of the input currently staged on
+    /// FUNCTION_STDIN (a pipeline stage's captured producer output), so
+    /// `read`/`select` can judge an armed deadline against the stream's
+    /// real arrival schedule instead of its materialization instant.
+    /// Installed/restored by the sequential pipeline driver alongside
+    /// the FUNCTION_STDIN pair; substitution clones inherit it (their
+    /// reads draw on the same stream). See timed_input.rs.
+    pub(crate) timed_stdin: Option<timed_input::SharedTimedInput>,
     stdout_capture: Option<Vec<u8>>,
     stderr_capture: Option<Vec<u8>>,
     /// niubash#345: while a shell-side pipeline producer (compound `while`/

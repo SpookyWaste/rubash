@@ -282,6 +282,11 @@ impl Executor {
         // open file description — reads in the subshell advance the shared
         // offset, matching fork().
         let mut subshell_fd_table: Option<crate::executor::fd_table::FdTable> = None;
+        // rubash#1141: the FUNCTION_STDIN production schedule is executor
+        // state too — saved with the region (a nested group's redirect
+        // feed replaces FUNCTION_STDIN mid-region and clears it) and
+        // restored at the boundary like the fd table.
+        let mut subshell_timed_stdin: Option<Option<super::timed_input::SharedTimedInput>> = None;
         // rubash#720 form 1: the enclosing fork-collapse value to restore
         // when the flat region closes — Some only when the region opened
         // with a single-subshell-command body (execute_cmd.c:1799-1806 +
@@ -319,6 +324,9 @@ impl Executor {
                         if let Some(saved) = subshell_fd_table.take() {
                             self.fd_table = saved;
                         }
+                        if let Some(saved) = subshell_timed_stdin.take() {
+                            self.timed_stdin = saved;
+                        }
                         if let Some(saved) = saved_fork_collapse.take() {
                             self.subshell_fork_collapse.set(saved);
                         }
@@ -353,6 +361,9 @@ impl Executor {
                     self.restore_flat_subshell(saved_state, subshell_cwd.take());
                     if let Some(saved) = subshell_fd_table.take() {
                         self.fd_table = saved;
+                    }
+                    if let Some(saved) = subshell_timed_stdin.take() {
+                        self.timed_stdin = saved;
                     }
                     if let Some(saved) = saved_fork_collapse.take() {
                         self.subshell_fork_collapse.set(saved);
@@ -521,6 +532,9 @@ impl Executor {
                             self.restore_flat_subshell(saved_state, subshell_cwd.take());
                             if let Some(saved) = subshell_fd_table.take() {
                                 self.fd_table = saved;
+                            }
+                            if let Some(saved) = subshell_timed_stdin.take() {
+                                self.timed_stdin = saved;
                             }
                             if let Some(saved) = saved_fork_collapse.take() {
                                 self.subshell_fork_collapse.set(saved);
@@ -747,6 +761,9 @@ impl Executor {
                         if let Some(saved) = subshell_fd_table.take() {
                             self.fd_table = saved;
                         }
+                        if let Some(saved) = subshell_timed_stdin.take() {
+                            self.timed_stdin = saved;
+                        }
                         // No ERR adjudication here: GNU -n executes nothing,
                         // so no subshell completion status can exist to
                         // adjudicate (run_error_trap gates on exec_result).
@@ -794,6 +811,7 @@ impl Executor {
                 }
                 subshell_state = Some(self.shell_state.clone_for_child_save());
                 subshell_fd_table = Some(self.fd_table.clone());
+                subshell_timed_stdin = Some(self.timed_stdin.clone());
                 subshell_cwd = env::current_dir().ok();
                 self.shell_state.loop_depth = 0;
                 // execute_in_subshell resets loop_level (execute_cmd.c:1642):
@@ -830,6 +848,11 @@ impl Executor {
                             self.shell_state
                                 .env_vars
                                 .insert(FUNCTION_STDIN_OFFSET.to_string(), "0".to_string());
+                            // rubash#1141: the fed text is locally
+                            // produced redirect input — the enclosing
+                            // stream's production schedule does not
+                            // describe it (restored at the boundary).
+                            self.timed_stdin = None;
                         }
                         break;
                     }
@@ -1863,6 +1886,9 @@ impl Executor {
                         if let Some(saved) = subshell_fd_table.take() {
                             self.fd_table = saved;
                         }
+                        if let Some(saved) = subshell_timed_stdin.take() {
+                            self.timed_stdin = saved;
+                        }
                         if let Some(saved) = saved_fork_collapse.take() {
                             self.subshell_fork_collapse.set(saved);
                         }
@@ -2007,6 +2033,9 @@ impl Executor {
                     self.restore_flat_subshell(saved_state, subshell_cwd.take());
                     if let Some(saved) = subshell_fd_table.take() {
                         self.fd_table = saved;
+                    }
+                    if let Some(saved) = subshell_timed_stdin.take() {
+                        self.timed_stdin = saved;
                     }
                     if let Some(saved) = saved_fork_collapse.take() {
                         self.subshell_fork_collapse.set(saved);
