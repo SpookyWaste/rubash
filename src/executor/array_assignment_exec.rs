@@ -415,25 +415,33 @@ impl Executor {
                         // grew by one segment without a re-parse, so upsert
                         // the binding in place — GNU assoc.c `assoc_insert`
                         // is itself an O(1) hash op.
-                        match upsert_typed_assoc_element(
+                        let cell_synced = match upsert_typed_assoc_element(
                             &mut self.shell_state.variables,
                             name,
                             &key,
                             &stored,
                         ) {
-                            AssocElementUpsert::NewKey => {}
+                            AssocElementUpsert::NewKey => true,
                             AssocElementUpsert::Overwrote => {
                                 if let Some(budget) =
                                     self.shell_state.array_compact_budget.get_mut(name)
                                 {
                                     *budget = budget.saturating_sub(1);
                                 }
+                                true
                             }
                             AssocElementUpsert::NoCell => {
                                 // Mirror grew without a synced cell: force the
                                 // canonical path next time so it re-syncs.
                                 self.shell_state.array_compact_budget.remove(name);
+                                false
                             }
+                        };
+                        // rubash#914 (F1): mirror segment and cell upsert
+                        // landed together, so the cell agrees with the
+                        // mirror by construction.
+                        if cell_synced {
+                            self.note_typed_cell_synced(name);
                         }
                         unmark_env_name(&mut self.shell_state.env_vars, DECLARED_UNSET_VARS, name);
                         // Cell and mirror moved together above (in-place
@@ -520,6 +528,9 @@ impl Executor {
             self.shell_state
                 .array_compact_budget
                 .insert(name.to_string(), compact_budget);
+            // rubash#914 (F1): the cell was just synced from the same
+            // entry list the mirror render folds from.
+            self.note_typed_cell_synced(name);
             // GNU assign_array_element (arrayfunc.c:815) ->
             // bind_assoc_variable gives the variable a real assoc cell, so
             // var_isset is true and array_var_assignment (subst.c:8690-8697)
