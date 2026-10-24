@@ -16,7 +16,9 @@ impl Executor {
         // Debug-only systemic regression net for the typed-cell ↔ mirror
         // invariant: after every command boundary every fresh (undirty)
         // structured array cell must still equal its mirror projection.
-        // Release builds compile this out.
+        // Cells carry a per-name freshness proof (rubash#1510) so an
+        // untouched array is not re-proven element by element at every
+        // boundary. Release builds compile this out.
         #[cfg(debug_assertions)]
         self.verify_typed_cells();
         result

@@ -19,6 +19,9 @@
 //! 1. `Executor::verify_typed_cells()` (also called at every command
 //!    boundary in debug builds, see `command_execute.rs`) walks every
 //!    structured array cell and asserts it equals its mirror parse.
+//!    The boundary call may skip per-name-fresh cells (rubash#1510);
+//!    the direct call below uses `verify_typed_cells_forced()` so this
+//!    net always re-proves every cell in full.
 //! 2. Every readback route (`${a[i]}`, `${#a[@]}`, `${a[@]}`, `declare -p`)
 //!    is compared against a mirror oracle parsed directly out of
 //!    `Executor::env_vars()`.
@@ -369,7 +372,10 @@ fn typed_cell_mirror_coherence_survives_random_writes() {
                 .unwrap_or_else(|| "<non-string panic>".to_string());
             panic!("seed={SEED:#x} step={step} op={op} cmd={command:?}: {detail}");
         }
-        exec.verify_typed_cells();
+        // The direct call uses the forced variant: the boundary verifier
+        // may skip per-name-fresh cells (rubash#1510), but this test's own
+        // systemic check must re-prove every cell after every step.
+        exec.verify_typed_cells_forced();
         for name in ["a", "A"] {
             if let Err(message) = check(&mut exec, name) {
                 panic!("seed={SEED:#x} step={step} op={op} cmd={command:?}: {message}");

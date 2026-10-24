@@ -928,6 +928,9 @@ impl Executor {
                     } else {
                         drop_typed_assoc_array(&mut self.shell_state.variables, base_name);
                     }
+                    // Sync-or-drop just ran over the landed mirror value
+                    // (rubash#1510).
+                    self.note_typed_cell_synced(base_name);
                     self.exit_code = 0;
                     return true;
                 }
@@ -1506,6 +1509,9 @@ impl Executor {
             self.shell_state
                 .env_vars
                 .insert(base_name.to_string(), storage);
+            // Cell refreshed from the same entries the render used
+            // (rubash#1510).
+            self.note_typed_cell_synced(base_name);
             mark_env_name(&mut self.shell_state.env_vars, ARRAY_VARS, base_name);
             if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "allexport") {
                 set_process_env(base_name, self.shell_state.env_vars[base_name].clone());
@@ -1556,6 +1562,8 @@ impl Executor {
             self.shell_state
                 .env_vars
                 .insert(base_name.to_string(), storage);
+            // Cell synced from the same render (rubash#1510).
+            self.note_typed_cell_synced(base_name);
             if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "allexport") {
                 self.mark_exported(base_name);
             }
@@ -1586,6 +1594,12 @@ impl Executor {
                     .insert(base_name.to_string(), value.clone());
             }
         }
+        // The block above (or the in-place append it defers to) synced
+        // the structured cell from the same render it wrote to the
+        // mirror — or dropped the cell, in which case this no-ops:
+        // register the pair as synced for the boundary verifier
+        // (rubash#1510).
+        self.note_typed_cell_synced(base_name);
         if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "allexport") {
             self.mark_exported(base_name);
         }
