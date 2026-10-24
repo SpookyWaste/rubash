@@ -5,6 +5,9 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<i32, ExecuteError> {
+        if let Some(result) = self.intercept_fake_bashpid_kill(cmd) {
+            return result;
+        }
         if let Some(status) = self.execute_tracked_background_kill(cmd)? {
             return Ok(status);
         }
@@ -19,6 +22,70 @@ impl Executor {
         )?;
         self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
         Ok(status)
+    }
+
+    /// rubash#1461: a `kill` whose operand is the CURRENT in-process
+    /// subshell layer's BASHPID. GNU's subshell is a real forked process
+    /// (variables.c:1511 get_bashpid = getpid), so `kill -KILL $BASHPID`
+    /// inside `( ... )` kills only that process: the parent survives,
+    /// sees status 128+sig, and gets the jobs.c death notice. Here the
+    /// layer runs in place and its BASHPID is fabricated as
+    /// pid + (depth - origin_depth) (dynamic_arrays.rs bashpid_value) —
+    /// delivering that number to kill(2) can hit the thread whose tid it
+    /// collides with and kill the WHOLE shell (or an unrelated process).
+    /// Intercept before any real delivery when every operand is that
+    /// fake pid: signal 0 is a liveness probe on a live layer (success);
+    /// an untrapped, unignored default-fatal signal records the layer's
+    /// signal death (consumed by the subshell boundary in compound_exec,
+    /// which skips the EXIT trap and queues the notice) and unwinds the
+    /// body with ExitCode(128+sig), the same channel `exit` uses.
+    /// Anything else — trapped or ignored signals (no in-subshell trap
+    /// delivery channel exists), stop/cont signals, mixed operand lists,
+    /// spawn-realized levels (depth == origin, BASHPID is the real pid),
+    /// and fork-copy executors (comsub/pipeline clones, which do not own
+    /// the flat subshell frame) — keeps the legacy path; see REPORT.
+    fn intercept_fake_bashpid_kill(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Option<Result<i32, ExecuteError>> {
+        let depth = self.shell_state.subshell_depth.get();
+        if depth <= self.bashpid_origin_depth || !self.owns_process_image {
+            return None;
+        }
+        let request = kill_request(&cmd.words[1..])?;
+        if request.operands.is_empty() {
+            return None;
+        }
+        let fake_pid = self.bashpid_value();
+        if !request
+            .operands
+            .iter()
+            .all(|operand| operand.parse::<u32>() == Ok(fake_pid))
+        {
+            return None;
+        }
+        if request.check_only || request.signal == 0 {
+            return Some(Ok(0));
+        }
+        // Default-fatal set (Linux numbers, the kill wire contract):
+        // HUP INT QUIT ILL ABRT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM
+        // TERM STKFLT XCPU XFSZ VTALRM PROF SYS.
+        if !matches!(
+            request.signal,
+            1 | 2 | 3 | 4 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 24 | 25 | 26 | 27
+                | 31
+        ) {
+            return None;
+        }
+        let name = super::trap_exec::signal_trap_name(request.signal)?;
+        if crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, &name).is_some() {
+            // Trapped (action) or explicitly ignored (empty action):
+            // GNU would deliver to the layer and run its trap there;
+            // that delivery channel does not exist in-process.
+            return None;
+        }
+        self.subshell_signal_death = Some((depth, request.signal));
+        Some(Err(ExecuteError::ExitCode(128 + request.signal)))
     }
 
     fn execute_tracked_background_kill(

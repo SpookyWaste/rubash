@@ -1636,6 +1636,7 @@ impl Executor {
             pending_list_time_reports: Vec::new(),
             pending_assignment_diagnostics: Vec::new(),
             parameter_assignment_failure: Cell::new(false),
+            no_closing_brace_failure: Cell::new(false),
             tempenv_names: Vec::new(),
             tempenv_marks: Vec::new(),
             tempenv_promoted_names: Vec::new(),
@@ -1693,6 +1694,7 @@ impl Executor {
             // exec-replacement latch never propagates (a post-reset exec
             // always exits its own frame, so a live parent cannot carry it).
             exec_replaced: false,
+            subshell_signal_death: None,
             // rubash#1175: a fork copy shares the parent shell's process;
             // it must never execve that process away.
             owns_process_image: false,

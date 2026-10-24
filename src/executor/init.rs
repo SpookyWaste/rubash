@@ -422,6 +422,7 @@ impl Executor {
             trap_saved_exit_value: None,
             trap_saved_exit_context: 0,
             exec_replaced: false,
+            subshell_signal_death: None,
             // rubash#1175: a process root IS its process's shell; the
             // image-replacement gates live at the exec dispatcher.
             owns_process_image: true,
@@ -441,6 +442,7 @@ impl Executor {
             pending_list_time_reports: Vec::new(),
             pending_assignment_diagnostics: Vec::new(),
             parameter_assignment_failure: Cell::new(false),
+            no_closing_brace_failure: Cell::new(false),
             tempenv_names: Vec::new(),
             tempenv_marks: Vec::new(),
             tempenv_promoted_names: Vec::new(),

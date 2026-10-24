@@ -785,6 +785,17 @@ impl Executor {
         else {
             return self.expand_embedded_parameters_mut_with_context(word, context);
         };
+        // rubash#1109: this extraction assumed the final `}` closes, but
+        // under the subst.c:1954 span rules (no posix+compat>42 literal
+        // gate) a body ending inside an unterminated single-quote span
+        // has NO closing brace in GNU — the extraction fails there.
+        if matches!(
+            context,
+            SubstitutionQuoteContext::DoubleQuoted | SubstitutionQuoteContext::HereDocument
+        ) && self.no_closing_brace_verdict(name, false, true, &format!("\"{word}\""))
+        {
+            return String::new();
+        }
         // The whole-word span check must use the same quote rules the lexer
         // used to build the word. In POSIX mode inside double quotes the
         // Interp 221 big hammer closes `${...}` at the first `}` (single

@@ -286,6 +286,170 @@ fn assignment_tilde_segment_starts_at(bytes: &[u8], start: usize) -> bool {
     bytes.get(start) == Some(&b'~')
 }
 
+/// rubash#1463 route (b): rewrite the RAW assignment RHS, expanding only
+/// the tilde prefixes that are unquoted in the raw text (at the value
+/// start or right after an unquoted `:` — GNU subst.c:11410-11460
+/// internal_tilde_assignment / tilde.c tilde_expand_word). The lexer
+/// dequotes a pure assignment word before the executor sees it, leaving
+/// only a whole-value QUOTED marker, so the per-segment quote state the
+/// tilde decision needs survives solely in the raw RHS the parser kept
+/// (`CommandNode::assignment_raws`). Returns the rewritten raw RHS when
+/// at least one prefix expanded; `None` when nothing may change (the
+/// caller then keeps the existing marker-suppressed behavior).
+///
+/// Safety rails: a prefix is rewritten only when it is plain text
+/// (`~` plus `[A-Za-z0-9_.+-]*`, covering `~`, `~user`, `~+`/`-`/`~+N`)
+/// up to `/`, an unquoted `:`, or the end of the RHS — `~$u` and quoted
+/// or escaped prefixes stay verbatim (rubash#1417) — and only when the
+/// resolved directory text carries no character the re-lexing of the
+/// rewritten raw word could reinterpret (whitespace, quotes, `$`,
+/// backslash, backtick).
+pub fn expand_unquoted_tildes_in_raw_assignment_rhs(
+    raw_rhs: &str,
+    env_vars: &HashMap<String, String>,
+) -> Option<String> {
+    let chars: Vec<char> = raw_rhs.chars().collect();
+    let mut out = String::with_capacity(raw_rhs.len());
+    let mut index = 0usize;
+    let mut changed = false;
+    let mut segment_start = true;
+    while index < chars.len() {
+        let ch = chars[index];
+        if segment_start && ch == '~' {
+            // Probe = `~` plus plain name characters, stopping at `/`,
+            // `:` or any byte that makes the prefix non-plain.
+            let mut end = index + 1;
+            while end < chars.len()
+                && (chars[end].is_ascii_alphanumeric()
+                    || matches!(chars[end], '_' | '.' | '+' | '-'))
+            {
+                end += 1;
+            }
+            let plain_prefix = end >= chars.len()
+                || matches!(chars[end], '/' | ':');
+            if plain_prefix {
+                let probe: String = chars[index..end].iter().collect();
+                let resolved = expand_tilde_segment(&probe, env_vars);
+                if resolved != probe
+                    && !resolved.chars().any(|c| {
+                        c.is_whitespace()
+                            || matches!(c, '\'' | '"' | '\\' | '$' | '`' | '~')
+                    })
+                {
+                    out.push_str(&resolved);
+                    index = end;
+                    changed = true;
+                    segment_start = false;
+                    continue;
+                }
+            }
+            out.push(ch);
+            index += 1;
+            segment_start = false;
+            continue;
+        }
+        segment_start = false;
+        match ch {
+            ':' => {
+                out.push(ch);
+                index += 1;
+                segment_start = true;
+            }
+            '\\' => {
+                out.push(ch);
+                index += 1;
+                if index < chars.len() {
+                    out.push(chars[index]);
+                    index += 1;
+                }
+            }
+            '\'' => {
+                // Single-quoted span (verbatim to the next `'`; backslash
+                // is literal there) or ANSI-C span when the quote follows
+                // a `$` (backslash escapes the next character there).
+                let ansi_c = out.ends_with('$');
+                out.push(ch);
+                index += 1;
+                while index < chars.len() {
+                    let inner = chars[index];
+                    out.push(inner);
+                    index += 1;
+                    if ansi_c && inner == '\\' && index < chars.len() {
+                        out.push(chars[index]);
+                        index += 1;
+                    } else if inner == '\'' {
+                        break;
+                    }
+                }
+            }
+            '"' | '`' => {
+                let close = ch;
+                out.push(ch);
+                index += 1;
+                while index < chars.len() {
+                    let inner = chars[index];
+                    out.push(inner);
+                    index += 1;
+                    if inner == '\\' && index < chars.len() {
+                        out.push(chars[index]);
+                        index += 1;
+                    } else if inner == close {
+                        break;
+                    }
+                }
+            }
+            '$' if chars.get(index + 1) == Some(&'(') || chars.get(index + 1) == Some(&'{') => {
+                // Substitution unit: verbatim through its matching close
+                // (quote- and nesting-aware enough for span skipping; a
+                // `:` or `~` inside is the substitution's own grammar).
+                let open = chars[index + 1];
+                let close = if open == '(' { ')' } else { '}' };
+                let mut depth = 0usize;
+                while index < chars.len() {
+                    let inner = chars[index];
+                    out.push(inner);
+                    index += 1;
+                    match inner {
+                        '\\' => {
+                            if index < chars.len() {
+                                out.push(chars[index]);
+                                index += 1;
+                            }
+                        }
+                        '\'' | '"' | '`' => {
+                            let quote = inner;
+                            while index < chars.len() {
+                                let q = chars[index];
+                                out.push(q);
+                                index += 1;
+                                if q == '\\' && index < chars.len() {
+                                    out.push(chars[index]);
+                                    index += 1;
+                                } else if q == quote {
+                                    break;
+                                }
+                            }
+                        }
+                        c if c == open => depth += 1,
+                        c if c == close => {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {
+                out.push(ch);
+                index += 1;
+            }
+        }
+    }
+    changed.then_some(out)
+}
+
 pub fn expand_assignment_tilde_value(
     value: &str,
     env_vars: &HashMap<String, String>,

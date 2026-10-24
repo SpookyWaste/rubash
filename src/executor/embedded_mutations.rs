@@ -979,7 +979,19 @@ impl Executor {
                                 output.push_str(&value);
                             }
                         } else {
-                            let (name, _terminated) = collect_braced_parameter_body(&mut chars);
+                            let (name, terminated) = collect_braced_parameter_body(&mut chars);
+                            if self.no_closing_brace_verdict(
+                                &name,
+                                terminated,
+                                matches!(
+                                    context,
+                                    SubstitutionQuoteContext::DoubleQuoted
+                                        | SubstitutionQuoteContext::HereDocument
+                                ) || in_double,
+                                &format!("\"{word}\""),
+                            ) {
+                                continue;
+                            }
                             let value =
                                 self.expand_with_parameter_env(saved_parameter_state, |executor| {
                                     executor.expand_word_mut_with_context(
@@ -996,7 +1008,19 @@ impl Executor {
                             }
                         }
                     } else {
-                        let (name, _terminated) = collect_braced_parameter_body(&mut chars);
+                        let (name, terminated) = collect_braced_parameter_body(&mut chars);
+                        if self.no_closing_brace_verdict(
+                            &name,
+                            terminated,
+                            matches!(
+                                context,
+                                SubstitutionQuoteContext::DoubleQuoted
+                                    | SubstitutionQuoteContext::HereDocument
+                            ) || in_double,
+                            &format!("\"{word}\""),
+                        ) {
+                            continue;
+                        }
                         let value =
                             self.expand_with_parameter_env(saved_parameter_state, |executor| {
                                 // Propagate the outer quote context so a

@@ -545,6 +545,13 @@ impl Executor {
             // consuming the flag it leaks into the *next* command's check
             // and discards an innocent command (v=${x-${'u'%'v'}} ate the
             // following `echo`).
+            // rubash#1109: DISCARD in every mode (see the word path in
+            // command_execute.rs / no_closing_brace_verdict).
+            if self.no_closing_brace_failure.replace(false) {
+                self.exit_code = 1;
+                self.command_expansion_failed.set(true);
+                return Err(ExecuteError::ExpansionFailure(1));
+            }
             if self.shell_state.parameter_bad_substitution.replace(false) {
                 if self.posix_mode_enabled()
                     && self

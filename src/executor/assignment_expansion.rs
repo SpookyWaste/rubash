@@ -535,6 +535,36 @@ impl Executor {
         if let Some(fast) = self.fast_plain_scalar_rhs(value, raw) {
             return fast;
         }
+        // rubash#1463 route (b): a pure assignment word whose RHS mixes
+        // quoted and unquoted segments reaches here with only the
+        // whole-value QUOTED marker — the lexer dequoted it and destroyed
+        // which colon segments' tildes were quoted, so the marker pass in
+        // expand_assignment_value_inner suppresses EVERY tilde (`a=~/x:'q'`
+        // kept `~/x`). The raw RHS the parser retained still knows: expand
+        // exactly the unquoted tilde prefixes in the raw text, re-derive
+        // the cooked value through the lexer's own word_value_from_raw
+        // (the same dequote the original token got), and let the normal
+        // chain finish — the remaining quoted tildes stay marker-guarded.
+        if value.starts_with(tilde_expand::QUOTED_ASSIGNMENT_VALUE) {
+            if let Some(raw) = raw {
+                if let Some(rewritten) =
+                    tilde_expand::expand_unquoted_tildes_in_raw_assignment_rhs(
+                        raw,
+                        &self.shell_state.env_vars,
+                    )
+                {
+                    let full = format!("{name}={rewritten}");
+                    let (rederived, _) =
+                        crate::lexer::word_value_from_raw(&full, self.posix_mode_enabled(), false);
+                    if let Some(rhs) = rederived
+                        .strip_prefix(name)
+                        .and_then(|rest| rest.strip_prefix('='))
+                    {
+                        return self.expand_assignment_value(name, rhs);
+                    }
+                }
+            }
+        }
         if let Some(raw) = raw.filter(|raw| {
             (value.contains("<(") || value.contains(">("))
                 && crate::parser::raw_word_has_unquoted_process_substitution(raw)
