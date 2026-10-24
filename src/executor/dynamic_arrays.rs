@@ -410,6 +410,40 @@ impl Executor {
         if is_marked_var(&self.shell_state.env_vars, UNSET_DYNAMIC_VARS, name) {
             return None;
         }
+        // rubash#1394: BASH_ARGC/BASH_ARGV are dynamic stack arrays
+        // whose scalar getter does not exist (dynamic_parameter_value
+        // has no arm for them and returns None), so render them here
+        // from the composed views BEFORE the scalar-value gate below —
+        // the same views element reads use (variables.c get_bashargcv
+        // materializes the bottom frame on a top-level read; inside a
+        // function the arrays stay unmaterialized without extdebug and
+        // render as ()).
+        if matches!(name, "BASH_ARGC" | "BASH_ARGV") {
+            let exported = if is_marked_var(&self.shell_state.env_vars, EXPORTED_VARS, name) {
+                "x"
+            } else {
+                ""
+            };
+            let readonly = if is_marked_var(&self.shell_state.env_vars, READONLY_VARS, name) {
+                "r"
+            } else {
+                ""
+            };
+            let values = if name == "BASH_ARGC" {
+                self.bash_argc_view()
+            } else {
+                self.bash_argv_view()
+            };
+            let elements = values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| format!("[{index}]={}", sh_double_quote_text(value)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Some(format!(
+                "declare -a{readonly}{exported} {name}=({elements})"
+            ));
+        }
         let value = self.dynamic_parameter_value(name)?;
         let quoted = sh_double_quote_text(&value);
         // mk_env_string/declare -p read the getter's CURRENT value through
