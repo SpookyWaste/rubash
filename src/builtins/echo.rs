@@ -229,6 +229,27 @@ fn push_char(output: &mut Vec<u8>, ch: char) {
 }
 
 fn push_codepoint(output: &mut Vec<u8>, value: u32) {
+    // GNU echo -e decodes \u/\U through ansicstr (builtins/echo.def:169 ->
+    // lib/sh/strtrans.c:161-181 -> lib/sh/unicode.c:239 u32cconv), the same
+    // path as $'\u': values <= 0x7f are emitted directly, everything else
+    // goes through u32cconv, whose non-UTF-8-locale fallback is u32tocesc
+    // (unicode.c:141: `\u%04X` / `\U%08X`, ISO C99 escape with UPPERCASE
+    // hex) — under LC_ALL=C GNU keeps `echo -e '\u00e9'` as the six literal
+    // characters `\u00E9` (rubash#1488). The ANSI-C decoder in lexer/ansi.rs
+    // already applies exactly this gate (#353); mirror it here. Only an
+    // EXPLICITLY selected non-UTF-8 locale closes the gate (no locale
+    // variables keeps rubash's platform-default UTF-8 model).
+    if value > 0x7f {
+        let name = crate::locale::active_locale_name();
+        if !name.is_empty() && !crate::locale::is_utf8_locale_name(&name) {
+            if value < 0x1_0000 {
+                output.extend_from_slice(format!("\\u{value:04X}").as_bytes());
+            } else {
+                output.extend_from_slice(format!("\\U{value:08X}").as_bytes());
+            }
+            return;
+        }
+    }
     if let Some(ch) = char::from_u32(value) {
         push_char(output, ch);
     }

@@ -3786,6 +3786,11 @@ impl Executor {
             "true" | ":" => Ok(Some((String::new(), String::new(), 0))),
             "false" => Ok(Some((String::new(), String::new(), 1))),
             "echo" => {
+                // rubash#1488: same variable-table locale guard as the
+                // plain execute_echo path — a pipeline stage's \u/\U
+                // gate must see the shell's LC_ALL, not the process env.
+                let _locale_guard =
+                    crate::locale::ShellLocaleGuard::new(&self.shell_state.env_vars);
                 let args = self.expand_pipeline_stage_arg_words(command, 1);
                 let mut output = Vec::new();
                 crate::builtins::echo::write_echo_decoded(

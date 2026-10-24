@@ -146,6 +146,10 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        // rubash#1488: echo's \u/\U locale gate must observe this shell's
+        // variable-table locale (a plain `LC_ALL=C` assignment counts, per
+        // GNU's sv_lc* watchers), not just the process environment.
+        let _locale_guard = crate::locale::ShellLocaleGuard::new(&self.shell_state.env_vars);
         self.exit_code = 0;
         // TODO(redir.c/execute_cmd.c/builtins/echo.def): Generalize builtin
         // redirection. This covers upstream source tests that create sourced
