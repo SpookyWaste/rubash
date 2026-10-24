@@ -466,11 +466,21 @@ where
                     'A' => unset_assoc = true,
                     'i' if set_attr => integer = true,
                     'i' => unset_integer = true,
+                    // GNU builtins/declare.def:341-356: each case option
+                    // sets its own bit in flags_on AND (only when setting,
+                    // i.e. flags == &flags_on) adds the other two case
+                    // attributes to flags_off. The bits accumulate across
+                    // the whole option scan — `declare -lu` therefore ends
+                    // with on={lower,upper} and off={upper,capcase,lower,
+                    // capcase}, and the later VSETATTR(flags_on) +
+                    // VUNSETATTR(flags_off) application (declare.def:
+                    // 525-527) leaves NO case attribute at all, instead of
+                    // the last option winning (rubash#1458).
                     'u' => {
                         if set_attr {
                             uppercase = true;
-                            lowercase = false;
-                            capcase = false;
+                            unset_lowercase = true;
+                            unset_capcase = true;
                         } else {
                             unset_uppercase = true;
                         }
@@ -478,16 +488,16 @@ where
                     'l' => {
                         if set_attr {
                             lowercase = true;
-                            uppercase = false;
-                            capcase = false;
+                            unset_uppercase = true;
+                            unset_capcase = true;
                         } else {
                             unset_lowercase = true;
                         }
                     }
                     'c' if set_attr => {
                         capcase = true;
-                        uppercase = false;
-                        lowercase = false;
+                        unset_uppercase = true;
+                        unset_lowercase = true;
                     }
                     'c' => unset_capcase = true,
                     'n' if set_attr => nameref = true,
