@@ -1604,6 +1604,40 @@ pub(in crate::executor) fn decode_double_quotes_in_quoted_parameter_word(
             index += 1;
             continue;
         }
+        // GNU parse.y:4451 parse_comsub / parse.y:3877 parse_matched_pair:
+        // a `$(...)` or `` `...` `` unit inside the ${...} word is a
+        // self-contained parse unit — its interior quoting belongs to the
+        // substitution's own grammar and is re-read fresh when the body
+        // executes (subst.c:7143 command_substitute -> parse_and_execute).
+        // The flat quote marking below (a `'` becomes DATA_SQUOTE in
+        // non-POSIX mode, a `$'...'` is ansiexpanded) must not cross the
+        // unit boundary, or the body's own quote characters reach the
+        // inner parse as literal data (`"${u:-$(printf 'x y')}"` expanded
+        // to `'x`). Copy the whole unit verbatim (rubash#1455).
+        if chars[index] == '$' && chars.get(index + 1) == Some(&'(') {
+            let end = crate::lexer::skip_parenthesized_unit_corrected(&chars, index + 1)
+                .unwrap_or(chars.len());
+            output.extend(&chars[index..end]);
+            index = end;
+            continue;
+        }
+        if chars[index] == '`' {
+            let mut cursor = index + 1;
+            output.push('`');
+            while cursor < chars.len() {
+                let ch = chars[cursor];
+                output.push(ch);
+                cursor += 1;
+                if ch == '\\' && cursor < chars.len() {
+                    output.push(chars[cursor]);
+                    cursor += 1;
+                } else if ch == '`' {
+                    break;
+                }
+            }
+            index = cursor;
+            continue;
+        }
         // GNU parse.y:4053-4070 (parse_matched_pair): inside a `${...}`
         // grouping construct a `$'...'` body is ansiexpanded at extraction
         // time and wrapped in sh_single_quote so the decoded bytes ride out
