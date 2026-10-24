@@ -263,27 +263,102 @@ pub fn strip_assignment_quote_marker(value: &str) -> &str {
 
 pub fn assignment_value_needs_tilde_expansion(value: &str, expand_after_colon: bool) -> bool {
     let value = strip_assignment_quote_marker(value);
-    let bytes = value.as_bytes();
-    if assignment_tilde_segment_starts_at(bytes, 0) {
-        return true;
-    }
     if !expand_after_colon {
-        return false;
+        return value.starts_with('~');
     }
-
-    bytes
+    // GNU expands every UNQUOTED `~` that starts an assignment value or
+    // follows an UNQUOTED `:` — `~user` included (subst.c:11410-11460
+    // internal_tilde tracking in expand_word_internal's W_ASSIGNMENT
+    // walk). A `:` inside a quoted span does not arm a new segment, and
+    // a segment that opens with a quote character has no tilde prefix to
+    // expand (rubash#1463: `a=~/x:'q'` expands the first segment only,
+    // `b='q':~/x` the second). The expansion pass itself keeps anything
+    // the passwd lookup cannot resolve verbatim (the GNU
+    // savestring(filename) fallback), so a generous predicate never
+    // turns a `~user` assignment into a literal by accident.
+    assignment_tilde_segments(value)
         .iter()
-        .enumerate()
-        .any(|(index, byte)| *byte == b':' && assignment_tilde_segment_starts_at(bytes, index + 1))
+        .any(|segment| segment.starts_with('~'))
 }
 
-fn assignment_tilde_segment_starts_at(bytes: &[u8], start: usize) -> bool {
-    // GNU expands every unquoted `~` that starts an assignment value or
-    // follows a `:` — `~user` included. The expansion pass itself keeps
-    // anything the passwd lookup cannot resolve verbatim (the GNU
-    // savestring(filename) fallback), so a generous predicate never turns a
-    // `~user` assignment into a literal by accident.
-    bytes.get(start) == Some(&b'~')
+/// Split an assignment value at its UNQUOTED `:` boundaries for the
+/// tilde pass. Quote state is tracked over every spelling a quote can
+/// take by the time a value reaches this layer: the raw `'`/`"`
+/// characters, the \x17/\x18 DATA carriers parameter_words substitutes
+/// for quotes inside `${...}` words, and the assignment-hoist sentinels
+/// (ASSIGN_DATA_SQUOTE / ASSIGN_DATA_DQUOTE / ASSIGN_HOISTED_SQUOTE).
+/// A real backslash escapes the next character; `$(...)` and `` `...` ``
+/// units are skipped whole (parse.y:4451 parse_comsub — their interiors,
+/// colons included, belong to the inner parse). Segments keep their
+/// quote characters: a segment-initial quote simply fails the `~`
+/// prefix test, and a quote INSIDE a segment rides along into
+/// expand_tilde_segment, whose user-name lookup then fails exactly like
+/// GNU's (`a=~'q'` keeps `~'q'`, dequoted later to `~q`).
+fn assignment_tilde_segments(value: &str) -> Vec<&str> {
+    let chars: Vec<char> = value.chars().collect();
+    let byte_offsets: Vec<usize> = value
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain([value.len()])
+        .collect();
+    let mut segments = Vec::new();
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut escaped = false;
+    let mut start = 0usize;
+    let mut index = 0usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        match ch {
+            '\\' if !in_sq => escaped = true,
+            '\''
+            | crate::executor::markers::DATA_SQUOTE
+            | crate::executor::markers::ASSIGN_DATA_SQUOTE
+            | crate::executor::markers::ASSIGN_HOISTED_SQUOTE
+                if !in_dq =>
+            {
+                in_sq = !in_sq;
+            }
+            '"'
+            | crate::executor::markers::DATA_DQUOTE
+            | crate::executor::markers::ASSIGN_DATA_DQUOTE
+                if !in_sq =>
+            {
+                in_dq = !in_dq;
+            }
+            '$' if !in_sq && !in_dq && chars.get(index + 1) == Some(&'(') => {
+                index = crate::lexer::skip_parenthesized_unit_corrected(&chars, index + 1)
+                    .unwrap_or(chars.len());
+                continue;
+            }
+            '`' if !in_sq && !in_dq => {
+                index += 1;
+                while index < chars.len() {
+                    let unit_ch = chars[index];
+                    index += 1;
+                    if unit_ch == '\\' && index < chars.len() {
+                        index += 1;
+                    } else if unit_ch == '`' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            ':' if !in_sq && !in_dq => {
+                segments.push(&value[byte_offsets[start]..byte_offsets[index]]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    segments.push(&value[byte_offsets[start]..]);
+    segments
 }
 
 pub fn expand_assignment_tilde_value(
@@ -295,18 +370,11 @@ pub fn expand_assignment_tilde_value(
         return expand_tilde_segment(value, env_vars);
     }
 
-    let mut output = String::new();
-    let mut start = 0;
-    for (index, ch) in value.char_indices() {
-        if index == 0 || ch != ':' {
-            continue;
-        }
-        output.push_str(&expand_tilde_segment(&value[start..index], env_vars));
-        output.push(':');
-        start = index + ch.len_utf8();
-    }
-    output.push_str(&expand_tilde_segment(&value[start..], env_vars));
-    output
+    assignment_tilde_segments(value)
+        .into_iter()
+        .map(|segment| expand_tilde_segment(segment, env_vars))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 pub(crate) fn expand_tilde_segment(segment: &str, env_vars: &HashMap<String, String>) -> String {
