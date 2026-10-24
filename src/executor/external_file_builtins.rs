@@ -1372,6 +1372,26 @@ impl Executor {
         let mut stderr = Vec::new();
         for expanded in operands {
             let target = shell_path_to_windows(expanded, &self.shell_state.env_vars);
+            // coreutils rm.c (niubash#534 wording residual): a recursive
+            // removal whose operand's last component is `.` or `..` is
+            // refused outright — `refusing to remove '.' or '..' directory:
+            // skipping '<operand>'`, status 1 — instead of attempting the
+            // removal and reporting the OS error (rubash answered
+            // "No such file or directory"). The refusal fires only when the
+            // operand resolves to an existing directory: a missing `foo/.`
+            // keeps the plain existence error (or the -f silence) GNU
+            // gives it, and without -r the operand still earns the plain
+            // `Is a directory` refusal.
+            if recursive && rm_operand_is_dot_or_dotdot(expanded) {
+                if fs::metadata(&target).is_ok_and(|meta| meta.is_dir()) {
+                    status = 1;
+                    writeln!(
+                        &mut stderr,
+                        "rm: refusing to remove '.' or '..' directory: skipping '{expanded}'"
+                    )?;
+                    continue;
+                }
+            }
             let result = match fs::symlink_metadata(&target) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
                     // A symlink operand names the link itself; a directory
@@ -1403,10 +1423,13 @@ impl Executor {
                     }
                 }
                 // GNU rm -f removes the "did not exist" diagnostic; it is
-                // not a license to hide a failed removal.
+                // not a license to hide a failed removal. gnulib remove.c
+                // counts ENOTDIR with ENOENT there (`rm -rf f/.` on a
+                // regular file f is silent, status 0 — niubash#534).
                 Err(error)
                     if force
                         && (error.kind() == io::ErrorKind::NotFound
+                            || error.kind() == io::ErrorKind::NotADirectory
                             || (cfg!(windows)
                                 && contains_windows_forbidden_posix_filename_char(&expanded))) => {}
                 Err(error) => {
@@ -1981,6 +2004,16 @@ fn cp_usage_text() -> &'static str {
 
 /// cp quotes names with quotearg_colon: single quotes around the name, and
 /// an embedded single quote becomes '\'' .
+/// coreutils' last-component test for the rm dot refusal: trailing
+/// slashes do not hide the component (`existing/../` and `./` still name
+/// `..`/`.`); a bare root names the root, not a dot component.
+fn rm_operand_is_dot_or_dotdot(operand: &str) -> bool {
+    let normalized = operand.replace('\\', "/");
+    let trimmed = normalized.trim_end_matches('/');
+    let last = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    last == "." || last == ".."
+}
+
 fn cp_quoted_name(name: &str) -> String {
     let mut out = String::new();
     out.push('\u{27}');
