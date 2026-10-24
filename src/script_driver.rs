@@ -3003,6 +3003,14 @@ fn run_source_impl(
         for token in &mut tokens {
             token.position += line_offset;
             token.column += line_offset;
+            // rubash#1186: logical_line must shift with position — the
+            // DISCARD skip gates compare command.logical_line against
+            // reader-line state seeded in the absolute (offset) space, so
+            // an unshifted logical_line left every interactive line after
+            // the first comparing unequal and the failglob discard died at
+            // compound boundaries (`{ set -- /no/such/*.zzz; }; echo rc`
+            // printed rc in the REPL only).
+            token.logical_line += line_offset;
         }
     }
     // GNU parse.y: a `)` or case-clause terminator at command position is
