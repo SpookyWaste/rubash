@@ -225,14 +225,9 @@ where
             )?;
             return Ok(EX_USAGE);
         }
-        if pathname == "/" {
-            writeln!(
-                stderr,
-                "{}hash: {pathname}: Is a directory",
-                script_prefix(env_vars)
-            )?;
-            return Ok(EXECUTION_FAILURE);
-        }
+        // (The directory check itself lives in the insert loop below:
+        // GNU tests file_isdir(pathname) per name, after the
+        // absolute_program skip — rubash#1360.)
         // GNU builtins/hash.def:190-196: with `-p`, every name is inserted
         // via phash_insert; a name containing '/' is silently skipped
         // (absolute_program → continue), never stored (rubash#1360 #1362).
@@ -243,8 +238,23 @@ where
         // would execute. Convert through shell_path_to_windows so the
         // cached PathBuf matches the Windows-native form produced by
         // find_user_command_uncached.
+        // GNU builtins/hash.def hash_builtin name loop: with a pathname,
+        // file_isdir(pathname) is tested per name (after the slash skip):
+        // a directory pathname reports "<pathname>: Is a directory",
+        // sets failure and stores nothing for that name — for ANY
+        // directory, not just "/" (rubash#1360).
+        let mut status = EXECUTION_SUCCESS;
         for name in &names {
             if name.contains('/') {
+                continue;
+            }
+            if std::path::Path::new(pathname).is_dir() {
+                writeln!(
+                    stderr,
+                    "{}hash: {pathname}: Is a directory",
+                    script_prefix(env_vars)
+                )?;
+                status = EXECUTION_FAILURE;
                 continue;
             }
             table.insert(
@@ -255,7 +265,7 @@ where
             crate::executor::path::set_command_lookup_cache(name, Some(cached_path));
         }
         store_hash_table(env_vars, &table);
-        return Ok(EXECUTION_SUCCESS);
+        return Ok(status);
     }
 
     if delete {
