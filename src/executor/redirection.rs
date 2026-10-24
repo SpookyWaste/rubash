@@ -1235,6 +1235,19 @@ impl Executor {
         state: &mut OutputFdState,
     ) -> Result<bool, ExecuteError> {
         for redirect in &cmd.redirects {
+            // rubash#1359: a `{var}` redirection is a redir_varassign
+            // (GNU redir.c:1133-1166) — it allocates a fresh descriptor
+            // >= 10 and is applied exactly once by
+            // apply_dynamic_fd_var_redirects; it NEVER binds the
+            // command's own fd 0/1/2. Walking it here defaulted its fd
+            // to 1 and rerouted the command's stdout into the var-fd
+            // target (a literal file named `>(cat)` for a procsub
+            // target; a delayed flush for a plain file target). The
+            // async-stdio walk in compound_exec.rs skips fd_var entries
+            // for the same reason.
+            if redirect.fd_var.is_some() {
+                continue;
+            }
             match redirect.kind {
                 crate::parser::RedirectKind::Output
                 | crate::parser::RedirectKind::Append

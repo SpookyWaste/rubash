@@ -102,14 +102,18 @@ pub(super) fn collect_trailing_redirections(
                 process_substitution.redirect_fd = fd;
                 let target = process_substitution.target.clone();
                 command.process_substitutions.push(process_substitution);
-                command.redirect_out = Some(redirect_node_with_fd_var(
-                    &token.value,
-                    fd,
-                    fd_var,
-                    &target,
-                    false,
-                    false,
-                ));
+                let redirect =
+                    redirect_node_with_fd_var(&token.value, fd, fd_var, &target, false, false);
+                command.redirects.push(redirect.clone());
+                // rubash#1359: a `{var}` redirect allocates a fresh
+                // descriptor (GNU redir.c redir_varassign) — it never
+                // binds fd 1, so it must not mirror into redirect_out
+                // (the main collector in redirect_assign.rs has the
+                // same rule). Mirroring it rerouted the command's
+                // stdout into the procsub target/file.
+                if redirect.fd_var.is_none() && redirect.fd.unwrap_or(1) == 1 {
+                    command.redirect_out = Some(redirect);
+                }
                 *index = next_i + 1;
                 continue;
             }
