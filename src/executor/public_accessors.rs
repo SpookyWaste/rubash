@@ -647,11 +647,7 @@ impl Executor {
             // fixup; cli_tests function_call_stack_* encode the GNU
             // shape). The SCRIPT_NAME branch below guards the reverse
             // seeding order.
-            store_indexed_array_state(
-                &mut self.shell_state,
-                "BASH_SOURCE",
-                Vec::<String>::new(),
-            );
+            store_indexed_array_state(&mut self.shell_state, "BASH_SOURCE", Vec::<String>::new());
         }
         if name == "__RUBASH_SCRIPT_NAME" {
             let source_value = if self
@@ -1421,7 +1417,9 @@ impl Executor {
     /// __RUBASH_SHELL_NAME (argv[0], main.rs) is consulted before the
     /// BASH_ARGV0 fallback. rubash#162 N6: this prolog used to print the
     /// full executable path.
-    fn interactive_shell_basename(env_vars: &HashMap<String, String>) -> String {
+    pub(in crate::executor) fn interactive_shell_basename(
+        env_vars: &HashMap<String, String>,
+    ) -> String {
         let name = env_vars
             .get("__RUBASH_SHELL_NAME")
             .or_else(|| env_vars.get("BASH_ARGV0"))
