@@ -1062,13 +1062,21 @@ impl Executor {
         // and skip it. Unix-only: Windows routes scripts through the shell
         // fallback before reaching any spawn (should_run_with_shell), so a
         // magic sniff here would only misroute batch files and MZ images.
-        let spawned =
-            if !used_shell && cfg!(unix) && !crate::executor::path::program_execs_directly(program)
-            {
-                Err(std::io::Error::from_raw_os_error(8))
-            } else {
-                process.spawn()
-            };
+        // The synthetic refusal must be ENOEXEC specifically: a file
+        // without any execute bit would fail execve with EACCES instead,
+        // and GNU reports that as Permission denied / 126 with no
+        // shell-script fallback (execute_cmd.c:6126-6159 shell_execve;
+        // rubash#1459). Non-executable files therefore take the real
+        // spawn so the genuine EACCES reaches the diagnostic path.
+        let spawned = if !used_shell
+            && cfg!(unix)
+            && !crate::executor::path::program_execs_directly(program)
+            && crate::executor::path::is_executable_file(program)
+        {
+            Err(std::io::Error::from_raw_os_error(8))
+        } else {
+            process.spawn()
+        };
         // Drop the Command NOW: std retains every `Stdio::from(..)` it was
         // given (the #144 shared capture-pipe write clones among them), so a
         // still-live Command keeps the pipe's write end open in the parent
@@ -1838,6 +1846,16 @@ fn is_exec_format_error(error: &io::Error) -> bool {
 pub(in crate::executor) fn is_enoexec_candidate(program: &std::path::Path) -> bool {
     use std::io::Read;
     if !std::fs::metadata(program).is_ok_and(|meta| meta.is_file()) {
+        return false;
+    }
+    // The ENOEXEC shell-script fallback (execute_cmd.c:6139-6233
+    // shell_execve) is only reached when execve actually fails with
+    // ENOEXEC. A file without any execute bit fails earlier with
+    // EACCES, and GNU reports it as Permission denied / exit 126
+    // (findcmd.c:591/695 keep such files out of the runnable set the
+    // same way). Without this gate a non-executable text file was run
+    // as a script with status 0 (rubash#1459).
+    if !crate::executor::path::is_executable_file(program) {
         return false;
     }
     let Ok(mut file) = std::fs::File::open(program) else {
