@@ -1749,10 +1749,13 @@ fn bracket_expression_end(chars: &[char], start: usize) -> Option<usize> {
 
 /// glibc regcomp (REG_BADRPT): a repetition operator with no
 /// quantifiable operand — at the start of the pattern or a
-/// subexpression, right after `|` or `(`, or right after the `^`
-/// anchor (an anchor is not an operand: `a^*` is invalid, while `$`
-/// IS one: `$*a` compiles). Stacked operators are fine (`a**`,
-/// `a*{2}` nest); only the first operator of a run can dangle.
+/// subexpression, right after `|` or `(`, or right after an anchor
+/// (an anchor is not an operand: `a^*`, `$*a`, and `a$*` all fail
+/// with REG_BADRPT in glibc regcomp; integration re-verified against
+/// regcomp directly and GNU bash 5.3.20, correcting an earlier probe
+/// note that claimed `$*a` compiles). Stacked operators are fine
+/// (`a**`, `a*{2}` nest); only the first operator of a run can
+/// dangle.
 fn posix_ere_has_dangling_quantifier(pattern: &str) -> bool {
     let chars: Vec<char> = pattern.chars().collect();
     let mut have_atom = false;
@@ -1779,7 +1782,7 @@ fn posix_ere_has_dangling_quantifier(pattern: &str) -> bool {
                 have_atom = false;
                 i += 1;
             }
-            '^' => {
+            '^' | '$' => {
                 have_atom = false;
                 i += 1;
             }
