@@ -1781,7 +1781,16 @@ impl Executor {
             }
             Err(error) => return Err(error),
         }
-        self.print_time_shell(time_command.posix_format, started);
+        // rubash#1277: under the list loop's defer flag the report is
+        // queued, not printed — the loop flushes it after the ERR trap
+        // adjudication (GNU fires the trap inside the inner
+        // execute_command, before execute_time_command's print).
+        if self.defer_list_time_report {
+            self.pending_list_time_reports
+                .push((started, time_command.posix_format));
+        } else {
+            self.print_time_shell(time_command.posix_format, started);
+        }
         if time_command.inverted {
             // rubash#846 (GNU execute_cmd.c:854-883 vs :1204): a compound
             // inner's OWN redirect failure suppresses the `!` flip (mark

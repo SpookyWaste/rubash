@@ -1036,6 +1036,10 @@ impl Executor {
             }
 
             if let Some(time_command) = &command.time_command {
+                // rubash#1277: queue the timing report inside
+                // execute_time_ast_command; it is flushed below, after
+                // the ERR trap adjudication (GNU's order).
+                self.defer_list_time_report = true;
                 let execution_result = if command.and_or().is_some() {
                     self.with_errexit_suppressed(|executor| {
                         executor.execute_time_ast_command(time_command)
@@ -1077,6 +1081,10 @@ impl Executor {
                         self.report_io_error_routed(command, &error)?;
                     }
                     Err(ExecuteError::ExitCode(code)) => {
+                        // An unwind: GNU's jump leaves execute_time_command
+                        // before its print — drop the queued report.
+                        self.defer_list_time_report = false;
+                        self.pending_list_time_reports.clear();
                         handle_exit_code!(code, command)
                     }
                     Err(ExecuteError::Return(code)) if subshell_state.is_some() => {
@@ -1092,7 +1100,10 @@ impl Executor {
                         // CR round 2 (rubash#720): an unwind crossing a flat
                         // region boundary must not leak the saved parent
                         // state — close first (a no-op outside a region),
-                        // then let the unwind continue.
+                        // then let the unwind continue. The queued time
+                        // report dies with the unwind, as in GNU.
+                        self.defer_list_time_report = false;
+                        self.pending_list_time_reports.clear();
                         close_subshell_region_if_ended!(command);
                         return Err(error);
                     }
@@ -1106,6 +1117,16 @@ impl Executor {
                 // folded into exit_code by execute_time_ast_command)
                 // exempts the command like an outer inversion.
                 self.maybe_run_error_trap(command)?;
+                // rubash#1277: flush the queued timing report(s) AFTER the
+                // ERR trap (GNU: the trap fires inside the inner
+                // execute_command, execute_time_command prints after it
+                // returns) and BEFORE the errexit jump below (GNU still
+                // prints the report for a `set -e`-fatal timed command).
+                self.defer_list_time_report = false;
+                let queued_time_reports = std::mem::take(&mut self.pending_list_time_reports);
+                for (started, posix_format) in queued_time_reports {
+                    self.print_time_shell(posix_format, started);
+                }
                 if self.errexit_enabled()
                     && self.errexit_is_active()
                     && self.suppress_errexit == 0

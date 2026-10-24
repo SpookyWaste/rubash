@@ -723,6 +723,18 @@ pub struct Executor {
     /// A deferred time report's (start, posix_format), stashed by the
     /// stage executor for the pipeline executor (rubash#1263).
     pending_stage_time_report: Option<(read_helpers::TimeCommandStart, bool)>,
+    /// rubash#1277: while the list loop executes a `time` command it
+    /// raises this flag so execute_time_ast_command queues its report
+    /// instead of printing it. GNU's ERR trap for the timed command fires
+    /// inside the inner execute_command (execute_cmd.c
+    /// execute_time_command -> execute_command -> run_error_trap),
+    /// BEFORE execute_time_command prints the timing block; the list
+    /// loop flushes the queue after its own maybe_run_error_trap and
+    /// before the errexit jump, reproducing that order.
+    defer_list_time_report: bool,
+    /// Queued (start, posix_format) reports under
+    /// defer_list_time_report, in completion order (innermost first).
+    pending_list_time_reports: Vec<(read_helpers::TimeCommandStart, bool)>,
     /// GNU subst.c: an assignment performed by `${var:=word}`/`${var=word}`
     /// that fails (invalid nameref target value, readonly, ...) is a word
     /// expansion error — expand_word_error -> exp_jump_to_top_level(DISCARD)

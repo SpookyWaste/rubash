@@ -437,6 +437,8 @@ impl Executor {
             getopts_optind_arith_fatal: false,
             defer_stage_time_report: false,
             pending_stage_time_report: None,
+            defer_list_time_report: false,
+            pending_list_time_reports: Vec::new(),
             pending_assignment_diagnostics: Vec::new(),
             parameter_assignment_failure: Cell::new(false),
             tempenv_names: Vec::new(),
