@@ -500,7 +500,7 @@ impl Executor {
                 // table fallback would render `-a` for every shape —
                 // only a live array (or the att_array valueless cell)
                 // carries it in GNU (rubash#1363/#1364).
-                let flag = |key: &str, letter: &str| {
+                let flag = |key: &str, letter: &'static str| -> &'static str {
                     if is_marked_var(&self.shell_state.env_vars, key, "PIPESTATUS") {
                         letter
                     } else {
