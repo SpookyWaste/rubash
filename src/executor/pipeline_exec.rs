@@ -1547,7 +1547,19 @@ impl Executor {
                         })
                     || !command.process_substitutions.is_empty()
                     || command_has_pipeline_process_substitution(command)
-        }) {
+        })
+            // rubash#1130: a member whose words, assignment values, heredoc
+            // bodies or here-string word would raise a word-expansion error
+            // (nounset unbound, `${x?}`, bad substitution) must not take the
+            // concurrent fast path — it spawns members directly and never
+            // runs the expansion-error gates, so `cat <<< prefix$p | wc -w`
+            // silently expanded `$p`. Decline to the sequential stage
+            // executor, whose gates report the error per element. The probe
+            // is the side-effect-free twin of the reporting scan.
+            || commands
+                .iter()
+                .any(|command| self.parameter_expansion_error_pending(command))
+        {
             return Ok(None);
         }
 
@@ -2432,8 +2444,8 @@ impl Executor {
         // parent drains that capture concurrently with the members —
         // subst.c:7428 close(fildes[1]) then subst.c:7437 read_comsub(fildes[0])
         // BEFORE subst.c:7441 wait_for(pid).
-        let stream_stdout = allow_stream_stdout
-            && self.final_member_stdout_streams_to_host(commands[last_index]);
+        let stream_stdout =
+            allow_stream_stdout && self.final_member_stdout_streams_to_host(commands[last_index]);
         let stdout_target = if stream_stdout {
             PipelineDrainTarget::StreamHostStdout
         } else {
@@ -2890,7 +2902,16 @@ impl Executor {
                         })
                     || !command.process_substitutions.is_empty()
                     || command_has_pipeline_process_substitution(command)
-        }) {
+        })
+            // rubash#1130: non-Windows twin of the concurrent-admission
+            // decline above — a member with a pending word-expansion error
+            // (nounset unbound in an argument, heredoc body or here-string
+            // word) takes the sequential stage path so its gate reports
+            // the error instead of the fast path expanding it away.
+            || commands
+                .iter()
+                .any(|command| self.parameter_expansion_error_pending(command))
+        {
             return Ok(None);
         }
 
@@ -3461,6 +3482,29 @@ impl Executor {
                 // subst.c:10416-10418/11032-11034: interactive_shell takes
                 // the error branch (DISCARD) — the pipeline is abandoned
                 // with status 1 and the session keeps reading.
+                if self.expansion_error_is_interactive_discard() {
+                    1
+                } else {
+                    self.expansion_fatal_status()
+                }
+            } else {
+                status
+            };
+            return Ok(Some((String::new(), String::new(), code)));
+        }
+
+        // Same gate for the element's heredoc bodies and here-string word:
+        // GNU applies do_redirections inside the element's forked child
+        // (execute_cmd.c:5606/5884), so a nounset unbound variable in a
+        // `<<<` word or heredoc body reports and kills only the element —
+        // the top-level command path runs this check
+        // (parameter_heredoc_expansion_error, command_execute.rs), but the
+        // stage path skipped it, so `cat <<< prefix$p | wc -w` silently
+        // expanded `$p` to empty (rubash#1130).
+        if let Some((name, message, status)) = self.parameter_heredoc_expansion_error(command) {
+            let line = format!("{}{}: {}\n", self.diagnostic_prefix(), name, message);
+            self.write_default_stderr(line.as_bytes())?;
+            let code = if status == Self::FATAL_PARAMETER_EXPANSION_STATUS {
                 if self.expansion_error_is_interactive_discard() {
                     1
                 } else {
