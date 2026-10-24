@@ -595,7 +595,15 @@ impl Executor {
         redirect: &Redirect,
     ) -> Result<Option<File>, ExecuteError> {
         if is_null_device(target) {
-            let null = File::create(if cfg!(windows) { "NUL" } else { "/dev/null" })?;
+            // A null target needs a plain writable handle. File::create's
+            // truncate-bearing open shape does not apply to a device (and
+            // stricter hosts reject it for device objects); the write-only
+            // open is what the fd layer's device arms use (niubash#519).
+            let null = if cfg!(windows) {
+                OpenOptions::new().write(true).open("NUL")?
+            } else {
+                File::create("/dev/null")?
+            };
             return Ok(Some(null));
         }
         if redirect_target_fd(target).is_some() || dev_stdio_redirect_fd(target).is_some() {
@@ -938,7 +946,14 @@ impl Executor {
 fn dup_process_handle(fd: u32) -> std::io::Result<File> {
     let handle = crate::fd::process_std_handle(fd);
     if handle == 0 || handle == -1 {
-        return File::create(if cfg!(windows) { "NUL" } else { "/dev/null" });
+        // Plain write open for the null device (see
+        // open_external_combined_target: no create/truncate shape on a
+        // device target, niubash#519).
+        return if cfg!(windows) {
+            OpenOptions::new().write(true).open("NUL")
+        } else {
+            File::create("/dev/null")
+        };
     }
     let dup = crate::fd::duplicate_handle(handle)?;
     Ok(crate::fd::handle_to_file(dup))

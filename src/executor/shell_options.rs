@@ -466,6 +466,19 @@ impl Executor {
                     }
                 });
         }
+        if crate::executor::execution_misc::is_dos_device_path(&path) {
+            // niubash#519 family: GNU redir_open's single open() succeeds
+            // on a character device because O_TRUNC is a no-op there; the
+            // Windows adaptation must not let File::create's
+            // truncate-bearing open shape fail the redirect on hosts
+            // that reject it for device objects. A DOS device target
+            // takes the same plain write open as the append arm
+            // (open_redirect_append).
+            return OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(|e| crate::posix_errors::path_error(&target, e));
+        }
         File::create(path).map_err(|e| crate::posix_errors::path_error(&target, e))
     }
 
