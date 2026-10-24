@@ -786,6 +786,14 @@ impl Executor {
             self.shell_state.env_vars.remove("__RUBASH_GETOPTS_OPTIND");
             self.shell_state.env_vars.remove("__RUBASH_GETOPTS_OFFSET");
         }
+        // GNU variables.c bind_variable / arrayfunc.c
+        // assign_array_var_from_string: a successful PIPESTATUS bind
+        // fixes the cell shape — compound makes a live array, scalar
+        // makes (or keeps) the shape note_pipestatus_assignment derives
+        // from the stored result (rubash#1363/#1364).
+        if result && base == "PIPESTATUS" {
+            self.note_pipestatus_assignment();
+        }
         // GNU variables.c:5760 { "BASH_COMPAT", sv_shcompat }: assigning
         // BASH_COMPAT re-syncs the compatNN shopt flags (and resets the
         // level to default on an unparseable/out-of-range value, keeping

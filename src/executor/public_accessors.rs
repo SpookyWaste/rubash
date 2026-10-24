@@ -1401,15 +1401,29 @@ impl Executor {
     where
         I: IntoIterator<Item = i32>,
     {
-        // GNU variables.c: PIPESTATUS is a normal variable once `readonly`
-        // (or any attribute) is applied — the dynamic update is suppressed
-        // and the frozen value persists (rubash#1364).
-        if self
-            .shell_state
-            .env_vars
-            .is_marked(crate::executor::READONLY_VARS, "PIPESTATUS")
-        {
-            return;
+        // GNU variables.c:6291 set_pipestatus_array stores into the
+        // PIPESTATUS ARRAY object directly and never consults
+        // att_readonly: the update lands iff the cell currently holds
+        // an array object. A scalar cell (`PIPESTATUS=99`) or a
+        // valueless att_invisible cell (`readonly PIPESTATUS` /
+        // `declare -a PIPESTATUS` before materialization — array_cell
+        // is NULL and array_insert fails silently) freezes the vector;
+        // an absent cell is recreated as a fresh array
+        // (make_new_array_variable), which is also how an `unset
+        // PIPESTATUS` is undone by the very next command (rubash#1363,
+        // rubash#1364).
+        match self.shell_state.pipestatus_shape {
+            crate::shell::state::PipestatusShape::Absent => {
+                self.shell_state.pipestatus_shape = crate::shell::state::PipestatusShape::LiveArray;
+                unmark_env_name(
+                    &mut self.shell_state.env_vars,
+                    crate::executor::UNSET_DYNAMIC_VARS,
+                    "PIPESTATUS",
+                );
+            }
+            crate::shell::state::PipestatusShape::LiveArray => {}
+            crate::shell::state::PipestatusShape::Scalar
+            | crate::shell::state::PipestatusShape::Valueless => return,
         }
         self.shell_state.pipestatus.clear();
         self.shell_state.pipestatus.extend(statuses);
@@ -1418,12 +1432,205 @@ impl Executor {
         }
     }
 
+    /// Shape bookkeeping after a successful PIPESTATUS bind through
+    /// the ordinary assignment path (variables.c bind_variable /
+    /// arrayfunc.c assign_array_var_from_string). The stored result
+    /// decides: an array-storage result means a compound bind (or a
+    /// scalar bind onto an array cell, which GNU routes to element 0
+    /// keeping the array) — the cell is a live array and the status
+    /// vector syncs from the stored entries until the next command
+    /// completion rewrites it. A scalar result creates a scalar cell
+    /// out of an absent or valueless one (which set_pipestatus then
+    /// leaves frozen, rubash#1364); on a live array the shape stays
+    /// LiveArray. Either way the bind revives an `unset` dynamic cell
+    /// as an ordinary variable, so the UNSET_DYNAMIC mark clears
+    /// (variables.c:3839's unbind is undone by the new cell).
+    pub(in crate::executor) fn note_pipestatus_assignment(&mut self) {
+        let stored = self
+            .shell_state
+            .env_vars
+            .get("PIPESTATUS")
+            .cloned()
+            .unwrap_or_default();
+        if is_array_storage(&stored)
+            || is_marked_var(&self.shell_state.env_vars, ARRAY_VARS, "PIPESTATUS")
+        {
+            self.shell_state.pipestatus_shape = crate::shell::state::PipestatusShape::LiveArray;
+            unmark_env_name(
+                &mut self.shell_state.env_vars,
+                crate::executor::UNSET_DYNAMIC_VARS,
+                "PIPESTATUS",
+            );
+            let entries = indexed_array_entries(&stored);
+            let len = entries.keys().max().map(|max| max + 1).unwrap_or(0);
+            let mut vector = vec![0i32; len];
+            for (index, element) in &entries {
+                vector[*index] = element.trim().parse::<i32>().unwrap_or(0);
+            }
+            self.shell_state.pipestatus = vector;
+        } else if self.shell_state.pipestatus_shape
+            != crate::shell::state::PipestatusShape::LiveArray
+        {
+            self.shell_state.pipestatus_shape = crate::shell::state::PipestatusShape::Scalar;
+            unmark_env_name(
+                &mut self.shell_state.env_vars,
+                crate::executor::UNSET_DYNAMIC_VARS,
+                "PIPESTATUS",
+            );
+        }
+    }
+
+    /// PIPESTATUS cell-shape transitions for the attribute builtins
+    /// (declare/typeset/local/export/readonly), applied after the
+    /// builtin ran on the env table (rubash#1363/#1364). GNU creates
+    /// the dynamic variable's cell at shell start with att_invisible
+    /// and NO array object; naming it in an attribute builtin before
+    /// it materializes leaves exactly that valueless cell behind —
+    /// set_pipestatus_array's array_insert then fails silently
+    /// forever (variables.c:6291 via array.c:516), which rubash models
+    /// as the Valueless shape. An assignment operand instead binds a
+    /// value, so it defers to note_pipestatus_assignment's post-state
+    /// rule. `declare -a PIPESTATUS` on a scalar cell converts it to
+    /// an array holding the scalar at [0] (variables.c
+    /// convert_var_to_array), reviving the writer. Print mode creates
+    /// nothing, so callers pass print_requested to stand down.
+    pub(in crate::executor) fn note_pipestatus_attribute_operands(
+        &mut self,
+        args: &[String],
+        print_requested: bool,
+    ) {
+        if print_requested {
+            return;
+        }
+        // Function mode (`readonly -f`, `export -f`, `declare -f`):
+        // the operands name functions, never the variable cell — GNU's
+        // internal_getopt permutes options ahead of operands, so an
+        // -f bundle anywhere before `--` decides the mode for all of
+        // them. Stand down entirely.
+        for arg in args {
+            if arg == "--" {
+                break;
+            }
+            if arg.len() > 1
+                && (arg.starts_with('-') || arg.starts_with('+'))
+                && arg[1..].chars().all(|c| c.is_ascii_alphabetic())
+                && arg[1..].contains('f')
+            {
+                return;
+            }
+        }
+        let mut array_flag = false;
+        for arg in args {
+            if arg.len() > 1
+                && (arg.starts_with('-') || arg.starts_with('+'))
+                && arg[1..].chars().all(|c| c.is_ascii_alphabetic())
+            {
+                if arg[1..].contains('a') {
+                    array_flag = arg.starts_with('-');
+                }
+                continue;
+            }
+            if arg == "--" {
+                continue;
+            }
+            let (raw_name, has_value) = match arg.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (arg.as_str(), false),
+            };
+            let base = raw_name.strip_suffix('+').unwrap_or(raw_name);
+            let base = base.split('[').next().unwrap_or(base);
+            if base != "PIPESTATUS" {
+                continue;
+            }
+            if has_value {
+                self.note_pipestatus_assignment();
+                continue;
+            }
+            match self.shell_state.pipestatus_shape {
+                crate::shell::state::PipestatusShape::Scalar if array_flag => {
+                    let scalar = self
+                        .shell_state
+                        .env_vars
+                        .get("PIPESTATUS")
+                        .cloned()
+                        .unwrap_or_default();
+                    self.shell_state.pipestatus = vec![scalar.trim().parse::<i32>().unwrap_or(0)];
+                    self.shell_state.pipestatus_shape =
+                        crate::shell::state::PipestatusShape::LiveArray;
+                }
+                crate::shell::state::PipestatusShape::Absent => {
+                    self.shell_state.pipestatus_shape =
+                        crate::shell::state::PipestatusShape::Valueless;
+                    unmark_env_name(
+                        &mut self.shell_state.env_vars,
+                        crate::executor::UNSET_DYNAMIC_VARS,
+                        "PIPESTATUS",
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `export -p` / `readonly -p` render from the env table alone, so
+    /// a live PIPESTATUS array — its value lives in the shape/vector
+    /// state, not the table — shows as a valueless `declare -x
+    /// PIPESTATUS` line. GNU's print_var_list reads the same cell
+    /// print_var does and emits the array form with its attributes
+    /// (`declare -ax PIPESTATUS=([0]="0")`), so swap any valueless
+    /// PIPESTATUS line in the buffered output for the dynamic view
+    /// (rubash#1363). Only print modes emit such a line, so callers
+    /// may invoke this unconditionally.
+    pub(in crate::executor) fn substitute_pipestatus_print_line(&self, stdout: &mut Vec<u8>) {
+        let Some(view) = self.dynamic_declaration_view("PIPESTATUS") else {
+            return;
+        };
+        let Ok(text) = std::str::from_utf8(stdout) else {
+            return;
+        };
+        let valueless_pipestatus_line = |line: &str| {
+            line.starts_with("declare -") && line.ends_with(" PIPESTATUS") && !line.contains('=')
+        };
+        if !text.lines().any(valueless_pipestatus_line) {
+            return;
+        }
+        let mut replaced = text
+            .lines()
+            .map(|line| {
+                if valueless_pipestatus_line(line) {
+                    view.as_str()
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.ends_with('\n') {
+            replaced.push('\n');
+        }
+        *stdout = replaced.into_bytes();
+    }
+
     pub(in crate::executor) fn pipestatus_values(&self) -> Vec<String> {
-        self.shell_state
-            .pipestatus
-            .iter()
-            .map(i32::to_string)
-            .collect()
+        // Shape-aware view of the PIPESTATUS cell (variables.c:6291):
+        // a scalar cell reads as its single value, a valueless or
+        // absent cell as an empty array, a live array as the vector.
+        match self.shell_state.pipestatus_shape {
+            crate::shell::state::PipestatusShape::Scalar => vec![self
+                .shell_state
+                .env_vars
+                .get("PIPESTATUS")
+                .cloned()
+                .unwrap_or_default()],
+            crate::shell::state::PipestatusShape::Valueless
+            | crate::shell::state::PipestatusShape::Absent => Vec::new(),
+            crate::shell::state::PipestatusShape::LiveArray => self
+                .shell_state
+                .pipestatus
+                .iter()
+                .map(i32::to_string)
+                .collect(),
+        }
     }
 
     /// GNU error.c get_name_for_error's interactive branch: `base_pathname

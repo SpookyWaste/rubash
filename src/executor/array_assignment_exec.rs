@@ -927,6 +927,31 @@ impl Executor {
         // canonical re-parse + sync): register the pair as synced for
         // the boundary verifier (rubash#1510).
         self.note_typed_cell_synced(name);
+        if name == "PIPESTATUS" {
+            // GNU arrayfunc.c assign_array_element converts whatever
+            // PIPESTATUS cell exists (absent, scalar, valueless) into a
+            // live ARRAY cell (variables.c:2798 make_new_array_variable);
+            // mirror that into the shape state and rebuild the status
+            // vector from the stored entries so the dynamic views agree
+            // with the cell until the next command completion rewrites
+            // it wholesale (rubash#1364).
+            self.shell_state.pipestatus_shape = crate::shell::state::PipestatusShape::LiveArray;
+            unmark_env_name(&mut self.shell_state.env_vars, UNSET_DYNAMIC_VARS, name);
+            let entries = indexed_array_entries(
+                &self
+                    .shell_state
+                    .env_vars
+                    .get("PIPESTATUS")
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            let len = entries.keys().max().map(|max| max + 1).unwrap_or(0);
+            let mut vector = vec![0i32; len];
+            for (index, element) in &entries {
+                vector[*index] = element.trim().parse::<i32>().unwrap_or(0);
+            }
+            self.shell_state.pipestatus = vector;
+        }
         self.exit_code = 0;
         true
     }

@@ -68,6 +68,18 @@ pub struct ShellState {
     pub(crate) positional_offset: usize,
     /// execute_cmd.c/jobs.c pipeline status vector ($PIPESTATUS).
     pub(crate) pipestatus: Vec<i32>,
+    /// variables.c:6291 set_pipestatus_array PIPESTATUS cell shape
+    /// (rubash#1363/#1364): the status writer stores straight into the
+    /// ARRAY object and never consults att_readonly — it is a no-op
+    /// unless the PIPESTATUS cell currently holds an array object.
+    /// A valueless declaration (`readonly`/`declare`/`export` naming
+    /// PIPESTATUS before any command materialized it) creates an
+    /// att_invisible cell with NO array object (array_insert(NULL)
+    /// fails silently), and a scalar assignment creates a scalar cell;
+    /// both shapes freeze the vector until an array-shaped bind
+    /// (compound/element assignment, or `declare -a` over a scalar)
+    /// installs an array object.
+    pub(crate) pipestatus_shape: PipestatusShape,
     /// variables.c FUNCNAME stack.
     pub(crate) function_name_stack: Vec<String>,
     /// variables.c BASH_ARGC/BASH_ARGV stacks.
@@ -268,6 +280,23 @@ pub struct ShellState {
     pub(crate) procsub_streams: RefCell<HashMap<PathBuf, Rc<RefCell<ProcSubStream>>>>,
 }
 
+/// The shape of the PIPESTATUS variable cell (variables.c:6291
+/// set_pipestatus_array's `array_p (v)` / `array_cell (v)` gate):
+/// `LiveArray` cells hold a real ARRAY object the status writer
+/// updates in place; `Scalar` cells hold a plain scalar value the
+/// writer leaves alone; `Valueless` cells (att_invisible, from a
+/// valueless `declare`/`readonly`/`export` operand) have neither a
+/// value nor an array object, so the writer's inserts fail and the
+/// variable reads as unset. `Absent` is no cell at all — the next
+/// status write materializes a fresh array (make_new_array_variable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipestatusShape {
+    Absent,
+    LiveArray,
+    Scalar,
+    Valueless,
+}
+
 /// Buffered contents of one materialized `<(cmd)` output — see
 /// `ShellState::procsub_streams`.
 #[derive(Debug)]
@@ -435,6 +464,7 @@ impl Clone for ShellState {
             positional_params: self.positional_params.clone(),
             positional_offset: self.positional_offset,
             pipestatus: self.pipestatus.clone(),
+            pipestatus_shape: self.pipestatus_shape,
             function_name_stack: self.function_name_stack.clone(),
             bash_argc_stack: self.bash_argc_stack.clone(),
             bash_argv_stack: self.bash_argv_stack.clone(),

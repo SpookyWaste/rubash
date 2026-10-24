@@ -340,6 +340,7 @@ impl Executor {
                 // GNU: PIPESTATUS starts unset (empty); it materializes on
                 // the first pipeline/simple-command execution (rubash#1364).
                 pipestatus: Vec::new(),
+                pipestatus_shape: crate::shell::state::PipestatusShape::Absent,
                 function_name_stack: Vec::new(),
                 bash_argc_stack: Vec::new(),
                 bash_argv_stack: Vec::new(),

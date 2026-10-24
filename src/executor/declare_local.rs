@@ -1116,6 +1116,12 @@ impl Executor {
             self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
             Ok(status)
         })();
+        // PIPESTATUS cell-shape transitions for this declare's operands
+        // (valueless creation / scalar->array conversion / binds) —
+        // see note_pipestatus_attribute_operands (rubash#1363/#1364).
+        if result.is_ok() {
+            self.note_pipestatus_attribute_operands(&args, declare_args_request_print(&args));
+        }
         if result.as_ref().is_ok_and(|status| *status == 0) {
             // Mirror the through-the-nameref assignments into the typed owner:
             // parameter expansion reads shell_state.variables first, so a
@@ -1200,13 +1206,13 @@ impl Executor {
     ) -> Result<i32, ExecuteError> {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let status = if self.shell_state.function_depth == 0 {
+        let (status, final_args) = if self.shell_state.function_depth == 0 {
             writeln!(
                 stderr,
                 "{}local: can only be used in a function",
                 self.diagnostic_prefix()
             )?;
-            1
+            (1, Vec::new())
         } else if let Err(option) = validate_local_options(&cmd.words[1..]) {
             writeln!(
                 stderr,
@@ -1214,7 +1220,7 @@ impl Executor {
                 self.diagnostic_prefix()
             )?;
             writeln!(stderr, "local: usage: local [option] name[=value] ...")?;
-            2
+            (2, Vec::new())
         } else {
             let mut args = self.expand_declare_assignment_args(&cmd.words[1..]);
             let mut args =
@@ -1553,8 +1559,17 @@ impl Executor {
             // frame exit restores the globals as declare -g left them),
             // and the visible cells hold the outer locals again.
             self.finish_global_declare_for_local_names(global_local_values);
-            status
+            (status, args)
         };
+        // Same PIPESTATUS shape transitions as execute_declare
+        // (rubash#1363/#1364); the -p-rewritten listing form reports
+        // print_requested and stands down.
+        if status == 0 {
+            self.note_pipestatus_attribute_operands(
+                &final_args,
+                declare_args_request_print(&final_args),
+            );
+        }
         let stderr = local_stderr_from_declare(stderr);
         self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
         Ok(status)
