@@ -770,35 +770,37 @@ fn decode_signal_name(value: &str, allow_sig_prefix: bool) -> Option<&'static st
     signal_number(bare)
 }
 
-/// The kill signal-spec validator for the `-s`/`-n`/`-SPEC` forms. GNU
-/// kill.def:103 sets DSIG_NOCASE unconditionally but only adds
-/// DSIG_SIGPREFIX when not posixly_correct: names fold case, but a
-/// SIG-prefixed spelling (any case) is rejected in POSIX mode.
-fn sigspec_accepted(value: &str, posix: bool) -> bool {
-    if posix && value.len() > 3 && value[..3].eq_ignore_ascii_case("SIG") {
-        return false;
+/// GNU trap.c:236 decode_signal, whole spec: a valid_number is the
+/// signal number itself (no 128 adjustment — that mapping exists only
+/// in display_signal_list's exit-status translation), anything else is
+/// a name. A number naming a hole in the table (glibc's reserved 32/33)
+/// stays NO_SIG here: the SIGNALS table is the acceptance contract the
+/// rest of the kill machinery (mailbox wire numbers, `kill -l` holes)
+/// is built on.
+fn decode_signal_spec(value: &str, posix: bool) -> Option<i32> {
+    if let Some(number) = valid_number(value) {
+        if number == 0 {
+            return Some(0);
+        }
+        return (number >= 1 && number <= 64 && signal_name(number as i32).is_some())
+            .then_some(number as i32);
     }
-    translate_signal(value).is_some()
+    decode_signal_name(value, !posix)?.parse::<i32>().ok()
 }
 
 fn signal_number_from_spec(value: &str) -> Option<i32> {
-    if value == "0" {
-        return Some(0);
-    }
+    decode_signal_spec(value, false)
+}
 
-    let name = value.strip_prefix("SIG").unwrap_or(value);
-    if name == "EXIT" {
-        return Some(0);
-    }
-
-    if let Ok(mut number) = value.parse::<i32>() {
-        if number > 128 {
-            number -= 128;
-        }
-        return (number == 0 || signal_name(number).is_some()).then_some(number);
-    }
-
-    signal_number(name)?.parse::<i32>().ok()
+/// The kill signal-spec validator for the `-s`/`-n`/`-SPEC` forms:
+/// exactly decode_signal_spec (kept as a named entry for the POSIX
+/// sigspec unit tests). The previous validator accepted a spec through
+/// translate_signal but the caller then re-decoded it with an
+/// exact-uppercase-only prefix strip and an exact `EXIT` compare, so
+/// `kill -s SigTerm` was rejected and `kill -s Exit` fell through to
+/// the TERM default and delivered the wrong signal (rubash#1385).
+fn sigspec_accepted(value: &str, posix: bool) -> bool {
+    decode_signal_spec(value, posix).is_some()
 }
 
 fn parse_pid(value: &str) -> Option<i32> {
@@ -3487,5 +3489,45 @@ mod posix_sigspec_tests {
         for spec in ["SIGEXIT", "SigExit", "sigexit"] {
             assert_eq!(translate_signal(spec), None, "{spec}");
         }
+    }
+
+    /// rubash#1385: the `-s`/`-n`/`-SPEC` decode folds case on the whole
+    /// spec, so mixed/lowercase prefixed spellings resolve to the same
+    /// signal number as the uppercase ones.
+    #[test]
+    fn mixed_case_prefixed_specs_decode() {
+        for spec in ["SigTerm", "sigterm", "SIGTERM", "sIgTeRm", "Term", "term"] {
+            assert!(sigspec_accepted(spec, false), "{spec}");
+            assert_eq!(signal_number_from_spec(spec), Some(15), "{spec}");
+        }
+        assert_eq!(signal_number_from_spec("sighup"), Some(1));
+        assert_eq!(signal_number_from_spec("SigHup"), Some(1));
+        assert_eq!(signal_number_from_spec("sigusr1"), Some(10));
+    }
+
+    /// rubash#1385: bare EXIT (any case) decodes to signal 0 in both
+    /// modes — the old exact-`EXIT` compare let `kill -s Exit` fall
+    /// through to the TERM default — and every SIG-prefixed EXIT
+    /// spelling is NO_SIG.
+    #[test]
+    fn exit_decodes_to_zero_without_prefix() {
+        for spec in ["EXIT", "Exit", "exit"] {
+            assert_eq!(signal_number_from_spec(spec), Some(0), "{spec}");
+            assert!(sigspec_accepted(spec, true), "{spec}");
+        }
+        for spec in ["SIGEXIT", "SigExit", "sigexit"] {
+            assert_eq!(signal_number_from_spec(spec), None, "{spec}");
+            assert!(!sigspec_accepted(spec, false), "{spec}");
+        }
+    }
+
+    /// POSIX mode drops DSIG_SIGPREFIX: prefixed spellings fold case for
+    /// the rejection too, bare names still decode.
+    #[test]
+    fn posix_rejects_prefixed_specs_in_any_case() {
+        assert!(!sigspec_accepted("sigterm", true));
+        assert!(!sigspec_accepted("SigTerm", true));
+        assert!(sigspec_accepted("term", true));
+        assert!(sigspec_accepted("Term", true));
     }
 }
