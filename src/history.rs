@@ -49,6 +49,23 @@ fn recreate_unwritable_history_file(_path: &str) {}
 fn history_create_options() -> fs::OpenOptions {
     fs::OpenOptions::new()
 }
+
+/// rubash#1314: on Windows, a HISTFILE that names a bare DOS device
+/// (NUL, CONOUT$, ...) is a byte stream — the append/truncate open
+/// shapes do not apply to it (the redirect layer makes the same
+/// substitution for device targets, see fd::open_file_append and
+/// executor::open_redirect_append). Returns the plain write open for
+/// a device target, or None where the caller's normal open applies.
+fn history_device_open(path: &str) -> Option<io::Result<fs::File>> {
+    #[cfg(windows)]
+    {
+        if crate::fd::is_dos_device_path(std::path::Path::new(path)) {
+            return Some(fs::OpenOptions::new().write(true).open(path));
+        }
+    }
+    let _ = path;
+    None
+}
 /// A host-owned command history used by Rubash's history-facing builtins.
 pub trait HistoryProvider: Debug {
     /// Return commands in oldest-to-newest order.
@@ -295,11 +312,14 @@ impl SessionHistory {
             out.push('\n');
         }
         recreate_unwritable_history_file(path);
-        let mut file = history_create_options()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
+        let mut file = match history_device_open(path) {
+            Some(opened) => opened?,
+            None => history_create_options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)?,
+        };
         io::Write::write_all(&mut file, out.as_bytes())?;
         Ok(self.entries.len())
     }
@@ -313,10 +333,13 @@ impl SessionHistory {
         let start = self.entries.len() - n;
         if n > 0 {
             recreate_unwritable_history_file(path);
-            let mut file = history_create_options()
-                .create(true)
-                .append(true)
-                .open(path)?;
+            let mut file = match history_device_open(path) {
+                Some(opened) => opened?,
+                None => history_create_options()
+                    .create(true)
+                    .append(true)
+                    .open(path)?,
+            };
             for i in start..self.entries.len() {
                 if write_timestamps {
                     if let Some(ts) = self.timestamps.get(i).filter(|ts| !ts.is_empty()) {
