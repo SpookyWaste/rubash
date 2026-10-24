@@ -312,6 +312,7 @@ impl Executor {
                     self.shell_state.env_vars.get("PIPESTATUS").cloned()
                 }
                 crate::shell::state::PipestatusShape::Valueless
+                | crate::shell::state::PipestatusShape::ValuelessArray
                 | crate::shell::state::PipestatusShape::Absent => None,
             },
             _ => None,

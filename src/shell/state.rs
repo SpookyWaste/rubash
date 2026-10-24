@@ -287,14 +287,19 @@ pub struct ShellState {
 /// writer leaves alone; `Valueless` cells (att_invisible, from a
 /// valueless `declare`/`readonly`/`export` operand) have neither a
 /// value nor an array object, so the writer's inserts fail and the
-/// variable reads as unset. `Absent` is no cell at all — the next
-/// status write materializes a fresh array (make_new_array_variable).
+/// variable reads as unset. `ValuelessArray` is the same frozen
+/// cell created with att_array (`declare -a PIPESTATUS` before
+/// materialization): still no ARRAY object for the writer, but
+/// `declare -p` renders the `-a` flag. `Absent` is no cell at
+/// all — the next status write materializes a fresh array
+/// (make_new_array_variable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PipestatusShape {
     Absent,
     LiveArray,
     Scalar,
     Valueless,
+    ValuelessArray,
 }
 
 /// Buffered contents of one materialized `<(cmd)` output — see

@@ -302,7 +302,12 @@ impl Executor {
             self.exit_code = 0;
             return true;
         }
-        if is_noassign_bash_array(name) {
+        // PIPESTATUS element assignment is an ordinary array bind
+        // in GNU (arrayfunc.c assign_array_element converts any cell
+        // shape into a live array) — it must reach the readonly check
+        // and the store below, whose tail syncs the shape state
+        // (rubash#1364). The stack arrays stay swallowed.
+        if is_noassign_bash_array(name) && name != "PIPESTATUS" {
             self.exit_code = 0;
             return true;
         }

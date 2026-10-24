@@ -1423,7 +1423,8 @@ impl Executor {
             }
             crate::shell::state::PipestatusShape::LiveArray => {}
             crate::shell::state::PipestatusShape::Scalar
-            | crate::shell::state::PipestatusShape::Valueless => return,
+            | crate::shell::state::PipestatusShape::Valueless
+            | crate::shell::state::PipestatusShape::ValuelessArray => return,
         }
         self.shell_state.pipestatus.clear();
         self.shell_state.pipestatus.extend(statuses);
@@ -1452,9 +1453,12 @@ impl Executor {
             .get("PIPESTATUS")
             .cloned()
             .unwrap_or_default();
-        if is_array_storage(&stored)
-            || is_marked_var(&self.shell_state.env_vars, ARRAY_VARS, "PIPESTATUS")
-        {
+        // The shape derives from the STORED FORM plus the prior shape
+        // only: the static ARRAY_VARS mark init applies to PIPESTATUS
+        // names its nominal type, not this cell's shape — consulting
+        // it here forced every scalar bind (`PIPESTATUS=99` as the
+        // first command) into a live array GNU keeps scalar/frozen.
+        if is_array_storage(&stored) {
             self.shell_state.pipestatus_shape = crate::shell::state::PipestatusShape::LiveArray;
             unmark_env_name(
                 &mut self.shell_state.env_vars,
@@ -1559,13 +1563,24 @@ impl Executor {
                         crate::shell::state::PipestatusShape::LiveArray;
                 }
                 crate::shell::state::PipestatusShape::Absent => {
-                    self.shell_state.pipestatus_shape =
-                        crate::shell::state::PipestatusShape::Valueless;
+                    // A bare operand before materialization leaves the
+                    // att_invisible cell; `-a` on the operand gives that
+                    // cell att_array, which `declare -p` renders even
+                    // though the writer still cannot fill it.
+                    self.shell_state.pipestatus_shape = if array_flag {
+                        crate::shell::state::PipestatusShape::ValuelessArray
+                    } else {
+                        crate::shell::state::PipestatusShape::Valueless
+                    };
                     unmark_env_name(
                         &mut self.shell_state.env_vars,
                         crate::executor::UNSET_DYNAMIC_VARS,
                         "PIPESTATUS",
                     );
+                }
+                crate::shell::state::PipestatusShape::Valueless if array_flag => {
+                    self.shell_state.pipestatus_shape =
+                        crate::shell::state::PipestatusShape::ValuelessArray;
                 }
                 _ => {}
             }
@@ -1623,6 +1638,7 @@ impl Executor {
                 .cloned()
                 .unwrap_or_default()],
             crate::shell::state::PipestatusShape::Valueless
+            | crate::shell::state::PipestatusShape::ValuelessArray
             | crate::shell::state::PipestatusShape::Absent => Vec::new(),
             crate::shell::state::PipestatusShape::LiveArray => self
                 .shell_state

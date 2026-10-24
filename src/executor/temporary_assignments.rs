@@ -1178,7 +1178,15 @@ impl Executor {
         if base_name == "BASH_COMMAND" && !append && !dynamic_unbound {
             return true;
         }
-        if is_noassign_bash_array(base_name) && !append {
+        // PIPESTATUS is the one noassign-list array whose cell is an
+        // ordinary bindable variable in GNU (variables.c:6291 gates
+        // only the status WRITER on the cell shape): a scalar or
+        // compound bind creates a real cell the writer then respects,
+        // so it takes the generic store below and the caller's
+        // note_pipestatus_assignment derives the shape from the
+        // stored form (rubash#1364). The stack arrays (BASH_ARGC &
+        // friends) keep the swallow: their storage is the frame stack.
+        if is_noassign_bash_array(base_name) && base_name != "PIPESTATUS" && !append {
             return true;
         }
         let compound_assignment = value.starts_with(COMPOUND_ASSIGNMENT_MARKER);
