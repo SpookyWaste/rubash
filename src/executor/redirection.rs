@@ -1235,6 +1235,19 @@ impl Executor {
         state: &mut OutputFdState,
     ) -> Result<bool, ExecuteError> {
         for redirect in &cmd.redirects {
+            // rubash#1359: a `{var}` redirection is a redir_varassign
+            // (GNU redir.c:1133-1166) — it allocates a fresh descriptor
+            // >= 10 and is applied exactly once by
+            // apply_dynamic_fd_var_redirects; it NEVER binds the
+            // command's own fd 0/1/2. Walking it here defaulted its fd
+            // to 1 and rerouted the command's stdout into the var-fd
+            // target (a literal file named `>(cat)` for a procsub
+            // target; a delayed flush for a plain file target). The
+            // async-stdio walk in compound_exec.rs skips fd_var entries
+            // for the same reason.
+            if redirect.fd_var.is_some() {
+                continue;
+            }
             match redirect.kind {
                 crate::parser::RedirectKind::Output
                 | crate::parser::RedirectKind::Append
@@ -1785,7 +1798,7 @@ impl Executor {
                 // stream goes to the default stdout resolution — active
                 // capture or raw process stdout — never a rebound fd 1.
                 if crate::executor::shell_options::stdout_capture_active() {
-                    crate::executor::shell_options::stdout_capture_write(&bytes)?;
+                    crate::executor::shell_options::stdout_capture_write_mapped(&bytes)?;
                 } else if let Some(capture) = self.stdout_capture.as_mut() {
                     use std::io::Write;
                     capture.write_all(&bytes)?;
@@ -1983,7 +1996,7 @@ impl OutputFdState {
                     self.deferred_stdout.borrow_mut().extend_from_slice(output);
                     Ok(())
                 } else if crate::executor::shell_options::stdout_capture_active() {
-                    crate::executor::shell_options::stdout_capture_write(output)?;
+                    crate::executor::shell_options::stdout_capture_write_mapped(output)?;
                     Ok(())
                 } else if let Some(capture) = executor.stdout_capture.as_mut() {
                     use std::io::Write;
@@ -2018,8 +2031,25 @@ impl OutputFdState {
             OutputTarget::Stderr => executor.write_default_stderr(output),
             OutputTarget::ProcessStderr => {
                 // dup2 snapshot of the original stderr object (rubash#279):
-                // the raw stderr channel, never the live fd_table[2].
-                super::shell_options::write_stderr_bytes(output)?;
+                // the raw stderr channel, never the live fd_table[2]. The
+                // snapshot names the stderr channel AS BOUND at dup time;
+                // while an executor stderr capture is active (a pipeline
+                // stage's transport for that very channel), the snapshot's
+                // bytes belong to the capture — writing them raw flushes
+                // them in real time while the stage's live fd-2 writes
+                // wait in the capture until stage end, splitting one
+                // logical stream across two flush times (rubash#1237
+                // item 4: `( ... ) 1>&2 | cat` printed the fd-2 write
+                // before both fd-1 writes). The capture field does not
+                // follow later fd-2 rebindings, so the snapshot still
+                // never tracks the live fd_table[2]; with no capture
+                // active the raw channel is used exactly as before.
+                if let Some(capture) = executor.stderr_capture.as_mut() {
+                    use std::io::Write;
+                    capture.write_all(output)?;
+                } else {
+                    super::shell_options::write_stderr_bytes(output)?;
+                }
                 Ok(())
             }
             OutputTarget::Null | OutputTarget::Closed => Ok(()),

@@ -340,6 +340,7 @@ impl Executor {
                 // GNU: PIPESTATUS starts unset (empty); it materializes on
                 // the first pipeline/simple-command execution (rubash#1364).
                 pipestatus: Vec::new(),
+                pipestatus_shape: crate::shell::state::PipestatusShape::Absent,
                 function_name_stack: Vec::new(),
                 bash_argc_stack: Vec::new(),
                 bash_argv_stack: Vec::new(),
@@ -365,6 +366,7 @@ impl Executor {
                 // (rubash#1074) covers coproc/other respawns where BG_DEPTH
                 // is absent.
                 subshell_depth: Cell::new(bg_depth.unwrap_or(respawned_subshell_depth)),
+                subshell_source_text: None,
                 in_command_substitution: Cell::new(false),
                 stdin_redir: Cell::new(false),
                 xtrace_indirection_level: Cell::new(0),
@@ -467,6 +469,12 @@ impl Executor {
             procsub_carrier_memo: std::cell::RefCell::new(HashMap::new()),
             reader_last_list_line: Cell::new(None),
             command_string_mode: Cell::new(false),
+            command_string_final_pending: Cell::new(false),
+            exec_replace_final_frame: Cell::new(false),
+            exec_replace_dispatch_stamp: Cell::new(0),
+            exec_replace_stamp_counter: Cell::new(0),
+            exec_replace_stamp_hold: Cell::new(0),
+            exec_replace_shlvl_snapshot: Cell::new(None),
             line_lex_locales: std::cell::RefCell::new(HashMap::new()),
             unit_lex_locale: std::cell::RefCell::new(None),
             ambient_line: Cell::new(None),
@@ -503,6 +511,7 @@ impl Executor {
             read_interrupted_signal: None,
             read_sigint_guard_armed: false,
             read_eof_no_delimiter: false,
+            timed_stdin: None,
             stdout_capture: None,
             stderr_capture: None,
             pipeline_stdout_stream: None,

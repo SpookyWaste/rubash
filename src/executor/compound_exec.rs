@@ -1893,6 +1893,14 @@ impl Executor {
         let Some(command) = commands.get(index) else {
             return Ok(None);
         };
+        // rubash#1355: an assignment prefix makes `time` a plain command
+        // name (GNU parse.y), never the timing keyword.
+        if !command.assignments.is_empty()
+            || !command.compound_assignments.is_empty()
+            || !command.array_element_assignments.is_empty()
+        {
+            return Ok(None);
+        }
         let Some(prefix) = time_prefix_parts(&command.words, self.posix_mode_enabled()) else {
             return Ok(None);
         };
@@ -2066,7 +2074,13 @@ impl Executor {
             // iteration, after the test succeeds and before the body.
             self.reap_dead_jobs_after_loop_body();
             ran_body = true;
-            self.shell_state.loop_depth += 1;
+            // rubash#1390: NO second loop_depth increment for the body —
+            // the entry increment above already spans the whole arith-for
+            // (GNU execute_arith_for_command bumps loop_level once,
+            // before init). Counting the body again made the body see
+            // depth 2 for a single loop, so `break 2`/`continue 2` were
+            // not clamped to the real depth and escaped as a spurious
+            // Break(1)/Continue(1) that aborted the script.
             let _t = super::exec_profile::PhaseTimer::new(&super::exec_profile::P_FOR_BODY);
             // execute_cmd.c:3236: line_number = arith_for_command->line is
             // the ambient for the body's non-line-setting commands. GNU
@@ -2077,18 +2091,25 @@ impl Executor {
             let result =
                 self.with_ambient_line(for_line, |executor| executor.execute_ast_inner(body));
             drop(_t);
-            self.shell_state.loop_depth -= 1;
             match result {
                 Ok(()) => {}
                 Err(ExecuteError::Break(level)) if level <= 1 => {
                     self.exit_code = self.take_break_failure_status().unwrap_or(0);
                     break;
                 }
-                Err(ExecuteError::Break(level)) => return Err(ExecuteError::Break(level - 1)),
+                // Propagating past this loop: balance the ENTRY
+                // increment before returning (the function tail's
+                // decrement is skipped by the early return), or the
+                // leaked depth makes later `break`s look in-loop.
+                Err(ExecuteError::Break(level)) => {
+                    self.shell_state.loop_depth -= 1;
+                    return Err(ExecuteError::Break(level - 1));
+                }
                 Err(ExecuteError::Continue(level)) if level <= 1 => {
                     self.exit_code = 0;
                 }
                 Err(ExecuteError::Continue(level)) => {
+                    self.shell_state.loop_depth -= 1;
                     return Err(ExecuteError::Continue(level - 1));
                 }
                 Err(error) => return Err(error),
@@ -2468,6 +2489,14 @@ impl Executor {
         let saved_exec_replaced = self.exec_replaced;
         crate::builtins::trap::reset_for_subshell_child(&mut self.shell_state.env_vars);
         self.shell_state.subshell_depth.set(saved_depth + 1);
+        // rubash#1493: GNU's signal-death notice for a job killed inside
+        // the parens names the WHOLE subshell command (jobs.c:4625
+        // pretty_print_job on the dead job). Record the node's print_cmd
+        // text for the exec-death queue site in trap_exec.rs; the entry
+        // clone saved the parent's value, so the wholesale boundary
+        // restore reverts this automatically.
+        self.shell_state.subshell_source_text =
+            Some(crate::executor::command_text::bash_command_source_text(cmd));
         // rubash#1115: the forked child reseeds RANDOM
         // (variables.c:1418-1423 get_random_number); saved_state keeps
         // the parent's sequence for the wholesale restore.
@@ -3871,10 +3900,7 @@ impl Executor {
         } else {
             let entries = super::indexed_array_entries_cached(value);
             let count = entries.len();
-            (
-                entries.values().next().cloned().unwrap_or_default(),
-                count,
-            )
+            (entries.values().next().cloned().unwrap_or_default(), count)
         }
     }
 
@@ -4561,8 +4587,7 @@ fn find_case_pattern_array_at(text: &str) -> Option<(usize, usize, String)> {
     let mut index = 0usize;
     while index < plain.len() {
         if plain[index] == '$' && plain.get(index + 1) == Some(&'(') {
-            if let Some(close) =
-                crate::lexer::skip_parenthesized_unit_corrected(&plain, index + 1)
+            if let Some(close) = crate::lexer::skip_parenthesized_unit_corrected(&plain, index + 1)
             {
                 index = close.min(plain.len());
                 continue;
@@ -4698,8 +4723,7 @@ fn quote_aware_case_pattern(
                     // Quotes inside a `${...}`/`$(...)`/backtick unit stay
                     // raw (parse.y:3877 parse_matched_pair owns them;
                     // rubash#258 BUG_PSUBSQUOT).
-                    let body =
-                        crate::lexer::quotes::mark_data_squotes_around_substitutions(&body);
+                    let body = crate::lexer::quotes::mark_data_squotes_around_substitutions(&body);
                     match case_pattern_quoted_segment(&body, &mut expand_word, array_at) {
                         CasePatternSegment::Continues(literal) => {
                             output.push_str(&escape_case_pattern_literal(&literal));

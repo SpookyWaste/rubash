@@ -358,6 +358,20 @@ fn run_script_grouped_at_line_offset(
             failglob_discard_until = None;
         }
         let group_last_line = start_line + group.len().saturating_sub(1);
+        // rubash#1497: in a -c string this grouped reader executes the
+        // string group by group; the group after which only blank or
+        // comment lines remain is the string's final reader unit — the
+        // only unit whose last command may exec-replace the process
+        // (builtins/evalstring.c:126 should_suppress_fork requires the
+        // whole string to be consumed). Outside command-string mode
+        // (script files, stdin, the REPL) the arming stays off.
+        executor.command_string_final_pending.set(
+            executor.command_string_mode()
+                && raw_lines[index..].iter().all(|line| {
+                    let trimmed = line.trim();
+                    trimmed.is_empty() || trimmed.starts_with('#')
+                }),
+        );
         let status = run_history_group(
             executor,
             &session,
@@ -3099,7 +3113,19 @@ fn run_source_impl(
         apply_parse_error_unit_voiding(&mut ast);
     }
 
-    match executor.execute_ast(&ast) {
+    // rubash#1497: consume the driver's final-unit arming (see
+    // Executor::command_string_final_pending): only the -c string's
+    // last reader unit raises the exec-replacement frame, and only in
+    // command-string mode. A nested unit (a sourced file inside the
+    // -c string) restores the enclosing frame state untouched after
+    // its run; its own walks never see the frame raised, because the
+    // pending flag was already taken by the outer unit.
+    let saved_final_frame = executor.exec_replace_final_frame.get();
+    let final_unit = executor.command_string_final_pending.take() && executor.command_string_mode();
+    executor.exec_replace_final_frame.set(final_unit);
+    let exec_result = executor.execute_ast(&ast);
+    executor.exec_replace_final_frame.set(saved_final_frame);
+    match exec_result {
         Ok(()) => executor.last_exit_code(),
         // ExitCode/FatalFunctionError reached the list top: GNU unwound via
         // jump_to_top_level (exit, errexit, POSIX special-builtin failure).

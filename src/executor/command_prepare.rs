@@ -3672,7 +3672,18 @@ impl Executor {
         if self.expansion_probe_active.get() {
             return;
         }
-        eprintln!("{}no match: {pattern}", self.diagnostic_prefix());
+        // GNU's failglob report (subst.c expand_word_list_internal ->
+        // error.c report_error family) goes to fd 2 AS BOUND by enclosing
+        // redirections: `( echo *.zzz ) 2>err` lands in err and the
+        // `2>&1` comsub capture sees it. The raw process-stderr write
+        // bypassed every binding (rubash#1469; same routing as the
+        // assignment-diagnostic fix, rubash#1317).
+        let line = format!("{}no match: {pattern}\n", self.diagnostic_prefix());
+        if !self.fd_table.is_closed(2) && self.fd_table.output_endpoint(2).is_none() {
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+        } else {
+            self.write_diagnostic_fd2(line.as_bytes());
+        }
         self.exit_code = 1;
     }
 }

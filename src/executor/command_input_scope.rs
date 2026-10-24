@@ -21,6 +21,14 @@ pub(in crate::executor) struct CommandFd0InputGuard {
     saved_fd0_entry: Option<FdEntry>,
     saved_function_stdin: Option<String>,
     saved_function_stdin_offset: Option<String>,
+    /// rubash#1141: production schedule of the FUNCTION_STDIN being
+    /// shadowed (the rebound text is heredoc/herestring/loop input with
+    /// no production timing of its own).
+    saved_timed_stdin: Option<super::timed_input::SharedTimedInput>,
+    /// rubash#1141: when fd 0 was bound to a process-substitution
+    /// stream's endpoint, the stream's registered path — restore writes
+    /// the endpoint's consumed offset back into the stream.
+    procsub_stream_path: Option<std::path::PathBuf>,
 }
 
 /// Saved descriptor state for an fd rebound by a compound command's
@@ -145,6 +153,52 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<Option<CommandFd0InputGuard>, ExecuteError> {
+        // rubash#1141: a `< <(...)` redirect whose target materialized to
+        // a registered process-substitution stream binds fd 0 to the
+        // stream's fd-table endpoint — not to a FileFd on the temp
+        // carrier — so the body's production schedule judges the
+        // compound's reads/selects (GNU binds the pipe itself). The
+        // endpoint starts at the stream's shared offset; restore writes
+        // the consumed offset back.
+        if let Some(redirect) = &cmd.redirect_in {
+            if redirect.fd.unwrap_or(0) == 0
+                && redirect.fd_var.is_none()
+                && redirect.kind == crate::parser::RedirectKind::Input
+                && !redirect.target.starts_with("<(")
+            {
+                let target = self.expand_redirect_target(redirect);
+                let path = super::path::windows_operand_file_path(
+                    super::path::shell_path_to_windows(&target, &self.shell_state.env_vars),
+                    &self.shell_state.env_vars,
+                );
+                if let Some((data, offset, timing)) = self.procsub_stream_lookup(&path) {
+                    let saved_fd0_entry = self.fd_table.entries.get(&0).cloned();
+                    let saved_function_stdin =
+                        self.shell_state.env_vars.get(FUNCTION_STDIN).cloned();
+                    let saved_function_stdin_offset = self
+                        .shell_state
+                        .env_vars
+                        .get(FUNCTION_STDIN_OFFSET)
+                        .cloned();
+                    self.fd_table.open_input(
+                        0,
+                        FdReadEndpoint::process_substitution_bytes(data),
+                        false,
+                    );
+                    self.fd_table.set_input_offset(0, offset);
+                    if let Some(timing) = timing {
+                        self.fd_table.set_input_timing(0, timing);
+                    }
+                    return Ok(Some(CommandFd0InputGuard {
+                        saved_fd0_entry,
+                        saved_function_stdin,
+                        saved_function_stdin_offset,
+                        saved_timed_stdin: self.timed_stdin.clone(),
+                        procsub_stream_path: Some(path),
+                    }));
+                }
+            }
+        }
         if let Some(file) = self.compound_fd0_regular_file(cmd) {
             // Snapshot the FUNCTION_STDIN pair too: restore_command_fd0_input
             // is unconditional, and this branch never rewrites the text
@@ -162,6 +216,10 @@ impl Executor {
                 saved_fd0_entry,
                 saved_function_stdin,
                 saved_function_stdin_offset,
+                // The text channel is untouched in this branch, so its
+                // timing stays valid; restore writes the same value back.
+                saved_timed_stdin: self.timed_stdin.clone(),
+                procsub_stream_path: None,
             }));
         }
         let Some(input) = self.command_input_redirect(cmd) else {
@@ -180,10 +238,16 @@ impl Executor {
         self.shell_state
             .env_vars
             .insert(FUNCTION_STDIN_OFFSET.to_string(), "0".to_string());
+        // rubash#1141: the rebound FUNCTION_STDIN is locally produced
+        // text (heredoc / here-string / loop input) — the enclosing
+        // stream's production schedule does not describe it.
+        let saved_timed_stdin = self.timed_stdin.take();
         Ok(Some(CommandFd0InputGuard {
             saved_fd0_entry,
             saved_function_stdin,
             saved_function_stdin_offset,
+            saved_timed_stdin,
+            procsub_stream_path: None,
         }))
     }
 
@@ -191,6 +255,14 @@ impl Executor {
     /// do_redirection_internal (RX_UNDOABLE) restores fd 0 at scope end —
     /// even undoing a permanent `exec 0<g` inside the body.
     pub(in crate::executor) fn restore_command_fd0_input(&mut self, guard: CommandFd0InputGuard) {
+        // rubash#1141: fold the fd-0 endpoint's consumption back into
+        // the process-substitution stream's shared offset before the
+        // descriptor binding is unwound.
+        if let Some(path) = &guard.procsub_stream_path {
+            if let Some((_, offset)) = self.fd_table.input_snapshot_bytes(0) {
+                self.procsub_stream_set_offset(path, offset);
+            }
+        }
         restore_optional_env_var(
             &mut self.shell_state.env_vars,
             FUNCTION_STDIN,
@@ -201,6 +273,7 @@ impl Executor {
             FUNCTION_STDIN_OFFSET,
             guard.saved_function_stdin_offset,
         );
+        self.timed_stdin = guard.saved_timed_stdin;
         match guard.saved_fd0_entry {
             Some(entry) => {
                 self.fd_table.entries.insert(0, entry);

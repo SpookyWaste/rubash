@@ -1592,6 +1592,41 @@ fn scan_word_prefix_quote_state(prefix: &str, quoted_word: bool) -> (bool, bool)
     (top.in_double, stack.len() > 1)
 }
 
+/// End index (exclusive) of the substitution unit starting at
+/// chars[start] == '$' with '(' or '{' at start + 1, or None when the
+/// unit is unterminated — the caller then falls back to per-character
+/// handling, preserving the historical behavior for broken input.
+fn substitution_unit_end(chars: &[char], start: usize, posix: bool) -> Option<usize> {
+    if chars.get(start + 1) == Some(&'(') {
+        crate::lexer::skip_parenthesized_unit_corrected(chars, start + 1)
+    } else {
+        let context = crate::lexer::dolbrace::BraceContext {
+            outer_double_quote: true,
+            posix,
+            replacement_context: false,
+            initial_state: crate::lexer::dolbrace::DolbraceState::Param,
+        };
+        crate::lexer::dolbrace::scan_braced_parameter_body_chars(&chars[start..], context)
+            .map(|scan| start + 2 + scan.end)
+            .filter(|end| *end <= chars.len())
+    }
+}
+
+/// End index (exclusive) of the backtick unit starting at chars[start]:
+/// a backslash escapes the next character (including the closing
+/// backtick); an unterminated unit runs to the end of the word.
+fn backtick_unit_end(chars: &[char], start: usize) -> usize {
+    let mut index = start + 1;
+    while index < chars.len() {
+        match chars[index] {
+            '\\' => index += 2,
+            '`' => return index + 1,
+            _ => index += 1,
+        }
+    }
+    chars.len()
+}
+
 pub(in crate::executor) fn decode_double_quotes_in_quoted_parameter_word(
     word: &str,
     posix: bool,
@@ -1744,6 +1779,27 @@ pub(in crate::executor) fn decode_double_quotes_in_quoted_parameter_word(
             index += 1;
             continue;
         }
+        // GNU parse.y:4451 parse_comsub / parse.y:3877
+        // parse_matched_pair: a nested substitution inside the alternate
+        // is a unit whose interior quotes belong to its own parse.
+        // Consume $(...), ${...} and `...` verbatim — decoding an
+        // interior `"` as an outer-context span corrupted the body
+        // (`"${u:-$(printf "it's")}"` lost the quotes around `it's`,
+        // and the surviving `'` then swallowed the substitution's
+        // closer downstream). rubash#1468.
+        if chars[index] == '$' && matches!(chars.get(index + 1), Some('(') | Some('{')) {
+            if let Some(end) = substitution_unit_end(&chars, index, posix) {
+                output.extend(chars[index..end].iter());
+                index = end;
+                continue;
+            }
+        }
+        if chars[index] == '`' {
+            let end = backtick_unit_end(&chars, index);
+            output.extend(chars[index..end].iter());
+            index = end;
+            continue;
+        }
         if chars[index] != '"' {
             output.push(chars[index]);
             index += 1;
@@ -1752,6 +1808,22 @@ pub(in crate::executor) fn decode_double_quotes_in_quoted_parameter_word(
 
         index += 1;
         while index < chars.len() {
+            // Nested substitution units stay verbatim inside a
+            // double-quote span too (rubash#1468): their interior
+            // quotes are their own, never span boundaries.
+            if chars[index] == '$' && matches!(chars.get(index + 1), Some('(') | Some('{')) {
+                if let Some(end) = substitution_unit_end(&chars, index, posix) {
+                    output.extend(chars[index..end].iter());
+                    index = end;
+                    continue;
+                }
+            }
+            if chars[index] == '`' {
+                let end = backtick_unit_end(&chars, index);
+                output.extend(chars[index..end].iter());
+                index = end;
+                continue;
+            }
             match chars[index] {
                 '"' => {
                     index += 1;

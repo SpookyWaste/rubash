@@ -420,6 +420,76 @@ pub(in crate::executor) fn record_contains_delimiter(
     false
 }
 
+/// EOF accounting for the slurp transports — the serves that hold the
+/// whole remaining input as one text (the fd-0 regular-file and procsub
+/// serves, here-strings, heredocs, and the `-u N` same-command redirect
+/// serve in read_redirected_fd.rs). GNU builtins/read.def consumes one
+/// character at a time: its loop breaks on the delimiter (read.def:834),
+/// breaks when the -n/-N budget is spent (read.def:880-881: `nr++; if
+/// (nchars > 0 && nr >= nchars) break;`), and sets `eof` only when the
+/// descriptor itself reports EOF (read.def:767); the builtin then
+/// returns `eof ? EXECUTION_FAILURE : EXECUTION_SUCCESS` (read.def:949).
+/// Replaying that walk over the slurped text decides whether THIS record
+/// ended at the delimiter or at the budget (not EOF) or by exhaustion
+/// (EOF, no delimiter). Testing the whole text for the delimiter alone
+/// (the old `!record_contains_delimiter` formula) misjudges both ways:
+/// a satisfied -n budget over delimiter-less input reported EOF, and a
+/// serve that never set the flag reported success at EOF. The unit model
+/// is the one read_function_stdin and truncate_read_post_escape use:
+/// post-escape characters, a raw-byte marker pair is one unit, and a
+/// backslash-newline continuation costs zero.
+pub(in crate::executor) fn slurped_record_eof_no_delimiter(
+    input: &str,
+    delimiter: char,
+    char_limit: Option<usize>,
+    exact_char_limit: bool,
+    escape_aware: bool,
+    raw: bool,
+) -> bool {
+    let needle = read_delimiter_needle(delimiter);
+    let chars: Vec<(usize, char)> = input.char_indices().collect();
+    let mut cursor = 0usize;
+    let mut units = 0usize;
+    let mut escaped = false;
+    while cursor < chars.len() {
+        let (index, ch) = chars[cursor];
+        if !exact_char_limit && !escaped && !(escape_aware && ch == '\\') {
+            if input[index..].starts_with(&needle) || input[index..].starts_with(delimiter) {
+                return false;
+            }
+        }
+        let pair = ch as u32 == RAW_BYTE_MARKER_ESCAPE
+            && chars.get(cursor + 1).is_some_and(|&(_, payload)| {
+                let code = payload as u32;
+                (RAW_BYTE_MARKER_FIRST..=RAW_BYTE_MARKER_LAST).contains(&code)
+            });
+        if pair {
+            // A marker pair is one raw byte: consumed as a whole, it is
+            // the escaped character when an escape was pending and never
+            // an escape introducer itself (as in read_function_stdin).
+            cursor += 2;
+            escaped = false;
+            units += 1;
+        } else {
+            cursor += 1;
+            if escaped {
+                if ch != '\n' {
+                    units += 1;
+                }
+                escaped = false;
+            } else if !raw && ch == '\\' {
+                escaped = true;
+            } else {
+                units += 1;
+            }
+        }
+        if char_limit.is_some_and(|limit| units >= limit) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Byte index of the first UNESCAPED delimiter occurrence in `text`,
 /// for non-raw reads (GNU builtins/read.def: a backslash consumes the
 /// following character as an escaped literal, and an escaped character

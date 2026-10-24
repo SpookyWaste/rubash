@@ -638,6 +638,12 @@ pub fn is_disk_file(h: HANDLE) -> bool {
     (unsafe { GetFileType(h) }) == FILE_TYPE_DISK
 }
 
+/// The handle refers to a pipe (FILE_TYPE_PIPE) — GNU test.c's `-p`
+/// file test on an fd path (rubash#1467).
+pub fn is_pipe_handle(h: HANDLE) -> bool {
+    (unsafe { GetFileType(h) }) == FILE_TYPE_PIPE
+}
+
 /// The filesystem path an open disk-file handle refers to, or None for
 /// pipes/consoles/devices. GNU's `open("/proc/self/fd/N", O_RDONLY)` on a
 /// regular-file descriptor performs a FRESH open at offset 0, so callers

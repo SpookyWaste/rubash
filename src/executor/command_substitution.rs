@@ -1664,6 +1664,12 @@ impl Executor {
             // transients of the parent, not fork state.
             reader_last_list_line: Cell::new(None),
             command_string_mode: Cell::new(false),
+            command_string_final_pending: Cell::new(false),
+            exec_replace_final_frame: Cell::new(false),
+            exec_replace_dispatch_stamp: Cell::new(0),
+            exec_replace_stamp_counter: Cell::new(0),
+            exec_replace_stamp_hold: Cell::new(0),
+            exec_replace_shlvl_snapshot: Cell::new(None),
             line_lex_locales: std::cell::RefCell::new(HashMap::new()),
             unit_lex_locale: std::cell::RefCell::new(None),
             ambient_line: Cell::new(None),
@@ -1743,6 +1749,12 @@ impl Executor {
             read_interrupted_signal: None,
             read_sigint_guard_armed: false,
             read_eof_no_delimiter: false,
+            // rubash#1141: the fork copy reads the SAME staged input
+            // stream as its parent (FUNCTION_STDIN crosses in the cloned
+            // shell state), so its production timing crosses too — the
+            // shared skipped-wait clock belongs to the stream, not to
+            // either executor.
+            timed_stdin: self.timed_stdin.clone(),
             stdout_capture: None,
             stderr_capture: None,
             // niubash#345: a command-substitution fork captures its stdout;

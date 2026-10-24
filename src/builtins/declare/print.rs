@@ -48,7 +48,7 @@ where
     let namerefs = marked_vars(variables, NAMEREF_VARS);
     let declared_unset = marked_vars(variables, DECLARED_UNSET_VARS);
     let names_to_print = if names.is_empty() {
-        declaration_names_to_print(
+        let mut listed = declaration_names_to_print(
             variables,
             filter_exported,
             filter_readonly,
@@ -61,7 +61,31 @@ where
             &uppercase,
             &lowercase,
             &namerefs,
-        )
+        );
+        // Dynamic variables whose values live outside the table (a live
+        // PIPESTATUS array) have no cell to enumerate, but GNU's full
+        // `declare -p` listing includes them once materialized
+        // (rubash#1363). The executor passes their views in listing
+        // mode only; merge the names that pass the attribute filters —
+        // a dynamic view is an array cell, and the remaining filters
+        // consult the mark sets exactly like the table-driven listing.
+        for (view_name, _) in dynamic_views {
+            if listed.iter().any(|name| name == view_name) {
+                continue;
+            }
+            let passes = (!filter_exported || exported.contains(view_name))
+                && (!filter_readonly || readonly.contains(view_name))
+                && (!filter_assoc)
+                && (!filter_integer || integers.contains(view_name))
+                && (!filter_uppercase || uppercase.contains(view_name))
+                && (!filter_lowercase || lowercase.contains(view_name))
+                && (!filter_nameref || namerefs.contains(view_name));
+            if passes {
+                listed.push(view_name.clone());
+            }
+        }
+        listed.sort();
+        listed
     } else {
         names
             .iter()

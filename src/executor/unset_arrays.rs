@@ -357,6 +357,19 @@ impl Executor {
         for name in variable_args.iter().filter(|a| !a.starts_with('-')) {
             self.shell_state.variables.remove(name);
         }
+        // GNU variables.c:3839 unbind_variable removes the PIPESTATUS
+        // cell outright (any shape — live array, scalar, valueless), so
+        // the next command completion's set_pipestatus_array recreates a
+        // live array from absent (rubash#1363). A readonly PIPESTATUS
+        // keeps its cell: unset_with_stderr refused the unbind above and
+        // the READONLY mark survives, which is the guard here.
+        for name in variable_args.iter().filter(|a| !a.starts_with('-')) {
+            if *name == "PIPESTATUS"
+                && !is_marked_var(&self.shell_state.env_vars, READONLY_VARS, "PIPESTATUS")
+            {
+                self.shell_state.pipestatus_shape = crate::shell::state::PipestatusShape::Absent;
+            }
+        }
         // GNU variables.c:6205-6217 sv_ignoreeof: unbinding the IGNOREEOF
         // variable turns the ignoreeof option off (the option tracks
         // "the variable is set").

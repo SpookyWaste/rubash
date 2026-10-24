@@ -40,7 +40,9 @@ pub(super) fn parse_conditional_command(
     let mut command = CommandNode::new();
     command.line = tokens.get(start).map(|token| token.position);
     command.logical_line = tokens.get(start).map(|token| token.logical_line);
-    if let Some((spec, echo_line)) = conditional_syntax_error_spec(&merged_args, true) {
+    if let Some((spec, echo_line)) =
+        conditional_syntax_error_spec(&merged_args, true, stream_eof_line(tokens, diagnostic_text))
+    {
         command.insert_assignment("__RUBASH_PARSE_ERROR_COND__".to_string(), spec);
         if let Some(source) = conditional_offending_line(
             tokens,
@@ -79,15 +81,30 @@ pub(super) fn parse_conditional_command(
 /// `near` prints each message, then `syntax error near `tok'` and echoes the
 /// offending source line. `eof` prints each message, then
 /// `syntax error: unexpected end of file from `[[' command on line N`.
+/// The line GNU reports for an EOF discovered while scanning to the
+/// end of the input: parse_matched_pair consumes raw text up to EOF,
+/// so the report lands one past the last newline of the whole stream
+/// (parse.y:5223-5227 at the EOF line). Falls back to the last token's
+/// line + 1 when the source text is unavailable — the same fallback
+/// shape conditional_eof_error_command already uses.
+fn stream_eof_line(tokens: &[Token], diagnostic_text: Option<&std::rc::Rc<str>>) -> usize {
+    if let Some(text) = diagnostic_text {
+        return text.matches('\n').count() + 1;
+    }
+    tokens.last().map(|token| token.position + 1).unwrap_or(1)
+}
+
 pub(super) fn conditional_syntax_error_spec(
     args: &[CondArg],
     closed: bool,
+    stream_eof_line: usize,
 ) -> Option<(String, Option<usize>)> {
     let open_line = args.first().map(|(_, _, _, line)| *line).unwrap_or(1);
     let mut cursor = CondCursor {
         args,
         index: 0,
         closed,
+        stream_eof_line,
         newline_consumed_for: None,
         virtual_newline_seen: false,
         bang_term_position: true,
@@ -212,9 +229,7 @@ impl CondFail {
                 args[*index].3,
                 args[*index].3,
             ),
-            CondOffending::Fixed(text, index) => {
-                (text.clone(), args[*index].3, args[*index].3)
-            }
+            CondOffending::Fixed(text, index) => (text.clone(), args[*index].3, args[*index].3),
             CondOffending::End => ("]]".to_string(), last_line, last_line),
             CondOffending::VirtualNewline(anchor) => {
                 let last = (*anchor).min(args.len()).saturating_sub(1);
@@ -364,6 +379,11 @@ struct CondCursor<'a> {
     args: &'a [CondArg],
     index: usize,
     closed: bool,
+    /// Line of the input stream's EOF (one past its last newline).
+    /// parse_matched_pair scans the raw regex word to EOF, so GNU's
+    /// follow-up diagnostic lands on the stream's EOF line, not on
+    /// the last collected conditional argument (rubash#1290 residual).
+    stream_eof_line: usize,
     /// The arg index whose leading `\n' token was already consumed, so each
     /// physical newline surfaces exactly once (GNU read_token returns it as
     /// a token in operand slots).
@@ -629,7 +649,7 @@ fn cond_term(cursor: &mut CondCursor) -> Result<(), CondFail> {
                     let (value, raw, _, arg_line) = &cursor.args[index.unwrap()];
                     if raw == value {
                         if let Some(paren_line) = unclosed_regex_paren_line(value, *arg_line) {
-                            let eof_line = cursor.args.last().map(|a| a.3).unwrap_or(*arg_line) + 1;
+                            let eof_line = cursor.stream_eof_line;
                             return Err(CondFail {
                                 messages: vec![
                                     (
@@ -685,9 +705,7 @@ fn cond_term(cursor: &mut CondCursor) -> Result<(), CondFail> {
                     // report (`unexpected token `&'' for `&3]]'), not the
                     // whole glued fragment.
                     let text = match text.chars().next() {
-                        Some(c @ ('&' | '|')) if text != "&&" && text != "||" => {
-                            c.to_string()
-                        }
+                        Some(c @ ('&' | '|')) if text != "&&" && text != "||" => c.to_string(),
                         _ => text,
                     };
                     Err(CondFail {
@@ -1158,7 +1176,12 @@ pub(super) fn conditional_eof_error_command(
         start + 1,
         tokens.len() - 1,
     ));
-    let (spec, echo_line) = conditional_syntax_error_spec(&merged, false).unwrap_or_else(|| {
+    let (spec, echo_line) = conditional_syntax_error_spec(
+        &merged,
+        false,
+        stream_eof_line(tokens, diagnostic_text),
+    )
+    .unwrap_or_else(|| {
         let sep = crate::executor::markers::PARSE_ERROR_FIELD_SEP;
         let open_line = tokens.get(start).map(|token| token.position).unwrap_or(1);
         let eof_line = tokens

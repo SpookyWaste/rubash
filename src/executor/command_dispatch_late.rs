@@ -41,6 +41,7 @@ impl Executor {
         }
         let mut overrides: Vec<(usize, String)> = Vec::new();
         let mut has_t = false;
+        let mut has_fd_path = false;
         let mut index = 0;
         // rubash#1202: the -v subscript rewrite's evalerror diagnostic is
         // a diagnostic OF THIS BUILTIN (GNU test.c via execute_cmd.c
@@ -52,6 +53,9 @@ impl Executor {
             let current = strip(&args[index]);
             if current == "-t" {
                 has_t = true;
+            }
+            if current.starts_with("/dev/fd/") || current.starts_with("/proc/self/fd/") {
+                has_fd_path = true;
             }
             // Operands are skipped after a `-v` (GNU test.c unary_operator
             // consumes the next word), so the operator test never sees a
@@ -120,6 +124,13 @@ impl Executor {
         // second `any()` pass, skip the sync entirely without `-t`.
         if has_t {
             self.sync_fd_terminal_marks(Some(cmd));
+        }
+        // Same fused-scan economy for the pipe marks (__RUBASH_FD_PIPE_<fd>,
+        // consumed by the /dev/fd/N operand arm in builtins/test.rs):
+        // refresh only when an argument actually spells an fd path
+        // (rubash#1467).
+        if has_fd_path {
+            self.sync_fd_pipe_marks();
         }
         // GNU execute_cmd.c: test's diagnostics go to the shell's CURRENTLY
         // BOUND fd 2 (redir.c) — an enclosing `exec 2>/dev/null` contains

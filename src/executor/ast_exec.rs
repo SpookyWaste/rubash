@@ -97,7 +97,28 @@ impl Executor {
         // sample must be intact when its adjudication runs after the
         // nested list returns.
         let saved_err_trap_sample = self.err_trap_armed_sample.get();
+        // rubash#1497: the -c tail exec-replacement stamp survives only
+        // the final unit's own top frame (and, via the one-shot hold, an
+        // and_or_list tail element's wrapper frame — GNU
+        // execute_cmd.c:2886 execute_connection walks &&/|| operands in
+        // the caller's frame; this port wraps each operand in its own
+        // execute_ast). Every other nested list walk — function bodies,
+        // trap actions, sourced/eval units, compound bodies — clears it
+        // for its duration, so a spawn inside can never mistake itself
+        // for the -c string's last top-level command.
+        let saved_exec_replace_stamp = self.exec_replace_dispatch_stamp.get();
+        let saved_exec_replace_shlvl = self.exec_replace_shlvl_snapshot.get();
+        if self.exec_replace_stamp_hold.replace(0) == 0
+            && !(self.exec_replace_final_frame.get() && self.evalerror_exec_depth.get() == 1)
+        {
+            self.exec_replace_dispatch_stamp.set(0);
+            self.exec_replace_shlvl_snapshot.set(None);
+        }
         let result = self.execute_ast_inner_body(commands);
+        self.exec_replace_dispatch_stamp
+            .set(saved_exec_replace_stamp);
+        self.exec_replace_shlvl_snapshot
+            .set(saved_exec_replace_shlvl);
         self.err_trap_armed_sample.set(saved_err_trap_sample);
         self.evalerror_exec_depth
             .set(self.evalerror_exec_depth.get().saturating_sub(1));
@@ -179,6 +200,71 @@ impl Executor {
         Ok(())
     }
 
+    /// rubash#1497: the node shapes GNU's fork optimization accepts
+    /// for the last command of a -c string (builtins/evalstring.c:106
+    /// should_optimize_fork: a cm_simple command, not a pipeline
+    /// element, carrying no redirections; parse_and_execute also
+    /// refuses CMD_TIME_PIPELINE / CMD_INVERT_RETURN carriers). Prefix
+    /// assignments are fine — they fold into the child's environment
+    /// exactly as in the fork path. A folded &&/|| list qualifies
+    /// through its last element, mirroring optimize_connection_fork
+    /// (builtins/evalstring.c:148).
+    fn exec_replace_shape_ok(command: &CommandNode) -> bool {
+        if let Some(list) = &command.and_or_list {
+            return !command.background
+                && command.redirects.is_empty()
+                && command.redirect_in.is_none()
+                && command.redirect_out.is_none()
+                && command.redirect_err.is_none()
+                && command.append.is_none()
+                && command.redirect_err_append.is_none()
+                && command.heredoc.is_none()
+                && command.here_string.is_none()
+                && command.heredoc_redirects.is_empty()
+                && list
+                    .commands
+                    .last()
+                    .is_some_and(Self::exec_replace_simple_shape_ok);
+        }
+        Self::exec_replace_simple_shape_ok(command)
+    }
+
+    fn exec_replace_simple_shape_ok(command: &CommandNode) -> bool {
+        !command.words.is_empty()
+            && command.pipeline_command.is_none()
+            && command.and_or_list.is_none()
+            && command.time_command.is_none()
+            && command.background_command.is_none()
+            && command.inverted_command.is_none()
+            && command.coproc_command.is_none()
+            && command.for_command.is_none()
+            && command.arithmetic_command.is_none()
+            && command.if_command.is_none()
+            && command.loop_command.is_none()
+            && command.conditional_command.is_none()
+            && command.subshell_command.is_none()
+            && command.case_command.is_none()
+            && command.select_command.is_none()
+            && command.function_command.is_none()
+            && command.brace_group.is_none()
+            && command.pipe.is_none()
+            && command.and_or.is_none()
+            && !command.background
+            && !command.inverted
+            && !command.subshell
+            && !command.subshell_end
+            && command.redirects.is_empty()
+            && command.redirect_in.is_none()
+            && command.redirect_out.is_none()
+            && command.redirect_err.is_none()
+            && command.append.is_none()
+            && command.redirect_err_append.is_none()
+            && command.heredoc.is_none()
+            && command.heredoc_body.is_none()
+            && command.here_string.is_none()
+            && command.heredoc_redirects.is_empty()
+    }
+
     fn execute_ast_inner_body(&mut self, commands: &[CommandNode]) -> Result<(), ExecuteError> {
         let mut index = 0;
         // GNU execute_cmd.c:1576 execute_in_subshell: the forked child's
@@ -196,6 +282,11 @@ impl Executor {
         // open file description — reads in the subshell advance the shared
         // offset, matching fork().
         let mut subshell_fd_table: Option<crate::executor::fd_table::FdTable> = None;
+        // rubash#1141: the FUNCTION_STDIN production schedule is executor
+        // state too — saved with the region (a nested group's redirect
+        // feed replaces FUNCTION_STDIN mid-region and clears it) and
+        // restored at the boundary like the fd table.
+        let mut subshell_timed_stdin: Option<Option<super::timed_input::SharedTimedInput>> = None;
         // rubash#720 form 1: the enclosing fork-collapse value to restore
         // when the flat region closes — Some only when the region opened
         // with a single-subshell-command body (execute_cmd.c:1799-1806 +
@@ -233,6 +324,9 @@ impl Executor {
                         if let Some(saved) = subshell_fd_table.take() {
                             self.fd_table = saved;
                         }
+                        if let Some(saved) = subshell_timed_stdin.take() {
+                            self.timed_stdin = saved;
+                        }
                         if let Some(saved) = saved_fork_collapse.take() {
                             self.subshell_fork_collapse.set(saved);
                         }
@@ -267,6 +361,9 @@ impl Executor {
                     self.restore_flat_subshell(saved_state, subshell_cwd.take());
                     if let Some(saved) = subshell_fd_table.take() {
                         self.fd_table = saved;
+                    }
+                    if let Some(saved) = subshell_timed_stdin.take() {
+                        self.timed_stdin = saved;
                     }
                     if let Some(saved) = saved_fork_collapse.take() {
                         self.subshell_fork_collapse.set(saved);
@@ -364,6 +461,32 @@ impl Executor {
                         && command.and_or().is_none(),
                 );
             }
+            // rubash#1497: stamp the final -c unit's last top-level
+            // command dispatch (GNU builtins/evalstring.c:126
+            // should_suppress_fork + execute_cmd.c:5813: the last
+            // command of a -c string replaces the shell process when it
+            // is a plain external command). The stamp is consumed at
+            // the spawn site; nested walks clear it (execute_ast_inner),
+            // so only this node's own spawn can observe it.
+            if self.exec_replace_final_frame.get() && self.evalerror_exec_depth.get() == 1 {
+                let armed = index + 1 == commands.len()
+                    && subshell_state.is_none()
+                    && Self::exec_replace_shape_ok(command);
+                if armed {
+                    let stamp = self.exec_replace_stamp_counter.get() + 1;
+                    self.exec_replace_stamp_counter.set(stamp);
+                    self.exec_replace_dispatch_stamp.set(stamp);
+                    // rubash#1497: freeze the SHLVL the spawn-site
+                    // adjustment must read (see
+                    // exec_replace_shlvl_snapshot) before this command's
+                    // own prefix assignments are committed.
+                    self.exec_replace_shlvl_snapshot
+                        .set(Some(self.current_shlvl_value()));
+                } else {
+                    self.exec_replace_dispatch_stamp.set(0);
+                    self.exec_replace_shlvl_snapshot.set(None);
+                }
+            }
             // GNU parse.y/eval.c: a syntax error inside a command
             // substitution is a read-time failure of the enclosing command —
             // the parser recovered at the `)`, so the command itself still
@@ -409,6 +532,9 @@ impl Executor {
                             self.restore_flat_subshell(saved_state, subshell_cwd.take());
                             if let Some(saved) = subshell_fd_table.take() {
                                 self.fd_table = saved;
+                            }
+                            if let Some(saved) = subshell_timed_stdin.take() {
+                                self.timed_stdin = saved;
                             }
                             if let Some(saved) = saved_fork_collapse.take() {
                                 self.subshell_fork_collapse.set(saved);
@@ -635,6 +761,9 @@ impl Executor {
                         if let Some(saved) = subshell_fd_table.take() {
                             self.fd_table = saved;
                         }
+                        if let Some(saved) = subshell_timed_stdin.take() {
+                            self.timed_stdin = saved;
+                        }
                         // No ERR adjudication here: GNU -n executes nothing,
                         // so no subshell completion status can exist to
                         // adjudicate (run_error_trap gates on exec_result).
@@ -682,6 +811,7 @@ impl Executor {
                 }
                 subshell_state = Some(self.shell_state.clone_for_child_save());
                 subshell_fd_table = Some(self.fd_table.clone());
+                subshell_timed_stdin = Some(self.timed_stdin.clone());
                 subshell_cwd = env::current_dir().ok();
                 self.shell_state.loop_depth = 0;
                 // execute_in_subshell resets loop_level (execute_cmd.c:1642):
@@ -690,6 +820,25 @@ impl Executor {
                 crate::builtins::trap::reset_for_subshell_child(&mut self.shell_state.env_vars);
                 let old_depth = self.shell_state.subshell_depth.get();
                 self.shell_state.subshell_depth.set(old_depth + 1);
+                // rubash#1493: record the region's whole `( ... )` text
+                // for the exec signal-death notice (jobs.c:4625 names
+                // the whole job command) — a node-form region renders
+                // its own node, a flat region renders its command span
+                // the way flat_subshell_region_source_text does for the
+                // ERR-trap stamp above. The region's saved state clone
+                // (taken just above) holds the parent's value, so the
+                // boundary restore reverts this automatically.
+                self.shell_state.subshell_source_text =
+                    Some(if command.subshell_command.is_some() {
+                        crate::executor::command_text::bash_command_source_text(command)
+                    } else {
+                        let close_index = (index..commands.len())
+                            .find(|candidate| commands[*candidate].subshell_end)
+                            .unwrap_or(index);
+                        crate::executor::command_text::flat_subshell_region_source_text(
+                            &commands[index..=close_index],
+                        )
+                    });
                 // rubash#1115: the forked child reseeds RANDOM
                 // (variables.c:1418-1423 get_random_number); the saved
                 // parent state above keeps the parent's sequence intact.
@@ -718,6 +867,11 @@ impl Executor {
                             self.shell_state
                                 .env_vars
                                 .insert(FUNCTION_STDIN_OFFSET.to_string(), "0".to_string());
+                            // rubash#1141: the fed text is locally
+                            // produced redirect input — the enclosing
+                            // stream's production schedule does not
+                            // describe it (restored at the boundary).
+                            self.timed_stdin = None;
                         }
                         break;
                     }
@@ -1751,6 +1905,9 @@ impl Executor {
                         if let Some(saved) = subshell_fd_table.take() {
                             self.fd_table = saved;
                         }
+                        if let Some(saved) = subshell_timed_stdin.take() {
+                            self.timed_stdin = saved;
+                        }
                         if let Some(saved) = saved_fork_collapse.take() {
                             self.subshell_fork_collapse.set(saved);
                         }
@@ -1819,8 +1976,8 @@ impl Executor {
             // compounds (cm_arith/cm_cond) — `if`/`while`/`until`/`for`/
             // `case`/etc. leave the last pipeline's PIPESTATUS untouched
             // (rubash#1383 #1384).
-            let is_pipestatus_compound = command.arithmetic_command.is_some()
-                || command.conditional_command.is_some();
+            let is_pipestatus_compound =
+                command.arithmetic_command.is_some() || command.conditional_command.is_some();
             let is_non_pipestatus_compound = command.if_command.is_some()
                 || command.loop_command.is_some()
                 || command.for_command.is_some()
@@ -1895,6 +2052,9 @@ impl Executor {
                     self.restore_flat_subshell(saved_state, subshell_cwd.take());
                     if let Some(saved) = subshell_fd_table.take() {
                         self.fd_table = saved;
+                    }
+                    if let Some(saved) = subshell_timed_stdin.take() {
+                        self.timed_stdin = saved;
                     }
                     if let Some(saved) = saved_fork_collapse.take() {
                         self.subshell_fork_collapse.set(saved);

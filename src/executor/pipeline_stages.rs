@@ -228,6 +228,10 @@ impl Executor {
         let stderr = subshell.stderr_capture.take().unwrap_or_default();
 
         crate::executor::shell_options::restore_stdout_capture(saved_capture);
+        // rubash#1141: the stage's output assembles field-sink bytes
+        // first, thread-sink bytes after — snapshot the prefix totals so
+        // the timing recorder can place thread arrivals behind them.
+        crate::executor::shell_options::capture_timing_set_prefix(&output);
         output.append(&mut thread_output);
 
         if let Some(saved_dir) = saved_dir {
@@ -355,6 +359,9 @@ impl Executor {
                 || subshell.run_exit_trap_for_status(body_status),
             );
         let mut output = subshell.stdout_capture.take().unwrap_or_default();
+        // rubash#1141: field-sink bytes precede the thread-sink bytes in
+        // the assembled output — snapshot the prefix for the recorder.
+        crate::executor::shell_options::capture_timing_set_prefix(&output);
         output.extend_from_slice(&thread_captured);
         output.extend_from_slice(&trap_thread_captured);
         // The call's ORDERED redirect list (call.redirects) still carries

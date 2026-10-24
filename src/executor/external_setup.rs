@@ -408,8 +408,15 @@ impl Executor {
                 .strip_prefix("<(")
                 .and_then(|target| target.strip_suffix(')'))
             {
-                if let Some(output) = self.process_substitution_output_bytes(source) {
+                if let Some((output, body_timing)) =
+                    self.process_substitution_output_bytes_timed(source)
+                {
                     let path = self.write_process_substitution_temp_bytes(&output)?;
+                    // rubash#1141: the temp path is registered as a procsub
+                    // stream by the write; attach the body's timing so the
+                    // fd-0 bind (and literal-redirect readers) can judge
+                    // TMOUT against the recorded arrival schedule.
+                    self.procsub_stream_set_timing(&path, body_timing);
                     let old_target = redirect.target.clone();
                     redirect.target = shell_display_path(&path.to_string_lossy());
                     redirect_target_rewrites.push((old_target, redirect.target.clone()));
@@ -620,13 +627,19 @@ impl Executor {
                 let display_path = self.process_substitution_output_fd_word(&path);
                 *word = word.replacen(&substitution.target, &display_path, 1);
             } else {
-                let Some(output) = self.process_substitution_output_bytes(&substitution.source)
+                let Some((output, body_timing)) =
+                    self.process_substitution_output_bytes_timed(&substitution.source)
                 else {
                     continue;
                 };
                 let path = self.write_process_substitution_temp_bytes(&output)?;
                 files.inputs.push(path.clone());
-                let display_path = self.process_substitution_fd_word(&output);
+                // rubash#1141: the same production schedule serves both
+                // carriers of the substitution's bytes — the fd-table
+                // endpoint (word form) and the draining stream (temp
+                // path form) share one virtual clock.
+                self.procsub_stream_set_timing(&path, body_timing.clone());
+                let display_path = self.process_substitution_fd_word_timed(&output, body_timing);
                 *word = word.replacen(&substitution.target, &display_path, 1);
             };
         }
@@ -1061,7 +1074,21 @@ impl Executor {
     /// every fd recorded here when the creating command finishes, matching
     /// GNU's reap (`a=(<(echo p9)); cat "${a[0]}"` reports `No such file`).
     pub(in crate::executor) fn process_substitution_fd_word(&mut self, output: &[u8]) -> String {
+        self.process_substitution_fd_word_timed(output, None)
+    }
+
+    /// rubash#1141: `process_substitution_fd_word` with the substitution
+    /// body's production schedule attached to the registered endpoint,
+    /// so reads through the fd observe GNU's pipe arrival times.
+    pub(in crate::executor) fn process_substitution_fd_word_timed(
+        &mut self,
+        output: &[u8],
+        timing: Option<super::timed_input::SharedTimedInput>,
+    ) -> String {
         let fd = self.register_process_substitution_fd(output);
+        if let Some(timing) = timing {
+            self.fd_table.set_input_timing(fd, timing);
+        }
         self.command_scoped_procsub_input_fds.push(fd);
         format!("/dev/fd/{fd}")
     }
@@ -1278,6 +1305,7 @@ impl Executor {
             Rc::new(RefCell::new(crate::shell::state::ProcSubStream {
                 data: output.to_vec(),
                 offset: 0,
+                timing: None,
             })),
         );
         Ok(path)
@@ -1288,27 +1316,84 @@ impl Executor {
     /// (GNU: the word is a `/dev/fd/N` pipe dup — redir.c:1183
     /// open_redir_file hands every consumer the same draining stream).
     /// Returns `None` when `path` is not a registered substitution.
+    fn procsub_stream_key(&self, path: &std::path::Path) -> Option<PathBuf> {
+        let streams = self.shell_state.procsub_streams.borrow();
+        if streams.contains_key(path) {
+            return Some(path.to_path_buf());
+        }
+        let canon = path.canonicalize().ok()?;
+        streams
+            .keys()
+            .find(|key| key.canonicalize().ok().as_deref() == Some(canon.as_path()))
+            .cloned()
+    }
+
     pub(in crate::executor) fn procsub_stream_take(
         &self,
         path: &std::path::Path,
     ) -> Option<Vec<u8>> {
-        let key = {
-            let streams = self.shell_state.procsub_streams.borrow();
-            if streams.contains_key(path) {
-                path.to_path_buf()
-            } else {
-                let canon = path.canonicalize().ok()?;
-                streams
-                    .keys()
-                    .find(|key| key.canonicalize().ok().as_deref() == Some(canon.as_path()))?
-                    .clone()
-            }
-        };
+        self.procsub_stream_take_timed(path)
+            .map(|(rest, _timing, _base)| rest)
+    }
+
+    /// rubash#1141: `procsub_stream_take` plus the stream's production
+    /// schedule and the offset the returned bytes start at, so a timed
+    /// consumer can judge the records it serves from the drained bytes.
+    pub(in crate::executor) fn procsub_stream_take_timed(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<(Vec<u8>, Option<super::timed_input::SharedTimedInput>, usize)> {
+        let key = self.procsub_stream_key(path)?;
         let stream = self.shell_state.procsub_streams.borrow().get(&key)?.clone();
         let mut stream = stream.borrow_mut();
+        let base = stream.offset;
         let rest = stream.data[stream.offset..].to_vec();
         stream.offset = stream.data.len();
-        Some(rest)
+        Some((rest, stream.timing.clone(), base))
+    }
+
+    /// rubash#1141: snapshot of a registered stream (bytes, shared
+    /// offset, production schedule) without draining it — the fd-0
+    /// binding for a compound `< <(...)` redirect serves the stream
+    /// through an fd-table endpoint and writes the consumed offset
+    /// back on restore.
+    pub(in crate::executor) fn procsub_stream_lookup(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<(Vec<u8>, usize, Option<super::timed_input::SharedTimedInput>)> {
+        let key = self.procsub_stream_key(path)?;
+        let stream = self.shell_state.procsub_streams.borrow().get(&key)?.clone();
+        let stream = stream.borrow();
+        Some((stream.data.clone(), stream.offset, stream.timing.clone()))
+    }
+
+    /// rubash#1141: write back a stream's shared offset (fd-0 binding
+    /// restore — see procsub_stream_lookup).
+    pub(in crate::executor) fn procsub_stream_set_offset(
+        &self,
+        path: &std::path::Path,
+        offset: usize,
+    ) {
+        if let Some(key) = self.procsub_stream_key(path) {
+            if let Some(stream) = self.shell_state.procsub_streams.borrow().get(&key) {
+                stream.borrow_mut().offset = offset;
+            }
+        }
+    }
+
+    /// rubash#1141: attach a substitution body's production schedule to
+    /// its registered stream (the temp file is written before the
+    /// schedule is attached — see materialize_process_substitution_word).
+    pub(in crate::executor) fn procsub_stream_set_timing(
+        &self,
+        path: &std::path::Path,
+        timing: Option<super::timed_input::SharedTimedInput>,
+    ) {
+        if let Some(key) = self.procsub_stream_key(path) {
+            if let Some(stream) = self.shell_state.procsub_streams.borrow().get(&key) {
+                stream.borrow_mut().timing = timing;
+            }
+        }
     }
 
     pub(in crate::executor) fn virtual_fd_stdin_remaining_bytes(&self, fd: u32) -> Option<Vec<u8>> {

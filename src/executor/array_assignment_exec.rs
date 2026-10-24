@@ -302,7 +302,12 @@ impl Executor {
             self.exit_code = 0;
             return true;
         }
-        if is_noassign_bash_array(name) {
+        // PIPESTATUS element assignment is an ordinary array bind
+        // in GNU (arrayfunc.c assign_array_element converts any cell
+        // shape into a live array) — it must reach the readonly check
+        // and the store below, whose tail syncs the shape state
+        // (rubash#1364). The stack arrays stay swallowed.
+        if is_noassign_bash_array(name) && name != "PIPESTATUS" {
             self.exit_code = 0;
             return true;
         }
@@ -387,6 +392,18 @@ impl Executor {
                 } else {
                     value.to_string()
                 };
+                // rubash#1400: the case attribute applies on an assoc
+                // element store too (GNU variables.c bind_assoc_variable
+                // runs the value through the att_uppercase/att_lowercase
+                // conversion, exactly like the indexed branch's #1401
+                // handling below) — `declare -uA h; h[k]=abc` stores ABC.
+                let stored = if attrs.uppercase {
+                    stored.to_uppercase()
+                } else if attrs.lowercase {
+                    stored.to_lowercase()
+                } else {
+                    stored
+                };
                 // rubash#618 budget: a fast append is scheduled by the
                 // per-variable budget, but the budget is spent only by an
                 // OVERWRITE. A new key adds a segment the mirror did not
@@ -415,25 +432,33 @@ impl Executor {
                         // grew by one segment without a re-parse, so upsert
                         // the binding in place — GNU assoc.c `assoc_insert`
                         // is itself an O(1) hash op.
-                        match upsert_typed_assoc_element(
+                        let cell_synced = match upsert_typed_assoc_element(
                             &mut self.shell_state.variables,
                             name,
                             &key,
                             &stored,
                         ) {
-                            AssocElementUpsert::NewKey => {}
+                            AssocElementUpsert::NewKey => true,
                             AssocElementUpsert::Overwrote => {
                                 if let Some(budget) =
                                     self.shell_state.array_compact_budget.get_mut(name)
                                 {
                                     *budget = budget.saturating_sub(1);
                                 }
+                                true
                             }
                             AssocElementUpsert::NoCell => {
                                 // Mirror grew without a synced cell: force the
                                 // canonical path next time so it re-syncs.
                                 self.shell_state.array_compact_budget.remove(name);
+                                false
                             }
+                        };
+                        // rubash#914 (F1): mirror segment and cell upsert
+                        // landed together, so the cell agrees with the
+                        // mirror by construction.
+                        if cell_synced {
+                            self.note_typed_cell_synced(name);
                         }
                         unmark_env_name(&mut self.shell_state.env_vars, DECLARED_UNSET_VARS, name);
                         // Cell and mirror moved together above (in-place
@@ -487,6 +512,16 @@ impl Executor {
             } else {
                 value
             };
+            // rubash#1400: case attribute on the canonical path as well —
+            // this `value` is the final stored text for both `=` and the
+            // `+=` combined result (GNU converts the post-append value).
+            let value = if attrs.uppercase {
+                value.to_uppercase()
+            } else if attrs.lowercase {
+                value.to_lowercase()
+            } else {
+                value
+            };
             if let Some((_, entry_value)) = entries
                 .iter_mut()
                 .rev()
@@ -520,6 +555,9 @@ impl Executor {
             self.shell_state
                 .array_compact_budget
                 .insert(name.to_string(), compact_budget);
+            // rubash#914 (F1): the cell was just synced from the same
+            // entry list the mirror render folds from.
+            self.note_typed_cell_synced(name);
             // GNU assign_array_element (arrayfunc.c:815) ->
             // bind_assoc_variable gives the variable a real assoc cell, so
             // var_isset is true and array_var_assignment (subst.c:8690-8697)
@@ -916,6 +954,31 @@ impl Executor {
         // canonical re-parse + sync): register the pair as synced for
         // the boundary verifier (rubash#1510).
         self.note_typed_cell_synced(name);
+        if name == "PIPESTATUS" {
+            // GNU arrayfunc.c assign_array_element converts whatever
+            // PIPESTATUS cell exists (absent, scalar, valueless) into a
+            // live ARRAY cell (variables.c:2798 make_new_array_variable);
+            // mirror that into the shape state and rebuild the status
+            // vector from the stored entries so the dynamic views agree
+            // with the cell until the next command completion rewrites
+            // it wholesale (rubash#1364).
+            self.shell_state.pipestatus_shape = crate::shell::state::PipestatusShape::LiveArray;
+            unmark_env_name(&mut self.shell_state.env_vars, UNSET_DYNAMIC_VARS, name);
+            let entries = indexed_array_entries(
+                &self
+                    .shell_state
+                    .env_vars
+                    .get("PIPESTATUS")
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            let len = entries.keys().max().map(|max| max + 1).unwrap_or(0);
+            let mut vector = vec![0i32; len];
+            for (index, element) in &entries {
+                vector[*index] = element.trim().parse::<i32>().unwrap_or(0);
+            }
+            self.shell_state.pipestatus = vector;
+        }
         self.exit_code = 0;
         true
     }

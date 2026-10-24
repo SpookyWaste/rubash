@@ -368,9 +368,43 @@ impl Executor {
         // instead reported an instant EOF (rubash#1204). A buffered
         // record still reports EOF-no-delimiter like GNU's unterminated
         // tail.
+        // rubash#1141: select's query is a read_builtin call
+        // (execute_cmd.c:3426 select_query over read.def), so TMOUT
+        // bounds it exactly like a read: an expired query returns NULL,
+        // which the loop treats as EOF.
+        let tmout_deadline = |executor: &Self| {
+            executor
+                .shell_state
+                .env_vars
+                .get("TMOUT")
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|t| t.is_finite() && *t > 0.0)
+                .map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s))
+        };
         if self.fd_table.fd0_bound_away_from_process_stdin() {
             self.fd_table.read_eof_no_delimiter = false;
-            return match self.fd_table.read_text(0, '\n', None, false, false, false) {
+            // Arm the fd table's read deadline so a materialized
+            // endpoint's production schedule can judge the record
+            // (fd_table::read_bytes). A regular file disables the
+            // timeout (read.def:499-505 S_ISREG rule), matching
+            // arm_read_deadline.
+            let saved_deadline = self.fd_table.read_deadline;
+            if saved_deadline.is_none()
+                && !matches!(
+                    self.fd_table.read_endpoint(0),
+                    Some(FdReadEndpoint::File(file))
+                        if crate::fd::is_disk_file(file.handle)
+                )
+            {
+                self.fd_table.read_deadline = tmout_deadline(self);
+            }
+            let line = self.fd_table.read_text(0, '\n', None, false, false, false);
+            self.fd_table.read_deadline = saved_deadline;
+            if self.fd_table.read_timed_out {
+                self.fd_table.read_timed_out = false;
+                return None;
+            }
+            return match line {
                 Some(line) => Some((line, self.fd_table.read_eof_no_delimiter)),
                 None => None,
             };
@@ -433,17 +467,44 @@ impl Executor {
             .get(FUNCTION_STDIN)
             .cloned()
             .unwrap_or_default();
+        // rubash#1141: judge the query against the stream's production
+        // schedule (materialized pipeline input): a line — or the EOF —
+        // that only arrives after TMOUT makes the query return NULL,
+        // exactly like the fd-0 paths above. A partial line cut by the
+        // deadline is discarded, as GNU's read timeout discards it
+        // before select_query ever sees a value.
         if *stdin_offset >= stdin_content.len() {
+            if let Some(timing) = self.timed_stdin.clone() {
+                let mut timing = timing.borrow_mut();
+                if timing.matches_len(stdin_content.len()) {
+                    let _ = timing.judge(None, *stdin_offset, tmout_deadline(self));
+                }
+            }
             return None;
         }
         let remaining = &stdin_content[*stdin_offset..];
-        let (input, at_eof) = if let Some(newline_pos) = remaining.find('\n') {
-            *stdin_offset += newline_pos + 1;
-            (remaining[..newline_pos].to_string(), false)
+        let (input, at_eof, new_offset) = if let Some(newline_pos) = remaining.find('\n') {
+            (
+                remaining[..newline_pos].to_string(),
+                false,
+                *stdin_offset + newline_pos + 1,
+            )
         } else {
-            *stdin_offset = stdin_content.len();
-            (remaining.to_string(), true)
+            (remaining.to_string(), true, stdin_content.len())
         };
+        if let Some(timing) = self.timed_stdin.clone() {
+            let mut timing = timing.borrow_mut();
+            if timing.matches_len(stdin_content.len()) {
+                let record_end = if at_eof { None } else { Some(new_offset) };
+                if matches!(
+                    timing.judge(record_end, *stdin_offset, tmout_deadline(self)),
+                    super::timed_input::TimedVerdict::Timeout { .. }
+                ) {
+                    return None;
+                }
+            }
+        }
+        *stdin_offset = new_offset;
         self.shell_state
             .env_vars
             .insert(FUNCTION_STDIN_OFFSET.to_string(), stdin_offset.to_string());

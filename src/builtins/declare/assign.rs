@@ -9,8 +9,9 @@ use super::storage::{
     is_noassign_bash_array, parse_array_tokens, parse_assoc_words, quote_assoc_storage_value,
 };
 use super::{
-    ARRAY_VARS, ASSOC_128_VARS, ASSOC_VARS, COMPOUND_ASSIGNMENT_MARKER, DECLARED_UNSET_VARS,
-    EXECUTION_FAILURE, EXECUTION_SUCCESS, INTEGER_VARS, NAMEREF_VARS, READONLY_VARS,
+    ARRAY_VARS, ASSOC_128_VARS, ASSOC_VARS, CAPCASE_VARS, COMPOUND_ASSIGNMENT_MARKER,
+    DECLARED_UNSET_VARS, EXECUTION_FAILURE, EXECUTION_SUCCESS, INTEGER_VARS, LOWERCASE_VARS,
+    NAMEREF_VARS, READONLY_VARS, UPPERCASE_VARS,
 };
 use crate::executor::arithmetic::eval_conditional_arith_value;
 use crate::executor::markers::{DATA_DOLLAR, STORAGE_WORD_PREFIX};
@@ -236,10 +237,16 @@ where
                     let key =
                         crate::executor::arithmetic::decode_arithmetic_assoc_key(index_expression)
                             .unwrap_or_else(|| index_expression.to_string());
+                    // rubash#1400: the bind converts through the
+                    // variable's own case attribute, set by an earlier
+                    // declare (`declare -uA h; declare h[k]=abc`
+                    // stores ABC) — the attrs.rs pass only converts
+                    // for attributes this command itself sets.
+                    let converted = declare_case_convert(value, variables, base);
                     let element = format!(
                         "([{}]={})",
                         super::storage::quote_assoc_key(&key),
-                        quote_assoc_storage_value(value)
+                        quote_assoc_storage_value(&converted)
                     );
                     let appended = append_assoc_value(&current, &element, integer, variables);
                     variables.insert(base.to_string(), appended);
@@ -320,6 +327,10 @@ where
                     } else {
                         value.to_string()
                     };
+                    // rubash#1400: same bind-time case conversion as
+                    // the assoc branch (`declare -u a; declare
+                    // a[0]=abc` stores ABC).
+                    let element = declare_case_convert(&element, variables, base);
                     entries.insert(index, element);
                     variables.insert(base.to_string(), format_indexed_array_storage(entries));
                     mark_typed(variables, ARRAY_VARS, base);
@@ -705,6 +716,11 @@ where
             status = EXECUTION_FAILURE;
             continue;
         }
+        // rubash#1400: whole-variable binds convert through the
+        // variable's own case attribute too (`declare -u s; declare
+        // s=abc` stores ABC; compound values convert per element,
+        // assoc keys never fold — rubash#1398).
+        let value = declare_case_convert_storage(&value, compound_operand, variables, var_name);
         variables.insert(var_name.to_string(), value.clone());
         unmark_typed(variables, DECLARED_UNSET_VARS, var_name);
         if compound_operand && !assoc && !variables.is_marked(ASSOC_VARS, var_name) {
@@ -730,6 +746,86 @@ where
         }
     }
     Ok(status)
+}
+
+/// GNU variables.c bind_variable_value: binding a value runs it
+/// through the variable's OWN att_uppercase / att_lowercase /
+/// att_capitalize. A declare operand therefore converts when the
+/// case attribute was set by an earlier command (`declare -uA h`
+/// then `declare h[k]=abc` stores ABC, rubash#1400); attributes set
+/// by THIS command are applied by the attrs.rs pass after the bind,
+/// so they are deliberately not consulted here.
+fn declare_case_convert(
+    value: &str,
+    variables: &crate::shell::var_table::VarTable,
+    name: &str,
+) -> String {
+    if variables.is_marked(UPPERCASE_VARS, name) {
+        value.to_uppercase()
+    } else if variables.is_marked(LOWERCASE_VARS, name) {
+        value.to_lowercase()
+    } else if variables.is_marked(CAPCASE_VARS, name) {
+        let mut chars = value.chars();
+        match chars.next() {
+            Some(first) => {
+                first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+            }
+            None => value.to_string(),
+        }
+    } else {
+        value.to_string()
+    }
+}
+
+fn declare_has_case_marks(variables: &crate::shell::var_table::VarTable, name: &str) -> bool {
+    variables.is_marked(UPPERCASE_VARS, name)
+        || variables.is_marked(LOWERCASE_VARS, name)
+        || variables.is_marked(CAPCASE_VARS, name)
+}
+
+/// Whole-variable form of [`declare_case_convert`]: the chain's
+/// result is a storage string for array/assoc targets, where only
+/// element VALUES convert (assoc keys never fold, rubash#1398), and
+/// a plain scalar for scalar targets.
+fn declare_case_convert_storage(
+    value: &str,
+    compound_operand: bool,
+    variables: &crate::shell::var_table::VarTable,
+    name: &str,
+) -> String {
+    if !declare_has_case_marks(variables, name) {
+        return value.to_string();
+    }
+    if variables.is_marked(ASSOC_VARS, name) {
+        let storage = value.strip_prefix(STORAGE_WORD_PREFIX).unwrap_or(value);
+        if storage.starts_with('(') {
+            let entries = parse_assoc_words(storage)
+                .into_iter()
+                .map(|(key, element)| (key, declare_case_convert(&element, variables, name)))
+                .collect::<Vec<_>>();
+            let rendered = format_assoc_storage(entries);
+            return if value.starts_with(STORAGE_WORD_PREFIX) {
+                format!("{STORAGE_WORD_PREFIX}{rendered}")
+            } else {
+                rendered
+            };
+        }
+        return declare_case_convert(value, variables, name);
+    }
+    if compound_operand
+        || variables.is_marked(ARRAY_VARS, name)
+        || value.starts_with(STORAGE_WORD_PREFIX)
+    {
+        let entries = indexed_array_entries(value);
+        if !entries.is_empty() || value.starts_with('(') {
+            let converted = entries
+                .into_iter()
+                .map(|(index, element)| (index, declare_case_convert(&element, variables, name)))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            return format_indexed_array_storage(converted);
+        }
+    }
+    declare_case_convert(value, variables, name)
 }
 
 /// GNU variables.c:3320 bind_variable -> assign_array_element: a scalar RHS

@@ -1021,14 +1021,29 @@ impl Executor {
                 // a plain declare draws never).
                 let print_requested = declare_args_request_print(&args);
                 let dynamic_views: Vec<(String, String)> = if print_requested {
-                    args.iter()
+                    let mut views: Vec<(String, String)> = args
+                        .iter()
                         .filter(|arg| !arg.starts_with('-') && !arg.starts_with('+'))
                         .filter_map(|arg| {
                             let name = arg.split('=').next().unwrap_or(arg);
                             self.dynamic_declaration_view(name)
                                 .map(|text| (name.to_string(), text))
                         })
-                        .collect()
+                        .collect();
+                    // Listing mode (no operands): GNU's full `declare -p`
+                    // includes a materialized PIPESTATUS array even though
+                    // its value lives outside the variable table
+                    // (rubash#1363) — pass its view so print_declare_names
+                    // can merge the name into the listing.
+                    let listing = args
+                        .iter()
+                        .all(|arg| arg.starts_with('-') || arg.starts_with('+'));
+                    if listing {
+                        if let Some(text) = self.dynamic_declaration_view("PIPESTATUS") {
+                            views.push(("PIPESTATUS".to_string(), text));
+                        }
+                    }
+                    views
                 } else {
                     Vec::new()
                 };
@@ -1116,6 +1131,12 @@ impl Executor {
             self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
             Ok(status)
         })();
+        // PIPESTATUS cell-shape transitions for this declare's operands
+        // (valueless creation / scalar->array conversion / binds) —
+        // see note_pipestatus_attribute_operands (rubash#1363/#1364).
+        if result.is_ok() {
+            self.note_pipestatus_attribute_operands(&args, declare_args_request_print(&args));
+        }
         if result.as_ref().is_ok_and(|status| *status == 0) {
             // Mirror the through-the-nameref assignments into the typed owner:
             // parameter expansion reads shell_state.variables first, so a
@@ -1200,13 +1221,13 @@ impl Executor {
     ) -> Result<i32, ExecuteError> {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let status = if self.shell_state.function_depth == 0 {
+        let (status, final_args) = if self.shell_state.function_depth == 0 {
             writeln!(
                 stderr,
                 "{}local: can only be used in a function",
                 self.diagnostic_prefix()
             )?;
-            1
+            (1, Vec::new())
         } else if let Err(option) = validate_local_options(&cmd.words[1..]) {
             writeln!(
                 stderr,
@@ -1214,7 +1235,7 @@ impl Executor {
                 self.diagnostic_prefix()
             )?;
             writeln!(stderr, "local: usage: local [option] name[=value] ...")?;
-            2
+            (2, Vec::new())
         } else {
             let mut args = self.expand_declare_assignment_args(&cmd.words[1..]);
             let mut args =
@@ -1369,8 +1390,20 @@ impl Executor {
                         .map_or(true, |name| !local_blocked.iter().any(|b| b == name))
                 });
             }
+            // GNU builtins/declare.def (local is declare with
+            // variable_context forced): `-g` suppresses the local creation
+            // and makes the builtin operate on the global variable
+            // (declare.def's -g handling in variable context). rubash#1471:
+            // execute_local used to localize every operand even with -g,
+            // so `local -g V=1` inside a function created a plain local
+            // that vanished at return. Mirror execute_declare: skip the
+            // frame save under -g and bracket the builtin call with the
+            // global-declare unshadow/restore pair so a same-named OUTER
+            // local stays in view for reads while the write lands on the
+            // global cell.
+            let force_global = declare_args_force_global(&args);
             let mut frame_locals: Vec<String> = Vec::new();
-            if !declare_args_request_print(&args) {
+            if !declare_args_request_print(&args) && !force_global {
                 let prefix_assignment_names = cmd
                     .assignment_keys()
                     .map(|name| assignment_name_and_append(name).0.to_string())
@@ -1412,6 +1445,10 @@ impl Executor {
                     self.diagnostic_prefix()
                 )?;
             }
+            // rubash#1471: under -g, unshadow same-named outer locals for
+            // the duration of the builtin call (the declare path's
+            // begin/finish pair); a no-op vec when -g is absent.
+            let global_local_values = self.begin_global_declare_for_local_names(&args);
             let (status, builtin_status) = if local_names(&args).is_empty()
                 && (had_dash_operand
                     || dash_printed
@@ -1532,8 +1569,22 @@ impl Executor {
                     }
                 }
             }
-            status
+            // rubash#1471: restore the outer locals begin unshadowed —
+            // the scope slots now hold the NEW global values (so a later
+            // frame exit restores the globals as declare -g left them),
+            // and the visible cells hold the outer locals again.
+            self.finish_global_declare_for_local_names(global_local_values);
+            (status, args)
         };
+        // Same PIPESTATUS shape transitions as execute_declare
+        // (rubash#1363/#1364); the -p-rewritten listing form reports
+        // print_requested and stands down.
+        if status == 0 {
+            self.note_pipestatus_attribute_operands(
+                &final_args,
+                declare_args_request_print(&final_args),
+            );
+        }
         let stderr = local_stderr_from_declare(stderr);
         self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
         Ok(status)

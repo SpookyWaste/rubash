@@ -363,35 +363,48 @@ where
     W: Write,
     E: Write,
 {
-    let Some(first) = args.first().map(String::as_str) else {
+    if args.is_empty() {
         write_kill_usage(stderr)?;
         return Ok(2);
-    };
+    }
 
-    if matches!(first, "-l" | "-L") {
-        if args.len() == 1 || args.get(1).is_some_and(|value| value == "-1") {
-            // POSIX mode (bash posix-mode notes / kill.def list_signals
-            // under POSIX_MODE): the bare list is ONE line of bare signal
-            // names, space-separated, no numbers and no SIG prefix
-            // (rubash#1054).
-            if posix {
-                write_signal_list_posix(stdout)?;
-            } else {
-                write_signal_list(stdout)?;
-            }
-            return Ok(0);
+    // GNU builtins/kill.def:104-168 kill_builtin: ONE option loop feeds
+    // both the listing dispatch and the delivery loop. `-l`/`-L` only set
+    // the listing flag, `-s`/`-n` (separate or attached) and a leading
+    // `-sigspec` word decode a signal (an invalid spec is remembered, not
+    // reported yet — with listing set it is never reported at all), `--`
+    // ends the loop, and the first non-option word ends it too. After
+    // the loop: listing -> display_signal_list(rest); else a NO_SIG spec
+    // -> sh_invalidsig; else no operands -> builtin_usage (EX_USAGE).
+    // The previous two-branch shape (a `-l`-first branch plus a delivery
+    // loop) diverged on the whole option-soup class: `kill -l -s TERM`
+    // listed nothing instead of the full list, `kill -s TERM -l` read
+    // `-l` as a pid operand, and `kill -l --` reported `--` as a bad
+    // sigspec (rubash#1399 family).
+    let mut listing = false;
+    let mut signal: Option<i32> = Some(15);
+    let mut sigspec: &str = "TERM";
+    // kill.def saw_signal: once any signal spec is seen (separate or
+    // attached), a later `-word` is an operand (process group) rather
+    // than another signal specification.
+    let mut saw_signal = false;
+    let mut index = 0;
+    while let Some(value) = args.get(index).map(String::as_str) {
+        if value == "-l" || value == "-L" {
+            listing = true;
+            index += 1;
+            continue;
         }
-        let mut status = 0;
-        let mut i = 1;
-        while i < args.len() {
-            let value = &args[i];
-            // GNU builtins/kill.def:114-132: `-s`/`-n` (separate or attached)
-            // are processed even when `-l` was seen; a trailing `-s` with no
-            // argument is `sh_needarg` ("option requires an argument"),
-            // not "invalid signal specification" (rubash#1399). The consumed
-            // sigspec is not listed.
-            if value == "-s" || value == "-n" {
-                if args.get(i + 1).is_none() {
+        // kill.def:114-142: `-s`/`-n` take the next word; the spec may
+        // also be attached (`-sNAME` with an alphabetic next char,
+        // `-nNUM` with a digit). A trailing separate form with no next
+        // word is sh_needarg ("option requires an argument", kill.def:
+        // 130-131) and returns EXECUTION_FAILURE immediately — even in
+        // listing mode (rubash#1399: `kill -l -s`).
+        let spec_form: Option<(&str, usize)> = if value == "-s" || value == "-n" {
+            match args.get(index + 1).map(String::as_str) {
+                Some(spec) => Some((spec, 2)),
+                None => {
                     writeln!(
                         stderr,
                         "{}kill: {value}: option requires an argument",
@@ -399,150 +412,64 @@ where
                     )?;
                     return Ok(1);
                 }
-                i += 2;
-                continue;
             }
-            let attached = value
-                .strip_prefix("-s")
-                .filter(|s| s.chars().next().is_some_and(|c| c.is_ascii_alphabetic()))
-                .or_else(|| {
-                    value
-                        .strip_prefix("-n")
-                        .filter(|s| s.chars().next().is_some_and(|c| c.is_ascii_digit()))
-                });
-            if attached.is_some() {
-                i += 1;
-                continue;
-            }
-            // GNU builtins/common.c:795-810 display_signal_list: a numeric
-            // argument is range-checked against NSIG; an IN-RANGE number
-            // whose slot has no name (glibc's reserved RT slots 32/33 —
-            // bash's signames array holds SIGJUNK there) prints NOTHING and
-            // keeps rc 0. Only an out-of-range number is an error
-            // (rubash#230: `kill -l 32` must be silent rc=0).
-            if let Ok(mut number) = value.parse::<i32>() {
-                if number > 128 {
-                    number -= 128;
-                }
-                if number == 0 {
-                    // signal_name slot 0 is bash's EXIT (signames.c), and
-                    // common.c prints it for `kill -l 0`.
-                    writeln!(stdout, "EXIT")?;
-                } else if !(0..=64).contains(&number) {
-                    writeln!(
-                        stderr,
-                        "{}kill: {value}: invalid signal specification",
-                        diagnostic_prefix()
-                    )?;
-                    status = 1;
-                } else if let Some(translation) = signal_name(number) {
-                    writeln!(stdout, "{translation}")?;
-                }
-                i += 1;
-                continue;
-            }
-            if let Some(translation) = translate_signal(value) {
-                writeln!(stdout, "{translation}")?;
-            } else {
-                writeln!(
-                    stderr,
-                    "{}kill: {value}: invalid signal specification",
-                    diagnostic_prefix()
-                )?;
-                status = 1;
-            }
-            i += 1;
-        }
-        return Ok(status);
-    }
-
-    let mut signal = 15;
-    let mut index = 0;
-    let mut operands_start = 0;
-    // GNU builtins/kill.def:99,124 saw_signal: once any signal spec is seen
-    // (separate or attached), a later `-word` is an operand (process group)
-    // rather than another signal specification.
-    let mut saw_signal = false;
-    while let Some(value) = args.get(index).map(String::as_str) {
-        if value == "--" {
-            operands_start = index + 1;
-            break;
-        }
-        if value == "-s" || value == "-n" {
-            let Some(sigspec) = args.get(index + 1).map(String::as_str) else {
-                // GNU builtins/kill.def:130-131: sh_needarg(word) prints
-                // "kill: -s: option requires an argument" with the full
-                // diagnostic prolog, then returns EXECUTION_FAILURE.
-                writeln!(
-                    stderr,
-                    "{}kill: {value}: option requires an argument",
-                    diagnostic_prefix()
-                )?;
-                return Ok(1);
-            };
-            if !sigspec_accepted(sigspec, posix) {
-                writeln!(
-                    stderr,
-                    "{}kill: {sigspec}: invalid signal specification",
-                    diagnostic_prefix()
-                )?;
-                return Ok(1);
-            }
-            signal = signal_number_from_spec(sigspec).unwrap_or(15);
-            index += 2;
-            operands_start = index;
-            saw_signal = true;
-            continue;
-        }
-        // GNU builtins/kill.def:134-142: the signal spec may be attached to
-        // the option letter — `-sNAME` when the letter is followed by an
-        // alphabetic char, `-nNUM` when followed by a digit.
-        let attached = value
+        } else if let Some(spec) = value
             .strip_prefix("-s")
             .filter(|s| s.chars().next().is_some_and(|c| c.is_ascii_alphabetic()))
-            .or_else(|| {
-                value
-                    .strip_prefix("-n")
-                    .filter(|s| s.chars().next().is_some_and(|c| c.is_ascii_digit()))
-            });
-        if let Some(sigspec) = attached {
-            if !sigspec_accepted(sigspec, posix) {
-                writeln!(
-                    stderr,
-                    "{}kill: {sigspec}: invalid signal specification",
-                    diagnostic_prefix()
-                )?;
-                return Ok(1);
-            }
-            signal = signal_number_from_spec(sigspec).unwrap_or(15);
-            index += 1;
-            operands_start = index;
+        {
+            Some((spec, 1))
+        } else if let Some(spec) = value
+            .strip_prefix("-n")
+            .filter(|s| s.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        {
+            Some((spec, 1))
+        } else {
+            None
+        };
+        if let Some((spec, advance)) = spec_form {
+            sigspec = spec;
+            signal = decode_signal_spec(spec, posix);
             saw_signal = true;
+            index += advance;
             continue;
         }
-        if value.starts_with('-') && value != "-" && !saw_signal {
-            // GNU kill.def takes the signal spec as the word after
-            // exactly one leading dash, so `--badflag` reports
-            // `-badflag` in the diagnostic (rubash#1259); stripping all
-            // dashes printed the bare `badflag`.
-            let sigspec = value.strip_prefix('-').unwrap_or(value);
-            if !sigspec_accepted(sigspec, posix) {
-                writeln!(
-                    stderr,
-                    "{}kill: {sigspec}: invalid signal specification",
-                    diagnostic_prefix()
-                )?;
-                return Ok(1);
-            }
-            signal = signal_number_from_spec(sigspec).unwrap_or(15);
+        if value == "--" {
             index += 1;
-            operands_start = index;
+            break;
+        }
+        if value == "-?" {
+            // kill.def ISOPTION(word, '?'): builtin_usage, EX_USAGE.
+            write_kill_usage(stderr)?;
+            return Ok(2);
+        }
+        if value.starts_with('-') && !saw_signal {
+            // kill.def takes the signal spec as the word after exactly
+            // one leading dash, so `--badflag` reports `-badflag` in the
+            // diagnostic (rubash#1259) and a bare `-` decodes the empty
+            // spec (invalid, per the GNU oracle).
+            sigspec = value.strip_prefix('-').unwrap_or(value);
+            signal = decode_signal_spec(sigspec, posix);
             saw_signal = true;
+            index += 1;
             continue;
         }
-        operands_start = index;
         break;
     }
+    let operands_start = index;
+
+    if listing {
+        return display_kill_list(&args[operands_start..], posix, stdout, stderr);
+    }
+
+    let Some(signal) = signal else {
+        // kill.def:171-175: sig == NO_SIG -> sh_invalidsig(sigspec).
+        writeln!(
+            stderr,
+            "{}kill: {sigspec}: invalid signal specification",
+            diagnostic_prefix()
+        )?;
+        return Ok(1);
+    };
 
     if operands_start >= args.len() {
         write_kill_usage(stderr)?;
@@ -713,11 +640,6 @@ pub fn translate_signal(value: &str) -> Option<&'static str> {
         return Some("EXIT");
     }
 
-    // DSIG_NOCASE: the EXIT pseudo-signal folds case too.
-    if value.eq_ignore_ascii_case("EXIT") || value.eq_ignore_ascii_case("SIGEXIT") {
-        return Some("0");
-    }
-
     if let Ok(mut number) = value.parse::<i32>() {
         if number > 128 {
             number -= 128;
@@ -725,39 +647,147 @@ pub fn translate_signal(value: &str) -> Option<&'static str> {
         return signal_name(number);
     }
 
-    let name = value.strip_prefix("SIG").unwrap_or(value);
-    signal_number(name)
+    decode_signal_name(value, true)
 }
 
-/// The kill signal-spec validator for the `-s`/`-n`/`-SPEC` forms. GNU
-/// kill.def:103 sets DSIG_NOCASE unconditionally but only adds
-/// DSIG_SIGPREFIX when not posixly_correct: names fold case, but a
-/// SIG-prefixed spelling (any case) is rejected in POSIX mode.
-fn sigspec_accepted(value: &str, posix: bool) -> bool {
-    if posix && value.len() > 3 && value[..3].eq_ignore_ascii_case("SIG") {
-        return false;
+/// GNU general.c valid_number: leading whitespace is skipped, an
+/// optional sign follows, then digits, then trailing whitespace, and
+/// the whole word must be consumed. Returns the parsed value.
+fn valid_number(value: &str) -> Option<i64> {
+    let trimmed = value.trim();
+    let digits = trimmed
+        .strip_prefix('+')
+        .or_else(|| trimmed.strip_prefix('-'))
+        .unwrap_or(trimmed);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
-    translate_signal(value).is_some()
+    trimmed.parse::<i64>().ok()
+}
+
+/// The `SIG` prefix of a signal spec, folded case-insensitively (GNU
+/// trap.c:236 decode_signal compares with strcasecmp under DSIG_NOCASE,
+/// which kill.def:103 sets unconditionally).
+fn strip_sig_prefix(value: &str) -> Option<&str> {
+    (value.len() >= 3 && value[..3].eq_ignore_ascii_case("SIG")).then(|| &value[3..])
+}
+
+/// GNU trap.c:236 decode_signal, name half, with the kill.def:103 /
+/// common.c:823 dflags (DSIG_NOCASE always; DSIG_SIGPREFIX unless POSIX
+/// mode): signal_names[] entries are `SIG<name>` — the bare name compares
+/// first and the prefixed spelling second — except slot 0, whose entry
+/// is `EXIT` with NO `SIG` in it, so `EXIT` (any case) decodes to 0 but
+/// a prefixed `SIGEXIT` (any case) is NO_SIG in every mode. Returns the
+/// signal number as a string. The previous implementation stripped only
+/// an exact-uppercase `SIG` and special-cased `SIGEXIT` as valid, so
+/// mixed/lowercase prefixed spellings (`SigTerm`, `sigterm`, `sighup`)
+/// were rejected by `kill -l` (rubash#1386) and the `-s` validator.
+fn decode_signal_name(value: &str, allow_sig_prefix: bool) -> Option<&'static str> {
+    if value.eq_ignore_ascii_case("EXIT") {
+        return Some("0");
+    }
+    let bare = if allow_sig_prefix {
+        strip_sig_prefix(value).unwrap_or(value)
+    } else {
+        value
+    };
+    if bare.eq_ignore_ascii_case("EXIT") {
+        return None;
+    }
+    signal_number(bare)
+}
+
+/// GNU trap.c:236 decode_signal, whole spec: a valid_number is the
+/// signal number itself (no 128 adjustment — that mapping exists only
+/// in display_signal_list's exit-status translation), anything else is
+/// a name. A number naming a hole in the table (glibc's reserved 32/33)
+/// stays NO_SIG here: the SIGNALS table is the acceptance contract the
+/// rest of the kill machinery (mailbox wire numbers, `kill -l` holes)
+/// is built on.
+fn decode_signal_spec(value: &str, posix: bool) -> Option<i32> {
+    if let Some(number) = valid_number(value) {
+        if number == 0 {
+            return Some(0);
+        }
+        return (number >= 1 && number <= 64 && signal_name(number as i32).is_some())
+            .then_some(number as i32);
+    }
+    decode_signal_name(value, !posix)?.parse::<i32>().ok()
 }
 
 fn signal_number_from_spec(value: &str) -> Option<i32> {
-    if value == "0" {
-        return Some(0);
-    }
+    decode_signal_spec(value, false)
+}
 
-    let name = value.strip_prefix("SIG").unwrap_or(value);
-    if name == "EXIT" {
-        return Some(0);
-    }
+/// The kill signal-spec validator for the `-s`/`-n`/`-SPEC` forms:
+/// exactly decode_signal_spec (kept as a named entry for the POSIX
+/// sigspec unit tests). The previous validator accepted a spec through
+/// translate_signal but the caller then re-decoded it with an
+/// exact-uppercase-only prefix strip and an exact `EXIT` compare, so
+/// `kill -s SigTerm` was rejected and `kill -s Exit` fell through to
+/// the TERM default and delivered the wrong signal (rubash#1385).
+fn sigspec_accepted(value: &str, posix: bool) -> bool {
+    decode_signal_spec(value, posix).is_some()
+}
 
-    if let Ok(mut number) = value.parse::<i32>() {
-        if number > 128 {
-            number -= 128;
+/// GNU builtins/common.c:747 display_signal_list over the words left
+/// after kill's option loop: no words -> the full list (POSIX mode: the
+/// one-line bare-names form, rubash#1054); a numeric word prints the
+/// signal name (with the >128 exit-status adjustment; an in-range hole
+/// prints nothing and keeps rc 0, rubash#230; 0 prints EXIT); a name
+/// word prints its number via decode_signal; an undecodable word is
+/// sh_invalidsig and the status becomes EXECUTION_FAILURE.
+fn display_kill_list<W, E>(
+    list: &[String],
+    posix: bool,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> io::Result<i32>
+where
+    W: Write,
+    E: Write,
+{
+    if list.is_empty() {
+        if posix {
+            write_signal_list_posix(stdout)?;
+        } else {
+            write_signal_list(stdout)?;
         }
-        return (number == 0 || signal_name(number).is_some()).then_some(number);
+        return Ok(0);
     }
-
-    signal_number(name)?.parse::<i32>().ok()
+    let mut status = 0;
+    for value in list {
+        let value = value.as_str();
+        if let Some(mut number) = valid_number(value) {
+            if number > 128 {
+                number -= 128;
+            }
+            if number == 0 {
+                writeln!(stdout, "EXIT")?;
+            } else if !(0..=64).contains(&number) {
+                writeln!(
+                    stderr,
+                    "{}kill: {value}: invalid signal specification",
+                    diagnostic_prefix()
+                )?;
+                status = 1;
+            } else if let Some(translation) = signal_name(number as i32) {
+                writeln!(stdout, "{translation}")?;
+            }
+            continue;
+        }
+        if let Some(translation) = decode_signal_name(value, !posix) {
+            writeln!(stdout, "{translation}")?;
+        } else {
+            writeln!(
+                stderr,
+                "{}kill: {value}: invalid signal specification",
+                diagnostic_prefix()
+            )?;
+            status = 1;
+        }
+    }
+    Ok(status)
 }
 
 fn parse_pid(value: &str) -> Option<i32> {
@@ -1020,7 +1050,10 @@ fn take_all_signals() -> Vec<i32> {
     //     with no traps (the common loop case).
     let self_pending = PENDING_ANY.load(std::sync::atomic::Ordering::Acquire);
     let kernel_pending = kernel_signals::handler_any_installed();
-    if !self_pending && !kernel_pending {
+    // rubash#1475: the fatal pair's handler is always installed, so its
+    // queue is a third independent producer for this drain.
+    let fatal_pending = kernel_signals::fatal_pending_any();
+    if !self_pending && !kernel_pending && !fatal_pending {
         return Vec::new();
     }
     let mut signals = if self_pending {
@@ -1030,6 +1063,9 @@ fn take_all_signals() -> Vec<i32> {
     };
     if kernel_pending {
         signals.extend(kernel_signals::drain());
+    }
+    if fatal_pending {
+        signals.extend(kernel_signals::drain_fatal());
     }
     // Clear only when both sources are provably empty again. A delivery
     // that raced this drain either set PENDING_ANY or installed a handler
@@ -2053,7 +2089,189 @@ mod kernel_signals {
     /// (trap cleared): SIG_DFL would have killed the process and SIG_IGN
     /// swallows, so neither can produce a legitimate pending entry.
     pub(super) fn handler_installed(sig: i32) -> bool {
+        if fatal_index(sig).is_some() {
+            // The fatal-pair handler is installed unconditionally at
+            // startup (rubash#1475); a queued entry for the pair is
+            // legitimate by construction, never a stale registry flag.
+            return true;
+        }
         MANAGED.contains(&sig) && HANDLER_SET.load(Ordering::Relaxed) & bit(sig) != 0
+    }
+
+    /// rubash#1475: the fatal pair, SIGSEGV and SIGBUS. Both are caught
+    /// by the Rust runtime before main() — its stack-overflow guard
+    /// installs a handler for them (visible in /proc/self/status SigCgt
+    /// on every rubash process) — and that handler RETURNS for a signal
+    /// that was SENT rather than faulted, so an untrapped `kill -SEGV
+    /// $$`, whether from this shell's own kill builtin (a real raise(2)
+    /// on unix) or from any other process, was silently swallowed and
+    /// the shell ran on. GNU runs both at SIG_DFL in a script shell
+    /// (sig.c initialize_signals never catches them), so an untrapped
+    /// delivery kills the shell and a trapped one runs its trap.
+    /// signal_hook cannot serve the pair: its handler is a signo queue
+    /// writer with no siginfo, and returning from a handler for a
+    /// synchronous fault re-executes the faulting instruction forever.
+    /// The custom handler below splits arrivals on siginfo.si_code:
+    ///   - si_code <= 0 (SI_USER / SI_TKILL / SI_QUEUE / ...): the
+    ///     signal was SENT. With a trap armed, count it for the boundary
+    ///     dispatcher (drained through drain_fatal into the same
+    ///     Vec<i32> as the managed set); with `trap ''`, drop it;
+    ///     untrapped, restore SIG_DFL and re-raise so the process dies
+    ///     BY the signal on the spot, exactly as a default disposition.
+    ///   - si_code > 0: a hardware fault (SEGV_MAPERR, BUS_ADRALN...).
+    ///     Chain to the disposition saved at install time — in practice
+    ///     the runtime's overflow handler — so stack-overflow detection
+    ///     and genuine-fault death keep working byte for byte.
+    const FATAL: [i32; 2] = [libc::SIGSEGV as i32, libc::SIGBUS as i32];
+
+    /// Queued SENT deliveries per fatal signal (handler increments,
+    /// drain_fatal swaps out; a plain atomic add is async-signal-safe).
+    static FATAL_PENDING: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+    /// Trap routing for SENT deliveries, per fatal signal:
+    /// 0 = Default (die), 1 = Ignore (drop), 2 = Handler (queue).
+    /// Mirrored from the trap table by reconcile_fatal.
+    static FATAL_STATE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+    /// Dispositions saved when the fatal handler was installed — the
+    /// hardware-fault chain targets. Written once inside
+    /// capture_entry_and_policy's Once before the handler is installed;
+    /// the Once's happens-before edge covers the handler's later reads.
+    static FATAL_PREV_HANDLER: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    static FATAL_PREV_FLAGS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+    fn fatal_index(sig: i32) -> Option<usize> {
+        FATAL.iter().position(|&f| f == sig)
+    }
+
+    extern "C" fn fatal_signal_handler(
+        sig: i32,
+        info: *mut libc::siginfo_t,
+        context: *mut libc::c_void,
+    ) {
+        let Some(index) = fatal_index(sig) else {
+            return;
+        };
+        let si_code = if info.is_null() {
+            0
+        } else {
+            unsafe { (*info).si_code }
+        };
+        if si_code > 0 {
+            // Hardware fault: chain to the saved disposition.
+            let prev = FATAL_PREV_HANDLER[index].load(Ordering::Relaxed) as usize;
+            match prev {
+                libc::SIG_IGN => return,
+                libc::SIG_DFL | 0 => {
+                    set_kernel_handler(sig, libc::SIG_DFL);
+                    unsafe { libc::raise(sig) };
+                    return;
+                }
+                _ => {}
+            }
+            let prev_flags = FATAL_PREV_FLAGS[index].load(Ordering::Relaxed) as i32;
+            // SAFETY: prev is the handler address the process had
+            // installed for this signal at startup (the Rust runtime's
+            // overflow guard); invoking it with the delivery's own
+            // arguments is exactly what the kernel would have done.
+            unsafe {
+                if prev_flags & libc::SA_SIGINFO != 0 {
+                    let handler: extern "C" fn(i32, *mut libc::siginfo_t, *mut libc::c_void) =
+                        std::mem::transmute(prev);
+                    handler(sig, info, context);
+                } else {
+                    let handler: extern "C" fn(i32) = std::mem::transmute(prev);
+                    handler(sig);
+                }
+            }
+            return;
+        }
+        // Sent by kill/tgkill/raise/sigqueue: shell semantics apply.
+        match FATAL_STATE[index].load(Ordering::Relaxed) {
+            2 => {
+                FATAL_PENDING[index].fetch_add(1, Ordering::Relaxed);
+            }
+            1 => {}
+            _ => {
+                set_kernel_handler(sig, libc::SIG_DFL);
+                unsafe { libc::raise(sig) };
+            }
+        }
+    }
+
+    /// Install the fatal-pair handler, saving the current dispositions
+    /// as the hardware-fault chain targets. Called from
+    /// capture_entry_and_policy's Once, before any trap can exist, so
+    /// both signals start at Default routing (an untrapped sent delivery
+    /// dies). A signal that is SIG_IGN at this point (entry-ignored, or
+    /// on a platform whose runtime ignores it) starts at Ignore routing
+    /// and reconcile_fatal never arms it — POSIX hard-ignore.
+    fn install_fatal_handlers() {
+        for (index, &sig) in FATAL.iter().enumerate() {
+            let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+            unsafe { libc::sigaction(sig, std::ptr::null(), &mut current) };
+            FATAL_PREV_HANDLER[index].store(current.sa_sigaction as u64, Ordering::Relaxed);
+            FATAL_PREV_FLAGS[index].store(current.sa_flags as i64 as u64, Ordering::Relaxed);
+            if current.sa_sigaction == libc::SIG_IGN {
+                FATAL_STATE[index].store(1, Ordering::Relaxed);
+            }
+            let action = libc::sigaction {
+                sa_sigaction: fatal_signal_handler as *const () as usize,
+                sa_flags: libc::SA_SIGINFO,
+                sa_mask: unsafe { std::mem::zeroed() },
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                sa_restorer: None,
+            };
+            unsafe { libc::sigaction(sig, &action, std::ptr::null_mut()) };
+        }
+    }
+
+    /// Drain the fatal pair's queued SENT deliveries (take_all_signals
+    /// merges them with the managed drain).
+    pub(super) fn drain_fatal() -> Vec<i32> {
+        let mut signals = Vec::new();
+        for (index, &sig) in FATAL.iter().enumerate() {
+            let count = FATAL_PENDING[index].swap(0, Ordering::Relaxed);
+            for _ in 0..count {
+                signals.push(sig);
+            }
+        }
+        signals
+    }
+
+    pub(super) fn fatal_pending_any() -> bool {
+        FATAL_PENDING
+            .iter()
+            .any(|count| count.load(Ordering::Relaxed) > 0)
+    }
+
+    /// True when both fatal signals sit at Default routing, so the
+    /// boundary reconcile's fast path may skip the trap-table walk.
+    pub(super) fn fatal_at_default() -> bool {
+        FATAL_STATE
+            .iter()
+            .all(|state| state.load(Ordering::Relaxed) == 0)
+    }
+
+    /// Mirror the trap table's wishes for the fatal pair (the managed
+    /// reconcile's Disposition mapping): Handler queues sent deliveries
+    /// for the boundary dispatcher, Ignore drops them, Default restores
+    /// die-on-delivery. Entry-ignored signals stay pinned at Ignore.
+    pub(super) fn reconcile_fatal(dispositions: &[(i32, Disposition)]) {
+        for &(sig, want) in dispositions {
+            let Some(index) = fatal_index(sig) else {
+                continue;
+            };
+            if FATAL_PREV_HANDLER[index].load(Ordering::Relaxed) as usize == libc::SIG_IGN {
+                continue;
+            }
+            let target = match want {
+                Disposition::Handler => 2u64,
+                Disposition::Ignore => 1u64,
+                Disposition::Default => 0u64,
+            };
+            FATAL_STATE[index].store(target, Ordering::Relaxed);
+        }
     }
 
     /// rubash#1250: foreground-builtin SIGINT hold. While set, the
@@ -2122,6 +2340,9 @@ mod kernel_signals {
                 set_kernel_handler(libc::SIGQUIT as i32, libc::SIG_IGN);
             }
             store_state(libc::SIGQUIT as i32, 1);
+            // rubash#1475: replace the runtime's SIGSEGV/SIGBUS handlers
+            // with the fatal-pair handler (see install_fatal_handlers).
+            install_fatal_handlers();
         });
     }
 
@@ -2370,13 +2591,24 @@ pub fn reconcile_kernel_trap_dispositions(env_vars: &std::collections::HashMap<S
             break;
         }
     }
+    // rubash#1475: a trap on the fatal pair (SIGSEGV/SIGBUS) also forces
+    // the slow path — its routing bits live outside the managed state.
+    if !any_armed {
+        any_armed = env_vars.contains_key("__RUBASH_TRAP_SIGSEGV")
+            || env_vars.contains_key("__RUBASH_TRAP_SIGBUS");
+    }
     // An armed EXIT trap also forces the slow path: it routes every
     // otherwise-untrapped managed signal through the handler
     // (sig.c:226-229, rubash#1332 — see the disposition loop below).
     let exit_armed = env_vars
         .get("__RUBASH_TRAP_EXIT")
         .is_some_and(|action| !action.is_empty());
-    if !any_armed && !exit_armed && no_reset && kernel_signals::at_default_state() {
+    if !any_armed
+        && !exit_armed
+        && no_reset
+        && kernel_signals::at_default_state()
+        && kernel_signals::fatal_at_default()
+    {
         return;
     }
     let reset = env_vars
@@ -2416,6 +2648,28 @@ pub fn reconcile_kernel_trap_dispositions(env_vars: &std::collections::HashMap<S
         *slot = (sig, want);
     }
     kernel_signals::reconcile(&dispositions);
+    // rubash#1475: mirror the fatal pair's trap state into the fatal
+    // handler's routing bits, with the same mapping as the managed set
+    // (a reset-listed fatal trap behaves like no trap; an armed EXIT
+    // trap does NOT reroute the pair — GNU's sig.c:226-229 applies to
+    // the terminating-signal handler set, and a fatal signal's default
+    // death already runs the EXIT trap through the shell's exit path).
+    let fatal_want = |short: &str, key: &str| match env_vars.get(key) {
+        Some(action) if !action.is_empty() && !reset_contains(reset, short) => Disposition::Handler,
+        Some(_) if reset_contains(reset, short) => Disposition::Default,
+        Some(_) => Disposition::Ignore,
+        None => Disposition::Default,
+    };
+    kernel_signals::reconcile_fatal(&[
+        (
+            libc::SIGSEGV as i32,
+            fatal_want("SEGV", "__RUBASH_TRAP_SIGSEGV"),
+        ),
+        (
+            libc::SIGBUS as i32,
+            fatal_want("BUS", "__RUBASH_TRAP_SIGBUS"),
+        ),
+    ]);
 }
 
 /// Short signal name (TERM) for the __RUBASH_TRAP_SIG* key family, matching
@@ -3196,5 +3450,71 @@ mod posix_sigspec_tests {
         assert!(sigspec_accepted("KILL", true));
         assert!(sigspec_accepted("15", true));
         assert!(sigspec_accepted("TERM", false));
+    }
+
+    /// rubash#1386: `kill -l` name lookup folds case on the whole spec —
+    /// the SIG prefix included — so mixed/lowercase prefixed spellings
+    /// print their number like the uppercase ones.
+    #[test]
+    fn mixed_case_prefixed_names_translate() {
+        for spec in ["SigTerm", "sigterm", "SIGTERM", "sIgTeRm", "Term", "term"] {
+            assert_eq!(translate_signal(spec), Some("15"), "{spec}");
+        }
+        assert_eq!(translate_signal("sighup"), Some("1"));
+        assert_eq!(translate_signal("SigHup"), Some("1"));
+        assert_eq!(translate_signal("sigusr1"), Some("10"));
+    }
+
+    /// rubash#1386: the EXIT pseudo-signal takes no SIG prefix in GNU
+    /// (signal_names[0] is "EXIT", not "SIGEXIT") — bare EXIT folds case
+    /// and translates to 0; every prefixed spelling is invalid.
+    #[test]
+    fn exit_takes_no_sig_prefix_in_translation() {
+        for spec in ["EXIT", "Exit", "exit"] {
+            assert_eq!(translate_signal(spec), Some("0"), "{spec}");
+        }
+        for spec in ["SIGEXIT", "SigExit", "sigexit"] {
+            assert_eq!(translate_signal(spec), None, "{spec}");
+        }
+    }
+
+    /// rubash#1385: the `-s`/`-n`/`-SPEC` decode folds case on the whole
+    /// spec, so mixed/lowercase prefixed spellings resolve to the same
+    /// signal number as the uppercase ones.
+    #[test]
+    fn mixed_case_prefixed_specs_decode() {
+        for spec in ["SigTerm", "sigterm", "SIGTERM", "sIgTeRm", "Term", "term"] {
+            assert!(sigspec_accepted(spec, false), "{spec}");
+            assert_eq!(signal_number_from_spec(spec), Some(15), "{spec}");
+        }
+        assert_eq!(signal_number_from_spec("sighup"), Some(1));
+        assert_eq!(signal_number_from_spec("SigHup"), Some(1));
+        assert_eq!(signal_number_from_spec("sigusr1"), Some(10));
+    }
+
+    /// rubash#1385: bare EXIT (any case) decodes to signal 0 in both
+    /// modes — the old exact-`EXIT` compare let `kill -s Exit` fall
+    /// through to the TERM default — and every SIG-prefixed EXIT
+    /// spelling is NO_SIG.
+    #[test]
+    fn exit_decodes_to_zero_without_prefix() {
+        for spec in ["EXIT", "Exit", "exit"] {
+            assert_eq!(signal_number_from_spec(spec), Some(0), "{spec}");
+            assert!(sigspec_accepted(spec, true), "{spec}");
+        }
+        for spec in ["SIGEXIT", "SigExit", "sigexit"] {
+            assert_eq!(signal_number_from_spec(spec), None, "{spec}");
+            assert!(!sigspec_accepted(spec, false), "{spec}");
+        }
+    }
+
+    /// POSIX mode drops DSIG_SIGPREFIX: prefixed spellings fold case for
+    /// the rejection too, bare names still decode.
+    #[test]
+    fn posix_rejects_prefixed_specs_in_any_case() {
+        assert!(!sigspec_accepted("sigterm", true));
+        assert!(!sigspec_accepted("SigTerm", true));
+        assert!(sigspec_accepted("term", true));
+        assert!(sigspec_accepted("Term", true));
     }
 }

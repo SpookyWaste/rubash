@@ -307,10 +307,9 @@ impl Executor {
                 )?;
                 Ok(())
             }
-            "time" => {
-                self.execute_time_command_node(&builtin_cmd)?;
-                Ok(())
-            }
+            // No "time" arm (rubash#1369): `time` is a reserved word,
+            // not a shell builtin, so `builtin time ...` takes the
+            // default arm's `builtin: time: not a shell builtin`, rc=1.
             "trap" => {
                 self.exit_code = self.execute_trap(&builtin_cmd)?;
                 Ok(())

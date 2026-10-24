@@ -84,6 +84,15 @@ impl Executor {
         let Some(command) = commands.get(index) else {
             return Ok(None);
         };
+        // rubash#1355: an assignment prefix makes `!` an ordinary word
+        // (GNU parse.y simple_command prefix rule) — only an
+        // alias-INTRODUCED `!` on a prefix-free command may invert.
+        if !command.assignments.is_empty()
+            || !command.compound_assignments.is_empty()
+            || !command.array_element_assignments.is_empty()
+        {
+            return Ok(None);
+        }
         let words = self.expand_aliases(&command.words);
         if words.first().map(String::as_str) != Some("!") {
             return Ok(None);
@@ -245,6 +254,14 @@ impl Executor {
         let Some(command) = commands.get(index) else {
             return Ok(None);
         };
+        // rubash#1355: same prefix rule as the inversion probe above —
+        // after `A=1`, `time` is a command name, not the keyword.
+        if !command.assignments.is_empty()
+            || !command.compound_assignments.is_empty()
+            || !command.array_element_assignments.is_empty()
+        {
+            return Ok(None);
+        }
         let words = self.expand_aliases(&command.words);
         if words.first().map(String::as_str) != Some("time") {
             return Ok(None);

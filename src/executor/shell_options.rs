@@ -371,6 +371,57 @@ impl Executor {
         }
     }
 
+    /// GNU test.c: a `/dev/fd/N` operand names the shell's OWN descriptor
+    /// N (via the magic symlink). Process-substitution and coproc
+    /// descriptors are virtual in this executor — stat() on the path
+    /// would interrogate the host process's unrelated fd N — so mirror
+    /// the pipe-like endpoints into __RUBASH_FD_PIPE_<fd> right before
+    /// `test`/`[` runs (rubash#1467; the verdict matrix lives in
+    /// builtins/test.rs fd_pipe_test, shared with the [[ ]] path).
+    /// Rewritten fresh each call, like the terminal marks.
+    pub(in crate::executor) fn sync_fd_pipe_marks(&mut self) {
+        self.shell_state
+            .env_vars
+            .retain(|key, _| !key.starts_with(FD_PIPE_PREFIX));
+        for (fd, entry) in &self.fd_table.entries {
+            if entry.closed {
+                continue;
+            }
+            let read_pipe = matches!(
+                entry.read,
+                Some(
+                    FdReadEndpoint::ProcessSubstitution(_)
+                        | FdReadEndpoint::Text(_)
+                        | FdReadEndpoint::CoprocStdout { .. }
+                )
+            ) || matches!(
+                &entry.read,
+                Some(FdReadEndpoint::File(file))
+                    if crate::fd::is_pipe_handle(file.handle)
+            );
+            // A File endpoint can also back the slot with a real OS pipe
+            // (`exec N< <(...)` stores the spawned child's pipe reader
+            // as a File) — classify by the handle, not the variant, so
+            // regular files stay unmarked (rubash#1467).
+            let write_pipe = matches!(
+                entry.write,
+                Some(
+                    FdWriteEndpoint::ProcessSubstitution { .. }
+                        | FdWriteEndpoint::CoprocStdin { .. }
+                )
+            ) || matches!(
+                &entry.write,
+                Some(FdWriteEndpoint::File(file))
+                    if crate::fd::is_pipe_handle(file.handle)
+            );
+            if read_pipe || write_pipe {
+                self.shell_state
+                    .env_vars
+                    .insert(format!("{FD_PIPE_PREFIX}{fd}"), "1".to_string());
+            }
+        }
+    }
+
     /// isatty() verdict for an expanded redirect target: `&N` and the
     /// /dev/fd/N aliases consult fd N's bound endpoint; a path is probed
     /// read-only (no create/truncate side effect) and judged by
@@ -602,9 +653,10 @@ impl Executor {
                 }
                 None => {
                     if stdout_capture_active() {
-                        stdout_capture_write(output)?;
+                        stdout_capture_write_mapped(output)?;
                     } else if let Some(capture) = &mut self.stdout_capture {
                         capture.write_all(output)?;
+                        capture_timing_note_field(output, capture.len());
                     } else {
                         write_stdout_bytes(output)?;
                     }
@@ -825,9 +877,10 @@ impl Executor {
                     }
                     None => {
                         if stdout_capture_active() {
-                            stdout_capture_write(output)?;
+                            stdout_capture_write_mapped(output)?;
                         } else if let Some(capture) = &mut self.stdout_capture {
                             capture.write_all(output)?;
+                            capture_timing_note_field(output, capture.len());
                         } else {
                             write_stdout_bytes(output)?;
                         }
@@ -1590,6 +1643,67 @@ thread_local! {
     /// `STDOUT_CAPTURE_PARKED`).
     static STDOUT_STREAM_PARKED: std::cell::RefCell<Vec<Option<crate::fd::HANDLE>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// rubash#1141: the armed production-timing recorder (timed_input.rs)
+    /// for the producer currently executing on this thread — a pipeline
+    /// stage or a process-substitution body. Capture appends note their
+    /// arrival against it; nested producers park the outer recorder.
+    static CAPTURE_TIMING: std::cell::RefCell<Option<super::timed_input::SharedCaptureTiming>> =
+        const { std::cell::RefCell::new(None) };
+    static CAPTURE_TIMING_PARKED: std::cell::RefCell<
+        Vec<Option<super::timed_input::SharedCaptureTiming>>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// rubash#1141: arm a fresh production-timing recorder for the producer
+/// about to run (a pipeline stage in the sequential driver, or a
+/// process-substitution body), parking any outer one. Returns the
+/// recorder the caller finishes into a `TimedInput` once production
+/// completes; pair with `end_capture_timing`.
+pub(in crate::executor) fn begin_capture_timing() -> super::timed_input::SharedCaptureTiming {
+    let recorder = std::rc::Rc::new(std::cell::RefCell::new(
+        super::timed_input::CaptureTiming::new(),
+    ));
+    CAPTURE_TIMING.with(|slot| {
+        let previous = slot.borrow_mut().replace(recorder.clone());
+        CAPTURE_TIMING_PARKED.with(|parked| parked.borrow_mut().push(previous));
+    });
+    recorder
+}
+
+/// rubash#1141: disarm the current timing recorder, restoring the
+/// parked outer one (counterpart of `begin_capture_timing`).
+pub(in crate::executor) fn end_capture_timing() {
+    CAPTURE_TIMING.with(|slot| {
+        let previous = CAPTURE_TIMING_PARKED.with(|parked| parked.borrow_mut().pop());
+        *slot.borrow_mut() = previous.flatten();
+    });
+}
+
+fn capture_timing_with(f: impl FnOnce(&mut super::timed_input::CaptureTiming)) {
+    CAPTURE_TIMING.with(|slot| {
+        let recorder = slot.borrow().clone();
+        if let Some(recorder) = recorder {
+            f(&mut recorder.borrow_mut());
+        }
+    });
+}
+
+/// rubash#1141: note one append to the thread-local capture against the
+/// armed timing recorder (no-op when none is armed).
+pub(in crate::executor) fn capture_timing_note_thread(appended: &[u8], new_raw_len: usize) {
+    capture_timing_with(|timing| timing.note_thread(appended, new_raw_len));
+}
+
+/// rubash#1141: note one append to an executor's field capture against
+/// the armed timing recorder (no-op when none is armed).
+pub(in crate::executor) fn capture_timing_note_field(appended: &[u8], new_raw_len: usize) {
+    capture_timing_with(|timing| timing.note_field(appended, new_raw_len));
+}
+
+/// rubash#1141: snapshot the field (prefix) sink's totals at a
+/// field++thread capture assembly merge point.
+pub(in crate::executor) fn capture_timing_set_prefix(field_bytes: &[u8]) {
+    capture_timing_with(|timing| timing.set_prefix(field_bytes));
 }
 
 /// niubash#345: the active capture frame's pipeline-pipe target, if this
@@ -1732,12 +1846,62 @@ pub(in crate::executor) fn stdout_capture_active() -> bool {
     STDOUT_CAPTURE.with(|capture| capture.borrow().is_some())
 }
 
+/// Write one chunk to a capture stream (a frame's armed pipeline pipe),
+/// normalizing a broken pipe to `io::ErrorKind::BrokenPipe` so callers
+/// that translate io errors can recover the SIGPIPE shape.
+fn write_capture_stream(stream: crate::fd::HANDLE, output: &[u8]) -> io::Result<()> {
+    crate::fd::write_all(stream, output).map_err(|error| {
+        if is_broken_pipe_error(&error) {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "pipeline consumer closed the pipe",
+            )
+        } else {
+            error
+        }
+    })
+}
+
 pub(in crate::executor) fn stdout_capture_write(output: &[u8]) -> io::Result<()> {
+    // rubash#1237 (item 4): a capture frame armed with a pipeline stream
+    // (the niubash#345 shell-writer producer frame, or a streaming tail)
+    // has the OS pipe as its fd-1 destination. GNU binds the element's
+    // pipe to fd 1 and dups fd 2 onto the SAME open file description
+    // (execute_cmd.c:2702-2723 execute_pipeline, redir.c:1169-1170 dup2),
+    // so every write resolving to the element's stdout object lands on
+    // the one channel in write order. Buffering this frame's writes
+    // while the fd-1 endpoint arm streams its writes live splits the
+    // merged fd1/fd2 pair across two sinks flushed at different times
+    // (the stream in real time, the frame at stage end) and destroys
+    // the interleave — `(echo o1; echo e >&2; echo o2) 2>&1 | cat`
+    // printed o1/o2/e. Route the frame's writes to its stream at write
+    // time, whatever fd or helper carried them; unarmed frames keep
+    // buffering exactly as before.
+    if let Some(stream) = active_capture_stream() {
+        return write_capture_stream(stream, output);
+    }
     STDOUT_CAPTURE.with(|capture| {
         if let Some(buffer) = capture.borrow_mut().as_mut() {
             buffer.write_all(output)?;
+            capture_timing_note_thread(output, buffer.len());
         }
         Ok(())
+    })
+}
+
+/// `stdout_capture_write` with the SIGPIPE shape restored for
+/// `ExecuteError` contexts: when the frame's stream reports a broken
+/// pipe, the write is the element's SIGPIPE death
+/// (`ExecuteError::BrokenPipe`, status 141), not a generic io failure —
+/// the buffered frame could never fail before its writes learned to
+/// stream (rubash#1237 item 4).
+pub(in crate::executor) fn stdout_capture_write_mapped(output: &[u8]) -> Result<(), ExecuteError> {
+    stdout_capture_write(output).map_err(|error| {
+        if error.kind() == io::ErrorKind::BrokenPipe && active_capture_stream().is_some() {
+            ExecuteError::BrokenPipe
+        } else {
+            ExecuteError::IoError(error)
+        }
     })
 }
 
@@ -1764,6 +1928,16 @@ pub(in crate::executor) fn write_stdout_capture_at_generation(
         return stdout_capture_write(output);
     }
     if generation < parked_len {
+        // A parked frame that was armed with a pipeline stream has the
+        // pipe as its destination (see stdout_capture_write): a dup2'd fd
+        // holding this generation writes the pipe in write order, not
+        // the parked copy (rubash#1237 item 4). The stream stack is
+        // parked in parallel with the buffer stack, same index.
+        let parked_stream =
+            STDOUT_STREAM_PARKED.with(|parked| parked.borrow().get(generation).copied().flatten());
+        if let Some(stream) = parked_stream {
+            return write_capture_stream(stream, output);
+        }
         return STDOUT_CAPTURE_PARKED.with(|parked| {
             if let Some(buffer) = parked.borrow_mut().get_mut(generation) {
                 buffer.write_all(output)?;

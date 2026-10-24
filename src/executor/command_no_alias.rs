@@ -166,10 +166,11 @@ impl Executor {
                 self.exit_code = self.execute_let(&cmd.words[1..]);
                 Ok(())
             }
-            "time" => {
-                self.execute_time_command_node(cmd)?;
-                Ok(())
-            }
+            // No "time" arm (rubash#1369): `time` is a reserved word,
+            // not a shell builtin (GNU builtins/*.def has `times`, not
+            // `time`), so the `command` re-dispatch must fall through
+            // to the ordinary PATH lookup — `command time true` is
+            // `time: command not found`, rc=127.
             "umask" => {
                 if crate::builtins::enable::is_disabled(&self.shell_state.env_vars, "umask") {
                     return self.execute_external(cmd);

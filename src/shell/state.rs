@@ -68,6 +68,18 @@ pub struct ShellState {
     pub(crate) positional_offset: usize,
     /// execute_cmd.c/jobs.c pipeline status vector ($PIPESTATUS).
     pub(crate) pipestatus: Vec<i32>,
+    /// variables.c:6291 set_pipestatus_array PIPESTATUS cell shape
+    /// (rubash#1363/#1364): the status writer stores straight into the
+    /// ARRAY object and never consults att_readonly — it is a no-op
+    /// unless the PIPESTATUS cell currently holds an array object.
+    /// A valueless declaration (`readonly`/`declare`/`export` naming
+    /// PIPESTATUS before any command materialized it) creates an
+    /// att_invisible cell with NO array object (array_insert(NULL)
+    /// fails silently), and a scalar assignment creates a scalar cell;
+    /// both shapes freeze the vector until an array-shaped bind
+    /// (compound/element assignment, or `declare -a` over a scalar)
+    /// installs an array object.
+    pub(crate) pipestatus_shape: PipestatusShape,
     /// variables.c FUNCNAME stack.
     pub(crate) function_name_stack: Vec<String>,
     /// variables.c BASH_ARGC/BASH_ARGV stacks.
@@ -130,6 +142,16 @@ pub struct ShellState {
     pub(crate) random_state: RandomGen,
     /// execute_cmd.c subshell_level.
     pub(crate) subshell_depth: Cell<usize>,
+    /// print_cmd.c make_command_string of the innermost enclosing
+    /// `( )` subshell, rendered at subshell entry (executor
+    /// execute_subshell_command_with_redirects / the ast_exec region
+    /// open). GNU's waitchld death notice names the WHOLE job command
+    /// (jobs.c:4625), so an `exec`ed command dying by signal inside
+    /// the parens is reported against this text, not its own
+    /// last-member text (rubash#1493). Set only after the entry
+    /// clone_for_child_save, so the wholesale boundary restore
+    /// reverts it to the parent's value like every other field here.
+    pub(crate) subshell_source_text: Option<String>,
     /// execute_cmd.c subshell_environment & SUBSHELL_COMSUB — set while a
     /// `$( )`/backtick body runs (shared-executor and cloned-executor
     /// paths). jobs.c:3837-3843 start_job refuses fg/bg inside it.
@@ -258,12 +280,38 @@ pub struct ShellState {
     pub(crate) procsub_streams: RefCell<HashMap<PathBuf, Rc<RefCell<ProcSubStream>>>>,
 }
 
+/// The shape of the PIPESTATUS variable cell (variables.c:6291
+/// set_pipestatus_array's `array_p (v)` / `array_cell (v)` gate):
+/// `LiveArray` cells hold a real ARRAY object the status writer
+/// updates in place; `Scalar` cells hold a plain scalar value the
+/// writer leaves alone; `Valueless` cells (att_invisible, from a
+/// valueless `declare`/`readonly`/`export` operand) have neither a
+/// value nor an array object, so the writer's inserts fail and the
+/// variable reads as unset. `ValuelessArray` is the same frozen
+/// cell created with att_array (`declare -a PIPESTATUS` before
+/// materialization): still no ARRAY object for the writer, but
+/// `declare -p` renders the `-a` flag. `Absent` is no cell at
+/// all — the next status write materializes a fresh array
+/// (make_new_array_variable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipestatusShape {
+    Absent,
+    LiveArray,
+    Scalar,
+    Valueless,
+    ValuelessArray,
+}
+
 /// Buffered contents of one materialized `<(cmd)` output — see
 /// `ShellState::procsub_streams`.
 #[derive(Debug)]
 pub(crate) struct ProcSubStream {
     pub(crate) data: Vec<u8>,
     pub(crate) offset: usize,
+    /// rubash#1141: production schedule of the substitution body, so
+    /// in-shell consumers of the stream observe GNU's pipe arrival
+    /// times for read/select deadlines (see executor::timed_input).
+    pub(crate) timing: Option<crate::executor::timed_input::SharedTimedInput>,
 }
 
 /// Typed snapshot of the interior-mutable slice of ShellState.
@@ -421,6 +469,7 @@ impl Clone for ShellState {
             positional_params: self.positional_params.clone(),
             positional_offset: self.positional_offset,
             pipestatus: self.pipestatus.clone(),
+            pipestatus_shape: self.pipestatus_shape,
             function_name_stack: self.function_name_stack.clone(),
             bash_argc_stack: self.bash_argc_stack.clone(),
             bash_argv_stack: self.bash_argv_stack.clone(),
@@ -440,6 +489,7 @@ impl Clone for ShellState {
             dollar_vars_changed_by_set: self.dollar_vars_changed_by_set,
             random_state: self.random_state.clone_state(),
             subshell_depth: Cell::new(self.subshell_depth.get()),
+            subshell_source_text: self.subshell_source_text.clone(),
             xtrace_indirection_level: Cell::new(self.xtrace_indirection_level.get()),
             xtrace_suspended: Cell::new(self.xtrace_suspended.get()),
             in_command_substitution: Cell::new(self.in_command_substitution.get()),

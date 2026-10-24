@@ -142,6 +142,13 @@ impl Executor {
             "sleep" => {
                 if !crate::executor::path::path_is_unset(&self.shell_state.env_vars)
                     && crate::builtins::sleep::can_execute_fast_path(&cmd.words[1..])
+                    // rubash#1497: a stamped -c tail command must reach
+                    // the spawn site so it can exec-replace the process
+                    // (GNU builtins/evalstring.c:126 should_suppress_
+                    // fork); the in-process fast path would keep the
+                    // shell's own process image. Windows has no process
+                    // replacement and keeps the fast path.
+                    && !(cfg!(unix) && self.exec_replace_dispatch_stamp.get() != 0)
                 {
                     // GNU sleep is an external child process, so the waiting
                     // shell is interruptible: a caught signal is recorded

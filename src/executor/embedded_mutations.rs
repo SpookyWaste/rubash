@@ -1919,7 +1919,29 @@ impl Executor {
         // words with no quoting, expansion, escape, redirection, or
         // command-syntax characters. Everything else falls through to the
         // real parser/executor paths below.
-        if command_substitution_function_call_is_trivial(source, &words) {
+        // rubash#1473: the in-shell function shortcut dispatches the call
+        // directly, so it can express none of the substitution child's
+        // trace semantics — GNU subst.c:7143 command_substitute runs the
+        // body through parse_and_execute in the child, where an inherited
+        // DEBUG trap (functrace, trap.c reset_or_restore_signal_handlers)
+        // fires per inner command with the INNER command text (the
+        // shortcut produced only the function-entry fire, reading the
+        // OUTER command's __RUBASH_LAST_COMMAND), an inherited ERR trap
+        // (set -E) fires inside the child, and every simple command gets
+        // its execute_cmd.c:4649 xtrace head line. Disqualify the
+        // shortcut under exactly the conditions that disqualify the
+        // &self shortcut family in expand_command_substitution_inner;
+        // the body then reaches the real child executor below.
+        let comsub_trap_context_disqualifies = self.xtrace_enabled()
+            || self.err_trap_inherited_into_comsub()
+            || (crate::builtins::set::shell_option_enabled(
+                &self.shell_state.env_vars,
+                "functrace",
+            ) && crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, "DEBUG")
+                .is_some_and(|action| !action.is_empty()));
+        if command_substitution_function_call_is_trivial(source, &words)
+            && !comsub_trap_context_disqualifies
+        {
             if let Some(output) = self.run_function_command_substitution(&words) {
                 self.set_positional_params(saved_positional_params);
                 let status = self.last_command_substitution_status.get().unwrap_or(0);

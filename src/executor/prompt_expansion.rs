@@ -524,6 +524,18 @@ impl Executor {
         self.command_string_mode.set(enabled);
     }
 
+    pub fn command_string_mode(&self) -> bool {
+        self.command_string_mode.get()
+    }
+
+    /// rubash#1497: arms the final reader unit of a `-c` string for
+    /// tail exec replacement (see command_string_final_pending).
+    /// run_source_impl consumes the arming; the grouped -c driver
+    /// re-arms it per group so only the string's last group carries it.
+    pub fn set_command_string_final_pending(&mut self, armed: bool) {
+        self.command_string_final_pending.set(armed);
+    }
+
     pub(in crate::executor) fn prompt_time(&self, format: &str) -> String {
         crate::builtins::printf::time::format_current_time(format, &self.shell_state.env_vars)
     }

@@ -102,6 +102,10 @@ where
                         // with rc 0; GNU clears the table, then rehashes
                         // the name and reports `hash: name: not found`
                         // (rc 1) when it does not resolve (rubash#1489).
+                        // The flush itself is applied below, after the
+                        // needarg/usage checks, so `hash -r ls` still
+                        // hashes `ls` and `hash -r -d` still reports the
+                        // -d needarg error (rubash#1382).
                         reset = true;
                     }
                     'd' => delete = true,
@@ -167,9 +171,11 @@ where
     }
 
     // GNU builtins/hash.def:131-135: `hash -p pathname` with no name is a
-    // usage error (EX_USAGE) — and it is reported BEFORE the -r expunge
-    // below (hash.def's checks precede phash_flush), so the table
-    // survives a malformed `hash -r -p path`.
+    // usage error (EX_USAGE), not a table print (rubash#1360) — and it
+    // is reported BEFORE the -r expunge below (hash.def's checks precede
+    // phash_flush), so the table survives a malformed `hash -r -p path`;
+    // it also precedes the restricted-shell pathname checks, matching
+    // hash_builtin's order (rubash#1382).
     if pathname.is_some() && names.is_empty() {
         writeln!(
             stderr,
@@ -181,7 +187,8 @@ where
     // GNU builtins/hash.def:150-151: with expunge set, the whole table is
     // flushed before the name loop (and before -t target listing); with
     // no names at all the builtin then ends silently at rc 0 — the table
-    // print above-all is skipped whenever expunge was requested.
+    // print above-all is skipped whenever expunge was requested
+    // (rubash#1489; ordering cross-checked for rubash#1382).
     if reset {
         env_vars.remove(HASH_TABLE);
         // The internal lookup cache holds the same remembered locations,
@@ -193,89 +200,11 @@ where
     }
 
     let mut table = hash_table(env_vars);
-    if let Some(pathname) = pathname {
-        // GNU builtins/hash.def:156-176: in a restricted shell `hash -p`
-        // refuses an absolute pathname (sh_restricted -> "hash: <path>:
-        // restricted") and requires a relative one to resolve through $PATH
-        // (sh_notfound -> "hash: <name>: not found"); both fail the builtin.
-        if crate::builtins::set::shell_option_enabled(env_vars, "restricted") {
-            if pathname.contains('/') || pathname.contains('\\') {
-                writeln!(
-                    stderr,
-                    "{}hash: {pathname}: restricted",
-                    script_prefix(env_vars)
-                )?;
-                return Ok(EXECUTION_FAILURE);
-            }
-            if crate::executor::path::find_user_command(pathname, env_vars).is_none() {
-                writeln!(
-                    stderr,
-                    "{}hash: {pathname}: not found",
-                    script_prefix(env_vars)
-                )?;
-                return Ok(EXECUTION_FAILURE);
-            }
-        }
-        // GNU builtins/hash.def:131-135: `hash -p pathname` with no name is a
-        // usage error (EX_USAGE), not a table print (rubash#1360).
-        if names.is_empty() {
-            writeln!(
-                stderr,
-                "hash: usage: hash [-lr] [-p pathname] [-dt] [name ...]"
-            )?;
-            return Ok(EX_USAGE);
-        }
-        if pathname == "/" {
-            writeln!(
-                stderr,
-                "{}hash: {pathname}: Is a directory",
-                script_prefix(env_vars)
-            )?;
-            return Ok(EXECUTION_FAILURE);
-        }
-        // GNU builtins/hash.def:190-196: with `-p`, every name is inserted
-        // via phash_insert; a name containing '/' is silently skipped
-        // (absolute_program → continue), never stored (rubash#1360 #1362).
-        // GNU hash.def `hash -p PATH NAME`: phash_insert(name, pathname)
-        // makes subsequent lookups of `name` return `pathname` without a
-        // PATH scan. Mirror that in the in-memory lookup cache so
-        // find_user_command(name) returns the same path external_inner
-        // would execute. Convert through shell_path_to_windows so the
-        // cached PathBuf matches the Windows-native form produced by
-        // find_user_command_uncached.
-        for name in &names {
-            if name.contains('/') {
-                continue;
-            }
-            table.insert(
-                (*name).to_string(),
-                (pathname.to_string(), 0, next_hash_seq(&table)),
-            );
-            let cached_path = crate::executor::path::shell_path_to_windows(pathname, env_vars);
-            crate::executor::path::set_command_lookup_cache(name, Some(cached_path));
-        }
-        store_hash_table(env_vars, &table);
-        return Ok(EXECUTION_SUCCESS);
-    }
-
-    if delete {
-        let mut status = EXECUTION_SUCCESS;
-        for name in names {
-            if table.remove(name).is_none() {
-                writeln!(stderr, "{}hash: {name}: not found", script_prefix(env_vars))?;
-                status = EXECUTION_FAILURE;
-            } else {
-                // GNU hash.def `hash -d NAME`: phash_remove(w) drops the entry
-                // from the hash table. The internal lookup cache holds the
-                // same information and must be invalidated in lockstep or the
-                // next `find_user_command(name)` returns the stale path.
-                crate::executor::path::remove_command_lookup_cache(name);
-            }
-        }
-        store_hash_table(env_vars, &table);
-        return Ok(status);
-    }
-
+    // GNU builtins/hash.def hash_builtin: list_targets is handled
+    // before the pathname/delete/add name loop (and before the
+    // restricted-shell pathname checks), so `hash -t -p /bin/ls n`
+    // looks `n` up instead of inserting it, and `hash -d -t ls`
+    // prints the target instead of deleting it (rubash#1382).
     if translate {
         let mut status = EXECUTION_SUCCESS;
         // GNU builtins/hash.def list_hashed_filename_targets: with several
@@ -317,6 +246,100 @@ where
         return Ok(status);
     }
 
+    if let Some(pathname) = pathname {
+        // GNU builtins/hash.def:156-176: in a restricted shell `hash -p`
+        // refuses an absolute pathname (sh_restricted -> "hash: <path>:
+        // restricted") and requires a relative one to resolve through $PATH
+        // (sh_notfound -> "hash: <name>: not found"); both fail the builtin.
+        if crate::builtins::set::shell_option_enabled(env_vars, "restricted") {
+            if pathname.contains('/') || pathname.contains('\\') {
+                writeln!(
+                    stderr,
+                    "{}hash: {pathname}: restricted",
+                    script_prefix(env_vars)
+                )?;
+                return Ok(EXECUTION_FAILURE);
+            }
+            if crate::executor::path::find_user_command(pathname, env_vars).is_none() {
+                writeln!(
+                    stderr,
+                    "{}hash: {pathname}: not found",
+                    script_prefix(env_vars)
+                )?;
+                return Ok(EXECUTION_FAILURE);
+            }
+        }
+        // (The no-name usage check for `-p` now lives above, before the
+        // expunge flush, in hash_builtin's order — rubash#1382. The
+        // directory check itself lives in the insert loop below:
+        // GNU tests file_isdir(pathname) per name, after the
+        // absolute_program skip — rubash#1360.)
+        // GNU builtins/hash.def:190-196: with `-p`, every name is inserted
+        // via phash_insert; a name containing '/' is silently skipped
+        // (absolute_program → continue), never stored (rubash#1360 #1362).
+        // GNU hash.def `hash -p PATH NAME`: phash_insert(name, pathname)
+        // makes subsequent lookups of `name` return `pathname` without a
+        // PATH scan. Mirror that in the in-memory lookup cache so
+        // find_user_command(name) returns the same path external_inner
+        // would execute. Convert through shell_path_to_windows so the
+        // cached PathBuf matches the Windows-native form produced by
+        // find_user_command_uncached.
+        // GNU builtins/hash.def hash_builtin name loop: with a pathname,
+        // file_isdir(pathname) is tested per name (after the slash skip):
+        // a directory pathname reports "<pathname>: Is a directory",
+        // sets failure and stores nothing for that name — for ANY
+        // directory, not just "/" (rubash#1360).
+        let mut status = EXECUTION_SUCCESS;
+        for name in &names {
+            if name.contains('/') {
+                continue;
+            }
+            if std::path::Path::new(pathname).is_dir() {
+                writeln!(
+                    stderr,
+                    "{}hash: {pathname}: Is a directory",
+                    script_prefix(env_vars)
+                )?;
+                status = EXECUTION_FAILURE;
+                continue;
+            }
+            table.insert(
+                (*name).to_string(),
+                (pathname.to_string(), 0, next_hash_seq(&table)),
+            );
+            let cached_path = crate::executor::path::shell_path_to_windows(pathname, env_vars);
+            crate::executor::path::set_command_lookup_cache(name, Some(cached_path));
+        }
+        store_hash_table(env_vars, &table);
+        return Ok(status);
+    }
+
+    if delete {
+        let mut status = EXECUTION_SUCCESS;
+        for name in names {
+            // GNU builtins/hash.def hash_builtin name loop: the
+            // absolute_program(w) → continue check is the loop's first
+            // statement, ahead of the delete branch — a slash name is
+            // silently skipped by `hash -d` too, never reported and never
+            // removed (rubash#1362 delete facet).
+            if name.contains('/') {
+                continue;
+            }
+            if table.remove(name).is_none() {
+                writeln!(stderr, "{}hash: {name}: not found", script_prefix(env_vars))?;
+                status = EXECUTION_FAILURE;
+            } else {
+                // GNU hash.def `hash -d NAME`: phash_remove(w) drops the entry
+                // from the hash table. The internal lookup cache holds the
+                // same information and must be invalidated in lockstep or the
+                // next `find_user_command(name)` returns the stale path.
+                crate::executor::path::remove_command_lookup_cache(name);
+            }
+        }
+        store_hash_table(env_vars, &table);
+        return Ok(status);
+    }
+
     // GNU builtins/hash.def:138-146: the table print happens only when no
     // names were given (`list == 0`) and the table was not just expunged;
     // `-l` with names goes through the name loop above (rubash#1368).
@@ -342,7 +365,18 @@ where
                 }
                 return Ok(EXECUTION_SUCCESS);
             }
-            for (name, (path, _, _)) in table {
+            // GNU print_hashed_commands walks the same bucket order for
+            // the portable (-l) form (hash_walk over bucket_array); the
+            // raw HashMap order is process-random and scrambles the
+            // listing (rubash#1382, whose repro diffs `hash -l` output
+            // for the two entries `n` and `-l`).
+            let mut entries: Vec<_> = table.into_iter().collect();
+            entries.sort_by(|left, right| {
+                gnu_hash_bucket(&left.0)
+                    .cmp(&gnu_hash_bucket(&right.0))
+                    .then(right.1 .2.cmp(&left.1 .2))
+            });
+            for (name, (path, _, _)) in entries {
                 writeln!(stdout, "builtin hash -p {path} {name}")?;
             }
             return Ok(EXECUTION_SUCCESS);

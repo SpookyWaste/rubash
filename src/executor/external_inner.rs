@@ -905,6 +905,118 @@ impl Executor {
         }
     }
 
+    /// rubash#1497: execution-time gates for tail exec replacement,
+    /// mirroring GNU builtins/evalstring.c:106 should_optimize_fork as
+    /// re-checked when the command runs (a trap armed by an earlier
+    /// command of the same -c string still blocks the replacement),
+    /// plus this port's capture bookkeeping: replacement is only sound
+    /// when the prepared Command inherits the process's own stdio, no
+    /// capture drain or deferred fd writeback is pending, and no
+    /// virtual stdin text waits in this process's memory. The DEBUG
+    /// trap does NOT block (it is not a signal trap; it still fires
+    /// before the command, in the shell), and neither does a RETURN
+    /// trap at top level (variable_context == 0 there).
+    #[cfg(unix)]
+    fn exec_replace_tail_ready(
+        &self,
+        cmd: &CommandNode,
+        program: &PathBuf,
+        dev_ops: &crate::executor::dev_fd_operands::DevOperandMaterialization,
+    ) -> bool {
+        if self.exec_replace_dispatch_stamp.get() == 0 {
+            return false;
+        }
+        if self.get_env("__RUBASH_INTERACTIVE").as_deref() == Some("1") {
+            return false;
+        }
+        if !crate::executor::path::program_execs_directly(program) {
+            return false;
+        }
+        // CapturePipe means the parent must drain the child's output
+        // itself — impossible after a process replacement.
+        // LiveHandles is the opposite shape: the prepared Command
+        // already carries the real destination handles (files, pipes,
+        // fd-table bindings), which an exec inherits unchanged, and
+        // the parent's only post-spawn duty was the wait.
+        if matches!(
+            self.external_stdio_outcome,
+            Some(super::external_redirects::ExternalStdioOutcome::CapturePipe(_))
+        ) || self.external_needs_fd_copy_capture(cmd)
+        {
+            return false;
+        }
+        if dev_ops.has_deferred_flushes() {
+            return false;
+        }
+        if self
+            .shell_state
+            .env_vars
+            .contains_key(crate::executor::types::FUNCTION_STDIN)
+            || self.virtual_fd_stdin_remaining(0).is_some()
+        {
+            return false;
+        }
+        let env = &self.shell_state.env_vars;
+        // EXIT and ERR traps block by presence (GNU signal_is_trapped
+        // counts `trap ''` too); get_trap_action is reset-aware.
+        if crate::builtins::trap::get_trap_action(env, "EXIT").is_some()
+            || crate::builtins::trap::get_trap_action(env, "ERR").is_some()
+        {
+            return false;
+        }
+        // Any real signal trap blocks, again by presence. Pseudo
+        // signals and bookkeeping keys share the trap prefix without
+        // being signal traps.
+        let reset = env
+            .get(crate::builtins::trap::TRAP_RESET)
+            .map(String::as_str)
+            .unwrap_or("");
+        for key in env.keys() {
+            let Some(signal) = key.strip_prefix(crate::builtins::trap::TRAP_PREFIX) else {
+                continue;
+            };
+            match signal {
+                "EXIT" | "ERR" | "ERROR" | "DEBUG" | "RETURN" | "RESET" | "ORIG_IGN" => {}
+                _ if reset.split(':').any(|name| name == signal) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// rubash#1497: GNU execute_cmd.c:5813-5819 — on the nofork path
+    /// the shell decrements its level (adjust_shell_level(-1)) before
+    /// building the export environment, so the replaced process sees
+    /// the level the shell itself inherited. The adjustment reads the
+    /// CURRENT SHLVL variable (prefix temp assignments are not yet
+    /// committed when execute_disk_command runs), clamps at 0, and the
+    /// variable is (re)created in the child environment even when the
+    /// shell variable is absent or unexported.
+    /// rubash#1497: the shell's current SHLVL as a number — an absent
+    /// or unparseable value counts as 0 (GNU adjust_shell_level works
+    /// on the variable's numeric value; see execute_cmd.c:5819).
+    pub(in crate::executor) fn current_shlvl_value(&self) -> i64 {
+        self.shell_state
+            .env_vars
+            .get("SHLVL")
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[cfg(unix)]
+    fn exec_replace_adjusted_shlvl(&self) -> String {
+        // GNU reads the CURRENT variable, which never includes the
+        // tail command's own prefix temp assignments; this port has
+        // committed them into env_vars by spawn time, so the value
+        // frozen at dispatch (exec_replace_shlvl_snapshot) is the one
+        // to adjust. The live read remains as a defensive fallback.
+        let current = self
+            .exec_replace_shlvl_snapshot
+            .get()
+            .unwrap_or_else(|| self.current_shlvl_value());
+        (current - 1).max(0).to_string()
+    }
+
     fn spawn_external_process(
         &mut self,
         cmd: &CommandNode,
@@ -1058,6 +1170,27 @@ impl Executor {
         #[cfg(unix)]
         crate::executor::dev_fd_operands::attach_unix_dev_fd_operands(&mut process, &dev_ops);
         suppress_orphan_console(&mut process);
+        // rubash#1497: GNU's nofork path (builtins/evalstring.c:126
+        // should_suppress_fork, execute_cmd.c:5813
+        // execute_disk_command): the last plain command of a -c string
+        // REPLACES the shell process instead of forking. The Command
+        // is fully prepared here (environment, stdio, fd channel,
+        // pre_exec signal reset and /dev/fd pins), so exec it in
+        // place: std's Command::exec runs the pre_exec closures
+        // in-process, then execve; it returns only on failure, where
+        // GNU's model has already committed — the shell diagnoses and
+        // exits with the classified status rather than forking.
+        #[cfg(unix)]
+        if !used_shell && self.exec_replace_tail_ready(cmd, program, &dev_ops) {
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            process.env("SHLVL", self.exec_replace_adjusted_shlvl());
+            use std::os::unix::process::CommandExt;
+            let error = process.exec();
+            let _ = self.report_external_spawn_error(cmd, program, error);
+            std::process::exit(self.exit_code);
+        }
         // rubash#1035: GNU shell_execve (execute_cmd.c:6126) execs the
         // program directly and only consults the file's first bytes when
         // the kernel refuses (ENOEXEC). Rust's spawn (posix_spawn) never

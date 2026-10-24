@@ -589,15 +589,17 @@ impl Executor {
                     index += 1;
                 }
                 "-d" => {
-                    delimiter = cmd
-                        .words
-                        .get(index + 1)
-                        .map(|word| read_delimiter_char(word))
-                        .unwrap_or('\u{0}');
+                    let Some(delimiter_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'd');
+                    };
+                    delimiter = read_delimiter_char(delimiter_word);
                     index += 2;
                 }
                 "-n" => {
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'n');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -612,7 +614,10 @@ impl Executor {
                     index += 2;
                 }
                 "-N" => {
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'N');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -650,7 +655,10 @@ impl Executor {
                     index += 2;
                 }
                 "-i" => {
-                    initial_text = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'i');
+                    };
+                    initial_text = Some(next_word.clone());
                     index += 2;
                 }
                 "-t" => {
@@ -680,7 +688,10 @@ impl Executor {
                     index += 2;
                 }
                 "-p" => {
-                    prompt = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'p');
+                    };
+                    prompt = Some(next_word.clone());
                     index += 2;
                 }
                 "-e" => {
@@ -700,7 +711,10 @@ impl Executor {
                     index += 1;
                 }
                 "-sn" => {
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'n');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -730,7 +744,10 @@ impl Executor {
                     index += 1;
                 }
                 "-sN" => {
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'N');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -760,7 +777,10 @@ impl Executor {
                     index += 1;
                 }
                 "-en" => {
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'n');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -791,7 +811,10 @@ impl Executor {
                 }
                 "-ren" | "-ern" => {
                     raw = true;
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'n');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -824,7 +847,10 @@ impl Executor {
                     index += 1;
                 }
                 "-eN" => {
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'N');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -855,7 +881,10 @@ impl Executor {
                 }
                 "-reN" | "-erN" => {
                     raw = true;
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'N');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -888,7 +917,10 @@ impl Executor {
                     index += 1;
                 }
                 "-sp" => {
-                    prompt = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'p');
+                    };
+                    prompt = Some(next_word.clone());
                     index += 2;
                 }
                 word if word.starts_with("-sp") && word.len() > 3 => {
@@ -896,7 +928,10 @@ impl Executor {
                     index += 1;
                 }
                 "-ep" => {
-                    prompt = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'p');
+                    };
+                    prompt = Some(next_word.clone());
                     index += 2;
                 }
                 word if word.starts_with("-ep") && word.len() > 3 => {
@@ -905,7 +940,10 @@ impl Executor {
                 }
                 "-rep" | "-erp" => {
                     raw = true;
-                    prompt = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'p');
+                    };
+                    prompt = Some(next_word.clone());
                     index += 2;
                 }
                 word if (word.starts_with("-rep") || word.starts_with("-erp"))
@@ -917,7 +955,10 @@ impl Executor {
                 }
                 "-ersp" | "-esrp" | "-resp" | "-rsep" | "-serp" | "-srep" => {
                     raw = true;
-                    prompt = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'p');
+                    };
+                    prompt = Some(next_word.clone());
                     index += 2;
                 }
                 word if (word.starts_with("-ersp")
@@ -933,7 +974,10 @@ impl Executor {
                     index += 1;
                 }
                 "-ei" => {
-                    initial_text = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'i');
+                    };
+                    initial_text = Some(next_word.clone());
                     index += 2;
                 }
                 word if word.starts_with("-ei") && word.len() > 3 => {
@@ -942,7 +986,10 @@ impl Executor {
                 }
                 "-rei" | "-eri" => {
                     raw = true;
-                    initial_text = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'i');
+                    };
+                    initial_text = Some(next_word.clone());
                     index += 2;
                 }
                 word if (word.starts_with("-rei") || word.starts_with("-eri"))
@@ -954,7 +1001,10 @@ impl Executor {
                 }
                 "-ersi" | "-esri" | "-resi" | "-rsei" | "-seri" | "-srei" => {
                     raw = true;
-                    initial_text = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'i');
+                    };
+                    initial_text = Some(next_word.clone());
                     index += 2;
                 }
                 word if (word.starts_with("-ersi")
@@ -1168,7 +1218,10 @@ impl Executor {
                     index += 1;
                 }
                 "-si" => {
-                    initial_text = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'i');
+                    };
+                    initial_text = Some(next_word.clone());
                     index += 2;
                 }
                 word if word.starts_with("-si") && word.len() > 3 => {
@@ -1254,11 +1307,10 @@ impl Executor {
                     index += 1;
                 }
                 "-ed" => {
-                    delimiter = cmd
-                        .words
-                        .get(index + 1)
-                        .map(|word| read_delimiter_char(word))
-                        .unwrap_or('\u{0}');
+                    let Some(delimiter_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'd');
+                    };
+                    delimiter = read_delimiter_char(delimiter_word);
                     index += 2;
                 }
                 word if word.starts_with("-ed") && word.len() > 3 => {
@@ -1267,11 +1319,10 @@ impl Executor {
                 }
                 "-red" | "-erd" => {
                     raw = true;
-                    delimiter = cmd
-                        .words
-                        .get(index + 1)
-                        .map(|word| read_delimiter_char(word))
-                        .unwrap_or('\u{0}');
+                    let Some(delimiter_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'd');
+                    };
+                    delimiter = read_delimiter_char(delimiter_word);
                     index += 2;
                 }
                 word if (word.starts_with("-red") || word.starts_with("-erd"))
@@ -1364,11 +1415,10 @@ impl Executor {
                     index += 1;
                 }
                 "-sd" => {
-                    delimiter = cmd
-                        .words
-                        .get(index + 1)
-                        .map(|word| read_delimiter_char(word))
-                        .unwrap_or('\u{0}');
+                    let Some(delimiter_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'd');
+                    };
+                    delimiter = read_delimiter_char(delimiter_word);
                     index += 2;
                 }
                 word if word.starts_with("-sd") && word.len() > 3 => {
@@ -1390,11 +1440,10 @@ impl Executor {
                 }
                 "-rd" => {
                     raw = true;
-                    delimiter = cmd
-                        .words
-                        .get(index + 1)
-                        .map(|word| read_delimiter_char(word))
-                        .unwrap_or('\u{0}');
+                    let Some(delimiter_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'd');
+                    };
+                    delimiter = read_delimiter_char(delimiter_word);
                     index += 2;
                 }
                 word if word.starts_with("-rd") && word.len() > 3 => {
@@ -1404,11 +1453,10 @@ impl Executor {
                 }
                 "-rsd" | "-srd" => {
                     raw = true;
-                    delimiter = cmd
-                        .words
-                        .get(index + 1)
-                        .map(|word| read_delimiter_char(word))
-                        .unwrap_or('\u{0}');
+                    let Some(delimiter_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'd');
+                    };
+                    delimiter = read_delimiter_char(delimiter_word);
                     index += 2;
                 }
                 word if (word.starts_with("-rsd") || word.starts_with("-srd"))
@@ -1420,11 +1468,10 @@ impl Executor {
                 }
                 "-ersd" | "-esrd" | "-resd" | "-rsed" | "-serd" | "-sred" => {
                     raw = true;
-                    delimiter = cmd
-                        .words
-                        .get(index + 1)
-                        .map(|word| read_delimiter_char(word))
-                        .unwrap_or('\u{0}');
+                    let Some(delimiter_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'd');
+                    };
+                    delimiter = read_delimiter_char(delimiter_word);
                     index += 2;
                 }
                 word if (word.starts_with("-ersd")
@@ -1441,7 +1488,10 @@ impl Executor {
                 }
                 "-rsn" | "-srn" => {
                     raw = true;
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'n');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -1476,7 +1526,10 @@ impl Executor {
                 }
                 "-ersn" | "-esrn" | "-resn" | "-rsen" | "-sern" | "-sren" => {
                     raw = true;
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'n');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -1516,7 +1569,10 @@ impl Executor {
                 }
                 "-rsN" | "-srN" => {
                     raw = true;
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'N');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -1551,7 +1607,10 @@ impl Executor {
                 }
                 "-ersN" | "-esrN" | "-resN" | "-rseN" | "-serN" | "-sreN" => {
                     raw = true;
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'N');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -1591,7 +1650,10 @@ impl Executor {
                 }
                 "-rn" => {
                     raw = true;
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'n');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -1623,7 +1685,10 @@ impl Executor {
                 }
                 "-rN" => {
                     raw = true;
-                    char_limit = match read_char_limit_argument(cmd.words.get(index + 1)) {
+                    let Some(limit_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'N');
+                    };
+                    char_limit = match read_char_limit_argument(Some(limit_word)) {
                         Ok(limit) => limit,
                         Err(word) => {
                             let _ = writeln!(
@@ -1786,7 +1851,10 @@ impl Executor {
                 }
                 "-rp" => {
                     raw = true;
-                    prompt = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'p');
+                    };
+                    prompt = Some(next_word.clone());
                     index += 2;
                 }
                 word if word.starts_with("-rp") && word.len() > 3 => {
@@ -1796,7 +1864,10 @@ impl Executor {
                 }
                 "-rsp" | "-srp" => {
                     raw = true;
-                    prompt = cmd.words.get(index + 1).cloned();
+                    let Some(next_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'p');
+                    };
+                    prompt = Some(next_word.clone());
                     index += 2;
                 }
                 word if (word.starts_with("-rsp") || word.starts_with("-srp"))
@@ -1808,6 +1879,10 @@ impl Executor {
                 }
                 "-ri" => {
                     raw = true;
+                    let Some(initial_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'i');
+                    };
+                    initial_text = Some(initial_word.clone());
                     index += 2;
                 }
                 word if word.starts_with("-ri") && word.len() > 3 => {
@@ -1816,6 +1891,10 @@ impl Executor {
                 }
                 "-rsi" | "-sri" => {
                     raw = true;
+                    let Some(initial_word) = cmd.words.get(index + 1) else {
+                        return self.read_missing_argument(cmd, &mut stderr, 'i');
+                    };
+                    initial_text = Some(initial_word.clone());
                     index += 2;
                 }
                 word if (word.starts_with("-rsi") || word.starts_with("-sri"))
@@ -2124,7 +2203,7 @@ impl Executor {
         // which lost the earlier assignments GNU keeps (`read ok 1bad
         // later` left ok unset) and skipped the record GNU consumes
         // for an invalid -a argument.
-        if invalid_name && scalar_names.is_empty() {
+        if invalid_name && scalar_names.is_empty() && !timeout_zero {
             return self.finish_read_error(cmd, &stderr, 1);
         }
         let fail_after_read = invalid_array_name.is_some();
@@ -2155,7 +2234,9 @@ impl Executor {
         initial_text = None;
 
         // Bash displays read -p prompts only for interactive stdin.
-        if prompt.is_some() && self.read_prompt_should_display(cmd, read_fd) {
+        // A -t 0 read returns before the prompt would print (read.def
+        // early return), so it is suppressed there too.
+        if prompt.is_some() && !timeout_zero && self.read_prompt_should_display(cmd, read_fd) {
             let expanded = self.expand_word(prompt.as_deref().unwrap_or_default());
             eprint!("{}", expanded);
             let _ = std::io::Write::flush(&mut std::io::stderr());
@@ -2255,55 +2336,15 @@ impl Executor {
             .any(|word| word.starts_with('-') && word.contains('s'));
 
         if timeout_zero {
-            // A -t 0 read consumes no input by definition, so the
-            // deferred -a failure resolves here: nothing is assigned.
-            if fail_after_read {
-                return self.finish_read_error(cmd, &stderr, 1);
-            }
-            let status = self.read_timeout_zero_status(cmd, read_fd);
-            if let Some(name) = array_name {
-                if !invalid_name {
-                    let _ = replace_typed_indexed_array(
-                        &mut self.shell_state.variables,
-                        &name,
-                        std::iter::empty::<String>(),
-                    );
-                    self.shell_state
-                        .env_vars
-                        .insert(name.clone(), read_array_storage(&[]));
-                    mark_env_name(&mut self.shell_state.env_vars, "__RUBASH_ARRAY_VARS", &name);
-                }
-                return if invalid_name {
-                    self.finish_read_error(cmd, &stderr, 1)
-                } else {
-                    status
-                };
-            }
-
-            let scalar_names = if scalar_names.is_empty() {
-                if invalid_name {
-                    Vec::new()
-                } else {
-                    vec!["REPLY".to_string()]
-                }
-            } else {
-                scalar_names.clone()
-            };
-            if !scalar_names.is_empty() {
-                let assign_status = self.assign_read_scalar_names(
-                    &scalar_names,
-                    initial_text.as_deref().unwrap_or(""),
-                    raw,
-                );
-                if assign_status != 0 {
-                    return self.finish_read_error(cmd, &stderr, assign_status);
-                }
-            }
-            return if invalid_name {
-                self.finish_read_error(cmd, &stderr, 1)
-            } else {
-                status
-            };
+            // GNU builtins/read.def:395-398: a `-t 0` read returns
+            // input_avail(fd) ? 0 : 1 immediately after option parsing —
+            // it consumes nothing and assigns NOTHING (scalars keep
+            // their values, a -a array is not replaced, REPLY is
+            // untouched), and neither the read targets' name validity
+            // nor the deferred -a failure is ever consulted. Only the
+            // -u descriptor itself was validated during option parsing,
+            // before this early return.
+            return self.read_timeout_zero_status(cmd, read_fd);
         }
 
         if let Some(name) = array_name {
@@ -2787,6 +2828,29 @@ impl Executor {
         self.finish_read_error(cmd, &stderr, 127)
     }
 
+    /// GNU builtins/read.def: an argument-taking option letter appearing
+    /// last in its word with no following word is a usage error —
+    /// `read: -X: option requires an argument` plus the usage line,
+    /// status 2 (the shape the -a/-t/-u arms already emit). rubash#1470:
+    /// the -d/-n/-N/-i/-p arms used to swallow the missing argument
+    /// silently (delimiter defaulted to NUL, char limit and prompt and
+    /// initial text to none) and start reading — a trailing `read -n` in
+    /// a script hung on stdin instead of failing.
+    fn read_missing_argument(
+        &mut self,
+        cmd: &CommandNode,
+        stderr: &mut Vec<u8>,
+        letter: char,
+    ) -> i32 {
+        let _ = writeln!(
+            stderr,
+            "{}read: -{letter}: option requires an argument",
+            self.diagnostic_prefix()
+        );
+        let _ = writeln!(stderr, "{READ_USAGE}");
+        self.finish_read_error(cmd, stderr, 2)
+    }
+
     fn read_prompt_should_display(&self, cmd: &CommandNode, read_fd: Option<u32>) -> bool {
         if self.shell_state.env_vars.contains_key(FUNCTION_STDIN)
             || command_redirects_stdin(cmd)
@@ -2870,84 +2934,79 @@ impl Executor {
     }
 
     fn read_timeout_zero_status(&mut self, cmd: &CommandNode, read_fd: Option<u32>) -> i32 {
-        // `-u 0` polls fd 0 — the same descriptor the no-`-u` arm below
-        // polls (read.def:539-562 select() on the one descriptor).
-        if let Some(fd) = read_fd.filter(|fd| *fd != 0) {
-            if matches!(
-                self.fd_table.read_endpoint(fd),
-                Some(FdReadEndpoint::InheritedProcessStdin)
-            ) {
-                return 1;
-            }
-            if self.fd_table.is_open_for_read(fd) {
-                return 0;
-            }
-            if cmd
-                .heredoc_redirects
-                .iter()
-                .any(|redirect| redirect.fd == Some(fd) && redirect.body.is_some())
-            {
-                return 0;
-            }
-            if cmd.redirect_in.as_ref().is_some_and(|redirect| {
-                redirect.fd == Some(fd)
-                    && !is_closed_redirect_target(&self.expand_redirect_target(redirect))
-            }) {
-                return 0;
-            }
-            // rubash#1296: same cmd.redirects fallback as
-            // read_fd_is_available for command-attached numbered fds.
-            if cmd.redirects.iter().rev().any(|redirect| {
-                redirect.fd == Some(fd)
-                    && matches!(
-                        redirect.kind,
-                        crate::parser::RedirectKind::Input | crate::parser::RedirectKind::ReadWrite
-                    )
-                    && !is_closed_redirect_target(&self.expand_redirect_target(redirect))
-            }) {
-                return 0;
-            }
+        // GNU builtins/read.def:395-398 + lib/sh/input_avail.c: the
+        // status is input_avail(fd) on the very descriptor the read
+        // would use — a zero-timeout select(). EOF, HUP and error
+        // conditions all report readable, exactly as poll() reports
+        // them Ready; a live pipe or terminal with nothing ready is
+        // the only failure. `-u 0` polls fd 0 itself.
+        let fd = read_fd.unwrap_or(0);
+        if self.fd_table.is_closed(fd) || (fd == 0 && command_closes_stdin(cmd)) {
             return 1;
         }
-
-        if command_closes_stdin(cmd) || self.fd_table.is_closed(0) {
-            return 1;
+        // Materialized command-attached inputs carry their bytes
+        // in-process (heredoc body, herestring/stdin string, function
+        // stdin): the descriptor GNU would poll already holds them.
+        if cmd
+            .heredoc_redirects
+            .iter()
+            .any(|redirect| redirect.fd.unwrap_or(0) == fd && redirect.body.is_some())
+        {
+            return 0;
         }
+        if fd == 0
+            && (self.stdin_string_for_command_mut(cmd).is_some()
+                || self.shell_state.env_vars.contains_key(FUNCTION_STDIN))
+        {
+            return 0;
+        }
+        if let Some(status) = self.read_timeout_zero_poll(fd) {
+            return status;
+        }
+        // Command-attached redirects that never entered the fd table
+        // (rubash#1296 dual-store): an opened source is readable, a
+        // `<&-` target is not.
         if cmd.redirect_in.as_ref().is_some_and(|redirect| {
-            redirect.fd.unwrap_or(0) == 0
+            redirect.fd.unwrap_or(0) == fd
                 && !is_closed_redirect_target(&self.expand_redirect_target(redirect))
         }) {
             return 0;
         }
-        if cmd
-            .heredoc_redirects
-            .iter()
-            .any(|redirect| redirect.fd.unwrap_or(0) == 0 && redirect.body.is_some())
-        {
-            return 0;
-        }
-        if self.stdin_string_for_command_mut(cmd).is_some()
-            || matches!(
-                self.fd_table.read_endpoint(0),
-                Some(
-                    FdReadEndpoint::Text(_)
-                        | FdReadEndpoint::ProcessSubstitution(_)
-                        | FdReadEndpoint::CoprocStdout { .. }
+        if cmd.redirects.iter().rev().any(|redirect| {
+            redirect.fd == Some(fd)
+                && matches!(
+                    redirect.kind,
+                    crate::parser::RedirectKind::Input | crate::parser::RedirectKind::ReadWrite
                 )
-            )
-            || self.shell_state.env_vars.contains_key(FUNCTION_STDIN)
-        {
+                && !is_closed_redirect_target(&self.expand_redirect_target(redirect))
+        }) {
             return 0;
         }
-        // GNU read.def polls fd 0 with select(): a non-terminal inherited
-        // stdin (regular file, /dev/null, a pipe at EOF) is always readable,
-        // so `-t 0` succeeds. Only a live terminal with no pending input
-        // fails the poll — the timeout exit is uniformly 128+SIGALRM
-        // (read.def:553), not a plain failure.
-        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-            142
-        } else {
-            0
+        if fd == 0 {
+            // No table entry for fd 0: the descriptor is the process
+            // stdin itself.
+            return read_timeout_zero_poll_handle(crate::fd::process_std_handle(0));
+        }
+        1
+    }
+
+    /// The select()/poll() half of read_timeout_zero_status. Endpoints
+    /// backed by a kernel object are polled for real: a live pipe with
+    /// no data is NOT available even though the fd is open, and a
+    /// terminal reports ready only when the line discipline holds a
+    /// complete line, so pending typeahead is neither consumed nor
+    /// misjudged. Text endpoints are materialized — always ready.
+    fn read_timeout_zero_poll(&self, fd: u32) -> Option<i32> {
+        match self.fd_table.read_endpoint(fd) {
+            Some(FdReadEndpoint::Text(_)) | Some(FdReadEndpoint::ProcessSubstitution(_)) => Some(0),
+            Some(FdReadEndpoint::File(file)) => Some(read_timeout_zero_poll_handle(file.handle)),
+            Some(FdReadEndpoint::CoprocStdout { fd, .. }) => {
+                Some(read_timeout_zero_poll_handle(fd.handle))
+            }
+            Some(FdReadEndpoint::InheritedProcessStdin) => Some(read_timeout_zero_poll_handle(
+                crate::fd::process_std_handle(0),
+            )),
+            None => None,
         }
     }
 
@@ -3044,6 +3103,16 @@ impl Executor {
             }
         }
         false
+    }
+}
+
+/// One zero-timeout readability poll, GNU input_avail's shape:
+/// Ready (data, EOF, HUP, or an error select() would also surface)
+/// is success; a genuinely unready descriptor is failure.
+fn read_timeout_zero_poll_handle(handle: crate::fd::HANDLE) -> i32 {
+    match crate::fd::wait_readable(handle, std::time::Duration::ZERO) {
+        crate::fd::ReadWait::Ready => 0,
+        crate::fd::ReadWait::Timeout => 1,
     }
 }
 

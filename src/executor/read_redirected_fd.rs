@@ -40,6 +40,14 @@ impl Executor {
             .and_then(|target| target.strip_suffix(')'))
         {
             let output = self.process_substitution_output(source)?;
+            self.read_eof_no_delimiter |= slurped_record_eof_no_delimiter(
+                &output,
+                delimiter,
+                char_limit,
+                exact_char_limit,
+                escape_aware,
+                raw,
+            );
             return Some(trim_read_input(
                 output,
                 delimiter,
@@ -74,6 +82,14 @@ impl Executor {
             Ok(text) => text,
             Err(_) => return None,
         };
+        self.read_eof_no_delimiter |= slurped_record_eof_no_delimiter(
+            &input,
+            delimiter,
+            char_limit,
+            exact_char_limit,
+            escape_aware,
+            raw,
+        );
         Some(trim_read_input(
             input,
             delimiter,
@@ -85,7 +101,7 @@ impl Executor {
     }
 
     pub(in crate::executor) fn read_heredoc_fd_input(
-        &self,
+        &mut self,
         cmd: &CommandNode,
         fd: u32,
         delimiter: char,
@@ -104,6 +120,14 @@ impl Executor {
             if let crate::parser::StdinBody::Preexpanded(text) = carrier {
                 let mut input = text.clone();
                 input.push('\n');
+                self.read_eof_no_delimiter |= slurped_record_eof_no_delimiter(
+                    &input,
+                    delimiter,
+                    char_limit,
+                    exact_char_limit,
+                    escape_aware,
+                    raw,
+                );
                 return Some(trim_read_input(
                     input,
                     delimiter,
@@ -118,6 +142,14 @@ impl Executor {
             let mut input =
                 decode_ansi_c_quoted_word(word).unwrap_or_else(|| self.expand_word(word));
             input.push('\n');
+            self.read_eof_no_delimiter |= slurped_record_eof_no_delimiter(
+                &input,
+                delimiter,
+                char_limit,
+                exact_char_limit,
+                escape_aware,
+                raw,
+            );
             return Some(trim_read_input(
                 input,
                 delimiter,
@@ -132,6 +164,14 @@ impl Executor {
         } else {
             strip_unterminated_heredoc_marker(strip_quoted_heredoc_marker(body)).to_string()
         };
+        self.read_eof_no_delimiter |= slurped_record_eof_no_delimiter(
+            &input,
+            delimiter,
+            char_limit,
+            exact_char_limit,
+            escape_aware,
+            raw,
+        );
         Some(trim_read_input(
             input,
             delimiter,

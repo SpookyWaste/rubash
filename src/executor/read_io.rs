@@ -263,8 +263,14 @@ impl Executor {
         if read_fd.is_none() {
             if cmd.heredoc_body.is_some() {
                 let input = self.expand_heredoc_body_mut_from_carrier(&cmd.heredoc_body);
-                self.read_eof_no_delimiter |=
-                    !record_contains_delimiter(&input, delimiter, escape_aware);
+                self.read_eof_no_delimiter |= slurped_record_eof_no_delimiter(
+                    &input,
+                    delimiter,
+                    char_limit,
+                    exact_char_limit,
+                    escape_aware,
+                    raw,
+                );
                 return Some(trim_read_input(
                     input,
                     delimiter,
@@ -276,8 +282,14 @@ impl Executor {
             }
             if let Some(heredoc) = &cmd.heredoc {
                 let input = self.expand_heredoc_body_mut(heredoc);
-                self.read_eof_no_delimiter |=
-                    !record_contains_delimiter(&input, delimiter, escape_aware);
+                self.read_eof_no_delimiter |= slurped_record_eof_no_delimiter(
+                    &input,
+                    delimiter,
+                    char_limit,
+                    exact_char_limit,
+                    escape_aware,
+                    raw,
+                );
                 return Some(trim_read_input(
                     input,
                     delimiter,
@@ -306,9 +318,14 @@ impl Executor {
             ) {
                 return Some(line);
             }
-            if let Some(output) =
-                self.read_coproc_stdout(fd, delimiter, char_limit, exact_char_limit, escape_aware, raw)
-            {
+            if let Some(output) = self.read_coproc_stdout(
+                fd,
+                delimiter,
+                char_limit,
+                exact_char_limit,
+                escape_aware,
+                raw,
+            ) {
                 self.read_eof_no_delimiter |=
                     !record_contains_delimiter(&output, delimiter, escape_aware);
                 return Some(trim_read_input(
@@ -418,9 +435,61 @@ impl Executor {
                 .strip_prefix("<(")
                 .and_then(|target| target.strip_suffix(')'))
             {
-                if let Some(output) = self.process_substitution_output(source) {
-                    self.read_eof_no_delimiter |=
-                        !record_contains_delimiter(&output, delimiter, escape_aware);
+                if let Some((output, body_timing)) =
+                    self.process_substitution_output_bytes_timed(source)
+                {
+                    // rubash#1141: serve the record through a scratch
+                    // fd-table endpoint so the substitution body's
+                    // production schedule judges it like any other
+                    // materialized stream (fd_table::read_bytes).
+                    if let Some(fd) = self.allocate_dynamic_fd() {
+                        self.fd_table.open_input(
+                            fd,
+                            FdReadEndpoint::process_substitution_bytes(output),
+                            true,
+                        );
+                        if let Some(timing) = body_timing {
+                            self.fd_table.set_input_timing(fd, timing);
+                        }
+                        let line = self.fd_table.read_text(
+                            fd,
+                            delimiter,
+                            char_limit,
+                            exact_char_limit,
+                            escape_aware,
+                            raw,
+                        );
+                        self.fd_table.entries.remove(&fd);
+                        return Some(match line {
+                            Some(line) => trim_read_input(
+                                line,
+                                delimiter,
+                                char_limit,
+                                exact_char_limit,
+                                escape_aware,
+                                raw,
+                            ),
+                            None => {
+                                if !self.fd_table.read_timed_out {
+                                    self.read_eof_no_delimiter = true;
+                                }
+                                String::new()
+                            }
+                        });
+                    }
+                    let output = bytes_to_shell_text(&output);
+                    // e3 (niubash#536) accounting: the pre-e3 formula
+                    // `!record_contains_delimiter(..)` misreports EOF when
+                    // a -n/-N limit stopped the trim before the end of the
+                    // slurped text; replay the per-unit walk instead.
+                    self.read_eof_no_delimiter |= slurped_record_eof_no_delimiter(
+                        &output,
+                        delimiter,
+                        char_limit,
+                        exact_char_limit,
+                        escape_aware,
+                        raw,
+                    );
                     return Some(trim_read_input(
                         output,
                         delimiter,
@@ -545,6 +614,52 @@ impl Executor {
                 }
                 return line;
             }
+            // rubash#1141: a timed process-substitution stream is served
+            // through a scratch fd-table endpoint so the body's
+            // production schedule judges the record (fd_table::read_bytes)
+            // — the plain text serve below would hand the consumer bytes
+            // that, on GNU's pipe, had not arrived by the deadline. The
+            // take drains the stream exactly like the text serve does.
+            let procsub_taken = self.procsub_stream_take_timed(&path);
+            if let Some((bytes, timing, base)) = &procsub_taken {
+                if let Some(timing) = timing {
+                    if let Some(shifted) = timing.borrow().shifted(*base) {
+                        if let Some(fd) = self.allocate_dynamic_fd() {
+                            self.fd_table.open_input(
+                                fd,
+                                FdReadEndpoint::process_substitution_bytes(bytes.clone()),
+                                true,
+                            );
+                            self.fd_table.set_input_timing(fd, shifted.shared());
+                            let line = self.fd_table.read_text(
+                                fd,
+                                delimiter,
+                                char_limit,
+                                exact_char_limit,
+                                escape_aware,
+                                raw,
+                            );
+                            self.fd_table.entries.remove(&fd);
+                            return Some(match line {
+                                Some(line) => trim_read_input(
+                                    line,
+                                    delimiter,
+                                    char_limit,
+                                    exact_char_limit,
+                                    escape_aware,
+                                    raw,
+                                ),
+                                None => {
+                                    if !self.fd_table.read_timed_out {
+                                        self.read_eof_no_delimiter = true;
+                                    }
+                                    String::new()
+                                }
+                            });
+                        }
+                    }
+                }
+            }
             // GNU read receives raw bytes from redir.c-opened inputs. Keep
             // invalid UTF-8 inside the RAW_BYTE_MARKER carrier instead of
             // dropping the whole record at this boundary.
@@ -552,7 +667,7 @@ impl Executor {
             // (docs/proc-vfs-plan.md hook B).
             let input = if let Some(bytes) = crate::proc_vfs::proc_file_content(&expanded_target) {
                 crate::executor::substitution_metadata::bytes_to_shell_text(&bytes)
-            } else if let Some(bytes) = self.procsub_stream_take(&path) {
+            } else if let Some((bytes, _, _)) = procsub_taken {
                 // `<(cmd)` carrier path: the word names a draining
                 // stream — serve the shared remainder (subst.c:7143).
                 crate::executor::substitution_metadata::bytes_to_shell_text(&bytes)
@@ -565,8 +680,14 @@ impl Executor {
             if input.is_empty() {
                 return None;
             }
-            self.read_eof_no_delimiter |=
-                !record_contains_delimiter(&input, delimiter, escape_aware);
+            self.read_eof_no_delimiter |= slurped_record_eof_no_delimiter(
+                &input,
+                delimiter,
+                char_limit,
+                exact_char_limit,
+                escape_aware,
+                raw,
+            );
             return Some(trim_read_input(
                 input,
                 delimiter,
@@ -582,8 +703,14 @@ impl Executor {
         // does not advance the shared fd cursor.
         if cmd.here_string.is_some() {
             if let Some(line) = self.stdin_string_for_command_mut(cmd) {
-                self.read_eof_no_delimiter |=
-                    !record_contains_delimiter(&line, delimiter, escape_aware);
+                self.read_eof_no_delimiter |= slurped_record_eof_no_delimiter(
+                    &line,
+                    delimiter,
+                    char_limit,
+                    exact_char_limit,
+                    escape_aware,
+                    raw,
+                );
                 return Some(trim_read_input(
                     line,
                     delimiter,
@@ -655,7 +782,13 @@ impl Executor {
         // If FUNCTION_STDIN is set (from heredoc or redirect), only read from it.
         // Do NOT fall through to process stdin - that would block on the terminal.
         if self.shell_state.env_vars.contains_key(FUNCTION_STDIN) {
-            return self.read_function_stdin(delimiter, char_limit, exact_char_limit, escape_aware, raw);
+            return self.read_function_stdin(
+                delimiter,
+                char_limit,
+                exact_char_limit,
+                escape_aware,
+                raw,
+            );
         }
 
         if let Some(line) = self.read_virtual_fd_stdin(
@@ -925,6 +1058,21 @@ impl Executor {
     }
 
     pub(crate) fn process_substitution_output_bytes(&mut self, source: &str) -> Option<Vec<u8>> {
+        self.process_substitution_output_bytes_timed(source)
+            .map(|(bytes, _timing)| bytes)
+    }
+
+    /// rubash#1141: `process_substitution_output_bytes` plus the body's
+    /// production schedule. GNU runs the body concurrently on a pipe
+    /// (subst.c:6362 process_substitute), so a consumer's read deadline
+    /// observes real arrival times; rubash materializes the bytes, so
+    /// the schedule recorded while the body ran is the consumer's only
+    /// timing evidence (timed_input.rs). Raw-byte units: fd-table
+    /// endpoints serve bytes, not shell text.
+    pub(crate) fn process_substitution_output_bytes_timed(
+        &mut self,
+        source: &str,
+    ) -> Option<(Vec<u8>, Option<super::timed_input::SharedTimedInput>)> {
         let ast = super::command_substitution::parse_procsub_body(self, source);
         if ast.commands.is_empty() {
             return None;
@@ -948,10 +1096,17 @@ impl Executor {
         // thread-local capture, which belongs to an enclosing pipeline
         // stage when this substitution runs inside one; give the body its
         // own capture.
+        let timing_recorder = crate::executor::shell_options::begin_capture_timing();
         let (thread_captured, result) =
             crate::executor::shell_options::capture_stdout(|| subshell.execute_ast(&ast));
+        crate::executor::shell_options::end_capture_timing();
         let mut output = subshell.stdout_capture.take().unwrap_or_default();
+        // rubash#1141: field-sink bytes precede thread-sink bytes.
+        crate::executor::shell_options::capture_timing_set_prefix(&output);
         output.extend_from_slice(&thread_captured);
+        let body_timing = std::mem::take(&mut *timing_recorder.borrow_mut())
+            .finish(output.len(), false, output.len())
+            .map(|timing| timing.shared());
         // GNU process_substitute leaves the fork's status for `wait $!`
         // (subst.c:6362+); rubash ran the substitution inline, so register
         // the finished subshell status under $! before returning.
@@ -981,7 +1136,7 @@ impl Executor {
             Ok(())
             | Err(ExecuteError::ExitCode(_))
             | Err(ExecuteError::ExpansionFailure(_))
-            | Err(ExecuteError::Return(_)) => Some(output),
+            | Err(ExecuteError::Return(_)) => Some((output, body_timing)),
             Err(_) => None,
         }
     }
@@ -997,10 +1152,14 @@ impl Executor {
         raw: bool,
     ) -> Option<String> {
         if self.fd_table.is_open_for_read(fd) {
-            if let Some(line) =
-                self.fd_table
-                    .read_text(fd, delimiter, char_limit, exact_char_limit, escape_aware, raw)
-            {
+            if let Some(line) = self.fd_table.read_text(
+                fd,
+                delimiter,
+                char_limit,
+                exact_char_limit,
+                escape_aware,
+                raw,
+            ) {
                 if let Some((_, offset)) = self.fd_table.input_snapshot(fd) {
                     self.shell_state
                         .env_vars
@@ -1073,15 +1232,33 @@ impl Executor {
             .get(FUNCTION_STDIN)
             .is_none_or(|input| offset >= input.len())
         {
+            // rubash#1141: EOF is itself a timed event — it "arrives"
+            // when production ends, so an EOF read against a stream
+            // whose production outlasts the deadline is a timeout, not
+            // an EOF (GNU: the alarm fires while zread blocks).
+            if let (Some(input), Some(timing)) = (
+                self.shell_state.env_vars.get(FUNCTION_STDIN),
+                self.timed_stdin.clone(),
+            ) {
+                let mut timing = timing.borrow_mut();
+                if timing.matches_len(input.len())
+                    && matches!(
+                        timing.judge(None, offset, self.read_deadline),
+                        super::timed_input::TimedVerdict::Timeout { .. }
+                    )
+                {
+                    self.read_timed_out = true;
+                }
+            }
             return None;
         }
         if char_limit == Some(0) {
             return Some(String::new());
         }
 
-        let (output, consumed, delimiter_found, limit_reached) = {
-            let input = self.shell_state.env_vars.get(FUNCTION_STDIN)?;
-            let slice = &input[offset..];
+        // One record scan over a window of the stream; re-run on the
+        // in-time prefix when the timing judge cuts the record short.
+        let scan_record = |slice: &str| -> Option<(String, usize, bool, bool)> {
             let mut output = String::new();
             let mut consumed = 0usize;
             let mut took_any = false;
@@ -1169,12 +1346,55 @@ impl Executor {
             if !took_any {
                 return None;
             }
-            (output, consumed, delimiter_found, limit_reached)
+            Some((output, consumed, delimiter_found, limit_reached))
         };
+        let input_len = self.shell_state.env_vars.get(FUNCTION_STDIN)?.len();
+        let (mut output, mut consumed, delimiter_found, limit_reached) = {
+            let input = self.shell_state.env_vars.get(FUNCTION_STDIN)?;
+            scan_record(&input[offset..])?
+        };
+
+        // rubash#1141: judge the record against the stream's production
+        // schedule. GNU's read blocks in zread until the record's bytes
+        // arrive or the deadline fires (read.def), so a record completed
+        // only by bytes that arrive after the deadline is a timeout:
+        // serve just the in-time prefix and report through
+        // read_timed_out (the caller still assigns the partial value,
+        // matching read.def's timeout path to assign_vars).
+        let mut timed_out = false;
+        if let Some(timing) = self.timed_stdin.clone() {
+            let mut timing = timing.borrow_mut();
+            if timing.matches_len(input_len) {
+                let record_end = if delimiter_found || limit_reached {
+                    Some(offset + consumed)
+                } else {
+                    None
+                };
+                if let super::timed_input::TimedVerdict::Timeout { available_end } =
+                    timing.judge(record_end, offset, self.read_deadline)
+                {
+                    timed_out = true;
+                    self.read_timed_out = true;
+                    let (p_output, p_consumed, _, _) = {
+                        let input = self.shell_state.env_vars.get(FUNCTION_STDIN)?;
+                        let mut end = available_end;
+                        while end > offset && !input.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        scan_record(&input[offset..end]).unwrap_or((String::new(), 0, false, false))
+                    };
+                    output = p_output;
+                    consumed = p_consumed;
+                }
+            }
+        }
 
         // read.def:949 eof: the buffered stdin ran out before the
         // delimiter (a -n/-N limit break is not EOF).
         self.read_eof_no_delimiter = !delimiter_found && !limit_reached;
+        if timed_out {
+            self.read_eof_no_delimiter = false;
+        }
         self.shell_state.env_vars.insert(
             FUNCTION_STDIN_OFFSET.to_string(),
             (offset + consumed).to_string(),

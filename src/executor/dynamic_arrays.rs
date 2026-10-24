@@ -296,14 +296,25 @@ impl Executor {
                         crate::builtins::shopt::bashopts_value(&self.shell_state.env_vars)
                     }),
             ),
-            "PIPESTATUS" => Some(
-                self.shell_state
-                    .pipestatus
-                    .first()
-                    .copied()
-                    .unwrap_or(0)
-                    .to_string(),
-            ),
+            // GNU: $PIPESTATUS is element 0 of the array cell — an
+            // absent or valueless cell (before the first command, or
+            // frozen by a valueless declaration) reads as unset, not
+            // as a fabricated 0 (rubash#1363/#1364).
+            "PIPESTATUS" => match self.shell_state.pipestatus_shape {
+                crate::shell::state::PipestatusShape::LiveArray => Some(
+                    self.shell_state
+                        .pipestatus
+                        .first()
+                        .map(i32::to_string)
+                        .unwrap_or_default(),
+                ),
+                crate::shell::state::PipestatusShape::Scalar => {
+                    self.shell_state.env_vars.get("PIPESTATUS").cloned()
+                }
+                crate::shell::state::PipestatusShape::Valueless
+                | crate::shell::state::PipestatusShape::ValuelessArray
+                | crate::shell::state::PipestatusShape::Absent => None,
+            },
             _ => None,
         }
     }
@@ -400,6 +411,40 @@ impl Executor {
         if is_marked_var(&self.shell_state.env_vars, UNSET_DYNAMIC_VARS, name) {
             return None;
         }
+        // rubash#1394: BASH_ARGC/BASH_ARGV are dynamic stack arrays
+        // whose scalar getter does not exist (dynamic_parameter_value
+        // has no arm for them and returns None), so render them here
+        // from the composed views BEFORE the scalar-value gate below —
+        // the same views element reads use (variables.c get_bashargcv
+        // materializes the bottom frame on a top-level read; inside a
+        // function the arrays stay unmaterialized without extdebug and
+        // render as ()).
+        if matches!(name, "BASH_ARGC" | "BASH_ARGV") {
+            let exported = if is_marked_var(&self.shell_state.env_vars, EXPORTED_VARS, name) {
+                "x"
+            } else {
+                ""
+            };
+            let readonly = if is_marked_var(&self.shell_state.env_vars, READONLY_VARS, name) {
+                "r"
+            } else {
+                ""
+            };
+            let values = if name == "BASH_ARGC" {
+                self.bash_argc_view()
+            } else {
+                self.bash_argv_view()
+            };
+            let elements = values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| format!("[{index}]={}", sh_double_quote_text(value)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Some(format!(
+                "declare -a{readonly}{exported} {name}=({elements})"
+            ));
+        }
         let value = self.dynamic_parameter_value(name)?;
         let quoted = sh_double_quote_text(&value);
         // mk_env_string/declare -p read the getter's CURRENT value through
@@ -435,41 +480,104 @@ impl Executor {
                     .map(|(index, group)| format!("[{index}]={}", sh_double_quote_text(group)))
                     .collect::<Vec<_>>()
                     .join(" ");
-                Some(format!("declare -a{readonly}{exported} {name}=({elements})"))
+                Some(format!(
+                    "declare -a{readonly}{exported} {name}=({elements})"
+                ))
             }
             // GNU: `declare -p PIPESTATUS` renders the live array as
-            // `declare -a PIPESTATUS=([0]="1" [1]="0")` (rubash#1363).
-            // A readonly PIPESTATUS keeps the -r flag; if it was never
-            // assigned it renders as a scalar `declare -r PIPESTATUS`.
-            // Unset and not readonly: not found (rubash#1364).
+            // `declare -a PIPESTATUS=([0]="1" [1]="0")` (rubash#1363),
+            // a scalar cell as `declare -- PIPESTATUS="99"`, and a
+            // valueless cell as its attribute string (`declare -r
+            // PIPESTATUS` for a readonly declaration, `declare -a
+            // PIPESTATUS` when created with -a). An absent cell is
+            // not found. Every non-absent shape renders here: the
+            // print fallback consults the table's static array mark
+            // and would emit `-a` for all of them (rubash#1364).
             "PIPESTATUS" => {
-                let readonly =
-                    is_marked_var(&self.shell_state.env_vars, READONLY_VARS, "PIPESTATUS");
-                let rflag = if readonly { "r" } else { "" };
-                if self.shell_state.pipestatus.is_empty() {
-                    if readonly {
-                        Some(format!("declare -{rflag}{exported} PIPESTATUS"))
+                // Attribute flags in declaration_scalar_attrs order
+                // (builtins/declare/output.rs): the static ARRAY mark
+                // init sets names PIPESTATUS's nominal type, so the
+                // table fallback would render `-a` for every shape —
+                // only a live array (or the att_array valueless cell)
+                // carries it in GNU (rubash#1363/#1364).
+                let flag = |key: &str, letter: &'static str| -> &'static str {
+                    if is_marked_var(&self.shell_state.env_vars, key, "PIPESTATUS") {
+                        letter
                     } else {
-                        None
+                        ""
                     }
-                } else {
-                    let elements = self
-                        .shell_state
-                        .pipestatus
-                        .iter()
-                        .enumerate()
-                        .map(|(index, status)| {
-                            format!("[{index}]={}", sh_double_quote_text(&status.to_string()))
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    Some(format!("declare -a{rflag}{exported} PIPESTATUS=({elements})"))
+                };
+                let iflag = flag(INTEGER_VARS, "i");
+                let nflag = flag(NAMEREF_VARS, "n");
+                let rflag = flag(READONLY_VARS, "r");
+                let tflag = flag(TRACE_VARS, "t");
+                let lflag = flag(LOWERCASE_VARS, "l");
+                let uflag = flag(UPPERCASE_VARS, "u");
+                let cflag = flag(CAPCASE_VARS, "c");
+                match self.shell_state.pipestatus_shape {
+                    crate::shell::state::PipestatusShape::LiveArray => {
+                        let elements = self
+                            .pipestatus_values()
+                            .iter()
+                            .enumerate()
+                            .map(|(index, status)| {
+                                format!("[{index}]={}", sh_double_quote_text(status))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        Some(format!(
+                            "declare -a{rflag}{exported} PIPESTATUS=({elements})"
+                        ))
+                    }
+                    crate::shell::state::PipestatusShape::Scalar => {
+                        let flags =
+                            format!("{iflag}{nflag}{rflag}{tflag}{exported}{lflag}{uflag}{cflag}");
+                        let flags = if flags.is_empty() {
+                            "--".to_string()
+                        } else {
+                            format!("-{flags}")
+                        };
+                        let value = self
+                            .shell_state
+                            .env_vars
+                            .get("PIPESTATUS")
+                            .cloned()
+                            .unwrap_or_default();
+                        Some(format!(
+                            "declare {flags} PIPESTATUS={}",
+                            sh_double_quote_text(&value)
+                        ))
+                    }
+                    crate::shell::state::PipestatusShape::Valueless
+                    | crate::shell::state::PipestatusShape::ValuelessArray => {
+                        let aflag = if self.shell_state.pipestatus_shape
+                            == crate::shell::state::PipestatusShape::ValuelessArray
+                        {
+                            "a"
+                        } else {
+                            ""
+                        };
+                        let flags = format!(
+                            "{aflag}{iflag}{nflag}{rflag}{tflag}{exported}{lflag}{uflag}{cflag}"
+                        );
+                        let flags = if flags.is_empty() {
+                            "--".to_string()
+                        } else {
+                            format!("-{flags}")
+                        };
+                        Some(format!("declare {flags} PIPESTATUS"))
+                    }
+                    crate::shell::state::PipestatusShape::Absent => None,
                 }
             }
             "EPOCHSECONDS" | "EPOCHREALTIME" | "LINENO" | "BASH_SUBSHELL" | "BASH_ARGV0"
             | "BASH_COMMAND" => {
                 let flags = format!("{readonly}{exported}");
-                let flags = if flags.is_empty() { "--".to_string() } else { format!("-{flags}") };
+                let flags = if flags.is_empty() {
+                    "--".to_string()
+                } else {
+                    format!("-{flags}")
+                };
                 Some(format!("declare {flags} {name}={quoted}"))
             }
             _ => None,
@@ -506,6 +614,16 @@ impl Executor {
     pub(in crate::executor) fn dynamic_parameter_is_set(&self, name: &str) -> bool {
         if is_marked_var(&self.shell_state.env_vars, UNSET_DYNAMIC_VARS, name) {
             return false;
+        }
+        if name == "PIPESTATUS" {
+            // A PIPESTATUS cell counts as set only once it holds a
+            // value: a live array or a scalar (variables.c var_isset —
+            // an att_invisible valueless cell is not set).
+            return matches!(
+                self.shell_state.pipestatus_shape,
+                crate::shell::state::PipestatusShape::LiveArray
+                    | crate::shell::state::PipestatusShape::Scalar
+            );
         }
         matches!(
             name,

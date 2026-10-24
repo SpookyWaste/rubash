@@ -123,6 +123,23 @@ impl Executor {
         if status == 0 {
             self.sync_setattr_typed_assignments(cmd.words[1..].iter().map(String::as_str));
         }
+        // PIPESTATUS cell-shape transitions for readonly's operands
+        // (rubash#1363/#1364): a bare `readonly PIPESTATUS` before the
+        // array materializes leaves a valueless cell the writer can
+        // never fill; on a live array it changes nothing (the writer
+        // ignores att_readonly). -p prints only.
+        let print_requested = args.iter().any(|arg| {
+            arg.len() > 1
+                && arg.starts_with('-')
+                && arg[1..].chars().all(|c| c.is_ascii_alphabetic())
+                && arg[1..].contains('p')
+        });
+        if status == 0 {
+            self.note_pipestatus_attribute_operands(&args, print_requested);
+        }
+        // A live readonly PIPESTATUS array prints in array form under
+        // `readonly -p`, not the table's valueless line (rubash#1363).
+        self.substitute_pipestatus_print_line(&mut stdout);
         self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
         Ok(status)
     }

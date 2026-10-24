@@ -447,6 +447,10 @@ impl Executor {
         // BASH_ARGC/BASH_ARGV frames (extdebug only — see below), so the
         // exit path pops exactly what this call pushed (rubash#1051).
         let mut pushed_bash_args = false;
+        // rubash#1141: set inside the entry block when the call replaces
+        // FUNCTION_STDIN, holding the enclosing stream's production
+        // schedule for the exit path to restore.
+        let mut saved_timed_stdin: Option<Option<super::timed_input::SharedTimedInput>> = None;
         let (old_function, old_function_stdin, old_function_stdin_offset, old_positional_params) = {
             let old_function = self
                 .shell_state
@@ -470,6 +474,18 @@ impl Executor {
                 self.shell_state
                     .env_vars
                     .insert(FUNCTION_STDIN_OFFSET.to_string(), "0".to_string());
+                // rubash#1141: a stdin carved from the parent's stream
+                // keeps the stream's production schedule, re-based to
+                // the carve point; input staged from a redirect is
+                // locally produced and carries no schedule.
+                saved_timed_stdin = Some(self.timed_stdin.take());
+                if stdin_carved_from_parent {
+                    self.timed_stdin = saved_timed_stdin
+                        .as_ref()
+                        .and_then(|saved| saved.as_ref())
+                        .and_then(|timing| timing.borrow().shifted(parent_stdin_base))
+                        .map(|timing| timing.shared());
+                }
             }
             self.shell_state
                 .function_name_stack
@@ -890,6 +906,9 @@ impl Executor {
                 FUNCTION_STDIN,
                 old_function_stdin,
             );
+            if let Some(saved) = saved_timed_stdin {
+                self.timed_stdin = saved;
+            }
             if stdin_carved_from_parent {
                 // The child's FUNCTION_STDIN_OFFSET is its cursor into the
                 // carved remainder; fold it back into the parent's cursor so
