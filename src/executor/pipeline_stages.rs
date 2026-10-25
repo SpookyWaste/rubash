@@ -352,6 +352,11 @@ impl Executor {
         // carries the trap output down the pipe). Run before harvesting the
         // captures so both the field buffer and the thread-local capture
         // (still open) receive the trap output.
+        // (No trampoline fold here, unlike the builtin stage: a no_args
+        // DISCARD raised inside a function element's body keeps the
+        // pre-set EX_BADUSAGE 2 — GNU 5.3.20 probe: `f() { exit 1 2; };
+        // f | cat` reports PIPESTATUS 2. Only a builtin that IS the
+        // element folds to 1.)
         let body_status = subshell.last_exit_code();
         let (trap_thread_captured, trap_result) =
             crate::executor::shell_options::capture_stdout_streamed(
@@ -386,8 +391,21 @@ impl Executor {
         }
         let status = match (result, trap_result) {
             (Ok(()), Ok(trap_status)) => trap_status,
-            (Err(ExecuteError::ExitCode(code)), Ok(_))
-            | (Err(ExecuteError::ExpansionFailure(code)), Ok(_)) => code,
+            (Err(ExecuteError::ExitCode(code)), Ok(_)) => code,
+            // rubash#1542: an expansion-phase DISCARD harvested from the
+            // element clone keeps its pre-set class status (EX_BADUSAGE
+            // 2 for a failed `${var:=word}` bind) — except when this
+            // pipeline itself runs inside a command-substitution body,
+            // where the body's parse_and_execute catch
+            // (builtins/evalstring.c:423-426) folds it to
+            // EXECUTION_FAILURE like every DISCARD in that frame.
+            (Err(ExecuteError::ExpansionFailure(code)), Ok(_)) => {
+                if code == 2 && self.discard_fold_frame() {
+                    1
+                } else {
+                    code
+                }
+            }
             // rubash#1423: the element runs in a subshell — a `return`
             // raised by the element body ends the element with that
             // status instead of unwinding the enclosing function.
@@ -519,7 +537,20 @@ impl Executor {
         // 'echo X' EXIT | cat` carries X down the pipe). The table was reset
         // at entry, so only traps the member installed can fire. Run before
         // harvesting the captures so the trap output joins the pipe.
-        let body_status = subshell.last_exit_code();
+        // rubash#1540: a no_args DISCARD raised by the element builtin
+        // itself (exit/return with too many arguments) is caught by the
+        // execute_subshell_builtin_or_function trampoline
+        // (execute_cmd.c) and converted to subshell_exit(1) — the
+        // element reports 1 (and its EXIT trap runs with 1), never the
+        // pre-set EX_BADUSAGE 2 the clone's reader-level adjudication
+        // leaves behind. Expansion-phase failures keep their class
+        // status (see the match below): the trampoline only ever sees
+        // jumps raised while the builtin runs.
+        let body_status = if subshell.evalerror_exit_toomany_pending.get() {
+            1
+        } else {
+            subshell.last_exit_code()
+        };
         let trap_result = subshell.run_exit_trap_for_status(body_status);
         let output = crate::executor::shell_options::take_stdout_capture();
         let stderr = subshell.stderr_capture.take().unwrap_or_default();
@@ -527,8 +558,21 @@ impl Executor {
         crate::executor::shell_options::restore_stdout_capture(saved_capture);
         let status = match (result, trap_result) {
             (Ok(()), Ok(trap_status)) => trap_status,
-            (Err(ExecuteError::ExitCode(code)), Ok(_))
-            | (Err(ExecuteError::ExpansionFailure(code)), Ok(_)) => code,
+            (Err(ExecuteError::ExitCode(code)), Ok(_)) => code,
+            // rubash#1542: an expansion-phase DISCARD harvested from the
+            // element clone keeps its pre-set class status (EX_BADUSAGE
+            // 2 for a failed `${var:=word}` bind) — except when this
+            // pipeline itself runs inside a command-substitution body,
+            // where the body's parse_and_execute catch
+            // (builtins/evalstring.c:423-426) folds it to
+            // EXECUTION_FAILURE like every DISCARD in that frame.
+            (Err(ExecuteError::ExpansionFailure(code)), Ok(_)) => {
+                if code == 2 && self.discard_fold_frame() {
+                    1
+                } else {
+                    code
+                }
+            }
             // rubash#1423: the element runs in a subshell — a `return`
             // raised by the element body ends the element with that
             // status instead of unwinding the enclosing function.
@@ -671,7 +715,17 @@ impl Executor {
                 }
                 match glob::pathname_expand_word(&value, &self.shell_state.env_vars) {
                     glob::PathnameExpansion::Matches(matches) => args.extend(matches),
-                    glob::PathnameExpansion::NoMatch | glob::PathnameExpansion::Fail(_) => {
+                    glob::PathnameExpansion::NoMatch => args.push(value),
+                    // rubash#1540: same failglob funnel as the stage
+                    // arg-words path — report once and latch; the
+                    // caller's stage wrapper (sequential path) or the
+                    // spec latch net (concurrent path) adjudicates the
+                    // failure as the element's own (empty, 1) result
+                    // instead of running the literal pattern.
+                    glob::PathnameExpansion::Fail(pattern) => {
+                        if !self.evalerror_failglob_pending.replace(true) {
+                            self.report_failglob(&pattern);
+                        }
                         args.push(value)
                     }
                 }

@@ -153,7 +153,16 @@ impl Executor {
         // holds 2 (probe W5: a script ending in `exit 1 2` exits 2), and
         // the next execute_ast clears it at entry.
         if self.evalerror_exec_depth.get() == 0 && self.evalerror_exit_toomany_pending.get() {
-            if self.shell_state.env_vars.contains_key("__RUBASH_IS_C") {
+            // rubash#1541: the same conversion at a command-substitution
+            // body frame — the child's top frame is parse_and_execute, not
+            // reader_loop, and its DISCARD catch (builtins/evalstring.c:
+            // 423-426) forces EXECUTION_FAILURE and stops the body, so a
+            // body ending in `exit 1 2` yields substitution status 1, not
+            // the pre-set 2 (probe: `x=$(exit 1 2)` in a script file).
+            // command_substitution_result_status maps the Err to the
+            // substitution status exactly like the `-c` driver's exit.
+            if self.shell_state.env_vars.contains_key("__RUBASH_IS_C") || self.discard_fold_frame()
+            {
                 return Err(ExecuteError::ExitCode(1));
             }
             self.evalerror_exit_toomany_pending.set(false);
@@ -546,6 +555,21 @@ impl Executor {
                             if let Some(saved) = saved_fork_collapse.take() {
                                 self.subshell_fork_collapse.set(saved);
                             }
+                            // rubash#1541: a `( )` region closed by the
+                            // no_args DISCARD inside a command-substitution
+                            // body takes the folded status 1, not the pre-set
+                            // EX_BADUSAGE 2 — the region's forked child
+                            // inherits the body's parse_and_execute frame
+                            // (see discard_fold_frame). At the main level
+                            // the same region keeps 2 (execute_in_subshell,
+                            // execute_cmd.c:1821-1825). Only the too-many
+                            // class pre-sets 2; every other DISCARD class
+                            // here already carries 1.
+                            if self.evalerror_exit_toomany_pending.get()
+                                && self.discard_fold_frame()
+                            {
+                                self.exit_code = 1;
+                            }
                             // rubash#720 form 2: the evalerror DISCARD aborts
                             // the forked subshell with status 1 and the
                             // parent's :769 wait-side ERR adjudication still
@@ -650,7 +674,8 @@ impl Executor {
                         // T1).
                         if self.evalerror_exec_depth.get() == 1
                             && subshell_state.is_none()
-                            && self.shell_state.env_vars.contains_key("__RUBASH_IS_C")
+                            && (self.shell_state.env_vars.contains_key("__RUBASH_IS_C")
+                                || self.discard_fold_frame())
                         {
                             self.evalerror_pending.set(false);
                             self.evalerror_line.set(None);
@@ -1834,6 +1859,17 @@ impl Executor {
                         && !self.inside_compound_condition.get()
                         && self.at_discard_boundary() =>
                 {
+                    // rubash#1542: inside a command-substitution body the
+                    // DISCARD catch of parse_and_execute (builtins/
+                    // evalstring.c:423-426) folds the pre-set EX_BADUSAGE 2
+                    // of a failed `${var:=word}` bind to EXECUTION_FAILURE
+                    // — `x=$(echo ${v:=x})` on a readonly `v` substitutes
+                    // with status 1, not 2 (see discard_fold_frame).
+                    let code = if code == 2 && self.discard_fold_frame() {
+                        1
+                    } else {
+                        code
+                    };
                     self.exit_code = code;
                     // GNU 5.3.20: under `set -e` a bad-substitution or
                     // failglob word-expansion failure exits the script
@@ -1920,6 +1956,15 @@ impl Executor {
                 // status but the parent script continues. Catch the error at
                 // the subshell boundary instead of propagating it.
                 Err(ExecuteError::ExpansionFailure(code)) if subshell_state.is_some() => {
+                    // rubash#1542: same parse_and_execute fold as the
+                    // discard-boundary arm — a `( )` region inside a
+                    // command-substitution body that dies on a failed
+                    // `${var:=word}` bind reports 1, not the pre-set 2.
+                    let code = if code == 2 && self.discard_fold_frame() {
+                        1
+                    } else {
+                        code
+                    };
                     self.exit_code = code;
                     while index + 1 < commands.len() && !commands[index + 1].subshell_end {
                         index += 1;

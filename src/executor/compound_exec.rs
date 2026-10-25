@@ -2748,6 +2748,20 @@ impl Executor {
                     executor.evalerror_subscript_pending.set(false);
                     executor.evalerror_failglob_pending.set(false);
                     executor.evalerror_line.set(None);
+                    // rubash#1541: a no_args DISCARD raised inside the
+                    // region, when the region itself sits inside a
+                    // command-substitution body, folds to 1: the forked
+                    // region inherits the body's parse_and_execute frame,
+                    // whose DISCARD catch forces EXECUTION_FAILURE
+                    // (builtins/evalstring.c:423-426). At the main level
+                    // the same region keeps the pre-set EX_BADUSAGE 2
+                    // (execute_in_subshell, execute_cmd.c:1821-1825).
+                    if executor.evalerror_exit_toomany_pending.get()
+                        && executor.discard_fold_frame()
+                    {
+                        executor.evalerror_exit_toomany_pending.set(false);
+                        executor.exit_code = 1;
+                    }
                     // Bash runs a subshell with errexit active; a failing
                     // command exits the subshell with that status but the
                     // parent script continues. Catch ExitCode errors at the

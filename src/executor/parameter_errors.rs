@@ -204,6 +204,144 @@ fn next_quoted_parameter_expansion_start(text: &str) -> Option<usize> {
     }
     None
 }
+/// Bodies of the `$((...))` arithmetic expansions in `word` that a
+/// pure probe may evaluate: parens are balance-matched the way
+/// parse.y:3877 parse_matched_pair matches an arithmetic span, and
+/// bodies containing a command substitution are excluded (evaluating
+/// them would run the substitution — a side effect a probe must not
+/// have; subst.c:7143 command_substitute runs as the walk reaches it).
+fn speculative_arithmetic_bodies(word: &str) -> Vec<String> {
+    let bytes = word.as_bytes();
+    let mut bodies = Vec::new();
+    let mut i = 0usize;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'$' && bytes[i + 1] == b'(' && bytes[i + 2] == b'(' {
+            let mut depth = 0i32;
+            let mut j = i + 1;
+            let mut end = None;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(j);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            let Some(end) = end else { break };
+            if end >= i + 4 {
+                let body = &word[i + 3..end - 1];
+                if !body.contains("$(") && !body.contains('`') {
+                    bodies.push(body.to_string());
+                }
+            }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+    bodies
+}
+
+/// True when `word` (raw source text when available) carries a glob
+/// metacharacter outside any quoting — the failglob risk shape. A
+/// quoted metachar is a false hit, which only costs the concurrent
+/// fast path its admission.
+pub(in crate::executor) fn word_has_unquoted_glob_meta(word: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for ch in word.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if !in_single => escaped = true,
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '*' | '?' | '[' if !in_single && !in_double => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Blank out (position-preserving) the spans of `word` whose `${...}`
+/// fragments are NOT expansions of the current shell: `$( )` command
+/// substitutions and backtick substitutions (their fragments belong to
+/// the substitution child, subst.c:7143 command_substitute) and
+/// single-quoted regions (no expansion at all). `$(( ))` arithmetic is
+/// NOT masked — its fragments expand in the current shell. Used by the
+/// parameter-assignment pre-scan (rubash#1542).
+fn mask_nonlocal_expansion_spans(word: &str) -> String {
+    let chars: Vec<char> = word.chars().collect();
+    let mut out: Vec<char> = chars.clone();
+    let mut index = 0usize;
+    let mut in_double = false;
+    while index < chars.len() {
+        match chars[index] {
+            '\\' => {
+                index += 2;
+                continue;
+            }
+            '"' => {
+                in_double = !in_double;
+                index += 1;
+            }
+            '\'' if !in_double => {
+                // Single-quoted region: blank through the closing quote.
+                let start = index;
+                index += 1;
+                while index < chars.len() && chars[index] != '\'' {
+                    index += 1;
+                }
+                let end = (index + 1).min(chars.len());
+                for slot in &mut out[start..end] {
+                    *slot = ' ';
+                }
+                index = end;
+            }
+            '`' => {
+                let start = index;
+                index += 1;
+                while index < chars.len() && chars[index] != '`' {
+                    if chars[index] == '\\' {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+                let end = (index + 1).min(chars.len());
+                for slot in &mut out[start..end] {
+                    *slot = ' ';
+                }
+                index = end;
+            }
+            '$' if chars.get(index + 1) == Some(&'(') && chars.get(index + 2) != Some(&'(') => {
+                if let Some(end) =
+                    crate::lexer::skip_parenthesized_unit_corrected(&chars, index + 1)
+                {
+                    for slot in &mut out[index..end] {
+                        *slot = ' ';
+                    }
+                    index = end;
+                } else {
+                    index += 1;
+                }
+            }
+            _ => {
+                index += 1;
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 impl Executor {
     pub(in crate::executor) fn parameter_assignment_error(
         &self,
@@ -242,6 +380,21 @@ impl Executor {
             .strip_prefix(crate::executor::markers::QUOTED_WORD_PREFIX)
             .or_else(|| word.strip_prefix(STORAGE_WORD_PREFIX))
             .unwrap_or(word);
+        // rubash#1542: fragments inside a command-substitution span
+        // belong to the substitution's child (subst.c:7143
+        // command_substitute) — the child's own commands are scanned
+        // when they run. This textual pre-scan of the ENCLOSING word
+        // must not claim them: `x=$(echo ${v:=x})` reported the child's
+        // failure against the parent command and discarded it at the
+        // top level. Mask substitution/backtick/single-quoted spans
+        // before scanning (positions preserved).
+        let masked;
+        let word = if word.contains("$(") || word.contains('`') || word.contains('\'') {
+            masked = mask_nonlocal_expansion_spans(word);
+            &masked
+        } else {
+            word
+        };
         let mut rest = word;
         while let Some(start) = rest.find("${") {
             let after_start = &rest[start + 2..];
@@ -886,6 +1039,65 @@ impl Executor {
             .any(|word| self.parameter_expansion_error_in_word(word).is_some())
     }
 
+    /// rubash#1540: side-effect-free prediction of the two DISCARD
+    /// classes the textual pre-scan above cannot see — an arithmetic
+    /// expansion error (the scan never evaluates `$(( ))`) and a
+    /// failglob failure (pathname expansion depends on the live
+    /// directory). Used only as concurrent-pipeline admission, beside
+    /// `parameter_expansion_error_pending`: GNU forks every pipeline
+    /// element and expands its words exactly once inside the child
+    /// (execute_cmd.c:2620 execute_pipeline -> execute_simple_command
+    /// -> subst.c:11229 expand_word_internal), so a member predicted
+    /// to fail must decline the fast path BEFORE any speculative
+    /// expansion prints — the sequential stage executor then reports
+    /// the error exactly once, with the element's own status. A false
+    /// hit only costs the fast path; the sequential path is always
+    /// semantically complete.
+    pub(in crate::executor) fn pipeline_member_arith_failglob_risk(
+        &self,
+        cmd: &CommandNode,
+    ) -> bool {
+        if cmd.arithmetic_command.is_some() {
+            return false;
+        }
+        // Evaluate each command-substitution-free `$((...))` body
+        // against the current environment on the evaluator's scratch
+        // clone (its writes are dropped): the same verdict the real
+        // expansion would reach for state-independent bodies
+        // (division by zero, bad literals, syntax errors). Bodies
+        // containing `$(`/backticks are skipped — GNU runs the
+        // substitution as the expansion walk reaches it (subst.c:7143
+        // command_substitute), which a pure probe must not do; the
+        // stage-spec latch net in pipeline_exec covers those instead.
+        let mut texts: Vec<&str> = cmd.words.iter().map(String::as_str).collect();
+        texts.extend(cmd.assignment_values().map(String::as_str));
+        for text in texts {
+            for body in speculative_arithmetic_bodies(text) {
+                let (value, _writes, _category) =
+                    crate::executor::arithmetic::eval_conditional_arith_value_categorized_with_writes(
+                        &body,
+                        &self.shell_state.env_vars,
+                    );
+                if value.is_none() {
+                    return true;
+                }
+            }
+        }
+        if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "failglob") {
+            for (index, word) in cmd.words.iter().enumerate() {
+                let text = cmd
+                    .word_metadata
+                    .get(index)
+                    .map(|metadata| metadata.raw.as_str())
+                    .unwrap_or(word.as_str());
+                if word_has_unquoted_glob_meta(text) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub(in crate::executor) fn parameter_expansion_error_in_heredoc_body(
         &self,
         body: &str,
@@ -991,6 +1203,64 @@ impl Executor {
             }
         } else {
             1
+        }
+    }
+
+    /// True when this executor's top frame is a command-substitution body
+    /// reader — GNU runs the body through parse_and_execute inside the
+    /// forked child (subst.c:7413 command_substitute), whose DISCARD catch
+    /// (builtins/evalstring.c:423-426) forces
+    /// `last_result = last_command_exit_value = EXECUTION_FAILURE` and, in
+    /// a subshell environment, stops the body outright. A DISCARD-class
+    /// abandonment raised anywhere in the child's clone tree (eval/source
+    /// frames, function bodies, `( )` regions, pipeline elements) therefore
+    /// surfaces as status 1 at the substitution boundary, never as the
+    /// pre-set EX_BADUSAGE 2 a script-level reader_loop catch preserves
+    /// (eval.c:111-118) — rubash#1541/#1542. The marker lives only in the
+    /// comsub child's cloned env (command_substitution.rs inserts
+    /// `__RUBASH_COMSUB_BODY`), so the main executor and `( )`-only
+    /// subshells (execute_in_subshell keeps the pre-set status,
+    /// execute_cmd.c:1821-1825) never fold.
+    pub(in crate::executor) fn discard_fold_frame(&self) -> bool {
+        let has = self
+            .shell_state
+            .env_vars
+            .contains_key("__RUBASH_COMSUB_BODY");
+        has
+    }
+
+    /// rubash#1542: the FINAL status a failed `${var:=word}`/`${var=word}`
+    /// assignment produces in the current frame, given the class's
+    /// pre-set status (`class_status`: EX_BADUSAGE 2 for a readonly
+    /// bind, subst.c parameter_brace_expand_rhs; EXECUTION_FAILURE 1
+    /// for a special/positional target, subst.c:10402-10404) and `$?`
+    /// from before the expansion (`prev_status`). GNU prints the
+    /// diagnostic through error.c report_error — from inside
+    /// bind_variable for the readonly class (variables.c err_readonly),
+    /// immediately after set_exit_status(1) for the special class — and
+    /// report_error exit_shells on the spot when
+    /// exit_immediately_on_error is live, with the status current at
+    /// print time: the pre-bind `$?` (0 remapped to EXECUTION_FAILURE)
+    /// for readonly, 1 for special. The flag is the raw option: errexit
+    /// -exempt positions do not clear it, so they die too. Without
+    /// errexit the DISCARD proceeds with the pre-set status, folded to
+    /// EXECUTION_FAILURE inside a command-substitution body
+    /// (discard_fold_frame).
+    pub(in crate::executor) fn param_assign_discard_status(
+        &self,
+        class_status: i32,
+        prev_status: i32,
+    ) -> i32 {
+        if self.errexit_enabled() {
+            if class_status == 1 || prev_status == 0 {
+                1
+            } else {
+                prev_status
+            }
+        } else if self.discard_fold_frame() {
+            1
+        } else {
+            class_status
         }
     }
 

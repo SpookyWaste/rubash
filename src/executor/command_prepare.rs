@@ -432,6 +432,9 @@ impl Executor {
             // readonly next-line $? is 2; positional next-line $? is 1).
             // ExitCode(1) here would bubble to the top and terminate the
             // whole script.
+            // rubash#1542: `$?` before this arm overwrites it — the
+            // status GNU's report_error would exit_shell with (below).
+            let prev_status = self.exit_code;
             let status = if message == "readonly variable" { 2 } else { 1 };
             self.exit_code = status;
             // POSIX-mode notes item 36, parameter-expansion assignment arm:
@@ -443,6 +446,26 @@ impl Executor {
             // arm keeps the historical status-1 discard.
             if status == 2 && self.posix_assignment_failure_is_fatal() {
                 return Err(ExecuteError::ExitCode(1));
+            }
+            // rubash#1542: the diagnostic above is GNU's report_error
+            // call (variables.c err_readonly, printed from inside
+            // bind_variable before subst.c writes EX_BADUSAGE;
+            // subst.c:10404 report_error for the special class right
+            // after its set_exit_status(1)) — with
+            // exit_immediately_on_error live, report_error exit_shells
+            // at print time with the status current then, never
+            // reaching the DISCARD below. The check reads the raw flag:
+            // errexit-exempt positions (|| / && elements, `!`, if
+            // conditions, function bodies called there) do not clear
+            // it in GNU, so they exit too (GNU 5.3.20 probes: the shell
+            // exits with the pre-expansion status in every such
+            // position, and no ERR trap fires).
+            if self.errexit_enabled() {
+                let code = self.param_assign_discard_status(status, prev_status);
+                self.exit_code = code;
+                // rubash#439: expansion error, not a failed command — no ERR trap.
+                self.command_expansion_failed.set(true);
+                return Err(ExecuteError::ExitCode(code));
             }
             // rubash#439: expansion error, not a failed command — no ERR trap.
             self.command_expansion_failed.set(true);
@@ -824,6 +847,9 @@ impl Executor {
             // target -> EX_BADUSAGE 2 (subst.c:8164); positional/special
             // "cannot assign in this way" -> EXECUTION_FAILURE 1
             // (subst.c:10404-10410); the script keeps running either way.
+            // rubash#1542: same report_error errexit overlay as the
+            // twin arm above — capture the pre-expansion `$?` first.
+            let prev_status = self.exit_code;
             let status = if message == "readonly variable" { 2 } else { 1 };
             self.exit_code = status;
             // POSIX-mode notes item 36, parameter-expansion assignment arm:
@@ -835,6 +861,13 @@ impl Executor {
             // arm keeps the historical status-1 discard.
             if status == 2 && self.posix_assignment_failure_is_fatal() {
                 return Err(ExecuteError::ExitCode(1));
+            }
+            if self.errexit_enabled() {
+                let code = self.param_assign_discard_status(status, prev_status);
+                self.exit_code = code;
+                // rubash#439: expansion error, not a failed command — no ERR trap.
+                self.command_expansion_failed.set(true);
+                return Err(ExecuteError::ExitCode(code));
             }
             // rubash#439: expansion error, not a failed command — no ERR trap.
             self.command_expansion_failed.set(true);
@@ -3708,7 +3741,8 @@ impl Executor {
         // failglob verdict. A probe hit stays silent — the wrapper fallback
         // re-expands in the child and reports exactly once (753.11: the
         // doubled `no match` on the `&` line).
-        if self.expansion_probe_active.get() {
+        if self.expansion_probe_active.get() || super::pipeline_exec::speculative_expansion_active()
+        {
             return;
         }
         // GNU's failglob report (subst.c expand_word_list_internal ->
