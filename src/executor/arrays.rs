@@ -817,6 +817,45 @@ pub(super) struct IndexedAppendOutcome {
     pub bad_subscript: Option<String>,
 }
 
+/// The case attribute a compound element bind must apply to each element
+/// value it writes (GNU make_array_variable_value, arrayfunc.c:166 ->
+/// make_variable_value, variables.c:2970-2986). Elements already stored
+/// were converted when THEY were bound and are never rewritten by an
+/// append, so the conversion hangs off `IndexedDecodeBase::insert` — the
+/// one choke point every element written by a compound call passes
+/// through (rubash#1618: `a+=(...)` skipped the conversion entirely;
+/// rubash#1619: capcase was missing from the same paths).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ElementCase {
+    None,
+    Upper,
+    Lower,
+    Capitalize,
+}
+
+impl ElementCase {
+    fn of(env_vars: &crate::shell::var_table::VarTable, name: &str) -> Self {
+        if is_marked_var(env_vars, UPPERCASE_VARS, name) {
+            ElementCase::Upper
+        } else if is_marked_var(env_vars, LOWERCASE_VARS, name) {
+            ElementCase::Lower
+        } else if is_marked_var(env_vars, CAPCASE_VARS, name) {
+            ElementCase::Capitalize
+        } else {
+            ElementCase::None
+        }
+    }
+
+    fn apply(&self, value: String) -> String {
+        match self {
+            ElementCase::Upper => value.to_uppercase(),
+            ElementCase::Lower => value.to_lowercase(),
+            ElementCase::Capitalize => super::variable_state::capitalize_value(&value),
+            ElementCase::None => value,
+        }
+    }
+}
+
 /// rubash#616 (plan Phase 1c): the array contents the compound scan decodes
 /// against. GNU edits the ARRAY object in place — assign_compound_array_list
 /// (arrayfunc.c:700) inserts each element and `array_max_index` + 1 is the
@@ -835,6 +874,8 @@ struct IndexedDecodeBase<'a> {
     parsed: BTreeMap<usize, String>,
     /// Writes made by THIS call; the last write to an index wins.
     mutations: BTreeMap<usize, String>,
+    /// Case conversion for THIS call's writes (see `ElementCase`).
+    case: ElementCase,
 }
 
 impl IndexedDecodeBase<'_> {
@@ -870,6 +911,7 @@ impl IndexedDecodeBase<'_> {
     }
 
     fn insert(&mut self, index: usize, value: String) {
+        let value = self.case.apply(value);
         self.mutations.insert(index, value);
     }
 
@@ -914,6 +956,7 @@ pub(super) fn append_array_value(
     current: &str,
     cell: Option<&BTreeMap<i64, String>>,
     value: &str,
+    name: &str,
     integer: bool,
     ifs: Option<&str>,
     env_vars: &crate::shell::var_table::VarTable,
@@ -926,6 +969,14 @@ pub(super) fn append_array_value(
             indexed_array_entries(current)
         },
         mutations: BTreeMap::new(),
+        // GNU make_variable_value (variables.c:2920-2986): the integer
+        // branch preempts the case branch, so a variable carrying both
+        // evaluates and never case-converts.
+        case: if integer {
+            ElementCase::None
+        } else {
+            ElementCase::of(env_vars, name)
+        },
     };
     let old_max = entries.max();
     // An integer array rewrites EVERY element in the post-pass below, so even
