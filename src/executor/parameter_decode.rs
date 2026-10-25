@@ -130,7 +130,14 @@ pub(in crate::executor) fn remove_matching_prefix(
     length: MatchLength,
     extglob: bool,
 ) -> String {
-    if pattern_has_raw_byte_markers(pattern) {
+    // rubash#1533: in a byte locale the candidate boundaries are byte
+    // positions, not char boundaries — a match may end mid-character
+    // (`${v#h?}` under LC_ALL=C leaves the trailing byte of é), so the
+    // raw-byte walk owns the search whenever either side carries
+    // non-ASCII text, exactly as it already does for marker spellings.
+    if pattern_has_raw_byte_markers(pattern)
+        || super::conditional::pattern::sides_need_byte_locale_units(pattern, value)
+    {
         return remove_matching_prefix_bytes(value, pattern, length, extglob);
     }
     // Plain-literal pattern (rubash#608): string equality is the only
@@ -189,7 +196,11 @@ pub(in crate::executor) fn remove_matching_suffix(
     length: MatchLength,
     extglob: bool,
 ) -> String {
-    if pattern_has_raw_byte_markers(pattern) {
+    // rubash#1533: byte-locale candidates are byte positions (see
+    // remove_matching_prefix).
+    if pattern_has_raw_byte_markers(pattern)
+        || super::conditional::pattern::sides_need_byte_locale_units(pattern, value)
+    {
         return remove_matching_suffix_bytes(value, pattern, length, extglob);
     }
     // Plain-literal suffix (rubash#608): mirror of the prefix fast

@@ -9,6 +9,56 @@ pub(in crate::executor) fn replace_parameter_pattern(
     patsub_replacement: bool,
     extglob: bool,
 ) -> String {
+    // rubash#1533: in a byte locale patsub scans BYTE positions (GNU
+    // pat_subst walks the raw string): a match may start or end in the
+    // middle of a multibyte character (`${v//?/x}` on 'héllo' under
+    // LC_ALL=C replaces all six bytes, not five characters). Run the
+    // whole substitution in unit space — both sides staged as match
+    // units, where one unit is one byte — and convert the assembled
+    // result back to canonical shell text at the end. The replacement
+    // is output text, not a matched side: it is inserted verbatim and
+    // survives the round trip (only byte-char units are folded back
+    // to raw bytes; every other char re-encodes as itself).
+    if super::conditional::pattern::sides_need_byte_locale_units(pattern, value) {
+        let unit_value: String = super::conditional::pattern::stage_word_match_units(value, true)
+            .into_iter()
+            .collect();
+        let unit_pattern: String =
+            super::conditional::pattern::stage_pattern_match_units(pattern, true)
+                .into_iter()
+                .collect();
+        let unit_output = replace_parameter_pattern_inner(
+            &unit_value,
+            &unit_pattern,
+            replacement,
+            global,
+            nocase,
+            patsub_replacement,
+            extglob,
+        );
+        let raw = super::conditional::pattern::match_units_to_raw_bytes(&unit_output);
+        return crate::executor::substitution_metadata::bytes_to_shell_text(&raw);
+    }
+    replace_parameter_pattern_inner(
+        value,
+        pattern,
+        replacement,
+        global,
+        nocase,
+        patsub_replacement,
+        extglob,
+    )
+}
+
+fn replace_parameter_pattern_inner(
+    value: &str,
+    pattern: &str,
+    replacement: &str,
+    global: bool,
+    nocase: bool,
+    patsub_replacement: bool,
+    extglob: bool,
+) -> String {
     // GNU subst.c: parameter_brace_patsub:9440-9444 sets MATCH_EXPREP only
     // when the patsub_replacement shopt is on AND shouldexp_replacement
     // (subst.c:9150-9181) finds an unquoted `&`, `\\&`, or `\\\\` in the
