@@ -1459,6 +1459,41 @@ pub fn stdin_source_needs_more(source: &str) -> bool {
     stdin_source_needs_more_posix(source, false)
 }
 
+/// Advance an open `=~` parse_matched_pair scan depth over one token
+/// (see the scan tracking in `stdin_source_needs_more_posix`). Keyword
+/// `(`/`)` are the lexer's split points; an unquoted word's unescaped
+/// parens count too (a `(' glued inside a word still opens the pair,
+/// parse.y:5443); a quoted token's parens are data — the same admission
+/// `merge_pattern_rhs_fragments`' unquoted_paren_delta uses. The depth
+/// saturates at zero: once no pair is open, a `)' is word data.
+fn advance_regexp_scan_depth(depth: isize, token: &crate::lexer::Token) -> isize {
+    if token.kind == TokenKind::Keyword {
+        return match token.value.as_str() {
+            "(" => depth + 1,
+            ")" => depth.saturating_sub(1),
+            _ => depth,
+        };
+    }
+    if token.raw != token.value {
+        return depth;
+    }
+    let mut depth = depth;
+    let mut escaped = false;
+    for ch in token.raw.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    depth
+}
+
 /// POSIX-aware variant: `set -o posix` changes `'` scanning inside
 /// `"${...}"` (Interp 221), which decides whether the input is complete.
 pub fn stdin_source_needs_more_posix(source: &str, posix: bool) -> bool {
@@ -1468,9 +1503,26 @@ pub fn stdin_source_needs_more_posix(source: &str, posix: bool) -> bool {
 
     let tokens = tokenize(source);
     let mut stack = Vec::new();
+    // parse.y:5443-5461 read_token_word under PST_REGEXP: once an
+    // unquoted `(' opens parse_matched_pair inside a `=~' RHS word, the
+    // reader consumes raw text until the balancing `)' — every following
+    // token (a `]]' the lexer still emits, later lines' keywords, plain
+    // words) is regex data, so the command cannot be complete while the
+    // scan is open (rubash#1290 residual: the stdin group was submitted
+    // after the `[[` line and the EOF diagnostic landed on the group's
+    // own last line instead of the stream's EOF line). The lexer flags
+    // the RHS fragments and counts only keyword parens for its own state
+    // (it resets at a data `]]'), so the scan depth is re-derived here
+    // from the fragment stream and then tracked across whatever follows.
+    let mut regexp_scan_depth = 0isize;
     for token in &tokens {
+        if regexp_scan_depth > 0 {
+            regexp_scan_depth = advance_regexp_scan_depth(regexp_scan_depth, token);
+            continue;
+        }
         // `=~` RHS fragments are word data, never grammar tokens.
         if token.regexp_rhs_fragment {
+            regexp_scan_depth = advance_regexp_scan_depth(0, token);
             continue;
         }
         // `;;`/`;&`/`;;;&` tokenize as Word: legal only inside a `case` or
@@ -1526,7 +1578,7 @@ pub fn stdin_source_needs_more_posix(source: &str, posix: bool) -> bool {
             _ => {}
         }
     }
-    if !stack.is_empty() {
+    if regexp_scan_depth > 0 || !stack.is_empty() {
         return true;
     }
     // GNU parse.y grammar consumes the newline AFTER a binary connector as
