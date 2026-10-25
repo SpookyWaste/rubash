@@ -888,7 +888,7 @@ impl Executor {
             return Ok(Some(end + 1));
         }
 
-        let time_prefix = time_pipeline_prefix(first, self.posix_mode_enabled());
+        let time_prefix = time_pipeline_prefix(first);
         let time_prefix_started = time_prefix.as_ref().map(|_| time_command_started());
         let mut time_report_routed = false;
         let mut hoisted_time_inverted = false;
@@ -4981,7 +4981,7 @@ fn timed_stage_merges_stderr(stage: &CommandNode) -> bool {
             .is_some_and(|timed| node_merges_stderr_into_stdout(&timed.command))
 }
 
-fn time_pipeline_prefix(command: &CommandNode, posix_mode: bool) -> Option<TimePipelinePrefix> {
+fn time_pipeline_prefix(command: &CommandNode) -> Option<TimePipelinePrefix> {
     if command.words.first().map(String::as_str) != Some("time") {
         return None;
     }
@@ -4995,7 +4995,9 @@ fn time_pipeline_prefix(command: &CommandNode, posix_mode: bool) -> Option<TimeP
     }
     // rubash#1218: posix mode + dash word — not the time keyword; the
     // pipeline runs an ordinary command named `time`.
-    if posix_time_dash_word(&command.words, posix_mode) {
+    // rubash#1520: judged by the parse-time-frozen decision recorded on
+    // the head node, not the live mode.
+    if time_dash_word_not_keyword(command) {
         return None;
     }
 

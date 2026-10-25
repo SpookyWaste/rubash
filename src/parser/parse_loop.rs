@@ -1003,6 +1003,7 @@ fn fold_time_pipeline_stage_command(mut command: CommandNode) -> CommandNode {
         command: Box::new(command),
         posix_format: prefix.posix_format,
         inverted: prefix.inverted,
+        keyword_was_plain_word: false,
     });
     timed
 }
@@ -1039,6 +1040,7 @@ fn fold_time_pipeline_commands(commands: Vec<CommandNode>) -> Vec<CommandNode> {
                 command: Box::new(command),
                 posix_format: prefix.posix_format,
                 inverted: prefix.inverted,
+                keyword_was_plain_word: false,
             });
             timed
         })
@@ -1090,6 +1092,7 @@ fn fold_time_simple_commands(commands: Vec<CommandNode>) -> Vec<CommandNode> {
                 command: Box::new(command),
                 posix_format: prefix.posix_format,
                 inverted: prefix.inverted,
+                keyword_was_plain_word: false,
             });
             timed
         })
@@ -1127,6 +1130,18 @@ fn time_prefix_from_command(command: &mut CommandNode) -> Option<TimePipelinePre
     if !command.assignments.is_empty()
         || !command.compound_assignments.is_empty()
         || !command.array_element_assignments.is_empty()
+    {
+        return None;
+    }
+    // rubash#1520: only a head the parser recorded as the reserved word
+    // folds into a TimeCommand. A plain-word head — quoted in the
+    // source, or reclassified by the lexer under a POSIX pass because a
+    // dash word followed (parse.y:3286 time_command_acceptable) — is an
+    // ordinary command name and stays a simple command. Nodes whose
+    // word_kinds were not recorded keep the legacy fold.
+    if command.time_head_plain_word
+        || (command.word_kinds.len() == command.words.len()
+            && command.word_kinds.first() != Some(&TokenKind::Keyword))
     {
         return None;
     }
@@ -2732,6 +2747,14 @@ pub(super) fn parse_time_prefixed_compound_command(
     start: usize,
 ) -> Option<(CommandNode, usize)> {
     tokens.get(start)?;
+    // The `time` head must be the reserved word (mirrors the gate in
+    // time_prefixed_shell_command_allows_simple_pipeline): callers that
+    // dispatch on the token VALUE (coproc / function body parsers) must
+    // not fold a plain-word `time` — e.g. one the lexer reclassified
+    // under a POSIX pass (parse.y:3286, rubash#1520).
+    if !is_keyword(tokens, start, "time") {
+        return None;
+    }
     let mut posix_format = false;
     let mut inverted = false;
     let mut prefix_words = Vec::new();
@@ -2812,6 +2835,7 @@ pub(super) fn parse_time_prefixed_compound_command(
         command: Box::new(command),
         posix_format,
         inverted,
+        keyword_was_plain_word: false,
     });
     Some((timed, next_i))
 }
