@@ -1082,6 +1082,7 @@ impl Executor {
         if !posix_bracket_class_names_valid(&pattern)
             || posix_ere_has_extended_group(&pattern)
             || posix_ere_has_dangling_quantifier(&pattern)
+            || posix_ere_has_empty_min_interval(&pattern)
         {
             return Err(regex::Regex::new("(").unwrap_err());
         }
@@ -1878,6 +1879,31 @@ fn posix_ere_has_bad_interval(pattern: &str) -> bool {
     false
 }
 
+/// Whether the pattern contains an interval with an omitted minimum
+/// (`{,5}` / `{,}`) outside brackets and escapes. POSIX ERE requires
+/// the leading number; glibc regcomp accepts the omission as {0,5},
+/// but the strict regcomp reading — the GNU oracle rubash#1658 was
+/// filed against — rejects it with "invalid repetition count(s)", so
+/// the compile gate does too.
+fn posix_ere_has_empty_min_interval(pattern: &str) -> bool {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 2,
+            '[' => i = bracket_expression_end(&chars, i).unwrap_or(i + 1),
+            '{' => {
+                if chars.get(i + 1) == Some(&',') && ere_interval_at(&chars, i).is_some() {
+                    return true;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 /// Rewrite the two POSIX ERE quantifier spellings the regex crate
 /// reads differently, leaving everything else byte-identical:
 ///
@@ -1888,8 +1914,9 @@ fn posix_ere_has_bad_interval(pattern: &str) -> bool {
 ///   `a+?` -> `(?:a+)?`, `a{2,}?` -> `(?:a{2,})?`, `(aa)+?` ->
 ///   `(?:(aa)+)?`. Other stacked operators (`**`, `*{2}`, `?+`) nest
 ///   identically in both engines and pass through.
-/// - The glibc empty-minimum intervals `{,m}` / `{,}` (== `{0,m}` /
-///   `{0,}`), which the regex crate rejects outright.
+///
+/// Empty-minimum intervals (`{,m}` / `{,}`) never reach this rewrite:
+/// the compile gate rejects them first (rubash#1658).
 fn translate_posix_ere_quantifiers(pattern: &str) -> String {
     let chars: Vec<char> = pattern.chars().collect();
     let mut out: Vec<char> = Vec::with_capacity(chars.len() + 8);
@@ -1979,31 +2006,22 @@ fn translate_posix_ere_quantifiers(pattern: &str) -> String {
                 }
                 i += 1;
             }
-            '{' => {
-                match ere_interval_at(&chars, i) {
-                    Some((next, _, _)) => {
-                        // `{,m}` / `{,}`: emit the explicit `{0,...}`.
-                        if chars.get(i + 1) == Some(&',') {
-                            out.push('{');
-                            out.push('0');
-                            out.extend_from_slice(&chars[i + 1..next]);
-                        } else {
-                            out.extend_from_slice(&chars[i..next]);
-                        }
-                        if last_atom.is_some() {
-                            quantified = true;
-                        }
-                        i = next;
+            '{' => match ere_interval_at(&chars, i) {
+                Some((next, _, _)) => {
+                    out.extend_from_slice(&chars[i..next]);
+                    if last_atom.is_some() {
+                        quantified = true;
                     }
-                    None => {
-                        let start = out.len();
-                        out.push('{');
-                        last_atom = Some((start, out.len()));
-                        quantified = false;
-                        i += 1;
-                    }
+                    i = next;
                 }
-            }
+                None => {
+                    let start = out.len();
+                    out.push('{');
+                    last_atom = Some((start, out.len()));
+                    quantified = false;
+                    i += 1;
+                }
+            },
             _ => {
                 let start = out.len();
                 out.push(chars[i]);
@@ -2026,8 +2044,9 @@ fn translate_posix_ere_quantifiers(pattern: &str) -> String {
 ///   `a|*b`, `{2}a`; stacked operators after an atom (`a**`) are fine;
 /// - `{...}` after an atom: unclosed is REG_EBRACE "Unmatched \{"
 ///   (`a{2`), closed with invalid content is REG_BADBR "Invalid
-///   content of \{\}" (`a{}`, `a{abc}`, `a{2,1}`); `{,5}`/`{5,}` are
-///   valid intervals.
+///   content of \{\}" (`a{}`, `a{abc}`, `a{2,1}`); `{5,}` is a valid
+///   interval, while `{,5}` (omitted minimum) is rejected with
+///   "invalid repetition count(s)" (rubash#1658).
 fn regexp_repetition_error(pattern: &str) -> Option<&'static str> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut prev_atom = false;
@@ -2088,6 +2107,13 @@ fn regexp_repetition_error(pattern: &str) -> Option<&'static str> {
                         return Some("Unmatched \\{");
                     }
                     return None;
+                }
+                // An omitted minimum (`{,5}` / `{,}`) after an atom is
+                // an invalid repetition count (rubash#1658); without a
+                // preceding atom the interval is a dangling operator
+                // and the interval_like path below reports it as such.
+                if prev_atom && content.starts_with(',') && ere_interval_at(&chars, i).is_some() {
+                    return Some("invalid repetition count(s)");
                 }
                 // Interval syntax: digits with an optional comma and
                 // optional upper bound (`{2}`, `{2,}`, `{,5}`, `{2,3}`).
