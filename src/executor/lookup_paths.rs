@@ -44,6 +44,26 @@ impl Executor {
             .map(|path| shell_display_path(&path.to_string_lossy().replace('\\', "/")))
     }
 
+    /// Whether an in-process emulation of the external command `name`
+    /// must stand down. GNU findcmd.c:348-427 search_for_command runs a
+    /// slash-free name only when the lookup succeeds — a hash-table hit
+    /// or a PATH walk hit. The emulations (pipeline inline stages, the
+    /// external file builtins, the identity tools, the sleep/dirname/
+    /// basename fast paths, the comsub shortcuts) stand in for that PATH
+    /// binary, so they inherit its resolvability: PATH unset is the
+    /// degenerate no-walk case (rubash#1126), and a SET PATH holding no
+    /// such command fails the lookup identically (rubash#1545 — a timed
+    /// pipeline's `cat` stage silently executed in-process under
+    /// PATH=/nonexistent while GNU reports `command not found`, 127;
+    /// the command's existence must not depend on the invocation
+    /// shape). The resolution model is this module's own
+    /// [`Executor::command_path`]: hash first, then the GNU walk, with
+    /// the unset/empty-PATH "." rule.
+    pub(in crate::executor) fn emulated_external_stands_down(&self, name: &str) -> bool {
+        crate::executor::path::path_is_unset(&self.shell_state.env_vars)
+            || self.command_path(name, false).is_none()
+    }
+
     fn command_path_in_dot(&self, name: &str) -> Option<String> {
         if name.contains('/') {
             return None;
