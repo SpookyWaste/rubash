@@ -72,7 +72,24 @@ impl Executor {
         // TERM STKFLT XCPU XFSZ VTALRM PROF SYS.
         if !matches!(
             request.signal,
-            1 | 2 | 3 | 4 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 24 | 25 | 26 | 27
+            1 | 2
+                | 3
+                | 4
+                | 6
+                | 7
+                | 8
+                | 9
+                | 10
+                | 11
+                | 12
+                | 13
+                | 14
+                | 15
+                | 16
+                | 24
+                | 25
+                | 26
+                | 27
                 | 31
         ) {
             return None;
@@ -290,6 +307,24 @@ impl Executor {
             // `Terminated` before cleaning it up (rubash#1256). The old
             // code also lied for a process that ignores TERM: it
             // vanished from the table while still running.
+            //
+            // rubash#1604: the one piece of bookkeeping a terminating
+            // signal DOES leave here is the delivery record itself.
+            // If the process dies at once, the post-kill refresh's
+            // incidental sweep must not apply the completion before a
+            // following `wait` can reap the job itself (a waited-for
+            // job's notice is suppressed — jobs.c wait_for); the
+            // refresh consults this record and stashes the reap for
+            // the rest of this reader command and the next one (the
+            // incidental reap lands at the next command's
+            // pre-execution sweep — see JobTable::note_reader_command).
+            // Signals whose default
+            // disposition is stop/continue/ignore (CONT, the stop
+            // family, CHLD, URG, WINCH) and the 0 probe never kill,
+            // so they leave no record.
+            if !matches!(request.signal, 0 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 28) {
+                self.shell_state.job_table.note_fatal_signal(pid);
+            }
             continue;
         }
 

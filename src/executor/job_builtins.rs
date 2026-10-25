@@ -239,10 +239,7 @@ impl Executor {
         result
     }
 
-    fn execute_wait_inner(
-        &mut self,
-        cmd: &CommandNode,
-    ) -> Result<i32, ExecuteError> {
+    fn execute_wait_inner(&mut self, cmd: &CommandNode) -> Result<i32, ExecuteError> {
         self.refresh_background_jobs_observed()?;
         // GNU wait.def wait_builtin() internal_getopt "fnp:": a dangling
         // `-p` (no joined text, no next word) is a getopt error, reported
@@ -1243,10 +1240,28 @@ impl Executor {
             // and at an observation point a completion applies at once;
             // anything else is stashed until the next observation
             // point (see the waitchld-lag note above).
-            if observe || self.shell_state.coproc_names.contains_key(&pid) {
+            //
+            // rubash#1604: one exception to "applies at once" — a job
+            // the shell's OWN kill fatally signalled during this same
+            // reader command. GNU's wait_for reaps such a job itself
+            // when a `wait` follows, and a waited-for job's death
+            // notice is suppressed (jobs.c wait_for/notify); if this
+            // incidental sweep applies the completion first, the
+            // notice is queued outside the wait and escapes raw —
+            // even past `wait $p 2>/dev/null` — whenever the zombie
+            // happens to be ready this early (~1/6 of runs). Stash
+            // it instead; a wait/fg observed refresh (force_observe)
+            // still applies it inside the wait, where the notice
+            // drains through the wait's own fd 2.
+            let fresh_fatal = !force_observe
+                && term_signal.is_some()
+                && !self.shell_state.coproc_names.contains_key(&pid)
+                && self.shell_state.job_table.take_fresh_fatal(pid);
+            if !fresh_fatal && (observe || self.shell_state.coproc_names.contains_key(&pid)) {
                 self.apply_job_completion(pid, status, term_signal)?;
             } else {
-                self.pending_job_completions.push((pid, status, term_signal));
+                self.pending_job_completions
+                    .push((pid, status, term_signal));
             }
         }
         Ok(())

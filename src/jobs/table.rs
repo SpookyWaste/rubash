@@ -131,6 +131,12 @@ pub struct JobTable {
     /// awaiting an observation event (rubash#1494, see
     /// [`DeferredJobState`]).
     pub deferred_state_marks: Vec<(u32, DeferredJobState, u64, std::time::Instant)>,
+    /// Pids the shell's own `kill` sent a terminating signal to
+    /// during the current reader command, stamped with
+    /// `reader_command_seq` (rubash#1604): an incidental reap of one
+    /// of these must not publish its death notice before a `wait`
+    /// has had its chance to reap the job itself.
+    pub fresh_fatal_marks: Vec<(u32, u64)>,
 }
 
 impl JobTable {
@@ -453,6 +459,18 @@ impl JobTable {
     /// (rubash#1494's notification-lag clock).
     pub fn note_reader_command(&mut self) {
         self.reader_command_seq += 1;
+        // rubash#1604: fatal-signal marks guard the reader command
+        // that sent them AND the one that follows it. The incidental
+        // reap that must not publish lands at the FOLLOWING command's
+        // pre-execution refresh (ast_exec runs the boundary sweep
+        // before a command executes, not after the previous one), and
+        // that following command is typically the `wait` itself —
+        // its redirects are not installed yet at sweep time, so
+        // applying the completion there prints the notice to raw
+        // stderr, past the wait's `2>/dev/null`. After the second
+        // advance an incidental reap publishes normally again.
+        self.fresh_fatal_marks
+            .retain(|(_, seq)| *seq + 1 >= self.reader_command_seq);
     }
 
     /// Queue a stop/continue transition sent by the shell's own `kill`
@@ -469,6 +487,37 @@ impl JobTable {
             std::time::Instant::now(),
         ));
     }
+
+    /// Record that the shell's own `kill` delivered a terminating
+    /// signal to `pid` during the current reader command
+    /// (rubash#1604).
+    pub fn note_fatal_signal(&mut self, pid: u32) {
+        if !self
+            .fresh_fatal_marks
+            .iter()
+            .any(|(marked, _)| *marked == pid)
+        {
+            self.fresh_fatal_marks.push((pid, self.reader_command_seq));
+        }
+    }
+
+    /// True (once) when `pid` was fatally signalled by the shell's
+    /// own `kill` during the current or the immediately preceding
+    /// reader command (see note_reader_command for why the window
+    /// spans the boundary); the mark is consumed so a later reap of
+    /// a recycled pid cannot match it.
+    pub fn take_fresh_fatal(&mut self, pid: u32) -> bool {
+        let now = self.reader_command_seq;
+        if let Some(position) = self
+            .fresh_fatal_marks
+            .iter()
+            .position(|(marked, seq)| *marked == pid && *seq + 1 >= now)
+        {
+            self.fresh_fatal_marks.remove(position);
+            true
+        } else {
+            false
+        }
     }
 
     /// Publish deferred marks at an observation event
