@@ -2039,6 +2039,7 @@ impl Executor {
             );
         }
         let mut last = processes.pop().expect("pipeline has at least two stages");
+        self.note_foreground_wait();
         let status = last.wait().map_err(ExecuteError::IoError)?;
         let stdout_bytes = join_pipe_drain(last_stdout)?;
         results[last_index] = (
@@ -2563,6 +2564,7 @@ impl Executor {
         }
         let mut last = processes.pop().expect("pipeline has at least two stages");
         debug_assert_eq!(processes.len(), last_index);
+        self.note_foreground_wait();
         let status = last.wait().map_err(ExecuteError::IoError)?;
         let mut stdout_bytes = join_pipe_drain(last_stdout)?;
         stdout_bytes
@@ -3175,6 +3177,7 @@ impl Executor {
 
         let mut results = Vec::with_capacity(processes.len());
         let last = processes.pop().expect("pipeline has at least two stages");
+        self.note_foreground_wait();
         let output = last.wait_with_output()?;
         results.push((
             crate::executor::substitution_metadata::bytes_to_shell_text(&output.stdout),

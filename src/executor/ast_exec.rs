@@ -44,6 +44,11 @@ impl Executor {
         self.evalerror_exit_toomany_pending.set(false);
         self.evalerror_line.set(None);
         self.reader_command_line.set(None);
+        // A fresh reader-level run is a GNU observation point for
+        // deferred background-job completions (job_builtins.rs
+        // refresh_background_jobs): the reap visibility mark advances.
+        self.execute_generation
+            .set(self.execute_generation.get() + 1);
         // rubash#353: this run's unit (file / -c string) was upfront-lexed
         // under the CURRENT locale; words carrying that lex locale are
         // eligible for the read-time re-derivation (words lexed later, e.g.

@@ -1073,6 +1073,7 @@ impl Executor {
             reader
                 .read_to_end(&mut merged)
                 .map_err(ExecuteError::IoError)?;
+            self.note_foreground_wait();
             let status = child.wait().map_err(ExecuteError::IoError)?;
             // The child is gone; its stdin pipe is broken, so the payload
             // writer thread (spawned above) has finished or is about to.
@@ -1109,6 +1110,7 @@ impl Executor {
                 crate::executor::wait_status::process_exit_status(&status),
             )));
         }
+        self.note_foreground_wait();
         let output = child.wait_with_output()?;
         // Same reaping boundary as the merged branch above: the exited child
         // broke the stdin pipe, the payload writer thread ends on its

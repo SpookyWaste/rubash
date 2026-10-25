@@ -535,6 +535,25 @@ pub struct Executor {
     /// executors keep the restore.
     is_process_exit_executor: bool,
     background_children: HashMap<u32, crate::fd::SpawnedChild>,
+    /// Background-job completions the boundary reap has already
+    /// observed (try_wait returned) but whose job-table visibility is
+    /// deferred to the next GNU observation point — a foreground
+    /// process wait, a new reader line, a new execute_ast run, or an
+    /// explicit wait/fg (jobs.c waitchld lag; see
+    /// refresh_background_jobs in job_builtins.rs). Entries are
+    /// (pid, flattened status, killing signal).
+    pending_job_completions: Vec<(u32, i32, Option<i32>)>,
+    /// The (execute_generation, reader_command_line,
+    /// foreground_wait_count) mark as of the previous
+    /// refresh_background_jobs call; an observation point has occurred
+    /// when the current mark differs in any component.
+    reap_prev_mark: Cell<(u64, Option<usize>, u64)>,
+    /// Bumped once per fresh reader-level execute_ast run.
+    execute_generation: Cell<u64>,
+    /// Count of foreground external processes this executor has
+    /// blocked in wait() for (GNU wait_for reaps background children
+    /// while it blocks, jobs.c:3064 — an observation point).
+    foreground_wait_count: Cell<u64>,
     coproc_stderr_forwarders: HashMap<u32, std::thread::JoinHandle<Result<(), std::io::Error>>>,
     assignment_output_process_substitutions: HashMap<String, String>,
     /// rubash#545 (cell 2): `/dev/fd/N` input-procsub word fds created by
