@@ -133,17 +133,22 @@ pub fn locale_name() -> String {
 /// Whether multibyte (UTF-8) character semantics are in effect, i.e. whether
 /// the locale named by the environment is actually active.
 ///
-/// An unset locale keeps rubash's default UTF-8 model. `C`/`POSIX` and any
-/// named single-byte locale (ru_RU.CP1251, en_US.ISO-8859-1, ...) select
-/// byte semantics. A UTF-8-named locale selects UTF-8 only when the C library
-/// can activate it; otherwise GNU bash - and rubash - fall back to the C
-/// locale, which is what makes `${#var}` count bytes on a machine that does
-/// not have `en_US.UTF-8` compiled in (intl1.sub: 31/30 for a 15-character
-/// Cyrillic word, not 16/15).
+/// GNU bash resolves the locale at startup with setlocale(LC_ALL, "")
+/// (locale.c set_default_locale, called from shell.c), so with NO locale
+/// variable set — or every one of them empty — the C locale is in effect
+/// and character semantics are byte semantics (rubash#1622; this branch
+/// used to keep a default UTF-8 model, a leftover of the locale port
+/// that #1464's explicit-locale fixes never reached). `C`/`POSIX` and
+/// any named single-byte locale (ru_RU.CP1251, en_US.ISO-8859-1, ...)
+/// likewise select byte semantics. A UTF-8-named locale selects UTF-8
+/// only when the C library can activate it; otherwise GNU bash - and
+/// rubash - fall back to the C locale, which is what makes `${#var}`
+/// count bytes on a machine that does not have `en_US.UTF-8` compiled
+/// in (intl1.sub: 31/30 for a 15-character Cyrillic word, not 16/15).
 pub fn is_utf8() -> bool {
     let name = locale_name();
     if name.is_empty() {
-        return true;
+        return false;
     }
     let lower = name.to_lowercase();
     if lower == "c" || lower == "posix" {
