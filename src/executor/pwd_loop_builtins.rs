@@ -121,16 +121,26 @@ impl Executor {
                     kind.name()
                 )?;
                 self.write_buffered_builtin_output(cmd, &[], &stderr)?;
-                // GNU builtins/common.c get_numeric_arg: "too many
-                // arguments" goes through the same fatal channel as a
-                // non-numeric count (sh_toomanyargs -> jump_to_top_level):
-                // a non-interactive shell exits 2 and the rest of the
-                // script never runs; interactive DISCARDs the list
-                // (rubash#1066 — it is NOT a per-iteration rc=1).
-                if self.get_env("__RUBASH_INTERACTIVE").as_deref() == Some("1") {
-                    return Err(ExecuteError::ExpansionFailure(2));
-                }
-                Err(ExecuteError::ExitCode(2))
+                // GNU builtins/break.def:73 (continue.def:118): a VALID
+                // numeric count goes to get_numeric_arg, whose tail calls
+                // no_args (list->next, 0) (builtins/common.c:511) for the
+                // extra operands. no_args (common.c:139-155) with fatal=0
+                // is NEVER the EXITPROG channel: builtin_error +
+                // top_level_cleanup + set_exit_status (EX_BADUSAGE) +
+                // jump_to_top_level (DISCARD) in every mode — the current
+                // command list (the enclosing loop, and the whole -c/eval
+                // string via the cleanup) is abandoned with status 2 and
+                // the reader continues at the next list. Only the
+                // NON-numeric branch (common.c:497-510, fatal=1
+                // non-interactive) takes EXITPROG — see the NotNumeric
+                // arm below. Ride the same evalerror vehicle as
+                // exit/return too-many (rubash#705/#1213): status 2 lands
+                // at the reader, whose -c catch maps the class to
+                // ExitCode(1) (shell.c:1477) (rubash#1519).
+                self.exit_code = 2;
+                self.raise_evalerror_abort();
+                self.evalerror_exit_toomany_pending.set(true);
+                Ok(())
             }
             Err(LoopControlError::OutOfRange(value)) => {
                 writeln!(
