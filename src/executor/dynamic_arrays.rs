@@ -167,6 +167,12 @@ pub(in crate::executor) fn env_derived_dynamic_parameter_value(
 ) -> Option<String> {
     match name {
         "EPOCHSECONDS" => Some(current_epoch_seconds().to_string()),
+        // GNU variables.c:1365 get_monoseconds (bash 5.3): the value is
+        // clock_gettime(CLOCK_MONOTONIC) whole seconds. The variable is
+        // registered with a NULL assign function (variables.c:1855
+        // INIT_DYNAMIC_VAR), so an assignment never sticks — every read
+        // recomputes, exactly like EPOCHSECONDS below (rubash#1649).
+        "BASH_MONOSECONDS" => Some(current_monotonic_seconds().to_string()),
         "EPOCHREALTIME" => {
             let micros = current_epoch_micros();
             Some(format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000))
@@ -267,6 +273,7 @@ impl Executor {
             "SECONDS"
                 | "EPOCHSECONDS"
                 | "EPOCHREALTIME"
+                | "BASH_MONOSECONDS"
                 | "RANDOM"
                 | "SRANDOM"
                 | "BASHPID"
@@ -289,7 +296,7 @@ impl Executor {
             return None;
         }
         match name {
-            "SECONDS" | "EPOCHSECONDS" | "EPOCHREALTIME" => {
+            "SECONDS" | "EPOCHSECONDS" | "EPOCHREALTIME" | "BASH_MONOSECONDS" => {
                 env_derived_dynamic_parameter_value(&self.shell_state.env_vars, name)
             }
             "RANDOM" => Some(self.next_random_value().to_string()),
@@ -717,6 +724,7 @@ impl Executor {
             name,
             "EPOCHSECONDS"
                 | "EPOCHREALTIME"
+                | "BASH_MONOSECONDS"
                 | "SECONDS"
                 | "RANDOM"
                 | "SRANDOM"
