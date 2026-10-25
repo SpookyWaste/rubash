@@ -1612,24 +1612,31 @@ impl Executor {
         // assignment fails like the plain `a[-2]=q` path does.
         let mut bad_subscript: Option<String> = None;
         let value = if append {
+            // Borrowed, not cloned: the old code cloned the whole mirror
+            // here on EVERY append, but the clone is read only by the
+            // render fallback below — the in-place append path (the
+            // fill-loop shape, where the mirror grows to Θ(n) bytes)
+            // never reads it, so the clone was a Θ(mirror) memcpy per
+            // append for nothing. The arms below consume the borrow
+            // through &str parameters only; the fallback re-fetches.
             let current = self
                 .shell_state
                 .env_vars
                 .get(base_name)
-                .cloned()
+                .map(String::as_str)
                 .unwrap_or_default();
             if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base_name) {
                 if value.starts_with('(') && value.ends_with(')') {
                     append_assoc_value(
-                        &current,
+                        current,
                         &value,
                         is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name),
                         &self.shell_state.env_vars,
                     )
                 } else {
-                    append_assoc_scalar_value(&current, &value)
+                    append_assoc_scalar_value(current, &value)
                 }
-            } else if is_array_storage(&current)
+            } else if is_array_storage(current)
                 || is_marked_var(&self.shell_state.env_vars, ARRAY_VARS, base_name)
                 || (value.starts_with('(') && value.ends_with(')'))
             {
@@ -1654,7 +1661,7 @@ impl Executor {
                 // variable used to fall through to append_scalar_value and
                 // store the serialized `("word")` literal as a scalar).
                 match append_array_value(
-                    &current,
+                    current,
                     self.shell_state.variables.indexed_array_cell(base_name),
                     &value,
                     is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name),
@@ -1686,6 +1693,25 @@ impl Executor {
                             mirror_written_in_place = true;
                             String::new()
                         } else {
+                            // Render fallback: re-fetch the mirror text
+                            // (the pre-append borrow ended before the
+                            // in-place attempt). When the attempt was
+                            // refused nothing was written, so this is the
+                            // pre-append text exactly as before; when
+                            // the mirror was extended but the cell
+                            // refused, this is the extended text, whose
+                            // parse folds to the same entries as the
+                            // pre-append text plus the outcome (the
+                            // segment writer appends exactly the
+                            // outcome's segments), so the render — and
+                            // the cell re-sync in the tail — lands on
+                            // the same state either way.
+                            let current = self
+                                .shell_state
+                                .env_vars
+                                .get(base_name)
+                                .cloned()
+                                .unwrap_or_default();
                             render_indexed_outcome(&current, outcome)
                         }
                     }
@@ -1697,6 +1723,10 @@ impl Executor {
                 // GNU variables.c:2922-2935: `x+=v` on an integer variable
                 // evaluates the current value first — its evalerror is just
                 // as fatal as the rhs one, and neither bind happens.
+                // (Materialize the small scalar text: the checked eval
+                // takes &mut self, so the borrowed mirror cannot be held
+                // across it. This arm is scalar-only by construction.)
+                let current = current.to_string();
                 let Some(current) = self.eval_integer_assignment_checked(&current) else {
                     return false;
                 };
@@ -1705,7 +1735,7 @@ impl Executor {
                 };
                 (current + value).to_string()
             } else {
-                append_scalar_value(&current, &value)
+                append_scalar_value(current, &value)
             }
         } else if compound_assignment
             && value.starts_with('(')
