@@ -1089,11 +1089,10 @@ impl Executor {
         // sh_regmatch), so `.` matches a newline (rubash#1058).
         // Granularity follows the locale model (rubash#1061): glibc
         // regexec matches one multibyte CHARACTER in a UTF-8 locale and
-        // one BYTE otherwise; rubash's locale model (locale.rs is_utf8,
-        // unset locale = UTF-8 default) names the active case, and an
-        // explicitly non-UTF-8 or unset locale in the oracle's C-locale
-        // sense takes the byte engine. A UTF-8 locale that is actually
-        // active keeps the char engine.
+        // one BYTE otherwise; rubash's locale model (locale.rs is_utf8)
+        // names the active case — an unset locale resolves to C there
+        // (rubash#1622), so only an actually active UTF-8 locale keeps
+        // the char engine.
         if byte_mode {
             regex::bytes::RegexBuilder::new(&pattern)
                 .case_insensitive(case_insensitive)
@@ -1670,14 +1669,15 @@ impl CompiledConditionalRegex {
 }
 
 /// Whether `=~` matches byte-wise. GNU regexec is byte-oriented in a
-/// single-byte locale and character-oriented in a UTF-8 locale;
-/// rubash's locale model keeps an UNSET locale in the UTF-8 default for
-/// character counting, but the oracle shells this build is diffed
-/// against run their unset locale as C/POSIX (byte semantics), which is
-/// also what the Android filing measured, so an unset locale name takes
-/// the byte engine here.
+/// single-byte locale and character-oriented in a UTF-8 locale. The
+/// locale decision itself lives in [`crate::locale::is_utf8`]: since
+/// rubash#1622 an unset locale resolves to the C locale there (GNU's
+/// setlocale(LC_ALL, "") startup default), so this is the plain
+/// negation — the empty-name clause this function used to carry was a
+/// one-surface compensation for the old unset-means-UTF-8 default
+/// (rubash#1061) and is gone with it.
 fn conditional_regex_byte_mode() -> bool {
-    !crate::locale::is_utf8() || crate::locale::locale_name().is_empty()
+    !crate::locale::is_utf8()
 }
 
 /// Convert one byte-mode capture into rubash's storage spelling: valid
