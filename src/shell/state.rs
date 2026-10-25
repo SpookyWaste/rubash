@@ -67,7 +67,16 @@ pub struct ShellState {
     /// Invariant: `offset <= len` (empty window is `offset == len`).
     pub(crate) positional_offset: usize,
     /// execute_cmd.c/jobs.c pipeline status vector ($PIPESTATUS).
-    pub(crate) pipestatus: Vec<i32>,
+    /// The PIPESTATUS array object as sparse (index, status) entries
+    /// in ascending index order with unique indices — the live ARRAY
+    /// of variables.c:6291 set_pipestatus_array, whose writer
+    /// preserves existing indices (update in place / insert at
+    /// position) and only rebuilds densely when the element count
+    /// shrinks past the status count. Only meaningful while
+    /// `pipestatus_shape` is `LiveArray`; reads of element 0 (the
+    /// scalar `$PIPESTATUS`, arithmetic contexts) resolve by INDEX,
+    /// never by position in this list (rubash#1364 R3).
+    pub(crate) pipestatus: Vec<(i64, i32)>,
     /// variables.c:6291 set_pipestatus_array PIPESTATUS cell shape
     /// (rubash#1363/#1364): the status writer stores straight into the
     /// ARRAY object and never consults att_readonly — it is a no-op

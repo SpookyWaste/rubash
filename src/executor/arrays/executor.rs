@@ -57,10 +57,11 @@ impl Executor {
 
     pub(in crate::executor) fn array_assignment_transform(&self, name: &str) -> String {
         if name == "PIPESTATUS" {
+            // Real indices (rubash#1364 R3): the @A render of a sparse
+            // cell keeps ([2]="0"), never a renumbered dense list.
             let rendered = self
-                .pipestatus_values()
+                .pipestatus_entries()
                 .into_iter()
-                .enumerate()
                 .map(|(index, value)| format!("[{index}]={}", quote_array_value(&value)))
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -501,6 +502,23 @@ impl Executor {
         // "bad array subscript" diagnostic for the unresolvable-negative
         // leg so the posture matches the storage path below.
         if let Some(values) = dynamic_values {
+            // PIPESTATUS keeps sparse indices (rubash#1364 R3): the
+            // element fetch resolves against the sparse cell, and the
+            // diagnostic fires only when a negative subscript cannot
+            // resolve against the maximum index — a hole at a
+            // resolvable index reads as unset in silence, where the
+            // dense view would have misreported values and errors.
+            if self.resolved_variable_name(array_name).as_deref() == Some("PIPESTATUS") {
+                return match self.pipestatus_element(index) {
+                    Some(element) => Some(element),
+                    None => {
+                        if index < 0 && !self.pipestatus_subscript_resolves(index) {
+                            eprintln!("{}{}: bad array subscript", self.error_prefix(), array_name);
+                        }
+                        None
+                    }
+                };
+            }
             match dense_view_element(&values, index) {
                 Some(element) => return Some(element),
                 None => {

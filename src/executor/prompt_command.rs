@@ -183,8 +183,20 @@ impl crate::executor::Executor {
         } else {
             // parse.y:7313/:7315 restore_parser_state: $? and PIPESTATUS
             // roll back to the pre-PC values on every normal return.
+            // GNU's restore is restore_pipestatus_array (variables.c):
+            // a wholesale copy of the saved ARRAY over the current
+            // array cell, indices included (rubash#1364 R3). Only a
+            // live-array current cell takes it — the other shapes are
+            // the frozen/absent cells set_pipestatus_array's gate
+            // already refuses, and routing the saved values through
+            // the status writer preserves exactly that gate.
             self.exit_code = saved_exit_code;
-            self.set_pipestatus(saved_pipestatus);
+            if self.shell_state.pipestatus_shape == crate::shell::state::PipestatusShape::LiveArray
+            {
+                self.shell_state.pipestatus = saved_pipestatus;
+            } else {
+                self.set_pipestatus(saved_pipestatus.iter().map(|(_, status)| *status));
+            }
             // parse.y:3022-3023 bind_lastarg(last_lastarg): `$_` likewise
             // rolls back on the normal path only — the exit-jump longjmp
             // skips the restore, same skip rule as the status above.
@@ -342,7 +354,7 @@ mod tests {
         // parse.y:7313/:7315 restore: $? and PIPESTATUS keep the pre-PC
         // values, and NO exit jump is armed — the shell must prompt again.
         assert_eq!(executor.last_exit_code(), 0);
-        assert_eq!(executor.shell_state.pipestatus, vec![0]);
+        assert_eq!(executor.shell_state.pipestatus, vec![(0, 0)]);
         assert_eq!(executor.exit_jump_pending.get(), false);
     }
 

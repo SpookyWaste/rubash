@@ -757,6 +757,12 @@ impl Executor {
             // declared as an empty array (array.tests: `unset e[*]` then
             // `declare -a e=()`).
             if subscript == "*" || subscript == "@" {
+                if array_name == "PIPESTATUS" {
+                    // rubash#1364 R3: the @/* flush empties the sparse
+                    // state list together with the mirror (see the
+                    // element-unset sync below).
+                    self.shell_state.pipestatus.clear();
+                }
                 self.shell_state.env_vars.insert(
                     array_name.to_string(),
                     format_indexed_array_storage(Default::default()),
@@ -810,6 +816,20 @@ impl Executor {
             };
             let mut entries = indexed_array_entries(&current);
             entries.remove(&resolved);
+            if array_name == "PIPESTATUS" {
+                // rubash#1364 R3: the PIPESTATUS cell's authoritative
+                // store is the sparse state list, not the mirror — an
+                // element unset must remove the entry there too, or
+                // the unset command's own completion (fast case:
+                // count == nproc == 1) would rewrite the status into
+                // the removed index instead of rebuilding densely.
+                self.shell_state.pipestatus = entries
+                    .iter()
+                    .map(|(index, element)| {
+                        (*index as i64, element.trim().parse::<i32>().unwrap_or(0))
+                    })
+                    .collect();
+            }
             // rubash#616 (1a): element unset rewrites the mirror — the
             // structured cell must follow (count drops by one) or the
             // `${#a[@]}` fast path would shadow the removal.
