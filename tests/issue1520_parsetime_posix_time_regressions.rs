@@ -187,16 +187,15 @@ fn issue1520_and_or_list_parsed_upfront() {
     assert_timed_ok(&stdout, &stderr, code);
 }
 
-/// Residual (pre-existing, outside #1520's fix surface): GNU parses a
-/// multi-line group as ONE complete_command, so the `set` on line 2 is
-/// invisible to line 3's parse and `time` stays the keyword (rc 0).
-/// rubash's feeder flips its parse mode at LINE granularity while
-/// gathering the group, so line 3 is lexed under posix and `time` is
-/// frozen as a plain word (rc 127). Moving the feeder's flip from line
-/// granularity to complete-command granularity is lexer-pipeline
-/// surgery; pinned here as the GNU expectation until that lands.
+/// GNU parses a multi-line group as ONE complete_command, so the
+/// `set` on line 2 is invisible to line 3's parse and `time` stays
+/// the keyword (rc 0). rubash's feeder used to flip its parse mode at
+/// LINE granularity while gathering the group, so line 3 was lexed
+/// under posix and `time` was frozen as a plain word (rc 127). Fixed
+/// by rubash#1544: the feeder parks the flip while a unit is open and
+/// lands it at the commit that closes the unit — this pin is active
+/// again (see the issue1544 pin file for the full surface).
 #[test]
-#[ignore = "feeder flips parse mode per line inside a multi-line group; GNU flips per complete_command"]
 fn issue1520_group_spanning_lines_parsed_before_execution() {
     let (stdout, stderr, code) = rubash_c("{\nset -o posix\ntime -p true\n}");
     assert_timed_ok(&stdout, &stderr, code);

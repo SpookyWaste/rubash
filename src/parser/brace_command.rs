@@ -32,8 +32,16 @@ pub(super) fn parse_brace_group_command(
         // read; GNU gates at read time, parse.y:5466).
         let saved_extglob = crate::lexer::parse_extended_glob();
         crate::lexer::set_parse_extended_glob(token.extglob_gate);
-        let body_tokens =
-            crate::lexer::tokenize_with_initial_posix_and_line(inner_source, false, token.position);
+        // rubash#1544: the body re-lex uses the mode of the pass that
+        // folded this group (Token::posix_gate), locked for the whole
+        // body — a `set -o posix` inside the group must not flip the
+        // group's own later lines (GNU reads the whole
+        // complete_command first, parse.y read_command).
+        let body_tokens = crate::lexer::tokenize_locked_body_with_initial_posix_and_line(
+            inner_source,
+            token.posix_gate,
+            token.position,
+        );
         crate::lexer::set_parse_extended_glob(saved_extglob);
         let inner_tail = inner_source.trim_end_matches([' ', '\t']);
         // GNU parse.y:1264-1290 list grammar: after a completed `list1' only

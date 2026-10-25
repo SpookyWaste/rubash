@@ -1375,3 +1375,48 @@ fn quoted_literal_tilde_marker_still_emitted_niubash_200() {
         .starts_with(crate::executor::markers::QUOTED_WORD_PREFIX));
     assert!(tokens[2].value.ends_with("~x"));
 }
+
+#[test]
+fn issue1544_fold_token_carries_posix_gate_of_its_pass() {
+    let source = "{\ntime -p true\n}\n";
+    let tokens = tokenize_with_initial_posix(source, true);
+    let fold = tokens
+        .iter()
+        .find(|token| token.kind == TokenKind::Keyword && token.value.starts_with('{'))
+        .expect("fold token");
+    assert!(
+        fold.posix_gate,
+        "fold token must carry its pass's posix mode"
+    );
+    let tokens = tokenize_with_initial_posix(source, false);
+    let fold = tokens
+        .iter()
+        .find(|token| token.kind == TokenKind::Keyword && token.value.starts_with('{'))
+        .expect("fold token");
+    assert!(!fold.posix_gate);
+}
+
+#[test]
+fn issue1544_locked_body_relex_ignores_in_body_posix_switch() {
+    // The parser re-lexes a folded body under the fold pass's mode,
+    // locked: an in-body `set -o posix` must not flip the body's own
+    // later lines (GNU reads the whole complete_command first).
+    let tokens = crate::lexer::tokenize_locked_body("\nset -o posix\ntime -p true\n", false);
+    let time_token = tokens
+        .iter()
+        .find(|token| token.value == "time")
+        .expect("time token");
+    assert_eq!(time_token.kind, TokenKind::Keyword, "tokens: {tokens:?}");
+    // And the mirror: read under posix, an in-body `set +o posix` must
+    // not un-flip the rest of the body either.
+    let tokens = crate::lexer::tokenize_locked_body("\nset +o posix\ntime -p true\n", true);
+    let time_token = tokens
+        .iter()
+        .find(|token| token.value == "time")
+        .expect("time token");
+    assert_eq!(
+        time_token.kind,
+        TokenKind::Word,
+        "posix pass + dash word = plain word (frozen veto): {tokens:?}"
+    );
+}

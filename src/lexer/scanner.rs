@@ -1153,6 +1153,9 @@ impl<'a> Lexer<'a> {
                 // rubash#131: stamp this pass's extglob gate for the body
                 // re-parse (see Token::extglob_gate).
                 token.extglob_gate = self.extended_glob;
+                // rubash#1544: same read-time snapshot for the posix mode
+                // (see Token::posix_gate).
+                token.posix_gate = self.posix;
                 Some(token)
             }
             '}' => {

@@ -272,7 +272,9 @@ fn parse_select_brace_body(tokens: &[Token], index: usize) -> Option<(Vec<Comman
             .trim_start_matches('{')
             .trim_end_matches('}')
             .trim();
-        let body_tokens = crate::lexer::tokenize(inner);
+        // rubash#1544: folded-body re-lex under the fold pass's posix
+        // mode, locked (see Token::posix_gate).
+        let body_tokens = crate::lexer::tokenize_locked_body(inner, token.posix_gate);
         return Some((parse_select_body_commands(&body_tokens), index + 1));
     }
 

@@ -2207,7 +2207,9 @@ pub(super) fn unclosed_brace_eof_node(
     let region: &[Token] = if inner_text.is_empty() {
         &tokens[brace_index + 1..]
     } else {
-        let mut inner = crate::lexer::tokenize(inner_text);
+        // rubash#1544: folded-body re-lex under the fold pass's posix
+        // mode, locked (see Token::posix_gate).
+        let mut inner = crate::lexer::tokenize_locked_body(inner_text, brace.posix_gate);
         for token in inner.iter_mut() {
             token.position = token.position + brace_line - 1;
         }
