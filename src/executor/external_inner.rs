@@ -4,7 +4,9 @@ impl Executor {
     /// The simple-command execution lookup. Under a `command -p`
     /// re-dispatch (standard_path_scope set) the lookup walks the
     /// standard path — by substituting PATH in a throwaway copy of the
-    /// env map, never in the shell's own variables (rubash#1047).
+    /// env map, never in the shell's own variables (rubash#1047) — and,
+    /// like GNU's stdpath search_for_command, never consults the
+    /// command hash table (rubash#1648).
     pub(in crate::executor) fn find_scoped_user_command(
         &self,
         name: &str,
@@ -13,7 +15,7 @@ impl Executor {
             Some(standard) => {
                 let mut env_vars = self.shell_state.env_vars.clone();
                 env_vars.insert("PATH".to_string(), standard.clone());
-                find_user_command(name, &env_vars)
+                find_user_command_ignoring_hash(name, &env_vars)
             }
             None => find_user_command(name, &self.shell_state.env_vars),
         }

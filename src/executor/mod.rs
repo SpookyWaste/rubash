@@ -320,8 +320,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use self::path::{
     adopt_orphan_console, apply_required_windows_child_environment,
-    external_command_for_named_program, find_shell, find_user_command, shell_path_to_process,
-    shell_path_to_windows, standard_path, suppress_orphan_console,
+    external_command_for_named_program, find_shell, find_user_command,
+    find_user_command_ignoring_hash, shell_path_to_process, shell_path_to_windows, standard_path,
+    suppress_orphan_console,
 };
 
 // version.c:90 show_shell_version(): the --version banner prints the same
