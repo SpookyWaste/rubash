@@ -4,7 +4,7 @@ use super::diagnostic::diagnostic_prefix;
 use super::marks::{mark_typed, marked_vars, unmark_typed};
 use super::names::valid_nameref_value;
 use super::storage::{
-    append_array_value, append_assoc_value, append_baseline_mirror, eval_arith_value,
+    append_array_value, append_assoc_value, append_baseline_mirror, eval_integer_value,
     format_assoc_storage, format_indexed_array_storage, indexed_array_entries,
     is_noassign_bash_array, parse_array_tokens, parse_assoc_words, quote_assoc_storage_value,
 };
@@ -576,7 +576,8 @@ where
                     }
                 }
             } else if integer {
-                (eval_arith_value(&current) + eval_arith_value(value)).to_string()
+                (eval_integer_value(&current, variables) + eval_integer_value(value, variables))
+                    .to_string()
             } else {
                 let mut current = current;
                 current.push_str(value);
@@ -632,7 +633,7 @@ where
                     }
                 }
             } else {
-                let scalar = eval_arith_value(value).to_string();
+                let scalar = eval_integer_value(value, variables).to_string();
                 scalar_assign_to_array(var_name, &scalar, variables).unwrap_or(scalar)
             }
         } else if value.starts_with('(')

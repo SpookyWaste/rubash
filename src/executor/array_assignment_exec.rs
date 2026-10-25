@@ -779,7 +779,15 @@ impl Executor {
                     .unwrap_or_default()
             };
             if attrs.integer {
-                (eval_arith_value(&current_element) + eval_arith_value(value)).to_string()
+                // GNU make_array_variable_value (arrayfunc.c:166) ->
+                // make_variable_value (variables.c:2905): an integer
+                // element append runs BOTH sides through the full evalexp
+                // (expr.c), exactly like the assoc branch below — the old
+                // split('+') evaluator stored 0 for `a[0]+='2*3'`
+                // (rubash#1617).
+                (self.eval_integer_assignment_value(&current_element)
+                    + self.eval_integer_assignment_value(value))
+                .to_string()
             } else {
                 append_scalar_value(&current_element, value)
             }
@@ -787,7 +795,7 @@ impl Executor {
             value.to_string()
         };
         let element = if attrs.integer {
-            eval_arith_value(&element).to_string()
+            self.eval_integer_assignment_value(&element).to_string()
         } else {
             element
         };

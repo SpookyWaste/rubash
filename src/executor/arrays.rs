@@ -31,11 +31,12 @@ use std::collections::{BTreeMap, HashMap};
 
 use super::assignment_expansion::decode_compound_expansion_carriers;
 use super::{
-    apply_parameter_case_mod, assoc_value_at, eval_arith_value, eval_conditional_arith_value,
-    is_marked_var, is_shell_name, parse_indirect_pattern_removal, parse_parameter_case_mod,
+    apply_parameter_case_mod, assoc_value_at, eval_conditional_arith_value, is_marked_var,
+    is_shell_name, parse_indirect_pattern_removal, parse_parameter_case_mod,
     parse_parameter_replacement, parse_parameter_transform, remove_parameter_pattern,
     split_indexed_tagged_token, split_storage_words, unquote_storage_value, Executor,
-    ParameterTransform, ARRAY_FIELD_SPLIT_MARKER, ASSOC_VARS,
+    ParameterTransform, ARRAY_FIELD_SPLIT_MARKER, ASSOC_VARS, CAPCASE_VARS, LOWERCASE_VARS,
+    UPPERCASE_VARS,
 };
 use crate::executor::markers::{DATA_DOLLAR, STORAGE_WORD_PREFIX};
 use crate::lexer::remove_shell_quotes;
@@ -1171,7 +1172,13 @@ pub(super) fn append_array_value(
         if scalar_append && !entries.is_empty() {
             let current = entries.get(0).cloned().unwrap_or_default();
             let appended = if integer {
-                (eval_arith_value(&current) + eval_arith_value(&token)).to_string()
+                // GNU make_variable_value ASS_APPEND (variables.c:2922):
+                // both sides go through evalexp — the same full evaluator
+                // the `[sub]+=` arm above uses (rubash#1617: the split('+')
+                // evaluator stored 1 for `ia=(1); ia+='2*3'`).
+                (eval_conditional_arith_value(&current, env_vars).unwrap_or(0)
+                    + eval_conditional_arith_value(&token, env_vars).unwrap_or(0))
+                .to_string()
             } else {
                 append_scalar_value(&current, &finalize_comsub_element(&token))
             };
