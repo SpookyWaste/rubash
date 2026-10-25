@@ -1650,6 +1650,7 @@ impl Executor {
             conditional_expansion_error_status: Cell::new(None),
             evalerror_subscript_pending: Cell::new(false),
             evalerror_failglob_pending: Cell::new(false),
+            evalerror_arith_pending: Cell::new(false),
             evalerror_exit_toomany_pending: Cell::new(false),
             eval_list_depth: Cell::new(None),
             evalerror_line: Cell::new(None),

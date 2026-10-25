@@ -41,6 +41,7 @@ impl Executor {
         self.nounset_force_eof.set(false);
         self.evalerror_subscript_pending.set(false);
         self.evalerror_failglob_pending.set(false);
+        self.evalerror_arith_pending.set(false);
         self.evalerror_exit_toomany_pending.set(false);
         self.evalerror_line.set(None);
         self.reader_command_line.set(None);
@@ -322,6 +323,7 @@ impl Executor {
                     self.nounset_force_eof.set(false);
                     self.evalerror_subscript_pending.set(false);
                     self.evalerror_failglob_pending.set(false);
+                    self.evalerror_arith_pending.set(false);
                     self.evalerror_exit_toomany_pending.set(false);
                     self.evalerror_line.set(None);
                     if let Some(saved_state) = subshell_state.take() {
@@ -554,6 +556,7 @@ impl Executor {
                         self.nounset_force_eof.set(false);
                         self.evalerror_subscript_pending.set(false);
                         self.evalerror_failglob_pending.set(false);
+                        self.evalerror_arith_pending.set(false);
                         self.evalerror_exit_toomany_pending.set(false);
                         self.evalerror_line.set(None);
                     }
@@ -571,6 +574,7 @@ impl Executor {
                     self.nounset_force_eof.set(false);
                     self.evalerror_subscript_pending.set(false);
                     self.evalerror_failglob_pending.set(false);
+                    self.evalerror_arith_pending.set(false);
                     self.evalerror_exit_toomany_pending.set(false);
                     self.evalerror_line.set(None);
                     index += 1;
@@ -687,6 +691,7 @@ impl Executor {
                 self.nounset_force_eof.set(false);
                 self.evalerror_subscript_pending.set(false);
                 self.evalerror_failglob_pending.set(false);
+                self.evalerror_arith_pending.set(false);
                 self.evalerror_exit_toomany_pending.set(false);
                 self.evalerror_line.set(None);
             }
@@ -1684,10 +1689,13 @@ impl Executor {
                     // (`{ z=1; }` left $? = 0 for the next line; GNU 1).
                     // Mirror the plain-command arm's errexit promotion,
                     // then consume the command like the Ok(true) arm.
+                    // The arithmetic evalerror class is exempt from the
+                    // promotion there and here (rubash#1518).
                     if self.errexit_enabled()
                         && self.errexit_is_active()
                         && self.suppress_errexit == 0
                         && self.exit_code != 0
+                        && !self.evalerror_arith_pending.get()
                         && !command.inverted
                         && command.and_or().is_none()
                     {
@@ -1822,16 +1830,25 @@ impl Executor {
                         && self.at_discard_boundary() =>
                 {
                     self.exit_code = code;
-                    // GNU 5.2: under `set -e` a fatal word-expansion
-                    // failure (bad substitution, failglob, arithmetic)
-                    // exits the script like any other failing command
+                    // GNU 5.3.20: under `set -e` a bad-substitution or
+                    // failglob word-expansion failure exits the script
                     // (probe 2026-09-02: `set -e; echo ${#:}; echo after`
                     // stops after the bad substitution; same for
-                    // `set -e; echo nope*` with failglob).
+                    // `set -e; echo nope*` with failglob). An ARITHMETIC
+                    // evalerror is a different class: expr.c's evalerror
+                    // jumps DISCARD directly, bypassing the errexit
+                    // epilogue in every context — `set -e` assignment,
+                    // argument, subscript, for-list and case-word forms
+                    // all discard the command and continue (rubash#1518,
+                    // probes 2026-10-25). The 2026-09-02 comment here
+                    // lumped arithmetic into the exiting classes from a
+                    // single-line probe, where line-abandon and exit are
+                    // indistinguishable; that was the #1518 regression.
                     if self.errexit_enabled()
                         && self.errexit_is_active()
                         && self.suppress_errexit == 0
                         && self.exit_code != 0
+                        && !self.evalerror_arith_pending.get()
                         && !command.inverted
                         && command.and_or().is_none()
                     {
@@ -2036,6 +2053,7 @@ impl Executor {
                 && self.errexit_is_active()
                 && self.suppress_errexit == 0
                 && self.exit_code != 0
+                && !self.evalerror_arith_pending.get()
                 && !command.inverted
                 && command.and_or().is_none()
             {
@@ -2051,6 +2069,7 @@ impl Executor {
                 self.nounset_force_eof.set(false);
                 self.evalerror_subscript_pending.set(false);
                 self.evalerror_failglob_pending.set(false);
+                self.evalerror_arith_pending.set(false);
                 self.evalerror_exit_toomany_pending.set(false);
                 self.evalerror_line.set(None);
                 if let Some(saved_state) = subshell_state.take() {
