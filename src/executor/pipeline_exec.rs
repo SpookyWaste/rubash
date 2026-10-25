@@ -794,6 +794,45 @@ impl Executor {
         Ok(())
     }
 
+    /// rubash#1540: snapshot the DISCARD-class expansion latches (the
+    /// `${var:=word}` bind failure with its pre-bind status snapshot,
+    /// the evalerror abandonment family, and the #439 expansion-failed
+    /// gate). A pipeline element is a forked child in GNU
+    /// (execute_cmd.c:2620 execute_pipeline): expansion failures raised
+    /// while expanding the element's words die with the element and
+    /// must never reach the parent's reader state. The speculative
+    /// fast-path attempts and the in-place stage executor both expand
+    /// member words on this shared executor, so callers bracket them
+    /// with snapshot/restore; the arithmetic flag family has its own
+    /// long-standing bracket (snapshot_arithmetic_error_flags) whose
+    /// deliberate latch-held handoff this one must not disturb.
+    pub(in crate::executor) fn snapshot_discard_latches(
+        &self,
+    ) -> (bool, Option<i32>, bool, bool, bool, bool, bool) {
+        (
+            self.parameter_assignment_failure.get(),
+            self.parameter_assignment_failure_prev_status.get(),
+            self.evalerror_failglob_pending.get(),
+            self.evalerror_pending.get(),
+            self.evalerror_exit_toomany_pending.get(),
+            self.evalerror_subscript_pending.get(),
+            self.command_expansion_failed.get(),
+        )
+    }
+
+    pub(in crate::executor) fn restore_discard_latches(
+        &self,
+        saved: &(bool, Option<i32>, bool, bool, bool, bool, bool),
+    ) {
+        self.parameter_assignment_failure.set(saved.0);
+        self.parameter_assignment_failure_prev_status.set(saved.1);
+        self.evalerror_failglob_pending.set(saved.2);
+        self.evalerror_pending.set(saved.3);
+        self.evalerror_exit_toomany_pending.set(saved.4);
+        self.evalerror_subscript_pending.set(saved.5);
+        self.command_expansion_failed.set(saved.6);
+    }
+
     pub(in crate::executor) fn execute_simple_pipeline(
         &mut self,
         commands: &[CommandNode],
