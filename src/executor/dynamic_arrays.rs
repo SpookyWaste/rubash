@@ -445,7 +445,19 @@ impl Executor {
                 "declare -a{readonly}{exported} {name}=({elements})"
             ));
         }
-        let value = self.dynamic_parameter_value(name)?;
+        let value = match self.dynamic_parameter_value(name) {
+            Some(value) => value,
+            // PIPESTATUS renders from the cell shape in the match
+            // below, not from this scalar getter: the getter returns
+            // None for an absent or valueless cell (the $PIPESTATUS
+            // read view, variables.c:6291), which must not gate the
+            // declaration view off — a valueless cell still renders
+            // (`declare -r PIPESTATUS` after a bare `readonly
+            // PIPESTATUS`), and the env-table fallback would bake the
+            // static ARRAY mark into its flags (rubash#1364).
+            None if name == "PIPESTATUS" => String::new(),
+            None => return None,
+        };
         let quoted = sh_double_quote_text(&value);
         // mk_env_string/declare -p read the getter's CURRENT value through
         // the cell's attributes: an exported dynamic variable renders
