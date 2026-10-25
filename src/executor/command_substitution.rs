@@ -1679,6 +1679,8 @@ impl Executor {
             inside_assignment_rhs: Cell::new(false),
             background_children: HashMap::new(),
             pending_job_completions: Vec::new(),
+            pending_timed_coproc_reports: Vec::new(),
+            timed_coproc_death_instants: std::collections::HashMap::new(),
             reap_prev_mark: Cell::new((0, None, 0)),
             execute_generation: Cell::new(0),
             foreground_wait_count: Cell::new(0),

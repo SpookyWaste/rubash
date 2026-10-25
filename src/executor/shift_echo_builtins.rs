@@ -85,7 +85,19 @@ impl Executor {
         posix_format: bool,
         started: TimeCommandStart,
     ) {
-        let metrics = TimeCommandMetrics::from_start(started);
+        self.print_time_shell_at(posix_format, started, std::time::Instant::now());
+    }
+
+    /// print_time_shell with the interval ending at a captured
+    /// instant (rubash#1528 deferred coproc reports: the end is the
+    /// reap instant recorded when the job's death was observed).
+    pub(in crate::executor) fn print_time_shell_at(
+        &mut self,
+        posix_format: bool,
+        started: TimeCommandStart,
+        end: std::time::Instant,
+    ) {
+        let metrics = TimeCommandMetrics::from_start_until(started, end);
         if let Some(report) = format_time_report(&self.shell_state.env_vars, posix_format, metrics)
         {
             self.xtrace_write(format!("{report}\n").as_bytes());

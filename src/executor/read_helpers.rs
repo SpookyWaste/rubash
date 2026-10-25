@@ -52,9 +52,25 @@ fn rusage_counters() -> RusageCounters {
 
 impl TimeCommandMetrics {
     pub(in crate::executor) fn from_start(started: TimeCommandStart) -> Self {
+        Self::from_start_until(started, std::time::Instant::now())
+    }
+
+    /// Metrics with the real interval ending at a CAPTURED instant
+    /// instead of now (rubash#1528): GNU's waitchld stamps a job's
+    /// timeval when the child is reaped, so a timed coproc's report
+    /// shows the true lifetime even when the completion is only
+    /// APPLIED at a later command boundary (a long foreground command
+    /// in between must not inflate `real`). user/sys stay delta-based:
+    /// RUSAGE_CHILDREN cannot be backdated, and the intervening
+    /// commands' own children are the only over-attribution (their
+    /// CPU is ~0 for the sleep-class commands this affects).
+    pub(in crate::executor) fn from_start_until(
+        started: TimeCommandStart,
+        end: std::time::Instant,
+    ) -> Self {
         let now = rusage_counters();
         Self {
-            real: started.instant.elapsed(),
+            real: end.saturating_duration_since(started.instant),
             user: now.user.saturating_sub(started.rusage.user),
             sys: now.sys.saturating_sub(started.rusage.sys),
         }
