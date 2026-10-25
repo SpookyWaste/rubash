@@ -842,6 +842,30 @@ pub(in crate::executor) fn current_epoch_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+/// Monotonic-clock whole seconds — the value behind $BASH_MONOSECONDS
+/// (GNU variables.c:1365 get_monoseconds reads
+/// clock_gettime(CLOCK_MONOTONIC).tv_sec). Platforms without a
+/// clock_gettime binding anchor a process-lifetime Instant instead;
+/// the tick rate (one second per second) is the observable contract.
+pub(in crate::executor) fn current_monotonic_seconds() -> i64 {
+    #[cfg(unix)]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: ts is a valid out-pointer for clock_gettime.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
+            return ts.tv_sec as i64;
+        }
+    }
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs() as i64
+}
+
 pub(in crate::executor) fn current_epoch_micros() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
