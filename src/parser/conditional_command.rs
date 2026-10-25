@@ -1189,6 +1189,27 @@ fn merge_pattern_rhs_fragments(arg_parts: Vec<CondArg>) -> Vec<CondArg> {
             continue;
         }
 
+        // A leading bare `)' never starts the right-hand word either:
+        // `)' is a shell break character, so read_token delivers it as
+        // its own token (parse.y:5305 read_token_word) and cond_term's
+        // argument slot reports it — letting it start the merge glued
+        // the following fragments into a fake word and the
+        // conditional silently evaluated (`[[ a == )abc ]]',
+        // rubash#1538). Under `=~' the reader jumps straight to word
+        // reading (parse.y:3663), where a leading break character ends
+        // the read at once (parse.y:5688): the regex word is EMPTY and
+        // the `)' stays in the stream, so cond_error's generic form —
+        // not the binary-argument form — reports it. Model that empty
+        // word and leave the `)' fragment for the next pass. A quoted
+        // `")"' (raw != value) is word text and still joins below.
+        if arg_parts[index].0 == ")" && arg_parts[index].1 == ")" {
+            if regexp {
+                let (_, _, ws, line) = arg_parts[index].clone();
+                args.push((String::new(), String::new(), ws, line));
+            }
+            continue;
+        }
+
         // The first fragment always begins the RHS word. The merged
         // word keeps the first fragment's leading whitespace: it is the
         // spacing the word actually has in the source, and consumers
