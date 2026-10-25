@@ -106,6 +106,17 @@ pub(super) struct ConditionalArithParser<'a> {
     /// getters resolve at find_variable time), and neither does this
     /// port: a name resolves only when an operand actually spells it.
     pub(super) dynamic_values: Option<&'a super::super::dynamic_arrays::ArithDynamicContext>,
+    /// Read-only view of the structured variable store, supplied only
+    /// when `env_vars` is the Executor's live table (or a plain clone of
+    /// it taken at evaluation start): element reads may then answer
+    /// from the typed cells under the same dirty-bit discipline the
+    /// braced paths use (rubash#616/#1510), instead of re-hashing and
+    /// re-scanning the serialized mirror on every read — the mirror leg
+    /// is Θ(mirror bytes) per read, which made `$((a[i]))` the one
+    /// remaining shape-level gap (11x at N=8000 while braced reads sit
+    /// at the ~3x floor). Parser-only contexts (no Executor) pass None
+    /// and keep the mirror leg byte-for-byte.
+    pub(super) cells: Option<&'a crate::shell::VariableStore>,
     pub(super) error_category: Option<super::ArithmeticErrorCategory>,
     pub(super) no_expand: bool,
     /// The first recorded evalerror — GNU longjmps on the first failure, so

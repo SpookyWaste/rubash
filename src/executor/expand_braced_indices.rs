@@ -669,6 +669,11 @@ impl Executor {
                     &overlaid,
                     Some(&self.shell_state.random_state),
                     Some(&dynamic_values),
+                    if matches!(&overlaid, std::borrow::Cow::Borrowed(_)) {
+                        Some(&self.shell_state.variables)
+                    } else {
+                        None
+                    },
                 );
                 if !writes.is_empty() {
                     PENDING_SUBSCRIPT_WRITES.with(|w| {
