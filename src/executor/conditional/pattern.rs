@@ -200,22 +200,32 @@ fn simple_glob_matches(pattern: &str, word: &str, nocase: bool) -> Option<bool> 
 /// folds with `eq_ignore_ascii_case`, the ASCII-only fold GNU's C-locale
 /// strncasecmp performs; non-ASCII bytes never admit here.
 fn literal_pattern_equality(pattern: &str, word: &str, nocase: bool) -> Option<bool> {
-    pattern
-        .bytes()
-        .all(|b| {
-            (b.is_ascii_graphic() || b == b' ')
-                && !matches!(
-                    b,
-                    b'*' | b'?' | b'[' | b']' | b'\\' | b'+' | b'@' | b'!' | b'(' | b')'
-                )
-        })
-        .then(|| {
-            if nocase {
-                word.eq_ignore_ascii_case(pattern)
-            } else {
-                word == pattern
-            }
-        })
+    pattern_is_plain_literal(pattern).then(|| {
+        if nocase {
+            word.eq_ignore_ascii_case(pattern)
+        } else {
+            word == pattern
+        }
+    })
+}
+
+/// Whether `pattern` belongs to the plain-literal class gated on in
+/// [`literal_pattern_equality`]: every byte is printable ASCII (or a
+/// space) and none carries glob or extglob operator meaning, so the
+/// only verdict the matcher can return for it is string equality. The
+/// `${v#pat}` / `${v%pat}` removal loops (parameter_decode.rs) answer
+/// such a pattern with a single candidate instead of one matcher call
+/// per candidate boundary — the literal case of the matches-nowhere
+/// short-circuit GNU documents for match_upattern (subst.c) —
+/// rubash#608.
+pub(in crate::executor) fn pattern_is_plain_literal(pattern: &str) -> bool {
+    pattern.bytes().all(|b| {
+        (b.is_ascii_graphic() || b == b' ')
+            && !matches!(
+                b,
+                b'*' | b'?' | b'[' | b']' | b'\\' | b'+' | b'@' | b'!' | b'(' | b')'
+            )
+    })
 }
 
 /// Normalization gate for byte-level matching (rubash#729). Subsumes the

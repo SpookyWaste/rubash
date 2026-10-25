@@ -153,6 +153,14 @@ fn parameter_pattern_match(pattern: &str, word: &str, nocase: bool, extglob: boo
 }
 
 fn normalize_parameter_pattern_backslashes(pattern: &str) -> String {
+    // The three passes rewrite the internal backslash markers only; a
+    // pattern carrying none of them is already normalized, so skip the
+    // three allocating replace passes (rubash#608).
+    if !pattern.contains(crate::executor::markers::DATA_BACKSLASH)
+        && !pattern.contains(crate::executor::markers::PATTERN_LITERAL_BACKSLASH)
+    {
+        return pattern.to_string();
+    }
     pattern
         .replace(
             &crate::executor::markers::PATTERN_LITERAL_BACKSLASH_STR.repeat(2),
@@ -921,6 +929,127 @@ mod tests {
         assert_eq!(
             remove_matching_suffix("x'a'y", "*a*", MatchLength::Shortest, false),
             "x'"
+        );
+    }
+
+    #[test]
+    fn issue_608_literal_removal_single_candidate() {
+        // GNU bash 5.3.20 verdicts (subst.c match_upattern): a
+        // plain-literal pattern can only match the single fragment of
+        // exactly its own length, for both match lengths — the fast
+        // path must reproduce the boundary walk exactly.
+        let v = "abcdefghijklmnopqrstuvwxyz";
+        assert_eq!(
+            remove_matching_prefix(v, "Q", MatchLength::Shortest, false),
+            v
+        );
+        assert_eq!(
+            remove_matching_prefix(v, "Q", MatchLength::Longest, false),
+            v
+        );
+        assert_eq!(
+            remove_matching_suffix(v, "Q", MatchLength::Shortest, false),
+            v
+        );
+        assert_eq!(
+            remove_matching_suffix(v, "Q", MatchLength::Longest, false),
+            v
+        );
+        assert_eq!(
+            remove_matching_prefix(v, "a", MatchLength::Shortest, false),
+            "bcdefghijklmnopqrstuvwxyz"
+        );
+        assert_eq!(
+            remove_matching_prefix(v, "abc", MatchLength::Longest, false),
+            "defghijklmnopqrstuvwxyz"
+        );
+        assert_eq!(
+            remove_matching_suffix(v, "xyz", MatchLength::Longest, false),
+            "abcdefghijklmnopqrstuvw"
+        );
+        assert_eq!(
+            remove_matching_suffix(v, "z", MatchLength::Shortest, false),
+            "abcdefghijklmnopqrstuvwxy"
+        );
+        // Empty pattern matches only the empty fragment: no-op.
+        assert_eq!(
+            remove_matching_prefix(v, "", MatchLength::Shortest, false),
+            v
+        );
+        assert_eq!(
+            remove_matching_suffix(v, "", MatchLength::Longest, false),
+            v
+        );
+        // A pattern longer than the value can never match.
+        assert_eq!(
+            remove_matching_prefix("ab", "abc", MatchLength::Shortest, false),
+            "ab"
+        );
+        assert_eq!(
+            remove_matching_suffix("ab", "abc", MatchLength::Shortest, false),
+            "ab"
+        );
+        // A literal containing a space is still the literal class.
+        assert_eq!(
+            remove_matching_prefix("a b c", "a ", MatchLength::Shortest, false),
+            "b c"
+        );
+        // Multibyte value: the single candidate is a byte length, so a
+        // match must land on a char boundary.
+        assert_eq!(
+            remove_matching_prefix("héllo", "h", MatchLength::Shortest, false),
+            "éllo"
+        );
+        assert_eq!(
+            remove_matching_suffix("héllo", "o", MatchLength::Shortest, false),
+            "héll"
+        );
+        // Case stays sensitive even though pat_subst honors nocasematch
+        // elsewhere: GNU removal matching does not fold (verified
+        // against the 5.3.20 oracle with nocasematch set).
+        assert_eq!(
+            remove_matching_prefix("ABC", "a", MatchLength::Shortest, false),
+            "ABC"
+        );
+        assert_eq!(
+            remove_matching_suffix("ABC", "c", MatchLength::Shortest, false),
+            "ABC"
+        );
+        // Glob patterns keep the general walk (GNU verdicts).
+        assert_eq!(
+            remove_matching_prefix("aXbXc", "*X", MatchLength::Shortest, false),
+            "bXc"
+        );
+        assert_eq!(
+            remove_matching_prefix("aXbXc", "*X", MatchLength::Longest, false),
+            "c"
+        );
+        assert_eq!(
+            remove_matching_suffix("aXbXc", "X*", MatchLength::Shortest, false),
+            "aXb"
+        );
+        assert_eq!(
+            remove_matching_suffix("aXbXc", "X*", MatchLength::Longest, false),
+            "a"
+        );
+    }
+
+    #[test]
+    fn issue_608_normalize_backslashes_marker_free_is_identity() {
+        // Patterns without either internal backslash marker are already
+        // normalized; the rewrite passes must not fire.
+        assert_eq!(normalize_parameter_pattern_backslashes("abc"), "abc");
+        assert_eq!(normalize_parameter_pattern_backslashes("a/b?c"), "a/b?c");
+        // Marker-carrying patterns still normalize to a real backslash.
+        let data_marked = format!("a{}b", crate::executor::markers::DATA_BACKSLASH);
+        assert_eq!(
+            normalize_parameter_pattern_backslashes(&data_marked),
+            "a\\b"
+        );
+        let literal_marked = format!("a{}b", crate::executor::markers::PATTERN_LITERAL_BACKSLASH);
+        assert_eq!(
+            normalize_parameter_pattern_backslashes(&literal_marked),
+            "a\\b"
         );
     }
 

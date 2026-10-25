@@ -133,6 +133,31 @@ pub(in crate::executor) fn remove_matching_prefix(
     if pattern_has_raw_byte_markers(pattern) {
         return remove_matching_prefix_bytes(value, pattern, length, extglob);
     }
+    // Plain-literal pattern (rubash#608): string equality is the only
+    // verdict removal_pattern_matches can return for this class (see
+    // literal_pattern_equality in conditional/pattern.rs), so the
+    // single candidate of exactly the pattern's byte length decides
+    // both match lengths — the literal case of the matches-nowhere
+    // short-circuit GNU documents for match_upattern (subst.c). The
+    // byte-spelling gate is applied first, exactly as
+    // removal_pattern_matches applies it ahead of the matcher; a
+    // candidate end that would split a marker pair is rejected just
+    // as the walk below rejects it, and a non-boundary byte length
+    // cannot match (the walk only ever tests char boundaries).
+    if super::conditional::pattern::pattern_is_plain_literal(pattern)
+        && !super::conditional::pattern::sides_need_byte_char_matching(pattern, value)
+    {
+        let end = pattern.len();
+        let matched = end <= value.len()
+            && value.is_char_boundary(end)
+            && !marker_pair_split_points(value).contains(&end)
+            && &value[..end] == pattern;
+        return if matched {
+            value[end..].to_string()
+        } else {
+            value.to_string()
+        };
+    }
     // Char boundaries plus the end offset, in one pass without staging a
     // Vec (rubash#281): the old `collect::<Vec<usize>>` + `Box<dyn
     // Iterator>` pair was two allocations per removal call, paid once per
@@ -166,6 +191,24 @@ pub(in crate::executor) fn remove_matching_suffix(
 ) -> String {
     if pattern_has_raw_byte_markers(pattern) {
         return remove_matching_suffix_bytes(value, pattern, length, extglob);
+    }
+    // Plain-literal suffix (rubash#608): mirror of the prefix fast
+    // path above — the only candidate is the suffix of exactly the
+    // pattern's byte length, for both match lengths.
+    if super::conditional::pattern::pattern_is_plain_literal(pattern)
+        && !super::conditional::pattern::sides_need_byte_char_matching(pattern, value)
+    {
+        let matched = value.len() >= pattern.len() && {
+            let start = value.len() - pattern.len();
+            value.is_char_boundary(start)
+                && !marker_pair_split_points(value).contains(&start)
+                && &value[start..] == pattern
+        };
+        return if matched {
+            value[..value.len() - pattern.len()].to_string()
+        } else {
+            value.to_string()
+        };
     }
     // Same allocation-free boundary walk as remove_matching_prefix above,
     // with the same marker-pair split exclusion (rubash#1261: the `%`
