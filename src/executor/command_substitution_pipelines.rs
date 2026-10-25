@@ -297,10 +297,11 @@ impl Executor {
             (first, ast.commands.get(1))
         };
         if first.words.first().map(String::as_str) != Some("cat")
-            || crate::executor::path::path_is_unset(&self.shell_state.env_vars)
+            || self.emulated_external_stands_down("cat")
         {
-            // With PATH unset, cat does not resolve (rubash#1126): the
-            // heredoc shortcut must not produce the content.
+            // When cat does not resolve (PATH unset, rubash#1126; or a
+            // set PATH without it, rubash#1545), the heredoc shortcut
+            // must not produce the content.
             return None;
         }
         // GNU redir.c expands the heredoc / here-string word in the
@@ -440,10 +441,11 @@ impl Executor {
             (first, ast.commands.get(1))
         };
         if first.words.first().map(String::as_str) != Some("cat")
-            || crate::executor::path::path_is_unset(&self.shell_state.env_vars)
+            || self.emulated_external_stands_down("cat")
         {
-            // With PATH unset, cat does not resolve (rubash#1126): the
-            // heredoc shortcut must not produce the content.
+            // When cat does not resolve (PATH unset, rubash#1126; or a
+            // set PATH without it, rubash#1545), the heredoc shortcut
+            // must not produce the content.
             return None;
         }
         // rubash#320: same admission whitelist as the typed path — a file
@@ -615,7 +617,7 @@ impl Executor {
             }
             Some("tty") | Some("/bin/tty") | Some("/usr/bin/tty") => {
                 if words.first().map(String::as_str) == Some("tty")
-                    && crate::executor::path::path_is_unset(&self.shell_state.env_vars)
+                    && self.emulated_external_stands_down("tty")
                 {
                     return None;
                 }
@@ -631,8 +633,9 @@ impl Executor {
                 })
             }
             Some("cat") => {
-                // With PATH unset, cat does not resolve (rubash#1126).
-                if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                // When cat does not resolve (PATH unset, rubash#1126; or
+                // a set PATH without it, rubash#1545), decline.
+                if self.emulated_external_stands_down("cat") {
                     return None;
                 }
                 // Bare `cat` (or flag/`-` operands) reads fd 0 — the shared

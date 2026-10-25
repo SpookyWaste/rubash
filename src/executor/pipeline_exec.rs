@@ -1350,9 +1350,10 @@ impl Executor {
         match name.as_str() {
             "true" | ":" => Some(()),
             "sleep" => {
-                // With PATH unset, sleep does not resolve (rubash#1126):
-                // decline the timing model so the real pipeline reports it.
-                if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                // When sleep does not resolve (PATH unset, rubash#1126;
+                // or a set PATH without it, rubash#1545), decline the
+                // timing model so the real pipeline reports the failure.
+                if self.emulated_external_stands_down("sleep") {
                     return None;
                 }
                 let duration = command
@@ -2211,8 +2212,16 @@ impl Executor {
         }
         let program =
             find_user_command(&expanded_name, &self.shell_state.env_vars).or_else(|| {
-                matches!(expanded_name.as_str(), "yes" | "head" | "wc")
-                    .then(|| internal_pipeline_program(&expanded_name))
+                // rubash#1545: the internal-program stand-in may only
+                // stand in for a command GNU would resolve (findcmd.c
+                // search_for_command) — on an unresolvable name the
+                // member is `command not found`, so decline the fast
+                // path and let the sequential stage executor report it.
+                // (The stand-in's legitimate case is a HASH-resolved
+                // name find_user_command's PATH walk cannot see.)
+                (matches!(expanded_name.as_str(), "yes" | "head" | "wc")
+                    && !self.emulated_external_stands_down(&expanded_name))
+                .then(|| internal_pipeline_program(&expanded_name))
             })?;
         // GNU execute_cmd.c:6139-6233 (shell_execve): a member the OS
         // cannot exec natively is classified by its first bytes before
@@ -3836,13 +3845,15 @@ impl Executor {
         // and a pure inline fast-path arm (`echo`/`printf`/`tr`/...) is
         // confirmed as a builtin when the stage returns.
         let _profiler_stage = super::profiler::enter_prepared_command(name);
-        // GNU findcmd.c: with PATH unset no external command resolves —
-        // the inline arms below that emulate external programs (head,
-        // cat, sed, grep, wc, tr) must stand down and let the external
-        // stage report the failure (rubash#1126). Builtin arms are
-        // unaffected.
-        if crate::executor::path::path_is_unset(&self.shell_state.env_vars)
-            && matches!(name, "head" | "cat" | "sed" | "grep" | "wc" | "tr" | "tput")
+        // GNU findcmd.c search_for_command: a slash-free external name
+        // runs only when it resolves — with PATH unset nothing resolves
+        // (rubash#1126), and a set PATH holding no such command fails
+        // identically (rubash#1545). The inline arms below that emulate
+        // external programs (head, cat, sed, grep, wc, tr) must stand
+        // down in both cases and let the external stage report the
+        // failure. Builtin arms are unaffected.
+        if matches!(name, "head" | "cat" | "sed" | "grep" | "wc" | "tr" | "tput")
+            && self.emulated_external_stands_down(name)
         {
             return self.execute_external_pipeline_stage(command, input, stdin_inherit);
         }

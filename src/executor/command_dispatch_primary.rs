@@ -140,7 +140,7 @@ impl Executor {
                 }
             }
             "sleep" => {
-                if !crate::executor::path::path_is_unset(&self.shell_state.env_vars)
+                if !self.emulated_external_stands_down("sleep")
                     && crate::builtins::sleep::can_execute_fast_path(&cmd.words[1..])
                     // rubash#1497: a stamped -c tail command must reach
                     // the spawn site so it can exec-replace the process
