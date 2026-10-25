@@ -245,7 +245,8 @@ impl CondFail {
         // reports `x' not `]]'.
         let (near, near_line, echo_line) = match &self.offending {
             CondOffending::Index(index) => (
-                walk_back_near_token(args, *index),
+                glued_semicolon_near(args, *index)
+                    .unwrap_or_else(|| walk_back_near_token(args, *index)),
                 args[*index].3,
                 args[*index].3,
             ),
@@ -259,7 +260,10 @@ impl CondFail {
                 let end_line = end_index
                     .and_then(|index| args.get(index))
                     .map_or(last_line, |arg| arg.3);
-                (end_near_token(args), end_line, end_line)
+                let near = end_index
+                    .and_then(|index| glued_semicolon_near(args, index))
+                    .unwrap_or_else(|| end_near_token(args));
+                (near, end_line, end_line)
             }
             CondOffending::VirtualNewline(anchor) => {
                 let last = (*anchor).min(args.len()).saturating_sub(1);
@@ -474,6 +478,23 @@ fn walk_back_near_token(args: &[CondArg], index: usize) -> String {
         }
     }
     near
+}
+
+/// rubash#1560: the near for an offending token that a glued `;'
+/// immediately follows. error_token_from_text (parse.y:6772-6808) is
+/// anchored at the reader index when report_syntax_error runs, and
+/// the reader has already consumed that `;' as its lookahead: the
+/// backward walk stops ON the break character and reports it alone
+/// (`[[ a =~ (b)]] && echo T; ...' reports near `;'', not `T''). A
+/// spaced `;' starts a fresh token run (its leading whitespace is
+/// non-empty) and the near stays the offending token's own.
+fn glued_semicolon_near(args: &[CondArg], offender_index: usize) -> Option<String> {
+    let next = args.get(offender_index + 1)?;
+    if next.2.is_empty() && next.1.starts_with(';') {
+        Some(";".to_string())
+    } else {
+        None
+    }
 }
 
 /// The near token for a `]]' (COND_END) offender. error_token_from_text
