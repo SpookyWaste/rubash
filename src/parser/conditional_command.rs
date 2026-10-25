@@ -40,9 +40,11 @@ pub(super) fn parse_conditional_command(
     let mut command = CommandNode::new();
     command.line = tokens.get(start).map(|token| token.position);
     command.logical_line = tokens.get(start).map(|token| token.logical_line);
-    if let Some((spec, echo_line)) =
-        conditional_syntax_error_spec(&merged_args, true, stream_eof_line(tokens, diagnostic_text))
-    {
+    if let Some((spec, echo_line)) = conditional_syntax_error_spec(
+        &merged_args,
+        true,
+        stream_eof_line(tokens, diagnostic_text, source_line_offset),
+    ) {
         command.insert_assignment("__RUBASH_PARSE_ERROR_COND__".to_string(), spec);
         if let Some(source) = conditional_offending_line(
             tokens,
@@ -87,9 +89,25 @@ pub(super) fn parse_conditional_command(
 /// (parse.y:5223-5227 at the EOF line). Falls back to the last token's
 /// line + 1 when the source text is unavailable — the same fallback
 /// shape conditional_eof_error_command already uses.
-fn stream_eof_line(tokens: &[Token], diagnostic_text: Option<&std::rc::Rc<str>>) -> usize {
+fn stream_eof_line(
+    tokens: &[Token],
+    diagnostic_text: Option<&std::rc::Rc<str>>,
+    source_line_offset: usize,
+) -> usize {
     if let Some(text) = diagnostic_text {
-        return text.matches('\n').count() + 1;
+        // The text is this parse input's own source; its lines are
+        // numbered from source_line_offset (token positions carry the
+        // same offset), so the EOF line is offset + newlines + 1 — plus
+        // one more when the final line is unterminated: GNU's reader
+        // completes that line at EOF, so its EOF diagnostics (the
+        // parse.y:5223-5227 report among them) land one past it either
+        // way (`bash -c '[[ abc =~ ([a-z]]]'` reports line 2, as does
+        // the same text as a file with or without a trailing newline).
+        let unterminated_tail = !text.is_empty() && !text.ends_with('\n');
+        return text.matches('\n').count()
+            + 1
+            + usize::from(unterminated_tail)
+            + source_line_offset;
     }
     tokens.last().map(|token| token.position + 1).unwrap_or(1)
 }
@@ -291,6 +309,79 @@ fn unclosed_regex_paren_line(word: &str, base_line: usize) -> Option<usize> {
             ')' => depth -= 1,
             _ => {}
         }
+    }
+    (depth > 0).then_some(open_line)
+}
+
+/// The same parse_matched_pair scan as `unclosed_regex_paren_line`, run
+/// over a merged RHS argument's RAW text (rubash#1290 residual). The scan
+/// GNU runs is over the raw input stream (parse.y:3901-3912): a backslash
+/// protects the next character (LEX_PASSNEXT, parse.y:3965-3984), and a
+/// quote character inside the scan is consumed as a nested matched pair
+/// whose contents never count toward the paren depth (parse.y:4040-4051)
+/// — which is also why a paren inside a quoted PREFIX of the raw form
+/// (`a"(b"c') never opens a pair: shellquote has already consumed it
+/// before the `(' special case (parse.y:5417). An unterminated quote
+/// inside the scan swallows the rest of the text here; GNU would recurse
+/// and report the quote's own EOF instead — a boundary this helper does
+/// not model (the paren is still unclosed, only the wording differs).
+fn unclosed_regex_paren_line_in_raw(raw: &str, base_line: usize) -> Option<usize> {
+    let mut depth = 0isize;
+    let mut open_line = base_line;
+    let mut line = base_line;
+    let mut escaped = false;
+    let mut quote: Option<char> = None;
+    // Whether the open '...' quote is the $'...' ANSI form, whose
+    // backslashes escape (P_ALLOWESC, parse.y:3990-3996); a plain '...'
+    // treats a backslash as a literal character.
+    let mut quote_dollar_single = false;
+    let mut prev = '\0';
+    for ch in raw.chars() {
+        if ch == '\n' {
+            line += 1;
+        }
+        match quote {
+            Some('\'') => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' && quote_dollar_single {
+                    escaped = true;
+                } else if ch == '\'' {
+                    quote = None;
+                }
+            }
+            Some(_) => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote.unwrap() {
+                    quote = None;
+                }
+            }
+            None => {
+                if escaped {
+                    escaped = false;
+                } else {
+                    match ch {
+                        '\\' => escaped = true,
+                        '\'' | '"' | '`' => {
+                            quote_dollar_single = ch == '\'' && prev == '$';
+                            quote = Some(ch);
+                        }
+                        '(' => {
+                            if depth == 0 {
+                                open_line = line;
+                            }
+                            depth += 1;
+                        }
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        prev = ch;
     }
     (depth > 0).then_some(open_line)
 }
@@ -647,24 +738,36 @@ fn cond_term(cursor: &mut CondCursor) -> Result<(), CondFail> {
                 // probes n6 / `[[ x =~ (unclosed`).
                 if op_is_regex && tok == CondTok::Word {
                     let (value, raw, _, arg_line) = &cursor.args[index.unwrap()];
-                    if raw == value {
-                        if let Some(paren_line) = unclosed_regex_paren_line(value, *arg_line) {
-                            let eof_line = cursor.stream_eof_line;
-                            return Err(CondFail {
-                                messages: vec![
-                                    (
-                                        paren_line,
-                                        "unexpected EOF while looking for matching `)'".to_string(),
-                                    ),
-                                    (
-                                        eof_line,
-                                        "unexpected argument to conditional binary operator"
-                                            .to_string(),
-                                    ),
-                                ],
-                                offending: CondOffending::BareEof,
-                            });
-                        }
+                    // An unquoted first fragment makes raw == value and the
+                    // cooked word is the scan text. When the merge swallowed
+                    // following lines into the RHS (the unclosed scan's own
+                    // doing), later fragments carry quoting, so raw != value
+                    // — but parse_matched_pair scans the RAW stream, where
+                    // those quote characters are just data inside the pair
+                    // (parse.y:3901-3912); scan the raw form then
+                    // (rubash#1290 residual: file-mode probes printed the
+                    // generic `]]' EOF shape instead).
+                    let paren_line = if raw == value {
+                        unclosed_regex_paren_line(value, *arg_line)
+                    } else {
+                        unclosed_regex_paren_line_in_raw(raw, *arg_line)
+                    };
+                    if let Some(paren_line) = paren_line {
+                        let eof_line = cursor.stream_eof_line;
+                        return Err(CondFail {
+                            messages: vec![
+                                (
+                                    paren_line,
+                                    "unexpected EOF while looking for matching `)'".to_string(),
+                                ),
+                                (
+                                    eof_line,
+                                    "unexpected argument to conditional binary operator"
+                                        .to_string(),
+                                ),
+                            ],
+                            offending: CondOffending::BareEof,
+                        });
                     }
                 }
                 if tok != CondTok::Word {
@@ -1179,7 +1282,7 @@ pub(super) fn conditional_eof_error_command(
     let (spec, echo_line) = conditional_syntax_error_spec(
         &merged,
         false,
-        stream_eof_line(tokens, diagnostic_text),
+        stream_eof_line(tokens, diagnostic_text, source_line_offset),
     )
     .unwrap_or_else(|| {
         let sep = crate::executor::markers::PARSE_ERROR_FIELD_SEP;

@@ -11,6 +11,13 @@ pub(in crate::executor) struct ProcessSubstitutionFiles {
 struct OutputProcessSubstitution {
     path: PathBuf,
     source: String,
+    /// Line of the command that constructed the substitution, captured
+    /// at materialization time. The body runs later (at finish, in a
+    /// spawned child), when the shell's current line has moved on, so
+    /// the construction line must ride along — GNU's process_substitute
+    /// fork (subst.c:6362) inherits the parent's line_number at fork
+    /// time (rubash#1184 f4).
+    line: Option<usize>,
 }
 
 fn exec_keeps_output_process_substitution(words: &[String], redirect: &Redirect) -> bool {
@@ -327,6 +334,10 @@ impl Executor {
     ) -> Result<(CommandNode, ProcessSubstitutionFiles), ExecuteError> {
         let mut rewritten = cmd.clone();
         let mut files = ProcessSubstitutionFiles::default();
+        // rubash#1184 f4: every output substitution materialized here is
+        // constructed by THIS command; its line is the body's diagnostic
+        // attribution (see OutputProcessSubstitution::line).
+        let cmd_line = cmd.line;
         let mut redirect_target_rewrites = Vec::new();
         // GNU subst.c: an unquoted `name=<( )` word is an assignment whose
         // value is the process substitution (make_dev_fd_filename,
@@ -392,6 +403,7 @@ impl Executor {
                     self.materialize_standalone_process_substitution_word(
                         &mut rewritten.words[word_index],
                         &mut files,
+                        cmd_line,
                     )?;
                 }
             } else {
@@ -399,6 +411,7 @@ impl Executor {
                     &mut rewritten.words[word_index],
                     substitutions,
                     &mut files,
+                    cmd_line,
                 )?;
             }
         }
@@ -465,9 +478,11 @@ impl Executor {
                 redirect.target = display_path;
                 redirect_target_rewrites.push((old_target, redirect.target.clone()));
             }
-            files
-                .outputs
-                .push(OutputProcessSubstitution { path, source });
+            files.outputs.push(OutputProcessSubstitution {
+                path,
+                source,
+                line: cmd_line,
+            });
         }
         if let Some(source) = shared_combined_output_process_substitution(
             rewritten.append.as_ref(),
@@ -485,9 +500,11 @@ impl Executor {
                 redirect.target = display_path;
                 redirect_target_rewrites.push((old_target, redirect.target.clone()));
             }
-            files
-                .outputs
-                .push(OutputProcessSubstitution { path, source });
+            files.outputs.push(OutputProcessSubstitution {
+                path,
+                source,
+                line: cmd_line,
+            });
         }
         if let Some(redirect) = &mut rewritten.redirect_out {
             if !exec_keeps_output_process_substitution(&exec_words, redirect) {
@@ -501,9 +518,11 @@ impl Executor {
                     let old_target = redirect.target.clone();
                     redirect.target = shell_display_path(&path.to_string_lossy());
                     redirect_target_rewrites.push((old_target, redirect.target.clone()));
-                    files
-                        .outputs
-                        .push(OutputProcessSubstitution { path, source });
+                    files.outputs.push(OutputProcessSubstitution {
+                        path,
+                        source,
+                        line: cmd_line,
+                    });
                 }
             }
         }
@@ -519,9 +538,11 @@ impl Executor {
                     let old_target = redirect.target.clone();
                     redirect.target = shell_display_path(&path.to_string_lossy());
                     redirect_target_rewrites.push((old_target, redirect.target.clone()));
-                    files
-                        .outputs
-                        .push(OutputProcessSubstitution { path, source });
+                    files.outputs.push(OutputProcessSubstitution {
+                        path,
+                        source,
+                        line: cmd_line,
+                    });
                 }
             }
         }
@@ -537,9 +558,11 @@ impl Executor {
                     let old_target = redirect.target.clone();
                     redirect.target = shell_display_path(&path.to_string_lossy());
                     redirect_target_rewrites.push((old_target, redirect.target.clone()));
-                    files
-                        .outputs
-                        .push(OutputProcessSubstitution { path, source });
+                    files.outputs.push(OutputProcessSubstitution {
+                        path,
+                        source,
+                        line: cmd_line,
+                    });
                 }
             }
         }
@@ -555,9 +578,11 @@ impl Executor {
                     let old_target = redirect.target.clone();
                     redirect.target = shell_display_path(&path.to_string_lossy());
                     redirect_target_rewrites.push((old_target, redirect.target.clone()));
-                    files
-                        .outputs
-                        .push(OutputProcessSubstitution { path, source });
+                    files.outputs.push(OutputProcessSubstitution {
+                        path,
+                        source,
+                        line: cmd_line,
+                    });
                 }
             }
         }
@@ -586,6 +611,7 @@ impl Executor {
         &mut self,
         word: &mut String,
         files: &mut ProcessSubstitutionFiles,
+        line: Option<usize>,
     ) -> Result<(), ExecuteError> {
         if let Some(source) = word
             .strip_prefix("<(")
@@ -604,9 +630,11 @@ impl Executor {
             let source = source.to_string();
             let path = self.empty_process_substitution_temp()?;
             *word = self.process_substitution_output_fd_word(&path);
-            files
-                .outputs
-                .push(OutputProcessSubstitution { path, source });
+            files.outputs.push(OutputProcessSubstitution {
+                path,
+                source,
+                line: line,
+            });
         }
         Ok(())
     }
@@ -616,6 +644,7 @@ impl Executor {
         word: &mut String,
         substitutions: Vec<crate::parser::ProcessSubstitution>,
         files: &mut ProcessSubstitutionFiles,
+        line: Option<usize>,
     ) -> Result<(), ExecuteError> {
         for substitution in substitutions {
             if substitution.output {
@@ -623,6 +652,7 @@ impl Executor {
                 files.outputs.push(OutputProcessSubstitution {
                     path: path.clone(),
                     source: substitution.source,
+                    line,
                 });
                 let display_path = self.process_substitution_output_fd_word(&path);
                 *word = word.replacen(&substitution.target, &display_path, 1);
@@ -798,8 +828,12 @@ impl Executor {
     pub(in crate::executor) fn finish_conditional_output_procsubs(
         &mut self,
     ) -> Result<(), ExecuteError> {
-        for (path, source) in std::mem::take(&mut self.conditional_output_procsubs) {
-            self.execute_output_process_substitution(&OutputProcessSubstitution { path, source })?;
+        for (path, source, line) in std::mem::take(&mut self.conditional_output_procsubs) {
+            self.execute_output_process_substitution(&OutputProcessSubstitution {
+                path,
+                source,
+                line,
+            })?;
         }
         Ok(())
     }
@@ -899,7 +933,7 @@ impl Executor {
         // stall the parent's next command (rubash#1220), and the child's own
         // `exit`/traps/variables stay child-local by construction (subst.c
         // 6421 restore_original_signals, :6628 exit).
-        self.spawn_output_process_substitution_child(&output.source, input)
+        self.spawn_output_process_substitution_child(&output.source, input, output.line)
     }
 
     /// Spawn the `>(body)` consumer detached, the stand-in for GNU's
@@ -916,6 +950,7 @@ impl Executor {
         &mut self,
         body: &str,
         input: Vec<u8>,
+        line: Option<usize>,
     ) -> Result<(), ExecuteError> {
         let exe = std::env::var_os("CARGO_BIN_EXE_rubash")
             .map(std::path::PathBuf::from)
@@ -926,6 +961,9 @@ impl Executor {
         // (background_function_prelude serializes them ahead of the body),
         // so `>(myfunc)` resolves the same definition GNU's fork would see.
         let mut source = self.background_function_prelude();
+        // The body's first line sits this many lines into the `-c`
+        // source; the line-offset seed below compensates for it.
+        let prelude_newlines = source.matches('\n').count();
         source.push_str(body);
         // Same environment transport as the `cmd &` respawn
         // (compound_exec.rs execute_background_ast_command): the process env
@@ -964,6 +1002,18 @@ impl Executor {
                     .cloned()
                     .unwrap_or_else(|| "1".to_string()),
             );
+        }
+        // rubash#1184 f4: when the construction line was captured at
+        // materialization, it overrides the finish-time current line —
+        // GNU's fork inherits line_number when process_substitute runs
+        // (subst.c:6362), not when the consumer is reaped. The offset
+        // follows the `&` respawn's protocol (line - 1), less the
+        // prelude's newlines, so the body's first line reports at the
+        // construction line in the child's own parse.
+        if let Some(line) = line {
+            env_map.insert("__RUBASH_CURRENT_LINE".to_string(), line.to_string());
+            let line_offset = line.saturating_sub(1).saturating_sub(prelude_newlines);
+            env_map.insert("__RUBASH_LINE_OFFSET".to_string(), line_offset.to_string());
         }
         // GNU setup_async_signals (subst.c:6424): the async child ignores
         // SIGINT/SIGQUIT while job control is off — the entry-ignore marker
