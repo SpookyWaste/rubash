@@ -415,12 +415,17 @@ pub(in crate::executor) fn execute_history_session(
                 .cloned()
                 .or_else(|| executor.get_env("HISTFILE").map(String::from))
             else {
+                // builtins/history.def history_builtin file branch: with
+                // no operand the filename comes from $HISTFILE, and an
+                // unset $HISTFILE draws the `parameter null or not set'
+                // diagnostic with EXECUTION_FAILURE — for -a/-n/-r/-w
+                // alike (rubash#1633).
                 let _ = writeln!(
                     stderr,
-                    "{}history: filename not specified",
+                    "{}history: HISTFILE: parameter null or not set",
                     executor.diagnostic_prefix()
                 );
-                return Ok(2);
+                return Ok(1);
             };
             // GNU history.def: a null $HISTFILE is its own diagnostic
             // (rubash#1289 B3), for both -w and -a.
@@ -428,6 +433,16 @@ pub(in crate::executor) fn execute_history_session(
                 let _ = writeln!(
                     stderr,
                     "{}history: HISTFILE: parameter null or not set",
+                    executor.diagnostic_prefix()
+                );
+                return Ok(1);
+            }
+            // builtins/history.def: an explicitly empty operand is the
+            // separate `empty filename' diagnostic (rubash#1633).
+            if !from_histfile && path.is_empty() {
+                let _ = writeln!(
+                    stderr,
+                    "{}history: empty filename",
                     executor.diagnostic_prefix()
                 );
                 return Ok(1);

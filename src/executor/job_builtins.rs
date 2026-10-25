@@ -2667,12 +2667,32 @@ impl Executor {
             }
 
             if has_io {
+                let from_histfile = file_arg.is_none();
                 let Some(file) = file_arg.or_else(|| self.get_env("HISTFILE").map(String::from))
                 else {
-                    writeln!(stderr, "history: filename not specified")?;
+                    // builtins/history.def history_builtin file branch:
+                    // no operand and $HISTFILE unset is the `parameter
+                    // null or not set' diagnostic (rubash#1633).
+                    writeln!(stderr, "history: HISTFILE: parameter null or not set")?;
                     self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
                     return Ok(1);
                 };
+                if file.is_empty() {
+                    // builtins/history.def: a null $HISTFILE and an
+                    // explicitly empty operand are distinct diagnostics
+                    // (rubash#1289 B3, rubash#1633).
+                    writeln!(
+                        stderr,
+                        "{}",
+                        if from_histfile {
+                            "history: HISTFILE: parameter null or not set"
+                        } else {
+                            "history: empty filename"
+                        }
+                    )?;
+                    self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+                    return Ok(1);
+                }
                 let mut p = provider.borrow_mut();
                 if do_clear {
                     p.clear()?;
