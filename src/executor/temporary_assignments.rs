@@ -1494,9 +1494,25 @@ impl Executor {
             DECLARED_UNSET_VARS,
             base_name,
         );
+        // GNU variables.c:6291 set_pipestatus_array gates the status
+        // writer on the CELL's array_p, and PIPESTATUS has no standing
+        // cell: a scalar bind creates a scalar cell unless the current
+        // cell already holds an array object (LiveArray) or was
+        // declared one (`declare -a`, ValuelessArray — bind_variable
+        // then writes element 0 and the writer takes the cell over).
+        // The static ARRAY_VARS mark init sets names the nominal type
+        // for the expansion views; on its own it must not turn
+        // `PIPESTATUS=99` into an element-0 write (rubash#1364).
+        let pipestatus_cell_is_array = base_name == "PIPESTATUS"
+            && matches!(
+                self.shell_state.pipestatus_shape,
+                crate::shell::state::PipestatusShape::LiveArray
+                    | crate::shell::state::PipestatusShape::ValuelessArray
+            );
         let is_array = compound_assignment
-            || is_marked_var(&self.shell_state.env_vars, ARRAY_VARS, base_name)
-            || is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base_name);
+            || is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base_name)
+            || (is_marked_var(&self.shell_state.env_vars, ARRAY_VARS, base_name)
+                && (base_name != "PIPESTATUS" || pipestatus_cell_is_array));
         // GNU variables.c:3128-3142 bind_variable_internal: when the
         // variable is already an array, a scalar assignment sets array[0]
         // without clearing other elements (array.tests:171-174:
