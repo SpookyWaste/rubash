@@ -3714,7 +3714,8 @@ impl Executor {
         // failglob verdict. A probe hit stays silent — the wrapper fallback
         // re-expands in the child and reports exactly once (753.11: the
         // doubled `no match` on the `&` line).
-        if self.expansion_probe_active.get() {
+        if self.expansion_probe_active.get() || super::pipeline_exec::speculative_expansion_active()
+        {
             return;
         }
         // GNU's failglob report (subst.c expand_word_list_internal ->
