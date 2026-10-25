@@ -833,6 +833,164 @@ impl Executor {
         self.command_expansion_failed.set(saved.6);
     }
 
+    /// rubash#1564: could expanding this element's words (or its
+    /// tempenv assignment values) mutate the variable table? Only
+    /// expansion-bearing text can: a `$` or backquote anywhere in a
+    /// word or an assignment value. Pure-literal members — the hot
+    /// pipeline shape — skip the snapshot entirely.
+    pub(in crate::executor) fn stage_expansion_may_bind(command: &CommandNode) -> bool {
+        command
+            .words
+            .iter()
+            .chain(command.assignments.iter().map(|(_, value)| value))
+            .chain(command.heredoc.iter())
+            .chain(command.here_string.iter())
+            .chain(
+                command
+                    .heredoc_redirects
+                    .iter()
+                    .filter_map(|redirect| redirect.body.as_ref()),
+            )
+            .any(|text| text.contains('$') || text.contains('`'))
+    }
+
+    /// rubash#1564: snapshot the variable table (and `$?`) before a
+    /// speculative or spawn-time expansion of a pipeline element's
+    /// words on this shared executor. GNU expands the element in its
+    /// forked child (execute_cmd.c:2620 execute_pipeline ->
+    /// execute_simple_command), so a successful side-effecting
+    /// expansion — `${var:=word}`, `$((var=expr))` — binds in the
+    /// child and dies with it; on the shared executor the bind would
+    /// otherwise stay in the parent table for the rest of the script
+    /// and leak into sibling elements' own expansions.
+    pub(in crate::executor) fn snapshot_spec_env(
+        &self,
+        command: &CommandNode,
+    ) -> Option<(
+        crate::shell::var_table::VarTable,
+        crate::shell::VariableStore,
+        i32,
+    )> {
+        Self::stage_expansion_may_bind(command).then(|| {
+            (
+                self.shell_state.env_vars.clone(),
+                self.shell_state.variables.clone(),
+                self.exit_code,
+            )
+        })
+    }
+
+    /// rubash#1564: restore a snapshot_spec_env snapshot. Returns true
+    /// when the expansion changed an EXPORTED variable's value (or
+    /// its export attribute): such a bind is observable in the
+    /// element's own child process environment, which only the
+    /// sequential stage executor can reproduce (it expands in the
+    /// element's clone and spawns from it) — a caller building a
+    /// speculative spec must decline the fast path in that case and
+    /// let the sequential path run the element.
+    pub(in crate::executor) fn restore_spec_env(
+        &mut self,
+        saved: Option<(
+            crate::shell::var_table::VarTable,
+            crate::shell::VariableStore,
+            i32,
+        )>,
+    ) -> bool {
+        let Some((saved_table, saved_store, saved_exit_code)) = saved else {
+            return false;
+        };
+        let current = &self.shell_state.env_vars;
+        let mut exported_delta = false;
+        for key in saved_table.keys().chain(current.keys()) {
+            let value_changed = saved_table.get(key) != current.get(key);
+            let saved_attrs = saved_table.attr_of(key);
+            let current_attrs = current.attr_of(key);
+            if (value_changed || saved_attrs != current_attrs)
+                && (saved_attrs.exported || current_attrs.exported)
+            {
+                exported_delta = true;
+                break;
+            }
+        }
+        // Roll back BOTH variable stores: a bind writes the typed
+        // cell store as well as the mirror table, and restoring the
+        // mirror alone leaves the cell holding the element's value
+        // (and tripping the cell/mirror freshness assertion).
+        self.shell_state.env_vars = saved_table;
+        self.shell_state.variables = saved_store;
+        self.exit_code = saved_exit_code;
+        exported_delta
+    }
+
+    /// rubash#1564: restore only the variable stores of a
+    /// snapshot_spec_env snapshot (not `$?`). For execute_pipeline_stage's
+    /// fork-containment bracket: the stage's execution is real, not
+    /// speculative — there is no decline — but its variable side
+    /// effects still belong to the element's dead child, while its
+    /// exit status flows back through the stage result tuple the
+    /// caller adjudicates.
+    pub(in crate::executor) fn restore_spec_variables(
+        &mut self,
+        saved: Option<(
+            crate::shell::var_table::VarTable,
+            crate::shell::VariableStore,
+            i32,
+        )>,
+    ) {
+        if let Some((saved_table, saved_store, _)) = saved {
+            self.shell_state.env_vars = saved_table;
+            self.shell_state.variables = saved_store;
+        }
+    }
+
+    /// rubash#1564: the spawn-time twin of restore_spec_env, for the
+    /// tempenv application (apply_external_environment), which
+    /// expands the element's assignment values on the shared executor
+    /// AFTER the child's base environment was already read. Binds the
+    /// values performed belong to the element's child: forward any
+    /// EXPORTED delta into the not-yet-spawned process (GNU's child
+    /// carries the values its own expansion bound), then roll the
+    /// parent table back.
+    pub(in crate::executor) fn restore_spec_env_into_process(
+        &mut self,
+        saved: Option<(
+            crate::shell::var_table::VarTable,
+            crate::shell::VariableStore,
+            i32,
+        )>,
+        process: &mut std::process::Command,
+    ) {
+        let Some((saved_table, saved_store, saved_exit_code)) = saved else {
+            return;
+        };
+        let current = &self.shell_state.env_vars;
+        let mut changed: Vec<String> = Vec::new();
+        for key in saved_table.keys().chain(current.keys()) {
+            if saved_table.get(key) != current.get(key)
+                || saved_table.attr_of(key) != current.attr_of(key)
+            {
+                if !changed.contains(key) {
+                    changed.push(key.clone());
+                }
+            }
+        }
+        for key in &changed {
+            if saved_table.attr_of(key).exported || current.attr_of(key).exported {
+                match current.get(key) {
+                    Some(value) => {
+                        process.env(key, value);
+                    }
+                    None => {
+                        process.env_remove(key);
+                    }
+                }
+            }
+        }
+        self.shell_state.env_vars = saved_table;
+        self.shell_state.variables = saved_store;
+        self.exit_code = saved_exit_code;
+    }
+
     pub(in crate::executor) fn execute_simple_pipeline(
         &mut self,
         commands: &[CommandNode],
@@ -2021,7 +2179,12 @@ impl Executor {
                     self.bash_argv0_env_supplied(&consumers[index].assignments),
                 )
             };
+            // rubash#1564: the tempenv application expands the
+            // element's assignment values on this shared executor —
+            // bracket it so binds land only in the child's env.
+            let saved_env = self.snapshot_spec_env(&consumers[index]);
             self.apply_external_environment(&consumers[index], &mut process);
+            self.restore_spec_env_into_process(saved_env, &mut process);
             // Consumer j's stdin is pipe[j]'s read end.
             {
                 let (read, _) = &mut pipes[index];
@@ -2230,6 +2393,29 @@ impl Executor {
     /// program that would be refused by exec classification.
     #[cfg(any(windows, unix))]
     fn concurrent_external_stage_spec(
+        &mut self,
+        command: &CommandNode,
+        index: usize,
+        is_last_member: bool,
+    ) -> Option<(std::path::PathBuf, String, Vec<String>)> {
+        // rubash#1564: the spec expansion below is speculative — it
+        // runs on the parent executor, but a pipeline element's
+        // expansion belongs to the element's own child in GNU
+        // (execute_cmd.c:2620). Bracket it with the variable-table
+        // snapshot: successful binds (`${var:=word}`, arithmetic
+        // assignments) are rolled back whatever the verdict, and a
+        // bind that touched an EXPORTED variable declines the fast
+        // path entirely (only the sequential stage executor can give
+        // the element's child the bound exported value).
+        let saved_env = self.snapshot_spec_env(command);
+        let spec = self.concurrent_external_stage_spec_inner(command, index, is_last_member);
+        if self.restore_spec_env(saved_env) {
+            return None;
+        }
+        spec
+    }
+
+    fn concurrent_external_stage_spec_inner(
         &mut self,
         command: &CommandNode,
         index: usize,
@@ -2596,7 +2782,12 @@ impl Executor {
             // (execute_cmd.c execute_simple_command tempenv); plain
             // assignments are the only ones that reach the concurrent path
             // (the bail above routed +=/PATH to the sequential executor).
+            // rubash#1564: the application expands the values on this
+            // shared executor — bracket it so binds land only in the
+            // child's env (see restore_spec_env_into_process).
+            let saved_env = self.snapshot_spec_env(&commands[index]);
             self.apply_external_environment(&commands[index], &mut process);
+            self.restore_spec_env_into_process(saved_env, &mut process);
 
             if index == 0 {
                 if stage0_inherits {
@@ -2855,7 +3046,10 @@ impl Executor {
                     self.bash_argv0_env_supplied(&commands[index].assignments),
                 )
             };
+            // rubash#1564: tempenv bracket, as in spawn_wait above.
+            let saved_env = self.snapshot_spec_env(commands[index]);
             self.apply_external_environment(commands[index], &mut process);
+            self.restore_spec_env_into_process(saved_env, &mut process);
             if index == 0 {
                 if stage0_inherits {
                     process.stdin(Stdio::inherit());
@@ -3183,6 +3377,12 @@ impl Executor {
             if command.words.is_empty() {
                 return Ok(None);
             }
+            // rubash#1564: bracket this member's speculative expansion
+            // with the variable-table snapshot (see
+            // concurrent_external_stage_spec): restore on every exit
+            // below, and decline the whole attempt when a bind touched
+            // an exported variable.
+            let saved_env = self.snapshot_spec_env(command);
             // rubash#205 (non-Windows twin of the first concurrent path):
             // expand the member's words with the per-word machinery the
             // sequential stage executor uses; `expand_word` re-parses
@@ -3201,9 +3401,11 @@ impl Executor {
                     .restricted_command_error(command, &expanded_name)
                     .is_some()
             {
+                self.restore_spec_env(saved_env);
                 return Ok(None);
             }
             if self.routes_as_builtin(&expanded_name) {
+                self.restore_spec_env(saved_env);
                 return Ok(None);
             }
             // Windows twin of the find_function-first bail-out below
@@ -3217,10 +3419,12 @@ impl Executor {
                 .function_name_for_command_word(&expanded_name)
                 .is_some()
             {
+                self.restore_spec_env(saved_env);
                 return Ok(None);
             }
             let Some(program) = find_user_command(&expanded_name, &self.shell_state.env_vars)
             else {
+                self.restore_spec_env(saved_env);
                 return Ok(None);
             };
             let mut args: Vec<String> = first_fields.into_iter().skip(1).collect();
@@ -3228,6 +3432,13 @@ impl Executor {
             // Same child-argv carrier decode as the sequential spawn path.
             for arg in &mut args {
                 *arg = super::execution_misc::restore_command_substitution_output(arg);
+            }
+            // rubash#1564: the member's spec is built — roll the
+            // speculative binds back before the next member expands,
+            // and decline the attempt if one touched an exported
+            // variable (the sequential executor owns that case).
+            if self.restore_spec_env(saved_env) {
+                return Ok(None);
             }
             specs.push((program, expanded_name, args));
         }
@@ -3302,7 +3513,10 @@ impl Executor {
                 self.bash_argv0_env_supplied(&commands[index].assignments),
             );
             // Same tempenv application as the os_pipe path above.
+            // rubash#1564: tempenv bracket, as in spawn_wait above.
+            let saved_env = self.snapshot_spec_env(&commands[index]);
             self.apply_external_environment(&commands[index], &mut process);
+            self.restore_spec_env_into_process(saved_env, &mut process);
 
             if let Some(stdout) = previous_stdout.take() {
                 process.stdin(Stdio::from(stdout));
@@ -3661,6 +3875,19 @@ impl Executor {
         self.evalerror_failglob_pending.set(false);
         self.evalerror_pending.set(false);
         self.evalerror_exit_toomany_pending.set(false);
+        // rubash#1564: the same fork containment for the VARIABLE
+        // state — the one piece of child state the brackets above do
+        // not cover. The stage's word expansions, classification
+        // probes and inline arms run on this shared executor, so a
+        // successful side-effecting expansion (`${var:=word}`,
+        // `$((var=expr))`, an array-element bind) would otherwise
+        // stay bound in the parent after the pipeline. Snapshot both
+        // stores before the stage (gated on expansion-bearing text so
+        // literal stages pay nothing) and restore them in the funnel
+        // below; the stage's own execution — including the child
+        // environment an external element spawns with — still sees
+        // the binds, exactly like GNU's forked element.
+        let saved_stage_variables = self.snapshot_spec_env(command);
         // GNU forks a <( ) / >( ) child while expanding the pipeline
         // element's words inside that element's subshell (subst.c
         // process_substitute, execute_cmd.c). The builtin/function/external
@@ -3765,6 +3992,10 @@ impl Executor {
             FUNCTION_STDIN_OFFSET,
             old_stdin_offset,
         );
+        // rubash#1564: roll the stage's variable side effects back
+        // (after the FUNCTION_STDIN bookkeeping above has read and
+        // restored its own mirror entries in the stage's table).
+        self.restore_spec_variables(saved_stage_variables);
         self.shell_state.random_state.restore_state(&saved_random);
         // rubash#1540: harvest the DISCARD latches this stage raised
         // (they were cleared at entry), then restore the entry state so
@@ -4895,9 +5126,19 @@ impl Executor {
         // external children, and the builtin readers' own inherited-handle
         // paths (e.g. stream_inherited_cat) — both keyed on fd 0 actually
         // designating the process stdin, not on the command's name.
+        // rubash#1564: the heredoc body is expanded HERE, in the parent,
+        // to materialize the element's stdin — but in GNU that
+        // expansion happens inside the forked element, so its variable
+        // side effects (`${var:=word}` in the body) die with the
+        // element. Bracket the expansion with the spec snapshot; the
+        // produced text keeps the expanded values, the binds do not
+        // survive. (The FUNCTION_STDIN_OFFSET bookkeeping below runs
+        // after the restore, on the restored table.)
+        let saved_input_env = self.snapshot_spec_env(command);
         let input = self
             .stdin_string_for_command_mut(command)
             .unwrap_or_default();
+        self.restore_spec_variables(saved_input_env);
         if from_function_stdin {
             self.shell_state
                 .env_vars
