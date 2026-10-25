@@ -22,6 +22,7 @@
 pub mod breakpoints;
 pub mod event;
 pub mod gate;
+pub mod session;
 
 pub use breakpoints::{
     Breakpoint, BreakpointId, BreakpointKind, BreakpointResolution, BreakpointTable,
@@ -32,3 +33,4 @@ pub use event::{
     SourceLocation, StopInfo, StopReason, SynthesizedFrameKind, WatchChange,
 };
 pub use gate::{GateFlag, SESSION_ACTIVE};
+pub use session::{DebugSession, SessionError, SessionState, StepArming, Termination};
