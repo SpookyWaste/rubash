@@ -129,7 +129,7 @@ impl Executor {
         }
 
         if cmd.words.is_empty() {
-            let result = self.execute_empty_words_command(cmd);
+            let result = self.execute_empty_words_command(cmd, None);
             // GNU execute_cmd.c:4625-4640: with WORDS==0 the null command
             // path binds `$_` to the null string (4638 bind_lastarg((char
             // *)NULL)) after the command (including its assignment
@@ -306,7 +306,19 @@ impl Executor {
                 || cmd.heredoc.is_some()
                 || cmd.here_string.is_some()
             {
-                return self.execute_empty_words_command(cmd);
+                // rubash#1661: the vanished words' substitution status
+                // is this null command's status seed (consumed here,
+                // where the bare arm below reads the same channel). The
+                // channel is only attributable when this command's own
+                // words carried a substitution — otherwise it may hold
+                // a previous command's leftover, and the seed stays
+                // None (the pre-#1661 behavior for those shapes).
+                let vanished_status = if original_words_had_command_substitution {
+                    self.last_command_substitution_status.take()
+                } else {
+                    None
+                };
+                return self.execute_empty_words_command(cmd, vanished_status);
             }
             if let Some(status) = self.last_command_substitution_status.get() {
                 self.exit_code = status;
@@ -325,6 +337,19 @@ impl Executor {
             // command binds `$_` to the null string.
             self.bind_underscore("");
             if self.errexit_enabled() && self.errexit_is_active() && self.exit_code != 0 {
+                // rubash#1661: GNU adjudicates the ERR trap for a failed
+                // simple command before the ERREXIT jump (execute_cmd.c
+                // run_error_trap ahead of the errexit exit) — a null
+                // command carrying a failed substitution's status is a
+                // failed simple command, so `set -e; trap 'echo T' ERR;
+                // $(false)` prints T and exits 1. The assignment/
+                // redirect forms fire at execute_empty_words_command's
+                // tail (rubash#1171); this bare arm converts here, so it
+                // fires here. maybe_run_error_trap's own gates keep the
+                // exempt shapes (inverted, and-or, suppressed) silent,
+                // and without -e nothing converts here at all, so the
+                // trap cannot fire twice.
+                self.maybe_run_error_trap(cmd)?;
                 return Err(ExecuteError::ExitCode(self.exit_code));
             }
             return Ok(());
@@ -351,7 +376,17 @@ impl Executor {
         // become assignment-only and must still apply the assignment and its
         // redirections.
         if cmd.words.is_empty() {
-            return self.execute_empty_words_command(&cmd);
+            // rubash#1661: same attributable-seed rule as the
+            // expansion-time vanished-words arm above — this site is
+            // reached by commands that started as `name=$(...)` and
+            // became assignment-only, whose substitution status word
+            // expansion left in the channel.
+            let vanished_status = if original_words_had_command_substitution {
+                self.last_command_substitution_status.take()
+            } else {
+                None
+            };
+            return self.execute_empty_words_command(&cmd, vanished_status);
         }
 
         // GNU redir.c do_redirections → redir_varassign (redir.c:1133-1166):
