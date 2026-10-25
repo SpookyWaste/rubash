@@ -1873,6 +1873,22 @@ impl GroupScanFeeder {
                 // but keep the mirror honest anyway (rubash#292).
                 self.rebuild_comsub_mirror();
             }
+            // rubash#1554: the flush re-lex below is a full pass over the
+            // open logical line, so its tokens are owed the same
+            // leading_ws capture push_main_line runs (issue #241
+            // admission) — the passes that accumulated this line
+            // discarded their token lists at the join returns, so
+            // without the capture the flushed tokens reach the
+            // conditional classifier with every inter-token gap empty
+            // and its near-token walk-back glues across spaces that are
+            // really there (`[[ x && ((a ]]' reported near `&((a]]' for
+            // GNU's `]]'). The admission is snapshotted BEFORE the
+            // re-lex: the pass mutates the very state it reads.
+            let ws_capture_armed = self.logical_line.contains("((")
+                || self.logical_line.contains("[[")
+                || self.logical_line.contains("case")
+                || self.keyword_stack.contains(&"esac")
+                || LexerParseState::cond_command_open(&self.lexer_parse_state);
             let (mut line_tokens, _, _, _) = tokenize_with_boundary(
                 self.boundary.take(),
                 self.opener.take(),
@@ -1882,6 +1898,25 @@ impl GroupScanFeeder {
                 &mut self.lexer_parse_state,
                 &mut self.brace_cache,
             );
+            if ws_capture_armed {
+                let mut previous_end = 0usize;
+                for token in line_tokens.iter_mut() {
+                    let start = token.column.min(self.logical_line.len());
+                    // Same monotonicity guard as push_main_line's
+                    // capture: skip tokens whose columns do not advance
+                    // through the logical line instead of slicing an
+                    // inverted byte range.
+                    if start >= previous_end {
+                        let gap = &self.logical_line[previous_end..start];
+                        if gap.chars().all(char::is_whitespace) {
+                            token.leading_ws = gap.to_string();
+                        }
+                    }
+                    previous_end = previous_end
+                        .max(start.saturating_add(token.raw.len()))
+                        .min(self.logical_line.len());
+                }
+            }
             // The flush's full re-lex replaces the open line's pass results:
             // refold from the line-start snapshot (a fresh scan folds the
             // committed tokens plus this list exactly once).

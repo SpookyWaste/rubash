@@ -408,6 +408,25 @@ impl<'a> Lexer<'a> {
         } else if self.parse_state.in_cond_command
             && (keyword_is("]]") || word_is("]]"))
             && self.parse_state.cond_rhs_paren_depth <= 0
+            // rubash#1553: a depth-zero `]]' that ABUTS the still-open
+            // regexp RHS word is word text, not COND_END — the group
+            // having closed only means parse_matched_pair returned; the
+            // word itself ends at whitespace (parse.y:5443-5461 absorbs
+            // the pair INTO the word, and `]' is not a word-break
+            // character). `(b)]]' therefore leaves PST_CONDCMD armed:
+            // resetting here disarmed the NEXT line's leading_ws capture
+            // admission (which reads the pass-start state), and the
+            // following line's tokens lost their spacing, gluing the
+            // parser's near token (`echoa' for GNU's `echo'). The
+            // fragment branch below owns this token when the reset is
+            // suppressed. Abutment is the position test the `#'-in-word
+            // branch below already uses (token start == previous
+            // fragment end): `leading_ws' cannot serve here — it is
+            // only filled by the feeder's post-pass capture, so it is
+            // empty for every token record_token ever sees.
+            && !(self.parse_state.cond_rhs_regexp
+                && self.parse_state.cond_rhs_started
+                && token.position == self.parse_state.cond_rhs_last_token_end)
         {
             self.parse_state.in_cond_command = false;
             self.parse_state.cond_rhs_regexp = false;
