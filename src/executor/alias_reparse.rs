@@ -266,9 +266,26 @@ impl Executor {
         if words.first().map(String::as_str) != Some("time") {
             return Ok(None);
         }
+        // rubash#1520: decline when the ORIGINAL node's head was frozen
+        // as a plain word at parse time (quoted, or reclassified by the
+        // lexer under a POSIX pass — parse.y:3286). The reparse below
+        // works from reprinted source text, which drops the quoting and
+        // the token kinds the verdict was frozen into; letting it run
+        // would resurrect the keyword reading GNU never made. Normal
+        // dispatch runs the node as an ordinary command instead.
+        if command.time_head_plain_word {
+            return Ok(None);
+        }
 
         let (source, next_index) = alias_time_source(commands, index, command, &words);
-        if let Some(time_command) = alias_time_arithmetic_command(command, &words) {
+        // rubash#1520: this reparse's parse moment is the execution
+        // moment, so the #1218 verdict recorded on the built nodes is
+        // the live one — unlike parser-built nodes, whose verdict was
+        // frozen when their reader unit was parsed.
+        let alias_time_plain_word = posix_time_dash_word(&words, self.posix_mode_enabled());
+        if let Some(time_command) =
+            alias_time_arithmetic_command(command, &words, alias_time_plain_word)
+        {
             self.execute_time_ast_command(&time_command)?;
             return Ok(Some(index + 1));
         }
@@ -278,6 +295,7 @@ impl Executor {
             let time_command = alias_time_command_from_words(
                 &words,
                 alias_timed_case_command(case_command, redirect_command),
+                alias_time_plain_word,
             );
             self.execute_time_ast_command(&time_command)?;
             return Ok(Some(next_index));
@@ -286,6 +304,11 @@ impl Executor {
         let tokens = crate::lexer::tokenize_with_options(
             &source,
             crate::lexer::TokenizeOptions {
+                // rubash#1520: this reparse reads the text NOW, so its
+                // initial parse mode is the live one — a folded `time`
+                // verdict must be frozen under the same mode GNU's
+                // reader would apply at this moment.
+                initial_posix: self.posix_mode_enabled(),
                 input_origin: crate::lexer::InputOrigin::AliasReplacementDeferredHeredoc,
                 ..Default::default()
             },
@@ -750,7 +773,11 @@ fn alias_time_case_command<'a>(
         .map(|case_command| (case_command, redirect_command, next_index))
 }
 
-fn alias_time_arithmetic_command(command: &CommandNode, words: &[String]) -> Option<TimeCommand> {
+fn alias_time_arithmetic_command(
+    command: &CommandNode,
+    words: &[String],
+    keyword_was_plain_word: bool,
+) -> Option<TimeCommand> {
     let expression_index = alias_time_compound_word_index(words)?;
     if matches!(
         words.get(expression_index).map(String::as_str),
@@ -799,7 +826,11 @@ fn alias_time_arithmetic_command(command: &CommandNode, words: &[String]) -> Opt
         has_update: metadata.has_update,
     });
     copy_command_redirects(command, &mut arithmetic);
-    Some(alias_time_command_from_words(words, arithmetic))
+    Some(alias_time_command_from_words(
+        words,
+        arithmetic,
+        keyword_was_plain_word,
+    ))
 }
 
 fn alias_time_arithmetic_expression_likely(expression: &str) -> bool {
@@ -997,7 +1028,11 @@ fn compound_end_word_for(word: &str) -> Option<&'static str> {
     }
 }
 
-fn alias_time_command_from_words(words: &[String], command: CommandNode) -> TimeCommand {
+fn alias_time_command_from_words(
+    words: &[String],
+    command: CommandNode,
+    keyword_was_plain_word: bool,
+) -> TimeCommand {
     let prefix_words = words
         .iter()
         .skip(1)
@@ -1022,6 +1057,7 @@ fn alias_time_command_from_words(words: &[String], command: CommandNode) -> Time
         prefix_words,
         prefix_word_metadata,
         command: Box::new(command),
+        keyword_was_plain_word,
     }
 }
 

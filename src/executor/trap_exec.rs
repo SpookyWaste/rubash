@@ -650,7 +650,13 @@ impl Executor {
             &self.shell_state.env_vars,
             "extglob",
         ));
-        let mut tokens = crate::lexer::tokenize(source);
+        // rubash#1520: eval's string is a fresh reader unit parsed at
+        // this moment (evalstring.c parse_and_execute), so its initial
+        // parse mode is the live one — the plain tokenize() default
+        // (posix off) would freeze parse-time verdicts (e.g. the `time`
+        // dash-word rule, parse.y:3286) under the wrong mode.
+        let mut tokens =
+            crate::lexer::tokenize_with_initial_posix(source, self.posix_mode_enabled());
         // GNU eval reports errors with the caller line numbering:
         // the string lines continue the script line counter
         // (posix2.tests: "eval: line 199: syntax error ...").

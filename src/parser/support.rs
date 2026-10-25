@@ -68,6 +68,15 @@ pub(super) fn push_command_word(cmd: &mut CommandNode, token: &Token) {
         scans.extglob_patterns,
         scans.pathname_patterns,
     ));
+    // rubash#1520: freeze the #1218 verdict on the node as its head word
+    // is recorded — a plain-word `time` head (quoted in the source, or
+    // reclassified by the lexer under a POSIX pass because a dash word
+    // followed, parse.y:3286) is an ordinary command name, whatever the
+    // live mode does after this reader unit was parsed.
+    if cmd.words.is_empty() && token.value == "time" && token.kind == TokenKind::Word {
+        cmd.time_head_plain_word = true;
+    }
+    if token.value == "time" {}
     cmd.words.push(token.value.clone());
     cmd.word_kinds.push(token.kind.clone());
 }
