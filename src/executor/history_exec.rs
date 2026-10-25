@@ -384,6 +384,11 @@ pub(in crate::executor) fn execute_history_session(
                 shell.entries.pop();
                 shell.timestamps.pop();
             }
+            // builtins/history.def expand_and_print_history: every
+            // operand is processed in order and successful expansions
+            // still print, but any failure flips the overall result to
+            // EXECUTION_FAILURE (rubash#1627).
+            let mut any_failed = false;
             for operand in &operands {
                 let result = shell.expand(operand, ctx);
                 if result.status < 0 {
@@ -392,9 +397,13 @@ pub(in crate::executor) fn execute_history_session(
                         "{}history: {operand}: history expansion failed",
                         executor.diagnostic_prefix()
                     );
+                    any_failed = true;
                     continue;
                 }
                 let _ = writeln!(stdout, "{}", result.text);
+            }
+            if any_failed {
+                return Ok(1);
             }
         }
         HistoryMode::Append | HistoryMode::Write | HistoryMode::Read | HistoryMode::ReadNew => {
