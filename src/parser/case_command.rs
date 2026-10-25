@@ -308,6 +308,40 @@ pub(super) fn parse_case_command(
         let pattern_close_delimiter_metadata = build_keyword_metadata(&tokens[i]);
         i += 1;
 
+        // rubash#1641: a second `)` right after the pattern's closing
+        // `)` is a stray token, not a body: GNU parse.y's pattern_list
+        // ends at the first `)` and the grammar admits no second one,
+        // so yacc reports `syntax error near unexpected token `)'`
+        // (the `(x)` already closed; the extra paren is illegal).
+        // Without this, the stray `)` fell into the clause body slice
+        // and was silently swallowed, so `(x)) echo P` ran the branch.
+        // The error node stops further parsing (like the `(`-in-pattern
+        // error above, but without its extglob-gate reparse: a `)`
+        // error is settled at parse time), and the executor reports
+        // it and aborts with status 2 — GNU's script outcome.
+        if is_keyword(tokens, i, ")") {
+            let mut command = CommandNode::new();
+            command.line = tokens.get(start).map(|token| token.position);
+            command.logical_line = tokens.get(start).map(|token| token.logical_line);
+            command.insert_assignment(
+                "__RUBASH_PARSE_ERROR_NEAR__".to_string(),
+                format!(
+                    "){}{}",
+                    crate::executor::markers::PARSE_ERROR_FIELD_SEP,
+                    tokens[i].position,
+                ),
+            );
+            command.insert_assignment(
+                "__RUBASH_PARSE_SOURCE__".to_string(),
+                pattern_error_line_text(tokens, i),
+            );
+            return Some(finish_compound_command(
+                command,
+                tokens,
+                case_command_end_index(tokens, start),
+            ));
+        }
+
         let body_start = i;
         i = case_body_end(tokens, i);
         let body = super::parse_loop::parse_body_with_diagnostics(
