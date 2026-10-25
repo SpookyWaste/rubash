@@ -610,7 +610,10 @@ impl Executor {
     /// expands there: the definition was read in the eval string's stream,
     /// earlier than the caller's token). The generation drops when the
     /// string's execution returns, on every path.
-    fn execute_eval_source(
+    // pub(in crate::executor): the mapfile -C callback path
+    // (mapfile_helpers.rs) runs its command string through this same
+    // parse_and_execute unit (rubash#1586).
+    pub(in crate::executor) fn execute_eval_source(
         &mut self,
         source: &str,
         caller_line: usize,
