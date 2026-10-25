@@ -279,6 +279,24 @@ impl Executor {
                     }
                     return Some(typed);
                 }
+                // Gate trusted and a structured assoc cell exists: the
+                // cell is a COMPLETE mirror of the render or absent
+                // (rubash#616 Phase 1a invariant), so a lookup miss is
+                // authoritative — the key is unset and the mirror scan
+                // below could only agree. Answer directly instead of
+                // cloning the whole mirror and linearly scanning it
+                // (the assoc_get_miss shape: Θ(n) per missed read).
+                // Names with no assoc cell (mirror-only or dynamic
+                // views) keep the mirror path untouched.
+                if matches!(
+                    self.shell_state
+                        .variables
+                        .get(storage_name)
+                        .map(|variable| &variable.value),
+                    Some(crate::shell::ShellValue::AssociativeArray(_))
+                ) {
+                    return None;
+                }
             }
             let storage_assoc = self.parameter_array_storage(array_name).unwrap_or_default();
             return assoc_value_at(&storage_assoc, &key);
@@ -553,9 +571,9 @@ impl Executor {
         // skipping the per-read O(n) mirror clone on a typed hit.
         // Admission (rubash#1510): global dirty bit clear OR per-name
         // fresh, same discipline as the assoc leg above.
-        if !self.shell_state.env_vars.array_cells_dirty()
-            || self.shell_state.env_vars.cell_is_fresh(storage_name)
-        {
+        let gate_trusted = !self.shell_state.env_vars.array_cells_dirty()
+            || self.shell_state.env_vars.cell_is_fresh(storage_name);
+        if gate_trusted {
             if let Ok(typed_index) = i64::try_from(index) {
                 if let Some(cell_value) = self
                     .shell_state
@@ -588,6 +606,24 @@ impl Executor {
                     return Some(typed);
                 }
             }
+        }
+        // Same completeness invariant as the assoc leg: under a trusted
+        // gate, an existing indexed cell that lacks this index proves
+        // the element unset — skip the mirror clone + re-parse the
+        // fallthrough below would pay per hole read. Negative indices
+        // stay with the mirror leg (it owns the rebase and the
+        // bad-subscript diagnostic), as do dynamic views and names
+        // without a complete cell (scalar bases, mirror-only arrays).
+        if gate_trusted
+            && index >= 0
+            && dynamic_values.is_none()
+            && self
+                .shell_state
+                .variables
+                .indexed_array_cell(storage_name)
+                .is_some()
+        {
+            return None;
         }
         // Mirror fetch for the remaining scalar/mirror legs only. The
         // assoc leg fetched its own mirror above (before subscript eval);
