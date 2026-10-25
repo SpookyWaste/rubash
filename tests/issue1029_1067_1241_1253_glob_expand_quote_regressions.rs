@@ -18,11 +18,11 @@
 //! Expectations hand-measured against GNU bash 5.3.20 via script files
 //! in this environment (byte-level stdout/stderr/rc).
 //!
-//! DRIFT (found by backfill bf-c, 2026-10-25): the three `set -e`
-//! #1253 pins below FAIL on current master — the shell aborts with
-//! rc=1 on the arithmetic error instead of discarding the command and
-//! continuing. They are `#[ignore]`d until the follow-up issue lands;
-//! the no-errexit control stays live and passes.
+//! DRIFT (found by backfill bf-c, 2026-10-25; FIXED by rubash#1518):
+//! the three `set -e` #1253 pins below failed on master — the shell
+//! aborted with rc=1 on the arithmetic error instead of discarding the
+//! command and continuing. They are live again; the no-errexit control
+//! stays live and passes.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -158,7 +158,6 @@ fn issue_1241_arith_error_in_case_word_prints_one_diagnostic() {
 }
 
 #[test]
-#[ignore = "issue#1253 drift: master aborts the shell (rc=1) on the arithmetic error under set -e instead of discarding the command and continuing; follow-up issue pending"]
 fn issue_1253_errexit_arith_error_discards_assignment_and_continues() {
     let (stdout, stderr, code) = run_script("set -e\nb=$((1/0))\necho AFTER\n");
     assert_eq!(stdout, "AFTER\n", "stderr: {stderr}");
@@ -167,7 +166,6 @@ fn issue_1253_errexit_arith_error_discards_assignment_and_continues() {
 }
 
 #[test]
-#[ignore = "issue#1253 drift: master aborts the shell (rc=1) on the arithmetic error under set -e instead of discarding the command and continuing; follow-up issue pending"]
 fn issue_1253_errexit_arith_error_discards_echo_and_continues() {
     let (stdout, stderr, code) = run_script("set -e\necho $((1/0))\necho AFTER\n");
     assert_eq!(stdout, "AFTER\n", "stderr: {stderr}");
@@ -176,7 +174,6 @@ fn issue_1253_errexit_arith_error_discards_echo_and_continues() {
 }
 
 #[test]
-#[ignore = "issue#1253 drift: master aborts the shell (rc=1) on the arithmetic error under set -e instead of discarding the command and continuing; follow-up issue pending"]
 fn issue_1253_failed_assignment_does_not_land() {
     let (stdout, stderr, code) = run_script("set -e\nb=7\nb=$((1/0))\necho \"b=$b\"\n");
     assert_eq!(stdout, "b=7\n", "stderr: {stderr}");

@@ -1248,6 +1248,10 @@ impl Executor {
             return Err(crate::executor::ExecuteError::ExitCode(127));
         }
         self.exit_code = 1;
+        // rubash#1518: compound-header arithmetic evalerror (case words,
+        // loop headers) is the same pure-DISCARD class — the reader's
+        // errexit promotion skips it.
+        self.evalerror_arith_pending.set(true);
         Err(crate::executor::ExecuteError::ExpansionFailure(1))
     }
 

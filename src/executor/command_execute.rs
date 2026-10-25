@@ -1228,6 +1228,10 @@ impl Executor {
                 // rubash#439: expansion error, not a failed command — no
                 // ERR trap.
                 self.command_expansion_failed.set(true);
+                // rubash#1518: the arithmetic evalerror class — the
+                // reader's errexit promotion skips it (GNU expr.c
+                // evalerror is a pure DISCARD jump in every context).
+                self.evalerror_arith_pending.set(true);
                 return Err(ExecuteError::ExpansionFailure(1));
             }
             self.exit_code = 1;
