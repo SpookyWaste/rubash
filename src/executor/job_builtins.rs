@@ -243,7 +243,7 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<i32, ExecuteError> {
-        self.refresh_background_jobs()?;
+        self.refresh_background_jobs_observed()?;
         // GNU wait.def wait_builtin() internal_getopt "fnp:": a dangling
         // `-p` (no joined text, no next word) is a getopt error, reported
         // before any validation or waiting, and returns EX_USAGE
@@ -444,7 +444,7 @@ impl Executor {
             }
 
             loop {
-                self.refresh_background_jobs()?;
+                self.refresh_background_jobs_observed()?;
                 // wait.def:328-331: the -n wait loop is interruptible by a
                 // trapped signal just like the operand form.
                 if let Some(interrupt) = self.wait_pending_signal_status()? {
@@ -1142,11 +1142,54 @@ impl Executor {
     /// command's redirects, so a dead coproc's `name`/`name_PID` are gone
     /// before that command expands.
     pub(in crate::executor) fn refresh_background_jobs(&mut self) -> Result<(), ExecuteError> {
+        self.refresh_background_jobs_impl(false)
+    }
+
+    /// The wait/fg form: an explicit wait observes reap state
+    /// unconditionally (GNU wait_for blocks in waitchld for its
+    /// operands), so deferred completions apply at once.
+    pub(in crate::executor) fn refresh_background_jobs_observed(
+        &mut self,
+    ) -> Result<(), ExecuteError> {
+        self.refresh_background_jobs_impl(true)
+    }
+
+    /// Record that this executor blocked in wait() for a foreground
+    /// external process — one of GNU's reap observation points
+    /// (wait_for reaps background children while it blocks,
+    /// jobs.c:3064).
+    pub(in crate::executor) fn note_foreground_wait(&self) {
+        self.foreground_wait_count
+            .set(self.foreground_wait_count.get() + 1);
+    }
+
+    fn refresh_background_jobs_impl(
+        &mut self,
+        force_observe: bool,
+    ) -> Result<(), ExecuteError> {
         // rubash#1494: job-state transitions the shell's own kill sent
         // become visible only after a full intervening reader command
         // (GNU waitchld notification lag) — apply the ripe ones here, at
         // the same per-command boundary that reaps finished children.
         self.shell_state.job_table.apply_deferred_state_marks();
+        // part_036 (jobs.c waitchld lag): a reap becomes VISIBLE in the
+        // job table only at a GNU observation point — the shell blocked
+        // in wait() for a foreground process, the reader advanced to a
+        // new line, or a fresh execute_ast run began. Between
+        // observation points (a stretch of builtins inside one read)
+        // `jobs` keeps showing the pre-death state: GNU 5.3.20 lists a
+        // jobspec-killed job as Running until the reap boundary even
+        // though the process is already dead, and the pre-fix eager
+        // application here printed `Terminated` for it.
+        let mark = (
+            self.execute_generation.get(),
+            self.reader_command_line.get(),
+            self.foreground_wait_count.get(),
+        );
+        let observation_happened = mark != self.reap_prev_mark.get();
+        self.reap_prev_mark.set(mark);
+        let observe = force_observe || observation_happened;
+        self.apply_pending_job_completions(observe)?;
         let mut finished = Vec::new();
         for (pid, child) in &mut self.background_children {
             if let Some(status) = child.try_wait()? {
@@ -1160,27 +1203,6 @@ impl Executor {
 
         for (pid, status, term_signal) in finished {
             self.background_children.remove(&pid);
-            // The raw wait status knows whether the child died by a
-            // signal; the flattened status does not. Record it so the
-            // jobs listing prints the signal description (rubash#1256).
-            if let Some(signal) = term_signal {
-                self.shell_state.job_table.note_term_signal(pid, signal);
-            }
-            // rubash#229: a background child killed by a signal gets the
-            // jobs.c:4625 notify_of_job_status notice at the reader
-            // boundary; the command text must be read before the job entry
-            // is removed below.
-            if status > 128 {
-                let command = self
-                    .shell_state
-                    .job_table
-                    .pid_to_job
-                    .get(&pid)
-                    .and_then(|job_id| self.shell_state.job_table.jobs.get(job_id))
-                    .map(|job| job.command.clone())
-                    .unwrap_or_default();
-                self.note_child_signal_death(pid, status - 128, command, false);
-            }
             // rubash#169: the reaped child no longer holds a capture pipe
             // write end — retire it from the writer set (drain when last).
             let drained = crate::executor::shell_options::retire_background_capture_writer(pid);
@@ -1193,10 +1215,66 @@ impl Executor {
                 }
             }
             self.join_coproc_stderr_forwarder(pid)?;
-            self.shell_state.job_table.mark_completed(pid, status);
-            self.run_sigchld_trap_for_reaped_child()?;
-            self.retire_completed_coproc(pid);
+            // Coproc disposal is per-command by contract (rubash#1023),
+            // and at an observation point a completion applies at once;
+            // anything else is stashed until the next observation
+            // point (see the waitchld-lag note above).
+            if observe || self.shell_state.coproc_names.contains_key(&pid) {
+                self.apply_job_completion(pid, status, term_signal)?;
+            } else {
+                self.pending_job_completions.push((pid, status, term_signal));
+            }
         }
+        Ok(())
+    }
+
+    /// Apply stashed reap results once an observation point arrives.
+    fn apply_pending_job_completions(&mut self, observe: bool) -> Result<(), ExecuteError> {
+        if !observe || self.pending_job_completions.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending_job_completions);
+        for (pid, status, term_signal) in pending {
+            self.apply_job_completion(pid, status, term_signal)?;
+        }
+        Ok(())
+    }
+
+    /// Make one reaped child's completion visible in the job table:
+    /// the term-signal record, the jobs.c:4625 death notice, the
+    /// completion mark, the CHLD trap, coproc retirement.
+    fn apply_job_completion(
+        &mut self,
+        pid: u32,
+        status: i32,
+        term_signal: Option<i32>,
+    ) -> Result<(), ExecuteError> {
+        // The raw wait status knows whether the child died by a
+        // signal; the flattened status does not. Record it so the
+        // jobs listing prints the signal description (rubash#1256).
+        if let Some(signal) = term_signal {
+            self.shell_state.job_table.note_term_signal(pid, signal);
+        }
+        // rubash#229: a background child killed by a signal gets the
+        // jobs.c:4625 notify_of_job_status notice at the reader
+        // boundary; the command text is read from the job entry (a job
+        // disowned while its completion was deferred has no entry
+        // left and gets no notice, as in GNU).
+        if status > 128 {
+            if let Some(command) = self
+                .shell_state
+                .job_table
+                .pid_to_job
+                .get(&pid)
+                .and_then(|job_id| self.shell_state.job_table.jobs.get(job_id))
+                .map(|job| job.command.clone())
+            {
+                self.note_child_signal_death(pid, status - 128, command, false);
+            }
+        }
+        self.shell_state.job_table.mark_completed(pid, status);
+        self.run_sigchld_trap_for_reaped_child()?;
+        self.retire_completed_coproc(pid);
         Ok(())
     }
 
@@ -2128,6 +2206,9 @@ impl Executor {
         stdout: &mut Vec<u8>,
         stderr: &mut Vec<u8>,
     ) -> Result<i32, ExecuteError> {
+        // fg blocks in wait_for for its job: an observation point, so
+        // deferred reap state applies before the operand resolves.
+        self.refresh_background_jobs_observed()?;
         let job = jobs.first().map(String::as_str);
         let pid = match self.resolve_fg_bg_operand("fg", job, stderr)? {
             JobOperandResolution::Pid(pid) => pid,

@@ -901,6 +901,7 @@ impl Executor {
             // (rubash#1250; GNU survives with rc=130). Non-interactive
             // shells keep SIG_DFL and die like GNU scripts do.
             let _sigint_guard = ForegroundWaitSigintGuard::hold_if_interactive_untrapped(self);
+            self.note_foreground_wait();
             child.wait().map_err(ExecuteError::IoError)
         }
     }
@@ -1304,6 +1305,7 @@ impl Executor {
                     }
                 } else if self.external_needs_fd_copy_capture(cmd) {
                     let foreground_pid = child.id();
+                    self.note_foreground_wait();
                     match child.wait_with_output() {
                         Ok(output) => {
                             self.exit_code = 0;

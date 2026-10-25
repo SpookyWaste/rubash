@@ -178,7 +178,11 @@ impl Executor {
                     // delivers SIGCHLD and a set trap runs at this boundary
                     // (trap8.sub counts the foreground sleep among the four
                     // CHLD firings). The fast path performs no spawn, so the
-                    // notification is raised here instead.
+                    // notification is raised here instead. The emulated
+                    // wait is also a reap observation point (part_036:
+                    // GNU's wait_for reaps background children while it
+                    // blocks for the real sleep).
+                    self.note_foreground_wait();
                     self.run_sigchld_trap_for_reaped_child()?;
                     Ok(())
                 } else {
