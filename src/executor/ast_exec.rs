@@ -1785,6 +1785,11 @@ impl Executor {
             }
 
             drop(_t_chain);
+            // rubash#1525: the absorbed-write marker belongs to one
+            // command execution; a flag left by a command whose own
+            // write site was skipped (a pipeline stage) must not
+            // suppress this command's completion write.
+            self.pipestatus_write_absorbed.set(false);
             let execution_result = if command.inverted || command.and_or().is_some() {
                 self.with_errexit_suppressed(|executor| executor.execute_command(command))
             } else {
@@ -1993,7 +1998,12 @@ impl Executor {
                 || command.brace_group.is_some()
                 || command.coproc_command.is_some();
             if !is_non_pipestatus_compound || is_pipestatus_compound {
-                self.set_pipestatus([self.exit_code]);
+                // rubash#1525: a command whose tempenv PIPESTATUS
+                // absorbed the completion write inside the dispatch
+                // funnel has already spent this write.
+                if !self.pipestatus_write_absorbed.replace(false) {
+                    self.set_pipestatus([self.exit_code]);
+                }
             }
 
             // GNU order (rubash#344): the ERR trap fires for the failed

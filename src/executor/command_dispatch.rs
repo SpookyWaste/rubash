@@ -162,11 +162,40 @@ impl Executor {
         // simple command; builtins that return EX_USAGE/EX_UTILERROR/etc.
         // (> EX_SHERRBASE) set it during dispatch.
         self.special_builtin_failed.set(false);
+        // rubash#1525: record whether the dispatch reaches
+        // execute_external. GNU's completion write
+        // (set_pipestatus_from_exit, execute_cmd.c:4904) targets the
+        // cell visible when the command returns: for a builtin the
+        // tempenv binding is still installed (variables.c
+        // push_temp_var surrounds the call), so a tempenv PIPESTATUS
+        // absorbs the write; for a disk command the tempenv was
+        // consumed into the child's environment
+        // (maybe_make_export_env), so the write lands in the real
+        // cell after the tempenv restore. The marker is saved and
+        // restored around the dispatch so a nested command's class
+        // cannot leak into this command's verdict.
+        let saved_external_marker = self.external_dispatch_ran.replace(false);
         let result = if redirect_rejected {
             Ok(())
         } else {
             self.execute_prepared_command(cmd)
         };
+        let external_ran = self.external_dispatch_ran.get();
+        self.external_dispatch_ran.set(saved_external_marker);
+        // rubash#1525: with a tempenv PIPESTATUS and an in-process
+        // dispatch, perform the completion write NOW, against the
+        // still-bound tempenv cell (scalar: frozen; array: absorbed
+        // into the tempenv vector, discarded with it at restore),
+        // and mark it spent so the ast_exec loop does not write a
+        // second time against the restored cell.
+        let pipestatus_write_absorbed = !external_ran
+            && temporary_assignments
+                .iter()
+                .any(|(name, ..)| name == crate::shell::state::PIPESTATUS_STATE_SNAPSHOT_KEY);
+        if pipestatus_write_absorbed {
+            let status = self.exit_code;
+            self.set_pipestatus([status]);
+        }
         self.finish_process_substitutions(process_substitution_files)?;
         self.finish_assignment_output_process_substitutions_for_command(cmd)?;
         if cmd.background && result.is_ok() {
@@ -202,8 +231,20 @@ impl Executor {
                 .collect();
             let survivors: Vec<_> = temporary_assignments
                 .into_iter()
-                .filter(|(name, ..)| name != "__RUBASH_EXPORTED_VARS" && !keep.contains(name))
+                .filter(|(name, ..)| {
+                    name != "__RUBASH_EXPORTED_VARS"
+                        && !keep.contains(name)
+                        // rubash#1525: an absorbed PIPESTATUS keeps
+                        // its tempenv shape — the (shape, vector)
+                        // snapshot must be dropped with its cell
+                        // entry, not restored over the live binding.
+                        && !(name == crate::shell::state::PIPESTATUS_STATE_SNAPSHOT_KEY
+                            && keep.contains("PIPESTATUS"))
+                })
                 .collect();
+            if keep.contains("PIPESTATUS") {
+                self.tempenv_pipestatus_state = None;
+            }
             self.restore_temporary_assignments(survivors);
             for name in &absorbed {
                 self.mark_exported(name);
@@ -265,6 +306,12 @@ impl Executor {
                     ));
                 }
             }
+        }
+        // rubash#1525: the tempenv completion write above is this
+        // command's one PIPESTATUS write; tell the ast_exec loop
+        // not to write again against the restored cell.
+        if pipestatus_write_absorbed {
+            self.pipestatus_write_absorbed.set(true);
         }
         self.update_underscore_parameter(cmd);
         // GNU execute_cmd.c:1004-1017: in POSIX mode, a non-interactive shell

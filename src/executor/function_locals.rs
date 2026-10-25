@@ -50,6 +50,21 @@ impl Executor {
                 );
                 self.shell_state.env_vars.remove("__RUBASH_GETOPTS_OFFSET");
             }
+            // rubash#1525: the PIPESTATUS shape note and status
+            // vector are frame state in the same sense — GNU's
+            // pop_var_context reinstalls the saved SHELL_VAR whole,
+            // shape included (see PIPESTATUS_STATE_SNAPSHOT_KEY).
+            if name == "PIPESTATUS"
+                && !scope.contains_key(crate::shell::state::PIPESTATUS_STATE_SNAPSHOT_KEY)
+            {
+                scope.insert(
+                    crate::shell::state::PIPESTATUS_STATE_SNAPSHOT_KEY.to_string(),
+                    Some(crate::shell::state::encode_pipestatus_state(
+                        self.shell_state.pipestatus_shape,
+                        &self.shell_state.pipestatus,
+                    )),
+                );
+            }
         }
     }
 
@@ -90,6 +105,22 @@ impl Executor {
                 }
             }
             self.shell_state.env_vars.remove("__RUBASH_GETOPTS_OFFSET");
+        }
+        // rubash#1525: PIPESTATUS shape/vector frame snapshot, as
+        // in save_local_names.
+        if name == "PIPESTATUS" {
+            if let Some(scope) = self.shell_state.local_var_scopes.last_mut() {
+                if !scope.contains_key(crate::shell::state::PIPESTATUS_STATE_SNAPSHOT_KEY) {
+                    let encoded = crate::shell::state::encode_pipestatus_state(
+                        self.shell_state.pipestatus_shape,
+                        &self.shell_state.pipestatus,
+                    );
+                    scope.insert(
+                        crate::shell::state::PIPESTATUS_STATE_SNAPSHOT_KEY.to_string(),
+                        Some(encoded),
+                    );
+                }
+            }
         }
     }
 
@@ -132,6 +163,19 @@ impl Executor {
                         .cloned(),
                 );
                 self.shell_state.env_vars.remove("__RUBASH_GETOPTS_OFFSET");
+            }
+            // rubash#1525: PIPESTATUS shape/vector frame snapshot,
+            // as in save_local_names.
+            if name == "PIPESTATUS"
+                && !scope.contains_key(crate::shell::state::PIPESTATUS_STATE_SNAPSHOT_KEY)
+            {
+                scope.insert(
+                    crate::shell::state::PIPESTATUS_STATE_SNAPSHOT_KEY.to_string(),
+                    Some(crate::shell::state::encode_pipestatus_state(
+                        self.shell_state.pipestatus_shape,
+                        &self.shell_state.pipestatus,
+                    )),
+                );
             }
         }
     }
@@ -282,9 +326,13 @@ impl Executor {
     }
 
     pub(in crate::executor) fn restore_function_locals(&mut self) -> HashSet<String> {
-        let Some(scope) = self.shell_state.local_var_scopes.pop() else {
+        let Some(mut scope) = self.shell_state.local_var_scopes.pop() else {
             return HashSet::new();
         };
+        // rubash#1525: the frame's PIPESTATUS (shape, vector)
+        // snapshot is not a variable binding — pull it out before
+        // the name loop and reinstall it with the restored cell.
+        let pipestatus_state = scope.remove(crate::shell::state::PIPESTATUS_STATE_SNAPSHOT_KEY);
         // GNU variables.c:5760 { "BASH_COMPAT", sv_shcompat }: popping a
         // frame that shadowed BASH_COMPAT reinstalls the saved binding
         // through the bind hook, so the compatNN flags re-derive from the
@@ -341,6 +389,15 @@ impl Executor {
             self.shell_state.variables.remove(&name);
             if let Some(variable) = variable {
                 let _ = self.shell_state.variables.set(name, variable);
+            }
+        }
+        // rubash#1525: reinstall the frame's saved PIPESTATUS
+        // shape and status vector with the restored cell — the
+        // local's writes during the frame must not leak either.
+        if let Some(Some(encoded)) = pipestatus_state {
+            if let Some((shape, vector)) = crate::shell::state::decode_pipestatus_state(&encoded) {
+                self.shell_state.pipestatus_shape = shape;
+                self.shell_state.pipestatus = vector;
             }
         }
         if touched_bashcompat {

@@ -302,6 +302,67 @@ pub(crate) enum PipestatusShape {
     ValuelessArray,
 }
 
+impl PipestatusShape {
+    pub(crate) fn snapshot_name(self) -> &'static str {
+        match self {
+            PipestatusShape::Absent => "Absent",
+            PipestatusShape::LiveArray => "LiveArray",
+            PipestatusShape::Scalar => "Scalar",
+            PipestatusShape::Valueless => "Valueless",
+            PipestatusShape::ValuelessArray => "ValuelessArray",
+        }
+    }
+
+    pub(crate) fn from_snapshot_name(name: &str) -> Option<Self> {
+        match name {
+            "Absent" => Some(PipestatusShape::Absent),
+            "LiveArray" => Some(PipestatusShape::LiveArray),
+            "Scalar" => Some(PipestatusShape::Scalar),
+            "Valueless" => Some(PipestatusShape::Valueless),
+            "ValuelessArray" => Some(PipestatusShape::ValuelessArray),
+            _ => None,
+        }
+    }
+}
+
+/// Scope-snapshot key under which the PIPESTATUS shape note and
+/// status vector ride through the two binding save/restore
+/// mechanisms that restore the variable CELL but historically not
+/// its shape (rubash#1525): the tempenv previous-list of
+/// apply/restore_temporary_assignments and the frame local scopes
+/// popped by restore_function_locals. GNU keeps shape and value in
+/// the one SHELL_VAR object (variables.c pop_var_context /
+/// dispose_temporary_env reinstall the saved object whole), so the
+/// pair encoded by `encode_pipestatus_state` travels with the cell
+/// snapshot and is reinstalled with it.
+pub(crate) const PIPESTATUS_STATE_SNAPSHOT_KEY: &str = "__RUBASH_PIPESSTATUS_STATE";
+
+/// Encode a (shape, status vector) pair for a scope snapshot:
+/// `Shape|v0,v1,...` (the vector segment is empty for no vector).
+pub(crate) fn encode_pipestatus_state(shape: PipestatusShape, vector: &[i32]) -> String {
+    let mut out = shape.snapshot_name().to_string();
+    out.push('|');
+    for (index, status) in vector.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&status.to_string());
+    }
+    out
+}
+
+pub(crate) fn decode_pipestatus_state(text: &str) -> Option<(PipestatusShape, Vec<i32>)> {
+    let (name, vector_text) = text.split_once('|')?;
+    let shape = PipestatusShape::from_snapshot_name(name)?;
+    let mut vector = Vec::new();
+    if !vector_text.is_empty() {
+        for part in vector_text.split(',') {
+            vector.push(part.parse::<i32>().ok()?);
+        }
+    }
+    Some((shape, vector))
+}
+
 /// Buffered contents of one materialized `<(cmd)` output — see
 /// `ShellState::procsub_streams`.
 #[derive(Debug)]

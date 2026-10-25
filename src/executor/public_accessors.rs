@@ -1548,6 +1548,52 @@ impl Executor {
             }
             if has_value {
                 self.note_pipestatus_assignment();
+                // rubash#1525: inside a function, an attribute
+                // builtin's value operand binds a NEW frame cell
+                // (make_local_variable) — a scalar result is a
+                // scalar local shadowing any outer array whole, not
+                // the permanent bind's element-0 write into the
+                // array. note_pipestatus_assignment's post-state
+                // rule keeps LiveArray for a scalar store, which is
+                // only reachable here through such a fresh cell
+                // (an existing array cell stores array form under
+                // every other path), so note the scalar shape.
+                if self.shell_state.function_depth > 0 {
+                    if let Some(stored) = self.shell_state.env_vars.get("PIPESTATUS") {
+                        if !is_array_storage(stored) {
+                            self.shell_state.pipestatus_shape =
+                                crate::shell::state::PipestatusShape::Scalar;
+                        }
+                    }
+                }
+                continue;
+            }
+            // rubash#1525: a bare operand inside a function creates
+            // a valueless frame local (att_invisible) even over a
+            // materialized outer array — the frame saved the name
+            // (the snapshot key rode along) and no value is bound.
+            // At top level the same operand is a no-op on an
+            // existing cell, so the shape stands.
+            if self.shell_state.function_depth > 0
+                && !self.shell_state.env_vars.contains_key("PIPESTATUS")
+                && self
+                    .shell_state
+                    .local_var_scopes
+                    .last()
+                    .is_some_and(|scope| {
+                        scope.contains_key(crate::shell::state::PIPESTATUS_STATE_SNAPSHOT_KEY)
+                    })
+            {
+                self.shell_state.pipestatus_shape = if array_flag {
+                    crate::shell::state::PipestatusShape::ValuelessArray
+                } else {
+                    crate::shell::state::PipestatusShape::Valueless
+                };
+                unmark_env_name(
+                    &mut self.shell_state.env_vars,
+                    crate::executor::UNSET_DYNAMIC_VARS,
+                    "PIPESTATUS",
+                );
                 continue;
             }
             match self.shell_state.pipestatus_shape {
