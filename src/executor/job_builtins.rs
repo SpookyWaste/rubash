@@ -1193,6 +1193,17 @@ impl Executor {
         let mut finished = Vec::new();
         for (pid, child) in &mut self.background_children {
             if let Some(status) = child.try_wait()? {
+                // rubash#1528: stamp the reap instant for a timed
+                // coproc — its deferred report must measure to the
+                // death, not to whenever the completion is applied.
+                if self
+                    .pending_timed_coproc_reports
+                    .iter()
+                    .any(|(pending_pid, _, _)| pending_pid == pid)
+                {
+                    self.timed_coproc_death_instants
+                        .insert(*pid, std::time::Instant::now());
+                }
                 finished.push((
                     *pid,
                     crate::executor::wait_status::process_exit_status(&status),
@@ -1240,6 +1251,30 @@ impl Executor {
         Ok(())
     }
 
+    /// rubash#1528: emit a deferred `time` report when the timed
+    /// coproc's completion becomes visible. GNU measures the job's
+    /// lifetime, so the metrics are only taken now — TimeCommandMetrics
+    /// ::from_start turns the saved stamp into the spawn-to-completion
+    /// interval (RUSAGE_CHILDREN already includes the reaped child).
+    pub(in crate::executor) fn flush_timed_coproc_report(&mut self, pid: u32) {
+        if let Some(position) = self
+            .pending_timed_coproc_reports
+            .iter()
+            .position(|(pending_pid, _, _)| *pending_pid == pid)
+        {
+            let (_, started, posix_format) = self.pending_timed_coproc_reports.remove(position);
+            // End the interval at the recorded reap instant when the
+            // boundary sweep observed the death; the blocking wait
+            // path reaps and flushes in one motion, so `now` is the
+            // reap instant there.
+            let end = self
+                .timed_coproc_death_instants
+                .remove(&pid)
+                .unwrap_or_else(std::time::Instant::now);
+            self.print_time_shell_at(posix_format, started, end);
+        }
+    }
+
     /// Make one reaped child's completion visible in the job table:
     /// the term-signal record, the jobs.c:4625 death notice, the
     /// completion mark, the CHLD trap, coproc retirement.
@@ -1273,6 +1308,7 @@ impl Executor {
             }
         }
         self.shell_state.job_table.mark_completed(pid, status);
+        self.flush_timed_coproc_report(pid);
         self.run_sigchld_trap_for_reaped_child()?;
         self.retire_completed_coproc(pid);
         Ok(())
@@ -1569,6 +1605,7 @@ impl Executor {
         };
         self.join_coproc_stderr_forwarder(pid)?;
         self.shell_state.job_table.mark_completed(pid, status);
+        self.flush_timed_coproc_report(pid);
         self.run_sigchld_trap_for_reaped_child()?;
         // Remove the visible job after any wait, while retaining the exit
         // status for repeated explicit PID waits.

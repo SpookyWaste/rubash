@@ -394,7 +394,16 @@ fn glob_vector_expand(
         Ok(entries) => entries,
         Err(_) => return Vec::new(),
     };
-    let pattern_chars: Vec<char> = pattern.chars().collect();
+    // rubash#1533: in a byte locale glob matching is byte-wise (glob.c
+    // matches the compiled pattern against raw dirent bytes), so stage
+    // both sides as byte units whenever the locale is not UTF-8; the
+    // split is the identity on ASCII and on the carrier plane.
+    let byte_locale = !crate::locale::is_utf8();
+    let pattern_chars: Vec<char> = if byte_locale {
+        super::conditional::pattern::split_text_chars_into_byte_units(pattern.chars().collect())
+    } else {
+        pattern.chars().collect()
+    };
     let mut names = Vec::new();
     // With globskipdots off, `.` and `..` come back from readdir and the
     // dot-filter/matcher decide whether they match (glob10.sub).
@@ -412,7 +421,15 @@ fn glob_vector_expand(
         .into_iter()
         .filter(|name| {
             scratch.clear();
-            scratch.extend(name.chars());
+            if byte_locale {
+                scratch.extend(
+                    super::conditional::pattern::split_text_chars_into_byte_units(
+                        name.chars().collect(),
+                    ),
+                );
+            } else {
+                scratch.extend(name.chars());
+            }
             !skipname(&pattern_chars, name, dot_mode, globskipdots)
                 && component_matches(&pattern_chars, &scratch, nocaseglob, extglob, dot_mode)
         })
@@ -543,6 +560,14 @@ fn component_matches(
 }
 
 fn case_pattern_matches_nocase(pattern: &str, word: &str) -> bool {
+    // rubash#1533: in a byte locale GNU's FNM_CASEFOLD folds per byte
+    // (ASCII only); a Unicode fold would equate é with É, which are
+    // different byte strings there.
+    if !crate::locale::is_utf8() {
+        let pattern_lower = pattern.to_ascii_lowercase();
+        let word_lower = word.to_ascii_lowercase();
+        return super::case_pattern_matches(&pattern_lower, &word_lower);
+    }
     let pattern_lower = pattern.to_lowercase();
     let word_lower = word.to_lowercase();
     super::case_pattern_matches(&pattern_lower, &word_lower)
@@ -1329,18 +1354,25 @@ fn ignore_pattern_matches(pattern: &str, word: &str, extglob: bool, nocase: bool
     // Plain patterns go through the strmatch FNM_PATHNAME port below —
     // the case-pattern engine lets `*` cross `/`, which would wrongly
     // ignore `d/x/inner` under a GLOBIGNORE of `*/inner`.
+    // rubash#1533: byte locale — ASCII-only fold and byte-unit staging
+    // (see glob_vector_expand / case_pattern_matches_nocase).
+    let byte_locale = !crate::locale::is_utf8();
+    let stage = |text: &str| -> Vec<char> {
+        if byte_locale {
+            super::conditional::pattern::split_text_chars_into_byte_units(text.chars().collect())
+        } else {
+            text.chars().collect()
+        }
+    };
     if nocase {
-        let pattern_lower = pattern.to_lowercase();
-        let word_lower = word.to_lowercase();
-        return strmatch_pathname(
-            &pattern_lower.chars().collect::<Vec<char>>(),
-            &word_lower.chars().collect::<Vec<char>>(),
-        );
+        let (pattern_lower, word_lower) = if byte_locale {
+            (pattern.to_ascii_lowercase(), word.to_ascii_lowercase())
+        } else {
+            (pattern.to_lowercase(), word.to_lowercase())
+        };
+        return strmatch_pathname(&stage(&pattern_lower), &stage(&word_lower));
     }
-    strmatch_pathname(
-        &pattern.chars().collect::<Vec<char>>(),
-        &word.chars().collect::<Vec<char>>(),
-    )
+    strmatch_pathname(&stage(pattern), &stage(word))
 }
 
 /// Port of bash lib/glob GMATCH (sm_loop.c) under FNM_PATHNAME, as

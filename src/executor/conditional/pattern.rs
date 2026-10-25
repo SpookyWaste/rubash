@@ -6,9 +6,13 @@ pub(in crate::executor) fn case_pattern_matches(pattern: &str, word: &str) -> bo
     // comsub payload sentinel (`[[ $v == *$(printf '\001')* ]]`,
     // rubash#729 rework) would be verdicted against the word's raw
     // spelling and never reach the normalization that decodes the payload.
-    if sides_need_byte_char_matching(pattern, word) {
-        let pattern: Vec<char> = flatten_pattern_to_byte_chars(pattern);
-        let word: Vec<char> = flatten_word_to_byte_chars(word);
+    // rubash#1533: the byte-locale units gate runs with the spelling
+    // gate — in a non-UTF-8 locale a multibyte char on either side
+    // matches as its raw bytes, one unit per byte.
+    let byte_locale = sides_need_byte_locale_units(pattern, word);
+    if byte_locale || sides_need_byte_char_matching(pattern, word) {
+        let pattern: Vec<char> = stage_pattern_match_units(pattern, byte_locale);
+        let word: Vec<char> = stage_word_match_units(word, byte_locale);
         return case_pattern_matches_at_with_case(&pattern, 0, &word, 0, false);
     }
     if let Some(verdict) = literal_pattern_equality(pattern, word, false) {
@@ -24,9 +28,11 @@ pub(in crate::executor) fn case_pattern_matches(pattern: &str, word: &str) -> bo
 
 pub(in crate::executor) fn case_pattern_matches_nocase(pattern: &str, word: &str) -> bool {
     // Byte-spelling gate runs BEFORE the pattern-only fast paths (see above).
-    if sides_need_byte_char_matching(pattern, word) {
-        let pattern: Vec<char> = flatten_pattern_to_byte_chars(pattern);
-        let word: Vec<char> = flatten_word_to_byte_chars(word);
+    // rubash#1533: byte-locale units gate joins it.
+    let byte_locale = sides_need_byte_locale_units(pattern, word);
+    if byte_locale || sides_need_byte_char_matching(pattern, word) {
+        let pattern: Vec<char> = stage_pattern_match_units(pattern, byte_locale);
+        let word: Vec<char> = stage_word_match_units(word, byte_locale);
         return case_pattern_matches_at_with_case(&pattern, 0, &word, 0, true);
     }
     if let Some(verdict) = literal_pattern_equality(pattern, word, true) {
@@ -65,7 +71,7 @@ pub(in crate::executor) fn case_pattern_matches_with_word_chars(
     // above): the fast paths verdict on raw chars and cannot see marker
     // spellings, so a marked word must go through the flattening base
     // function instead of the staged raw-char path below.
-    if sides_need_byte_char_matching(pattern, word) {
+    if sides_need_byte_char_matching(pattern, word) || sides_need_byte_locale_units(pattern, word) {
         return case_pattern_matches(pattern, word);
     }
     if let Some(verdict) = literal_pattern_equality(pattern, word, false) {
@@ -86,7 +92,7 @@ pub(in crate::executor) fn case_pattern_matches_nocase_with_word_chars(
     word_chars: &mut Option<Vec<char>>,
 ) -> bool {
     // Byte-spelling gate first (see base function above).
-    if sides_need_byte_char_matching(pattern, word) {
+    if sides_need_byte_char_matching(pattern, word) || sides_need_byte_locale_units(pattern, word) {
         return case_pattern_matches_nocase(pattern, word);
     }
     if let Some(verdict) = literal_pattern_equality(pattern, word, true) {
@@ -287,6 +293,95 @@ fn chars_carry_byte_spelling(chars: &[char]) -> bool {
 }
 
 /// U+E100+byte byte-char → the byte it carries, or None for any other char.
+/// rubash#1533: in a single-byte locale (LC_CTYPE is not UTF-8) GNU's
+/// matchers walk BYTE strings — gmatch/sm_loop advance one byte per `?`,
+/// and a multibyte character on either side is simply its raw bytes
+/// (subst.c pat_substr / lib/glob sm_loop.c walk `unsigned char` buffers;
+/// there is no decoding step when the locale is not multibyte). Rubash
+/// stages chars, so under a byte locale any ordinary non-ASCII char must
+/// be re-staged as one byte-char unit per UTF-8 byte before matching,
+/// reusing the byte units the spelling gate above already feeds the
+/// engine. The PUA plane (E000–EFFF: byte-chars, raw-byte markers, the
+/// E400 literal escape, the other carriers) is transport, not text, and
+/// keeps its existing units.
+pub(in crate::executor) fn char_is_text_non_ascii(ch: char) -> bool {
+    (ch as u32) >= 0x80 && !matches!(ch as u32, 0xE000..=0xEFFF)
+}
+
+pub(in crate::executor) fn sides_need_byte_locale_units(pattern: &str, word: &str) -> bool {
+    !crate::locale::is_utf8()
+        && (pattern.chars().any(char_is_text_non_ascii) || word.chars().any(char_is_text_non_ascii))
+}
+
+pub(in crate::executor) fn sides_need_byte_locale_units_staged(
+    pattern: &str,
+    word_chars: &[char],
+) -> bool {
+    !crate::locale::is_utf8()
+        && (pattern.chars().any(char_is_text_non_ascii)
+            || word_chars.iter().copied().any(char_is_text_non_ascii))
+}
+
+/// Split every ordinary non-ASCII char in an already-staged unit buffer
+/// into one byte-char per UTF-8 byte (#1533). ASCII, byte-chars and the
+/// PUA carrier plane pass through untouched.
+pub(in crate::executor) fn split_text_chars_into_byte_units(chars: Vec<char>) -> Vec<char> {
+    let mut out = Vec::with_capacity(chars.len());
+    for ch in chars {
+        if char_is_text_non_ascii(ch) {
+            let mut buf = [0u8; 4];
+            for byte in ch.encode_utf8(&mut buf).as_bytes() {
+                out.push(char::from_u32(BYTE_CHAR_BASE + u32::from(*byte)).unwrap());
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Stage a pattern for matching: the #729 spelling flattening, plus the
+/// #1533 byte-locale text split when `byte_locale` holds.
+pub(in crate::executor) fn stage_pattern_match_units(
+    pattern: &str,
+    byte_locale: bool,
+) -> Vec<char> {
+    let staged = flatten_pattern_to_byte_chars(pattern);
+    if byte_locale {
+        split_text_chars_into_byte_units(staged)
+    } else {
+        staged
+    }
+}
+
+/// Word twin of [`stage_pattern_match_units`].
+pub(in crate::executor) fn stage_word_match_units(word: &str, byte_locale: bool) -> Vec<char> {
+    let staged = flatten_word_to_byte_chars(word);
+    if byte_locale {
+        split_text_chars_into_byte_units(staged)
+    } else {
+        staged
+    }
+}
+
+/// Raw bytes of a unit-space string (the inverse direction of the
+/// staging above, for assembled substitution output): a byte-char
+/// contributes the byte it carries, every other char contributes its
+/// UTF-8 encoding — so an E400 literal-escape pair re-encodes as the
+/// pair's own UTF-8 bytes and survives the caller's
+/// bytes_to_shell_text round trip verbatim (rubash#1533).
+pub(in crate::executor) fn match_units_to_raw_bytes(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut buf = [0u8; 4];
+    for ch in text.chars() {
+        match byte_char_value(ch) {
+            Some(byte) => out.push(byte),
+            None => out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes()),
+        }
+    }
+    out
+}
+
 fn byte_char_value(ch: char) -> Option<u8> {
     let code = ch as u32;
     if (BYTE_CHAR_BASE..BYTE_CHAR_BASE + 0x100).contains(&code) {

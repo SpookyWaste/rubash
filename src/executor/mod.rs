@@ -543,6 +543,19 @@ pub struct Executor {
     /// refresh_background_jobs in job_builtins.rs). Entries are
     /// (pid, flattened status, killing signal).
     pending_job_completions: Vec<(u32, i32, Option<i32>)>,
+    /// rubash#1528: deferred `time` reports for timed coproc commands.
+    /// GNU times a coproc like any async job — the interval is the
+    /// job's lifetime (spawn to completion) and the report prints when
+    /// the completion is noticed (at `wait` or a later command
+    /// boundary), not when the spawn returns. Entries are
+    /// (pid, start stamp, posix_format), flushed by
+    /// flush_timed_coproc_report when the job's completion is applied.
+    pending_timed_coproc_reports: Vec<(u32, read_helpers::TimeCommandStart, bool)>,
+    /// rubash#1528: the reap instant of a timed coproc, recorded when
+    /// the boundary sweep's try_wait first observes the death (GNU
+    /// waitchld stamps the job timeval at reap, not at notice). Keyed
+    /// by pid, consumed by flush_timed_coproc_report.
+    timed_coproc_death_instants: std::collections::HashMap<u32, std::time::Instant>,
     /// The (execute_generation, reader_command_line,
     /// foreground_wait_count) mark as of the previous
     /// refresh_background_jobs call; an observation point has occurred

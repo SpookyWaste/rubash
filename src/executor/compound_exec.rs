@@ -1744,6 +1744,20 @@ impl Executor {
             plain.redirect_err_append = inner.redirect_err_append.clone();
             return self.execute_command(&plain);
         }
+        // rubash#1528: a timed coproc returns at spawn, but GNU times
+        // the job's whole lifetime and reports at completion notice
+        // (measured on the 5.3.20 oracle: `time coproc C { sleep 2; }`
+        // + wait reports real 2.017s at the wait, an instant body
+        // reports 0.000s — both at notice time, never at spawn).
+        // Snapshot the child set so the spawn below can be identified
+        // and its report deferred to the completion funnel.
+        let timed_coproc_shape = time_command.command.coproc_command.is_some()
+            || time_command.command.words.first().map(String::as_str) == Some("coproc");
+        let children_before: std::collections::HashSet<u32> = if timed_coproc_shape {
+            self.background_children.keys().copied().collect()
+        } else {
+            std::collections::HashSet::new()
+        };
         let started = time_command_started();
         let inner_result = if let Some(coproc_cmd) = &time_command.command.coproc_command {
             self.execute_coproc_command(&time_command.command, coproc_cmd)
@@ -1804,11 +1818,27 @@ impl Executor {
             }
             Err(error) => return Err(error),
         }
-        // rubash#1277: under the list loop's defer flag the report is
-        // queued, not printed — the loop flushes it after the ERR trap
-        // adjudication (GNU fires the trap inside the inner
-        // execute_command, before execute_time_command's print).
-        if self.defer_list_time_report {
+        // rubash#1528: when the timed inner was a coproc that is still
+        // running, defer the report to the job-completion funnel
+        // (flush_timed_coproc_report) instead of measuring the spawn.
+        // A coproc already reaped by the time control reaches here
+        // (no longer in background_children) keeps the immediate print:
+        // its lifetime is the elapsed interval either way.
+        let running_timed_coproc = if timed_coproc_shape {
+            self.background_children.keys().copied().find(|pid| {
+                !children_before.contains(pid) && self.shell_state.coproc_names.contains_key(pid)
+            })
+        } else {
+            None
+        };
+        if let Some(pid) = running_timed_coproc {
+            self.pending_timed_coproc_reports
+                .push((pid, started, time_command.posix_format));
+        } else if self.defer_list_time_report {
+            // rubash#1277: under the list loop's defer flag the report is
+            // queued, not printed — the loop flushes it after the ERR trap
+            // adjudication (GNU fires the trap inside the inner
+            // execute_command, before execute_time_command's print).
             self.pending_list_time_reports
                 .push((started, time_command.posix_format));
         } else {
@@ -2740,8 +2770,7 @@ impl Executor {
                     // no EXIT trap; consume the death mark here and let
                     // the code after the state restore queue the parent's
                     // jobs.c notice instead.
-                    if executor.subshell_signal_death
-                        == Some((saved_depth + 1, status - 128))
+                    if executor.subshell_signal_death == Some((saved_depth + 1, status - 128))
                         && status >= 128
                     {
                         trap_result = None;
