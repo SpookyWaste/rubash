@@ -590,6 +590,28 @@ fn store_hash_table(env_vars: &mut VarTable, table: &HashMap<String, (String, u3
     );
 }
 
+/// Empty the command hash table in this shell state (rubash#1551).
+///
+/// GNU variables.c:5819 registers an assignment function for PATH —
+/// `{ "PATH", sv_path }` — and sv_path (variables.c:5919) is exactly
+/// `phash_flush()` (hashcmd.c:57): ANY operation that binds a value to
+/// PATH or unbinds it empties the whole remembered-location table,
+/// even a same-value bind. Attribute-only operations (`export PATH`,
+/// `readonly PATH`, `declare -p PATH`) never bind and do not flush.
+/// Every bind funnel calls this next to its store, mirroring the
+/// #1531 sv_locale funnel discipline: the executor assignment funnel
+/// (plain, `+=`, temp-prefix, read/for/select/getopts binds), the
+/// declare/typeset/local operand path, export/readonly value binds,
+/// `unset`, and the temp-assignment / function-local restore paths
+/// (a restore is a re-bind of the saved value in GNU's model).
+pub(crate) fn flush_command_hash_table(env_vars: &mut VarTable) {
+    env_vars.remove(HASH_TABLE);
+    // The process-global lookup cache mirrors this table in its
+    // `hashed` map; both stores must die together or the next lookup
+    // would serve the stale location the flush just forgot.
+    crate::executor::path::flush_command_lookup_cache_hashed();
+}
+
 /// GNU hashlib.c:254: a hash_search hit increments times_found — every
 /// phash_search (`type`, `command -v`, exec resolution, `hash -t`) counts.
 pub(crate) fn bump_hashed_path_hit(env_vars: &mut VarTable, name: &str) {

@@ -367,6 +367,11 @@ fn assign_printf_output(
             return Ok(Some(1));
         }
         env_vars.insert(name.to_string(), output);
+        // rubash#1551 sv_path: binding a nameref cell named PATH is a
+        // PATH bind (variables.c:5819/5919 -> phash_flush).
+        if name == "PATH" {
+            crate::builtins::hash::flush_command_hash_table(env_vars);
+        }
         return Ok(None);
     }
     let resolved = resolve_printf_bind_name(env_vars, name);
@@ -429,6 +434,11 @@ fn assign_printf_output(
         let _ = store.set_scalar(name, output.clone());
     }
     env_vars.insert(name.to_string(), output);
+    // GNU variables.c:5819/5919 sv_path -> phash_flush (rubash#1551):
+    // a printf -v bind of PATH is a bind.
+    if name == "PATH" {
+        crate::builtins::hash::flush_command_hash_table(env_vars);
+    }
     Ok(None)
 }
 

@@ -237,6 +237,12 @@ where
         crate::builtins::shopt::clear_compat_flags(env_vars);
     }
     env_vars.remove(&unset_name);
+    // GNU variables.c:5819/5919 sv_path -> phash_flush (rubash#1551):
+    // unbinding PATH empties the command hash table too (verified
+    // oracle: `unset PATH` leaves `hash` empty).
+    if unset_name == "PATH" {
+        crate::builtins::hash::flush_command_hash_table(env_vars);
+    }
     // Process-env removal is existence-gated, not name-gated (#916/#917):
     // ordinary names were never mirrored by writes, but an inherited copy
     // predates the mirror and must be dropped so table-miss fallbacks do

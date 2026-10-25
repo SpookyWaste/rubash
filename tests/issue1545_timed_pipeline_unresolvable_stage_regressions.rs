@@ -176,14 +176,9 @@ fn issue1545_timed_pipeline_first_stage_failure_is_a_control() {
 /// GNU flushes the whole command hash table on ANY PATH assignment
 /// (variables.c sv_path -> phash_flush), so a `hash -p` entry recorded
 /// before `PATH=/nonexistent` does NOT rescue the stage: GNU reports
-/// the same 127 as the filed form. rubash does not yet model sv_path
-/// (its mirrored hash table survives the assignment, so
-/// `command -v cat` still reports the stale path and the emulation
-/// gate still sees a resolution) — that watcher belongs to the
-/// assignment-watcher family, outside this cluster's surface; pinned
-/// here with the GNU expectation until it lands.
+/// the same 127 as the filed form. The sv_path watcher landed with
+/// rubash#1551 (flush at every PATH bind funnel), activating this pin.
 #[test]
-#[ignore = "rubash lacks the sv_path hash flush on PATH assignment (variables.c sv_path -> phash_flush)"]
 fn issue1545_hashed_name_dies_with_path_assignment() {
     let (stdout, stderr, code) =
         rubash_c("hash -p /usr/bin/cat cat; PATH=/nonexistent; time -p true | cat; echo rc=$?");

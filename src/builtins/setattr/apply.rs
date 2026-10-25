@@ -152,6 +152,14 @@ where
             // cross via the explicit child env; mirror to the process env
             // only when exported-or-special, like plain assignments (#916).
             sync_shell_assignment_process_env(env_vars, name, &value);
+            // GNU variables.c:5819/5919 sv_path -> phash_flush
+            // (rubash#1551): an export VALUE bind is a bind. A name-only
+            // `export PATH` merely marks att_exported in GNU (no bind,
+            // no flush) — the value unwrap above only materializes the
+            // existing binding for the mirror, so gate on has_assign.
+            if has_assign && name == "PATH" {
+                crate::builtins::hash::flush_command_hash_table(env_vars);
+            }
             mark_exported(env_vars, name);
         }
         ExportMode::Unset => {
@@ -181,6 +189,11 @@ where
                     oob_word,
                 );
                 env_vars.insert(name.to_string(), new_value);
+                // GNU setattr.def binds the operand before removing
+                // att_exported, so sv_path fires here too (rubash#1551).
+                if name == "PATH" {
+                    crate::builtins::hash::flush_command_hash_table(env_vars);
+                }
                 if assoc {
                     mark_assoc(env_vars, name, converted);
                 } else if array || bound_array {
@@ -314,6 +327,13 @@ where
     // attribute but its storage value never enters the child env. Mirrored
     // through the same gate as every other write (#916).
     sync_shell_assignment_process_env(env_vars, name, &value);
+    // GNU variables.c:5819/5919 sv_path -> phash_flush (rubash#1551):
+    // a readonly VALUE bind is a bind; a name-only `readonly PATH`
+    // only sets the attribute in GNU and must not flush (same
+    // has_assign gate as export above).
+    if has_assign && name == "PATH" {
+        crate::builtins::hash::flush_command_hash_table(env_vars);
+    }
     mark_readonly(env_vars, name);
     Ok(EXECUTION_SUCCESS)
 }

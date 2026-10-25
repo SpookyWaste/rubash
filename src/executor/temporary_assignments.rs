@@ -878,6 +878,16 @@ impl Executor {
                 self.emit_assignment_diag(line);
             }
         }
+        // GNU variables.c:5819 { "PATH", sv_path } -> variables.c:5919
+        // sv_path -> hashcmd.c:57 phash_flush: every successful PATH
+        // bind empties the command hash table (rubash#1551). This
+        // funnel carries plain and `+=` assignments, temp-prefix binds,
+        // and the read/for/select/getopts binds that route through
+        // apply_shell_assignment; the restore side of a temp bind is a
+        // re-bind handled in the tempenv restore path.
+        if result && base == "PATH" {
+            crate::builtins::hash::flush_command_hash_table(&mut self.shell_state.env_vars);
+        }
         result
     }
 

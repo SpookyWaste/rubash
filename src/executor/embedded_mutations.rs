@@ -1849,6 +1849,13 @@ impl Executor {
         // deduplicates against the &self wrapper entry this function calls
         // into for its specialized routes.
         let _profiler_comsub = super::profiler::enter_comsub();
+        // rubash#1551: this dispatcher is a comsub fork face of its own
+        // (its shortcut routes run bodies without reaching the &self
+        // wrapper's bracket), so the hash-table mirror fork bracket
+        // opens here too; routes that fall through to
+        // expand_command_substitution_with_context nest a second,
+        // inner bracket harmlessly.
+        let _hashed_fork = crate::executor::path::hashed_cache_fork_guard();
         // GNU command_substitute (subst.c:7143) runs the body in a subshell:
         // arithmetic subscript writes queued inside never reach the parent
         // environment. Scope the deferred-write queue to this substitution.
