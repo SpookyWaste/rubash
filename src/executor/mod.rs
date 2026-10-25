@@ -555,7 +555,11 @@ pub struct Executor {
     /// while it blocks, jobs.c:3064 — an observation point).
     foreground_wait_count: Cell<u64>,
     coproc_stderr_forwarders: HashMap<u32, std::thread::JoinHandle<Result<(), std::io::Error>>>,
-    assignment_output_process_substitutions: HashMap<String, String>,
+    /// Assignment-RHS output process substitutions awaiting their
+    /// finish, in materialization order (GNU forks left-to-right
+    /// and the bodies' observable effects order the same way,
+    /// rubash#1523). Keyed by the `/dev/fd/N` word form.
+    assignment_output_process_substitutions: Vec<(String, String)>,
     /// rubash#1525: set by execute_external so the simple-command
     /// funnel can tell which completion-write class a command fell
     /// into (GNU execute_cmd.c: the tempenv of a disk command is
