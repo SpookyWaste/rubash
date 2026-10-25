@@ -221,6 +221,21 @@ pub(crate) fn shell_assignment_needs_process_env(name: &str) -> bool {
         name,
         "HOME" | "OLDPWD" | "PATH" | "PATHEXT" | "PWD" | "TEMP" | "TMP" | "TMPDIR" | "USERPROFILE"
     ) || name.starts_with("__RUBASH_")
+        // rubash#1531: the locale family. GNU variables.c's special_vars
+        // table binds LANG and every LC_* category to sv_locale, which
+        // fires on ASSIGNMENT (not export) and recomputes the effective
+        // locale (locale.c set_locale_var: LC_ALL > LC_<cat> > LANG).
+        // Rubash's locale readers resolve the categories from the PROCESS
+        // environment (crate::locale collate_locale_name / locale_name /
+        // decimal_point), so a plain `LC_COLLATE=de_DE.UTF-8` must mirror
+        // immediately or glob order, `[[ a<b ]]`, ${#v} and printf number
+        // parsing never see it. The save/restore machinery (temporary
+        // assignments, function locals) keys off this same gate, so
+        // scoped assignments restore the previous process value too.
+        || matches!(
+            name,
+            "LANG" | "LC_ALL" | "LC_COLLATE" | "LC_CTYPE" | "LC_MESSAGES" | "LC_NUMERIC" | "LC_TIME"
+        )
 }
 
 pub(in crate::executor) fn safe_temp_dir_string() -> String {
