@@ -1346,6 +1346,21 @@ impl Executor {
         }
     }
 
+    /// Latch a failed `${var:=word}`/`${var=word}` bind (subst.c
+    /// parameter_brace_expand_rhs: bind_variable fails, then EX_BADUSAGE
+    /// is written and bash_variable_assignment_error jumps DISCARD).
+    /// `prev_status` is `$?` as it stood before the bind attempts — GNU
+    /// prints the diagnostic from inside bind_variable (err_readonly ->
+    /// error.c report_error) BEFORE the EX_BADUSAGE write, and
+    /// report_error's errexit branch exit_shells with that earlier value
+    /// (rubash#1542), so the consumer needs it snapshotted here.
+    fn latch_parameter_assignment_failure(&self, prev_status: i32) {
+        if !self.parameter_assignment_failure.replace(true) {
+            self.parameter_assignment_failure_prev_status
+                .set(Some(prev_status));
+        }
+    }
+
     fn apply_parameter_assignment_expansion_with_context(
         &mut self,
         inner: &str,
@@ -1415,6 +1430,11 @@ impl Executor {
             // out of the set-test's cross-pass memo.
             let _assign_site =
                 crate::executor::expand_braced_indices::SubSiteGuard::new(usize::MAX);
+            // rubash#1542: `$?` before the bind attempts — the value
+            // error.c report_error would exit_shell with under errexit
+            // (the diagnostic prints inside the bind, before subst.c
+            // writes EX_BADUSAGE over it).
+            let prev_status = self.exit_code;
             if self.apply_array_element_parameter_assignment(name, bound.clone()) {
                 return;
             }
@@ -1425,7 +1445,7 @@ impl Executor {
                 return;
             }
             if !self.apply_shell_assignment(name, bound) {
-                self.parameter_assignment_failure.set(true);
+                self.latch_parameter_assignment_failure(prev_status);
             }
             return;
         }
@@ -1446,6 +1466,8 @@ impl Executor {
             // Same assign-target re-evaluation as `:=` above.
             let _assign_site =
                 crate::executor::expand_braced_indices::SubSiteGuard::new(usize::MAX);
+            // rubash#1542: same pre-bind `$?` snapshot as the `:=` arm.
+            let prev_status = self.exit_code;
             if self.apply_array_element_parameter_assignment(name, bound.clone()) {
                 return;
             }
@@ -1456,7 +1478,7 @@ impl Executor {
                 return;
             }
             if !self.apply_shell_assignment(name, bound) {
-                self.parameter_assignment_failure.set(true);
+                self.latch_parameter_assignment_failure(prev_status);
             }
         }
     }

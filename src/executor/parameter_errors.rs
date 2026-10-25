@@ -204,6 +204,77 @@ fn next_quoted_parameter_expansion_start(text: &str) -> Option<usize> {
     }
     None
 }
+
+/// Blank out (position-preserving) the spans of `word` whose `${...}`
+/// fragments are NOT expansions of the current shell: `$( )` command
+/// substitutions and backtick substitutions (their fragments belong to
+/// the substitution child, subst.c:7143 command_substitute) and
+/// single-quoted regions (no expansion at all). `$(( ))` arithmetic is
+/// NOT masked — its fragments expand in the current shell. Used by the
+/// parameter-assignment pre-scan (rubash#1542).
+fn mask_nonlocal_expansion_spans(word: &str) -> String {
+    let chars: Vec<char> = word.chars().collect();
+    let mut out: Vec<char> = chars.clone();
+    let mut index = 0usize;
+    let mut in_double = false;
+    while index < chars.len() {
+        match chars[index] {
+            '\\' => {
+                index += 2;
+                continue;
+            }
+            '"' => {
+                in_double = !in_double;
+                index += 1;
+            }
+            '\'' if !in_double => {
+                // Single-quoted region: blank through the closing quote.
+                let start = index;
+                index += 1;
+                while index < chars.len() && chars[index] != '\'' {
+                    index += 1;
+                }
+                let end = (index + 1).min(chars.len());
+                for slot in &mut out[start..end] {
+                    *slot = ' ';
+                }
+                index = end;
+            }
+            '`' => {
+                let start = index;
+                index += 1;
+                while index < chars.len() && chars[index] != '`' {
+                    if chars[index] == '\\' {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+                let end = (index + 1).min(chars.len());
+                for slot in &mut out[start..end] {
+                    *slot = ' ';
+                }
+                index = end;
+            }
+            '$' if chars.get(index + 1) == Some(&'(') && chars.get(index + 2) != Some(&'(') => {
+                if let Some(end) =
+                    crate::lexer::skip_parenthesized_unit_corrected(&chars, index + 1)
+                {
+                    for slot in &mut out[index..end] {
+                        *slot = ' ';
+                    }
+                    index = end;
+                } else {
+                    index += 1;
+                }
+            }
+            _ => {
+                index += 1;
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 impl Executor {
     pub(in crate::executor) fn parameter_assignment_error(
         &self,
@@ -242,6 +313,21 @@ impl Executor {
             .strip_prefix(crate::executor::markers::QUOTED_WORD_PREFIX)
             .or_else(|| word.strip_prefix(STORAGE_WORD_PREFIX))
             .unwrap_or(word);
+        // rubash#1542: fragments inside a command-substitution span
+        // belong to the substitution's child (subst.c:7143
+        // command_substitute) — the child's own commands are scanned
+        // when they run. This textual pre-scan of the ENCLOSING word
+        // must not claim them: `x=$(echo ${v:=x})` reported the child's
+        // failure against the parent command and discarded it at the
+        // top level. Mask substitution/backtick/single-quoted spans
+        // before scanning (positions preserved).
+        let masked;
+        let word = if word.contains("$(") || word.contains('`') || word.contains('\'') {
+            masked = mask_nonlocal_expansion_spans(word);
+            &masked
+        } else {
+            word
+        };
         let mut rest = word;
         while let Some(start) = rest.find("${") {
             let after_start = &rest[start + 2..];

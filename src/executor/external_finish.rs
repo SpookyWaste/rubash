@@ -445,6 +445,8 @@ impl Executor {
         let saved_evalerror_line = self.evalerror_line.get();
         let saved_reader_command_line = self.reader_command_line.get();
         let saved_parameter_assignment_failure = self.parameter_assignment_failure.get();
+        let saved_parameter_assignment_failure_prev_status =
+            self.parameter_assignment_failure_prev_status.get();
         // evalerror_exec_depth counts execute_ast_inner nesting: the child
         // is a fresh reader (its own process in GNU), so a pending abort
         // inside it discards only same-line commands rather than unwinding
@@ -458,6 +460,7 @@ impl Executor {
         self.evalerror_exit_toomany_pending.set(false);
         self.evalerror_line.set(None);
         self.parameter_assignment_failure.set(false);
+        self.parameter_assignment_failure_prev_status.set(None);
         // A parse error inside the child dies with it (GNU shell.c: the
         // child exits 2 and the parent's reader is untouched). The flag
         // lives on Executor outside shell_state, so save/reset/restore it
@@ -740,6 +743,8 @@ impl Executor {
         self.reader_command_line.set(saved_reader_command_line);
         self.parameter_assignment_failure
             .set(saved_parameter_assignment_failure);
+        self.parameter_assignment_failure_prev_status
+            .set(saved_parameter_assignment_failure_prev_status);
         self.evalerror_exec_depth.set(saved_evalerror_exec_depth);
         self.assignment_command_name = saved_assignment_command_name;
         if let Some(cwd) = saved_cwd {
