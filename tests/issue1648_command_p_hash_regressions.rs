@@ -36,9 +36,7 @@ fn rubash(script: &str) -> (String, String, Option<i32>) {
 
 #[test]
 fn command_p_skips_hash_table() {
-    let (stdout, stderr, _) = rubash(
-        "hash -p /bin/false myls; command -p myls; echo \"rc=$?\"",
-    );
+    let (stdout, stderr, _) = rubash("hash -p /bin/false myls; command -p myls; echo \"rc=$?\"");
     assert_eq!(stdout, "rc=127\n");
     assert!(
         stderr.contains("myls: command not found"),
@@ -63,6 +61,16 @@ fn command_p_hit_overwrites_poisoned_entry() {
         stdout,
         "p-rc=0\nhits\tcommand\n   1\t/bin/ls\nplain-rc=0\nhits\tcommand\n   2\t/bin/ls\n"
     );
+}
+
+#[test]
+fn issue1648_command_p_creates_hash_entry_when_table_empty() {
+    // GNU oracle (bash 5.3.20): with an empty table, a -p hit still
+    // records the resolution — `hash -t ls` afterwards reports the
+    // standard-path location (execute_cmd.c passes CMDSRCH_HASH).
+    let (stdout, _, _) =
+        rubash("hash -r; command -p ls /tmp >/dev/null; echo \"rc=$?\"; hash -t ls");
+    assert_eq!(stdout, "rc=0\n/bin/ls\n");
 }
 
 #[test]

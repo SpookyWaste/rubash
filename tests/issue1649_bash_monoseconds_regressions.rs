@@ -55,20 +55,58 @@ fn monoseconds_expands_and_declares() {
 
 #[test]
 fn monoseconds_ticks_with_monotonic_clock() {
-    let (stdout, _stderr, code) = rubash(
-        "a=$BASH_MONOSECONDS; sleep 2; b=$BASH_MONOSECONDS; echo $((b - a))",
-    );
+    let (stdout, _stderr, code) =
+        rubash("a=$BASH_MONOSECONDS; sleep 2; b=$BASH_MONOSECONDS; echo $((b - a))");
     assert_eq!(code, Some(0));
     assert_eq!(stdout.trim(), "2");
 }
 
 #[test]
 fn monoseconds_in_arithmetic_and_v_test() {
-    let (stdout, _stderr, code) = rubash(
-        "echo $((BASH_MONOSECONDS > 0 ? 1 : 0)); [[ -v BASH_MONOSECONDS ]] && echo v-set",
-    );
+    let (stdout, _stderr, code) =
+        rubash("echo $((BASH_MONOSECONDS > 0 ? 1 : 0)); [[ -v BASH_MONOSECONDS ]] && echo v-set");
     assert_eq!(code, Some(0));
     assert_eq!(stdout, "1\nv-set\n");
+}
+
+#[test]
+fn issue1649_monoseconds_listed_in_declare_dump_and_compgen_v() {
+    // GNU oracle (bash 5.3.20): the dynamic variable is part of the
+    // variable surface — a full `declare -p` dump names it and
+    // `compgen -v` lists it, like SECONDS/EPOCHSECONDS.
+    let (stdout, _stderr, code) = rubash(
+        "case \"$(declare -p)\" in *BASH_MONOSECONDS*) echo in-declare-dump;; *) echo missing-declare;; esac; \
+         case \"$(compgen -v)\" in *BASH_MONOSECONDS*) echo in-compgen;; *) echo missing-compgen;; esac",
+    );
+    assert_eq!(code, Some(0));
+    assert_eq!(stdout, "in-declare-dump\nin-compgen\n");
+}
+
+#[test]
+fn issue1649_monoseconds_assignment_is_ignored() {
+    // GNU oracle (bash 5.3.20): assigning to the dynamic variable is
+    // accepted but the next read still reports monotonic seconds —
+    // the stored value is never observable.
+    let (stdout, _stderr, code) = rubash(
+        "BASH_MONOSECONDS=5; a=$BASH_MONOSECONDS; sleep 1; b=$BASH_MONOSECONDS; echo \"a=$a b=$b\"",
+    );
+    assert_eq!(code, Some(0));
+    let mut fields = stdout.split_whitespace();
+    let a: i64 = fields
+        .next()
+        .and_then(|f| f.strip_prefix("a="))
+        .and_then(|v| v.parse().ok())
+        .expect("first read must be an integer");
+    let b: i64 = fields
+        .next()
+        .and_then(|f| f.strip_prefix("b="))
+        .and_then(|v| v.parse().ok())
+        .expect("second read must be an integer");
+    assert_ne!(a, 5, "assignment must not be observable: {stdout}");
+    assert!(
+        (1..=2).contains(&(b - a)),
+        "value must keep ticking after assignment: {stdout}"
+    );
 }
 
 #[test]
