@@ -2417,6 +2417,13 @@ impl Executor {
                 return if invalid_name {
                     self.finish_read_error(cmd, &stderr, 1)
                 } else {
+                    // rubash#1639: an interrupted read is an untrapped
+                    // SIGINT fg-wait abort (the take only fires while
+                    // the guard is armed: interactive + untrapped), so
+                    // it arms the line discard like the sleep and
+                    // external waits. The invalid-name arm above does
+                    // not arm: its status is 1, not 128+SIGINT.
+                    self.arm_sigint_discard(signal);
                     128 + signal
                 };
             }
@@ -2804,7 +2811,9 @@ impl Executor {
             // assigns nothing (rubash#1250); on timeout the vars keep
             // the partial assignment above and the builtin returns
             // 128+SIGALRM=142 (read.def:539-562).
+            let mut interrupt_signal = None;
             let status = if let Some(signal) = self.take_read_interrupted_signal() {
+                interrupt_signal = Some(signal);
                 128 + signal
             } else if self.take_read_timed_out() {
                 142
@@ -2814,6 +2823,12 @@ impl Executor {
             return if invalid_name || fail_after_read {
                 self.finish_read_error(cmd, &stderr, 1)
             } else {
+                // rubash#1639: arm the discard only when the
+                // interrupted status is the one actually returned
+                // (the error arms above return 1 instead).
+                if let Some(signal) = interrupt_signal {
+                    self.arm_sigint_discard(signal);
+                }
                 status
             };
         }

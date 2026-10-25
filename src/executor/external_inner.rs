@@ -906,6 +906,47 @@ impl Executor {
         }
     }
 
+    /// rubash#1639: arm the untrapped-SIGINT discard for a foreground
+    /// wait that ended in a SIGINT death. The loop-top abandon check
+    /// (ast_exec) then discards the rest of the current reader line
+    /// with `$?` = 130, matching GNU's job-control foreground job
+    /// killed by SIGINT (jobs.c:3305-3361 ADDINTERRUPT). The gate is
+    /// deliberately narrow: interactive only (GNU scripts continue
+    /// after a child SIGINT death, verified against bash 5.2) and
+    /// untrapped only (a trapped SIGINT runs its action at the
+    /// boundary and the list continues). The child-death side alone
+    /// decides — no mailbox correlation is needed: in rubash's
+    /// no-job-control model the shell shares the terminal foreground
+    /// group with the child, so a terminal ^C reaches both, while a
+    /// child that kills only itself still counts as a job-control-like
+    /// fg SIGINT death (GNU job-control discards there too; GNU
+    /// no-job-control continues — rubash interactive is the
+    /// job-control-like mode, rubash#1250).
+    pub(crate) fn arm_sigint_discard(&self, signal: i32) {
+        #[cfg(not(unix))]
+        {
+            let _ = signal;
+        }
+        #[cfg(unix)]
+        {
+            if signal != libc::SIGINT {
+                return;
+            }
+            if self.get_env("__RUBASH_INTERACTIVE").as_deref() != Some("1") {
+                return;
+            }
+            let trapped = super::trap_exec::signal_trap_name(signal).is_some_and(|name| {
+                crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, &name)
+                    .is_some_and(|action| !action.is_empty())
+            });
+            if trapped {
+                return;
+            }
+            self.evalerror_pending.set(true);
+            self.sigint_discard_pending.set(true);
+        }
+    }
+
     /// rubash#1497: execution-time gates for tail exec replacement,
     /// mirroring GNU builtins/evalstring.c:106 should_optimize_fork as
     /// re-checked when the command runs (a trap armed by an earlier
@@ -1279,6 +1320,7 @@ impl Executor {
                                 self.signal_notice_command_text(cmd),
                                 true,
                             );
+                            self.arm_sigint_discard(signal);
                         }
                         self.run_sigchld_trap_for_reaped_child()?;
                         // Route the merged stream into the active capture
@@ -1296,6 +1338,7 @@ impl Executor {
                                 self.signal_notice_command_text(cmd),
                                 true,
                             );
+                            self.arm_sigint_discard(signal);
                         }
                         self.exit_code = crate::executor::wait_status::process_exit_status(&status);
                         // A reaped foreground child delivers SIGCHLD in
@@ -1321,6 +1364,7 @@ impl Executor {
                                     self.signal_notice_command_text(cmd),
                                     true,
                                 );
+                                self.arm_sigint_discard(signal);
                             }
                             // A reaped foreground child delivers SIGCHLD in
                             // GNU bash; a set trap runs once at this
@@ -1354,6 +1398,7 @@ impl Executor {
                                     self.signal_notice_command_text(cmd),
                                     true,
                                 );
+                                self.arm_sigint_discard(signal);
                             }
                             self.exit_code =
                                 crate::executor::wait_status::process_exit_status(&status);

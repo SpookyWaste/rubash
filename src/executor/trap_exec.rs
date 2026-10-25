@@ -1597,6 +1597,14 @@ impl Executor {
             // still flows through observe and runs its action.
             #[cfg(unix)]
             if _builtin_guard.take_sigint_abort() {
+                // rubash#1639: the untrapped fg-wait abort arms the
+                // line discard (the trapped path below does not — its
+                // trap runs and the list continues). The flag rides
+                // this abort: rubash#1640's kernel-caused gate (its own
+                // branch) decides when the abort happens at all, so a
+                // shell-directed kill(2) INT never arms it once that
+                // gate lands.
+                self.arm_sigint_discard(libc::SIGINT);
                 return Ok(Some(libc::SIGINT));
             }
             // The µs race (delivery lands between the take above and
@@ -1605,6 +1613,7 @@ impl Executor {
             #[cfg(unix)]
             match self.observe_signals_while_blocked() {
                 Err(ExecuteError::ExitCode(code)) if code == 128 + libc::SIGINT => {
+                    self.arm_sigint_discard(libc::SIGINT);
                     return Ok(Some(libc::SIGINT));
                 }
                 other => other?,

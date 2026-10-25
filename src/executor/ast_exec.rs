@@ -38,6 +38,7 @@ impl Executor {
         // A fresh reader-level run: an evalerror abort still pending from a
         // finished run is stale and must not discard commands here.
         self.evalerror_pending.set(false);
+        self.sigint_discard_pending.set(false);
         self.nounset_force_eof.set(false);
         self.evalerror_subscript_pending.set(false);
         self.evalerror_failglob_pending.set(false);
@@ -329,6 +330,7 @@ impl Executor {
             ($command:expr) => {
                 if $command.subshell_end {
                     self.evalerror_pending.set(false);
+                    self.sigint_discard_pending.set(false);
                     self.nounset_force_eof.set(false);
                     self.evalerror_subscript_pending.set(false);
                     self.evalerror_failglob_pending.set(false);
@@ -577,6 +579,7 @@ impl Executor {
                             self.close_flat_region_err_adjudication(commands, index)?;
                         }
                         self.evalerror_pending.set(false);
+                        self.sigint_discard_pending.set(false);
                         self.nounset_force_eof.set(false);
                         self.evalerror_subscript_pending.set(false);
                         self.evalerror_failglob_pending.set(false);
@@ -595,6 +598,7 @@ impl Executor {
                 // (`( a[\" \"]=v ); echo after` prints `after`).
                 if command.subshell_end {
                     self.evalerror_pending.set(false);
+                    self.sigint_discard_pending.set(false);
                     self.nounset_force_eof.set(false);
                     self.evalerror_subscript_pending.set(false);
                     self.evalerror_failglob_pending.set(false);
@@ -636,6 +640,14 @@ impl Executor {
                     // downgrade it.
                     if self.nounset_force_eof.replace(false) {
                         self.exit_code = self.expansion_fatal_status();
+                    } else if self.sigint_discard_pending.get() {
+                        // rubash#1639: the untrapped-SIGINT fg-wait class
+                        // leaves 130 behind (GNU's 128+SIGINT status for
+                        // the next command), not the plain DISCARD 1.
+                        // The flag itself stays armed while the
+                        // same-line skip below runs and is consumed by
+                        // the boundary clear, like every other class.
+                        self.exit_code = 130;
                     } else {
                         self.exit_code = 1;
                     }
@@ -694,6 +706,22 @@ impl Executor {
                         self.evalerror_subscript_pending.set(false);
                     }
                 }
+                // rubash#1639: inside an eval/source boundary list,
+                // the SIGINT discard is NOT line-contained. GNU's
+                // interrupt_state breaks the whole parse_and_execute
+                // loop, so an interrupted eval'd string / sourced file
+                // is abandoned entirely — unlike evalerror DISCARD,
+                // whose per-line skip lets later lines of the string
+                // run (rubash#637). Skip every remaining command of
+                // this unit; the flag stays armed and propagates to
+                // the caller, whose own loop-top check discards the
+                // caller's line. At the top-level reader
+                // (eval_list_depth None) this arm never fires, so a
+                // following queued line still runs as a new command.
+                if self.sigint_discard_pending.get() && self.eval_list_depth.get().is_some() {
+                    index += 1;
+                    continue;
+                }
                 let boundary = self.evalerror_line.get();
                 if std::env::var("RUBASH_DEBUG_EVALERR").is_ok() {
                     eprintln!(
@@ -713,6 +741,7 @@ impl Executor {
                     continue;
                 }
                 self.evalerror_pending.set(false);
+                self.sigint_discard_pending.set(false);
                 self.nounset_force_eof.set(false);
                 self.evalerror_subscript_pending.set(false);
                 self.evalerror_failglob_pending.set(false);
@@ -2142,6 +2171,7 @@ impl Executor {
                 // forked process boundary, so the abort dies with the
                 // subshell (`( a[$bad]=v ); echo after` runs `after`).
                 self.evalerror_pending.set(false);
+                self.sigint_discard_pending.set(false);
                 self.nounset_force_eof.set(false);
                 self.evalerror_subscript_pending.set(false);
                 self.evalerror_failglob_pending.set(false);

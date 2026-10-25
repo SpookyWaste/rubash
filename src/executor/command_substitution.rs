@@ -1654,6 +1654,7 @@ impl Executor {
             tempenv_propagated_names: Vec::new(),
             function_tempenv_names: Vec::new(),
             evalerror_pending: Cell::new(false),
+            sigint_discard_pending: Cell::new(false),
             nounset_force_eof: Cell::new(false),
             conditional_expansion_fatal: Cell::new(false),
             conditional_fatal_status: Cell::new(None),

@@ -967,6 +967,23 @@ pub struct Executor {
     /// and cleared at every pending-clearing boundary, same discipline as
     /// `evalerror_subscript_pending`.
     pub(crate) evalerror_exit_toomany_pending: Cell<bool>,
+    /// rubash#1639: marks a pending evalerror abort as the untrapped-SIGINT
+    /// fg-wait class (GNU jobs.c:3305-3361: a job-control foreground job
+    /// killed by SIGINT with SIGINT untrapped sets interrupt_state, so the
+    /// loop or list breaks and the reader discards the rest of the line).
+    /// Rubash has no job control; its interactive fg wait is the
+    /// job-control-like mode (jobs.c wait_for model, rubash#1250), so an
+    /// interactive fg wait aborted by untrapped SIGINT — an external child
+    /// reaped dead by SIGINT, or the builtin virtual sleep's
+    /// kernel-caused abort — rides the same abandon vehicle, but the
+    /// status it leaves behind is 130, not the plain DISCARD 1. Armed
+    /// alongside `evalerror_pending` at those wait sites; consumed at
+    /// the abandon point and cleared at every pending-clearing boundary,
+    /// same discipline as the other class markers. Non-interactive
+    /// shells never arm it (GNU scripts continue after a child SIGINT
+    /// death); trapped SIGINT never arms it (the trap runs and the list
+    /// continues).
+    pub(crate) sigint_discard_pending: Cell<bool>,
     /// rubash#1518: marks a pending evalerror abort as the ARITHMETIC
     /// evalerror class (GNU expr.c `evalerror` -> `jump_to_top_level
     /// (DISCARD)`). Unlike the bad-substitution / failglob classes —
