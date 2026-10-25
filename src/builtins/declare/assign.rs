@@ -14,6 +14,7 @@ use super::{
     NAMEREF_VARS, READONLY_VARS, UPPERCASE_VARS,
 };
 use crate::executor::arithmetic::eval_conditional_arith_value;
+use crate::executor::local_helpers::sync_shell_assignment_process_env;
 use crate::executor::markers::{DATA_DOLLAR, STORAGE_WORD_PREFIX};
 use crate::executor::types::ARRAY_FIELD_SPLIT_MARKER;
 
@@ -473,6 +474,10 @@ where
                     continue;
                 }
                 variables.insert(var_name.to_string(), value.to_string());
+                // rubash#1531: same bind hook as the scalar path below —
+                // gated names (locale family) must reach the process-env
+                // mirror on a declare bind too.
+                sync_shell_assignment_process_env(variables, var_name, value);
                 unmark_typed(variables, DECLARED_UNSET_VARS, var_name);
                 continue;
             }
@@ -722,6 +727,14 @@ where
         // assoc keys never fold — rubash#1398).
         let value = declare_case_convert_storage(&value, compound_operand, variables, var_name);
         variables.insert(var_name.to_string(), value.clone());
+        // rubash#1531: this path writes VarTable directly, bypassing
+        // the assignment funnel (the BASH_COMPAT hook above exists for
+        // the same reason), so fire the process-env mirror explicitly:
+        // GNU bind_variable runs sv_locale on a declare bind, and a
+        // plain `declare LC_COLLATE=de_DE.UTF-8` must re-collate at
+        // once. The sync is gated (#916), so ordinary names pay only
+        // the name check.
+        sync_shell_assignment_process_env(variables, var_name, &value);
         unmark_typed(variables, DECLARED_UNSET_VARS, var_name);
         if compound_operand && !assoc && !variables.is_marked(ASSOC_VARS, var_name) {
             mark_typed(variables, ARRAY_VARS, var_name);

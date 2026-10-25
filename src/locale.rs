@@ -451,7 +451,18 @@ pub fn check_setlocale_warning() {
 /// equivalent single source of truth for those readers. Unset names are
 /// removed so the next-priority category applies.
 pub fn sync_process_locale(env_vars: &std::collections::HashMap<String, String>) {
-    for name in ["LC_ALL", "LC_CTYPE", "LC_COLLATE", "LANG"] {
+    // rubash#1531: the full watcher family (GNU variables.c special_vars
+    // binds every LC_* category plus LANG to sv_locale), not only the
+    // collate/ctype subset the #1512 fix needed.
+    for name in [
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_COLLATE",
+        "LC_MESSAGES",
+        "LC_NUMERIC",
+        "LC_TIME",
+        "LANG",
+    ] {
         match env_vars.get(name) {
             Some(value) => std::env::set_var(name, value),
             None => std::env::remove_var(name),

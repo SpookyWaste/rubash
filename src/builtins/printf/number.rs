@@ -96,7 +96,21 @@ pub(super) fn parse_long_double(value: &str) -> ParsedNumber<FloatVal> {
     match scan_float_subject(value) {
         Some(subject) => {
             let end = subject.end;
-            let (parsed, erange) = parse_long_double_subject(&value[subject.start..end]);
+            // rubash#1531: strtod's radix character is the LC_NUMERIC
+            // decimal point; the scanner above matched it in locale
+            // form, so normalize it back to '.' for the (locale-free)
+            // subject parser. The byte-range bookkeeping (suffix
+            // detection) stays in original-input coordinates.
+            let dp = crate::locale::decimal_point();
+            let raw_subject = &value[subject.start..end];
+            let normalized;
+            let subject_text = if dp != '.' && raw_subject.contains(dp) {
+                normalized = raw_subject.replacen(dp, ".", 1);
+                &normalized
+            } else {
+                raw_subject
+            };
+            let (parsed, erange) = parse_long_double_subject(subject_text);
             // printf.def:1472-1495 getdouble(): strtod accumulates the
             // longest valid subject sequence and getdouble RETURNS it even
             // when chk_converror rejects the trailing bytes, so `printf %f
@@ -289,6 +303,24 @@ struct FloatSubject {
     end: usize,
 }
 
+/// rubash#1531: the byte length of the strtod radix character at
+/// `bytes[index..]` — the current LC_NUMERIC decimal point
+/// (localeconv()->decimal_point), NOT a hard-coded '.': under
+/// LC_NUMERIC=de_DE the subject of `1,5` is the whole string and the
+/// subject of `1.5` is just `1` (the '.' becomes a rejected suffix,
+/// exactly as glibc strtod leaves it). Returns None when no radix
+/// character stands at `index`.
+fn decimal_point_len_at(bytes: &[u8], index: usize) -> Option<usize> {
+    let dp = crate::locale::decimal_point();
+    let mut encoded = [0u8; 4];
+    let dp = dp.encode_utf8(&mut encoded).as_bytes();
+    if bytes.len() >= index + dp.len() && &bytes[index..index + dp.len()] == dp {
+        Some(dp.len())
+    } else {
+        None
+    }
+}
+
 fn scan_float_subject(value: &str) -> Option<FloatSubject> {
     let leading = value.len() - skip_leading_space(value).len();
     let body = &value[leading..];
@@ -360,9 +392,16 @@ fn scan_float_subject(value: &str) -> Option<FloatSubject> {
             if byte.is_ascii_hexdigit() {
                 any = true;
                 index += 1;
-            } else if *byte == b'.' && !seen_dot {
-                seen_dot = true;
-                index += 1;
+            } else if !seen_dot {
+                // The hex significand's radix char is the locale
+                // decimal point too (strtod grammar, #1531).
+                match decimal_point_len_at(rest_bytes, index) {
+                    Some(len) => {
+                        seen_dot = true;
+                        index += len;
+                    }
+                    None => break,
+                }
             } else {
                 break;
             }
@@ -400,8 +439,8 @@ fn scan_float_subject(value: &str) -> Option<FloatSubject> {
         any_digits = true;
         index += 1;
     }
-    if rest_bytes.get(index) == Some(&b'.') {
-        index += 1;
+    if let Some(len) = decimal_point_len_at(rest_bytes, index) {
+        index += len;
         while rest_bytes.get(index).is_some_and(u8::is_ascii_digit) {
             any_digits = true;
             index += 1;
