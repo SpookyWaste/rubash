@@ -504,7 +504,23 @@ impl Executor {
             // dbg-support.tests) and `caller` sees the full caller chain
             // (probe: BASH_LINENO[1]=[] vs GNU [0]).
             self.shell_state.bash_lineno_stack.insert(0, call_line);
-            let source = self.current_bash_source();
+            // GNU execute_cmd.c:5310-5313 execute_function: the call
+            // frame's BASH_SOURCE entry is `shell_fn->source_file` —
+            // the file the function was DEFINED in — not the caller's
+            // current source. Rubash records that site in
+            // function_definition_locations at definition time
+            // (rubash#1587: filling slot 0 from the caller made it
+            // always duplicate slot 1 and lose the definition file).
+            // Functions with no recorded definition site (imported
+            // from the environment) keep the caller-source fallback,
+            // whose empty case is the "environment" frame label.
+            let source = self
+                .shell_state
+                .function_definition_locations
+                .get(name)
+                .map(|location| location.source.clone())
+                .filter(|source| !source.is_empty())
+                .unwrap_or_else(|| self.current_bash_source());
             self.shell_state.bash_source_stack.insert(
                 0,
                 if source.is_empty() {
