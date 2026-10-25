@@ -372,7 +372,15 @@ fn execute_source_with_args(
     // evalfile.c:395 both run one nesting level deeper than the sourcer.
     // The depth feeds the trap bare-exit context check (rubash#524).
     executor.push_source_nest();
+    // rubash#1563: the file runs through GNU's parse_and_execute
+    // (evalfile.c source_file -> evalstring.c) — push its frame (the
+    // DISCARD fold catch, and the CMD_IGNORE_RETURN errexit-clearing
+    // frame when this source was itself dispatched from an exempt
+    // position) for the groups' duration, restored before the unwind
+    // tail below.
+    let saved_frame = executor.enter_parse_and_execute_frame();
     let result = run_source_groups(executor, source, redirect_cmd);
+    executor.exit_parse_and_execute_frame(saved_frame);
 
     // evalfile.c:395: run_unwind_frame pops the pushed stream (restoring
     // line_number) BEFORE source_file's run_return_trap — the read

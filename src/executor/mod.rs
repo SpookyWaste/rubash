@@ -610,6 +610,29 @@ pub struct Executor {
     conditional_output_procsubs: Vec<(std::path::PathBuf, String, Option<usize>)>,
     pending_scalar_assignment: bool,
     suppress_errexit: usize,
+    /// rubash#1563: depth of GNU's CMD_IGNORE_RETURN clearing frame for
+    /// eval/source (execute_cmd.c:5004-5016): when the builtin is
+    /// dispatched under CMD_IGNORE_RETURN outside a subshell environment,
+    /// execute_builtin unwind-protects exit_immediately_on_error, sets it
+    /// to 0 for the body's duration and raises builtin_ignoring_errexit
+    /// (which flags.c:262 consults, so a `set -e` inside the body updates
+    /// the option without re-arming the print-time exit). While this is
+    /// nonzero, exit_immediately_on_error() reads false even with the
+    /// errexit option on — the eval/source bodies in `eval '...' || true`
+    /// therefore survive a DISCARD-class diagnostic GNU only prints.
+    pub(crate) errexit_ignore_frame: usize,
+    /// rubash#1563: the stack of live parse_and_execute frames (eval
+    /// strings and sourced files), each entry the subshell_depth at
+    /// which the frame was entered. GNU's parse_and_execute DISCARD
+    /// catch (builtins/evalstring.c:423-450) folds the pre-set
+    /// EX_BADUSAGE 2 to EXECUTION_FAILURE; the catch that receives a
+    /// DISCARD is the innermost one whose environment is still current,
+    /// and a `( )` region entered since the frame installs
+    /// execute_in_subshell's preserving catch instead
+    /// (execute_cmd.c:1821-1825) — the entry-depth snapshot models that
+    /// barrier: inside such a region the current depth differs from the
+    /// entry and the fold must not fire.
+    pub(crate) parse_and_execute_frames: Vec<usize>,
     /// GNU execute_cmd.c:273 `executing_command_builtin`: set while a
     /// command runs as the argument of the `command` builtin
     /// (execute_cmd.c:4732-4736 wraps the CMD_COMMAND_BUILTIN re-dispatch,

@@ -460,7 +460,12 @@ impl Executor {
             // it in GNU, so they exit too (GNU 5.3.20 probes: the shell
             // exits with the pre-expansion status in every such
             // position, and no ERR trap fires).
-            if self.errexit_enabled() {
+            // rubash#1563: the print-time exit reads the DYNAMIC
+            // exit_immediately_on_error — inside an eval/source
+            // CMD_IGNORE_RETURN frame the diagnostic only prints, and the
+            // DISCARD below carries the parse_and_execute catch's folded
+            // status (param_assign_discard_status).
+            if self.exit_immediately_on_error() {
                 let code = self.param_assign_discard_status(status, prev_status);
                 self.exit_code = code;
                 // rubash#439: expansion error, not a failed command — no ERR trap.
@@ -471,6 +476,9 @@ impl Executor {
             self.command_expansion_failed.set(true);
             // rubash#1318: the DISCARD must survive the group/function
             // boundaries the Err crosses on its way to the reader.
+            // rubash#1563: the raw pre-set status travels with the
+            // DISCARD — the receiving catch folds it (an intervening
+            // `( )` region must still see the 2 it preserves).
             self.raise_assignment_discard(cmd.logical_line.or(cmd.line));
             return Err(ExecuteError::ExpansionFailure(status));
         }
@@ -862,7 +870,12 @@ impl Executor {
             if status == 2 && self.posix_assignment_failure_is_fatal() {
                 return Err(ExecuteError::ExitCode(1));
             }
-            if self.errexit_enabled() {
+            // rubash#1563: the print-time exit reads the DYNAMIC
+            // exit_immediately_on_error — inside an eval/source
+            // CMD_IGNORE_RETURN frame the diagnostic only prints, and the
+            // DISCARD below carries the parse_and_execute catch's folded
+            // status (param_assign_discard_status).
+            if self.exit_immediately_on_error() {
                 let code = self.param_assign_discard_status(status, prev_status);
                 self.exit_code = code;
                 // rubash#439: expansion error, not a failed command — no ERR trap.
@@ -873,6 +886,9 @@ impl Executor {
             self.command_expansion_failed.set(true);
             // rubash#1318: the DISCARD must survive the group/function
             // boundaries the Err crosses on its way to the reader.
+            // rubash#1563: the raw pre-set status travels with the
+            // DISCARD — the receiving catch folds it (an intervening
+            // `( )` region must still see the 2 it preserves).
             self.raise_assignment_discard(cmd.logical_line.or(cmd.line));
             return Err(ExecuteError::ExpansionFailure(status));
         }

@@ -1314,16 +1314,18 @@ impl Executor {
             // when exit_immediately_on_error is live — with the status
             // from BEFORE the bind (EXECUTION_FAILURE when it was 0),
             // never reaching the EX_BADUSAGE write or the DISCARD. The
-            // check reads the flag only: errexit-exempt positions
+            // check reads the DYNAMIC flag: errexit-exempt positions
             // (|| / && elements, `!`, if conditions, function bodies
             // called there) do NOT clear exit_immediately_on_error, so
             // they all die (GNU 5.3.20 probes: exit = prev $? in every
             // such position). The frames that DO clear it are the
             // eval/source CMD_IGNORE_RETURN frame (execute_cmd.c:
-            // 5004-5016) and the comsub child (subst.c:7356-7359, whose
-            // option table rubash clears the same way, so
-            // errexit_enabled is false there unless inherit_errexit).
-            if self.errexit_enabled() {
+            // 5004-5016; rubash#1563 models it as errexit_ignore_frame,
+            // read through exit_immediately_on_error) and the comsub
+            // child (subst.c:7356-7359, whose option table rubash clears
+            // the same way, so errexit_enabled is false there unless
+            // inherit_errexit).
+            if self.exit_immediately_on_error() {
                 let code = self.param_assign_discard_status(2, prev_status.unwrap_or(0));
                 self.exit_code = code;
                 // rubash#439: expansion error, not a failed command — no
@@ -1333,7 +1335,11 @@ impl Executor {
             }
             // GNU reports expansion failures with EX_BADUSAGE (2), matching
             // `${var?msg}` / bad-substitution status, not the builtin-failure
-            // status 1.
+            // status 1. The pre-set 2 travels with the DISCARD: the catch
+            // that receives it (reader, `( )` region, parse_and_execute)
+            // decides the final status — folding here at the raise site
+            // would hide the 2 from an intervening preserving catch
+            // (rubash#1563: `( : ${v:=x} )` inside a comsub body keeps 2).
             self.exit_code = 2;
             // rubash#439: expansion error, not a failed command — no ERR trap.
             self.command_expansion_failed.set(true);
