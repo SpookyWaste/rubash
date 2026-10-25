@@ -189,8 +189,14 @@ fn issue1553_no_paren_rhs_form_unchanged() {
 }
 
 #[test]
-#[ignore = "pre-existing stdin group-splitter divergence: the stdin path closes the group at line 1 and reports the EOF shape instead of GNU's `echo' diagnostics; separate layer from #1553's lexer state defect, tracked as a residual in the parser-diag3 cluster report"]
 fn issue1553_stdin_form_reads_next_line() {
+    // Activated by rubash#1573: the stdin group splitter now holds the
+    // group open while the scanner's PST_CONDCMD state is armed (the
+    // glued `]]` is word text, so the conditional — and the group —
+    // continues onto the next line, whose first token GNU diagnoses
+    // inside the conditional). FILED_DIAGS already carries the live
+    // oracle's three lines, including the `` `echo after' ``
+    // source-line echo, so the expectations needed no change.
     let (stdout, stderr, code) = run_rubash(&[], Some("[[ a =~ (b)]]\necho after\n"));
     assert_eq!(stdout, "");
     expect_diags(&stderr, FILED_DIAGS);

@@ -1460,6 +1460,46 @@ pub fn stdin_source_needs_more(source: &str) -> bool {
     stdin_source_needs_more_posix(source, false)
 }
 
+/// The 1-based line (within `text`) on which the OUTERMOST keyword
+/// compound that is still open at the end of `text` began, if any. The
+/// keyword stack mirrors `stdin_source_needs_more_posix`'s discipline
+/// (same push/pop pairs); token positions carry physical lines. Used by
+/// the unclosed-diagnostics route in `run_source_impl` to find where
+/// the FAILED command starts: a matched-pair construct (quote, `$(`,
+/// ...) that dies at EOF inside an unclosed `if`/`while`/`{`/... makes
+/// the whole compound the failed command in GNU's reader (parse.y
+/// read_token fails inside the compound's own token read), so none of
+/// the compound — and nothing else on its opening line — ever runs,
+/// and the compound-EOF diagnostic is never printed (rubash#1589).
+fn unclosed_compound_open_line(text: &str) -> Option<usize> {
+    let tokens = tokenize(text);
+    let mut stack: Vec<(&str, usize)> = Vec::new();
+    for token in &tokens {
+        if token.kind != TokenKind::Keyword {
+            continue;
+        }
+        match token.value.as_str() {
+            "case" => stack.push(("esac", token.position)),
+            "if" => stack.push(("fi", token.position)),
+            "for" | "select" | "while" | "until" => stack.push(("done", token.position)),
+            "{" => stack.push(("}", token.position)),
+            "(" => stack.push((")", token.position)),
+            ")" => {
+                if stack.last().map(|(closer, _)| *closer) == Some(")") {
+                    stack.pop();
+                }
+            }
+            "esac" | "fi" | "done" | "}" => {
+                if stack.last().map(|(closer, _)| *closer) == Some(token.value.as_str()) {
+                    stack.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    stack.first().map(|(_, line)| *line)
+}
+
 /// Advance an open `=~` parse_matched_pair scan depth over one token
 /// (see the scan tracking in `stdin_source_needs_more_posix`). Keyword
 /// `(`/`)` are the lexer's split points; an unquoted word's unescaped
@@ -1499,6 +1539,14 @@ fn advance_regexp_scan_depth(depth: isize, token: &crate::lexer::Token) -> isize
 /// `"${...}"` (Interp 221), which decides whether the input is complete.
 pub fn stdin_source_needs_more_posix(source: &str, posix: bool) -> bool {
     if stdin_source_text_needs_more(source, posix) {
+        return true;
+    }
+    // rubash#1573: an unterminated `[[` holds the group open (the
+    // conditional is one command; see GroupScanFeeder::
+    // token_level_needs_more for the parked-feeder arm of this rule —
+    // both halves of the completeness test ask the scanner's PST_CONDCMD
+    // state so their answers agree).
+    if crate::lexer::source_ends_in_cond_command(source, posix) {
         return true;
     }
 
@@ -2988,6 +3036,21 @@ fn run_source_impl(
                 .rsplit_once('\n')
                 .map(|(prefix, _)| prefix.to_string())
                 .unwrap_or_default(),
+        };
+        // rubash#1589: the matched-pair cut above stops at the pair's
+        // own line, but when that line sits inside a keyword compound
+        // that is itself unclosed at EOF (`if true; then` on the line
+        // above an unclosed quote), the prefix still ends mid-compound
+        // — running it standalone makes the prefix's own parse report
+        // the compound's EOF diagnostic ahead of the pair's, while GNU
+        // prints only the pair's (its reader died inside the compound,
+        // so the compound is the failed command and none of it — nor
+        // anything else on its opening line — ever ran). Retreat the
+        // cut to the outermost still-open compound's opening line.
+        let prefix = match unclosed_compound_open_line(&prefix) {
+            Some(open) if open > 1 => prefix.lines().take(open - 1).collect::<Vec<_>>().join("\n"),
+            Some(_) => String::new(),
+            None => prefix,
         };
         if !prefix.trim().is_empty() {
             let _ = run_source_prefix_diagnostic_owned(
