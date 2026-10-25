@@ -288,7 +288,9 @@ fn parse_arithmetic_for_brace_body(
             .trim_start_matches('{')
             .trim_end_matches('}')
             .trim();
-        let body_tokens = crate::lexer::tokenize(inner);
+        // rubash#1544: folded-body re-lex under the fold pass's posix
+        // mode, locked (see Token::posix_gate).
+        let body_tokens = crate::lexer::tokenize_locked_body(inner, token.posix_gate);
         return Some((parse_arithmetic_for_body_commands(&body_tokens), index + 1));
     }
 

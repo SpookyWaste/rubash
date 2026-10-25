@@ -376,6 +376,9 @@ impl<'a> Lexer<'a> {
         // on the live `extended_glob' as each word is lexed), not the
         // post-tokenization global a later `shopt -u' may have flipped.
         token.extglob_gate = self.extended_glob;
+        // rubash#1544: same read-time snapshot for the posix mode
+        // (see Token::posix_gate).
+        token.posix_gate = self.posix;
         token
     }
 
