@@ -895,6 +895,23 @@ pub struct Executor {
     /// and cleared at every pending-clearing boundary, same discipline as
     /// `evalerror_subscript_pending`.
     pub(crate) evalerror_exit_toomany_pending: Cell<bool>,
+    /// rubash#1518: marks a pending evalerror abort as the ARITHMETIC
+    /// evalerror class (GNU expr.c `evalerror` -> `jump_to_top_level
+    /// (DISCARD)`). Unlike the bad-substitution / failglob classes —
+    /// whose word-expansion errors a `set -e` shell treats as fatal
+    /// (GNU 5.3.20 probes: `set -e; echo ${#:}; echo after` and the
+    /// failglob twin both stop) — an arithmetic evalerror is a pure
+    /// jump in every context: it bypasses the errexit epilogue exactly
+    /// like it bypasses the ERR trap (probes: assignment, argument,
+    /// subscript, offset, for-list, case-word and declare forms under
+    /// `set -e` all discard the command and continue with rc 0). The
+    /// reader's errexit promotion therefore skips this class. Armed at
+    /// the conversion funnels that turn a recorded arithmetic failure
+    /// into `ExpansionFailure` (abort_on_expansion_errors,
+    /// expand_command_words, the assignment-word funnel); cleared at
+    /// every pending-clearing boundary, same discipline as
+    /// `evalerror_failglob_pending`.
+    pub(crate) evalerror_arith_pending: Cell<bool>,
     /// rubash#637: the `evalerror_exec_depth` value at which the currently
     /// executing eval'd list runs (`None` outside `eval`). A nested abort
     /// unwinds silently everywhere EXCEPT the eval'd top list itself, where

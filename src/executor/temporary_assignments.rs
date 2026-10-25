@@ -222,6 +222,9 @@ impl Executor {
                 // rubash#439: expansion error, not a failed command — no ERR
                 // trap may fire for a command that never ran.
                 self.command_expansion_failed.set(true);
+                // rubash#1518: prefix-assignment evalerror is the same
+                // pure-DISCARD class — no errexit promotion.
+                self.evalerror_arith_pending.set(true);
                 self.raise_evalerror_abort();
                 assignments_failed = true;
                 break;
