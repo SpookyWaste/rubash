@@ -14,6 +14,12 @@ pub(crate) struct ArithDynamicContext {
     funcname_top: Option<String>,
     debug_trap_command: Option<String>,
     pipestatus_first: i32,
+    /// Sparse (index, status) snapshot of the live PIPESTATUS cell
+    /// (rubash#1364 R3); empty unless the cell shape is LiveArray.
+    /// Arithmetic element reads consult it because the env mirror
+    /// never carries pipeline results — the completion writer updates
+    /// the cell state only.
+    pipestatus_entries: Vec<(i64, i32)>,
 }
 
 impl ArithDynamicContext {
@@ -65,6 +71,37 @@ impl ArithDynamicContext {
             "PIPESTATUS" => Some(self.pipestatus_first.to_string()),
             _ => None,
         }
+    }
+
+    /// Arithmetic `${PIPESTATUS[i]}` / `PIPESTATUS[i]` element read
+    /// over the live-cell snapshot (rubash#1364 R3): the outer None
+    /// means "no live snapshot — fall back to the env mirror" (scalar
+    /// or frozen shapes keep their existing arithmetic posture); the
+    /// inner Option is the element verdict, with a negative subscript
+    /// resolving against the maximum index exactly like
+    /// array_reference (a miss reads as unset, i.e. empty text).
+    pub(in crate::executor) fn pipestatus_element(&self, index: i128) -> Option<Option<String>> {
+        if self.pipestatus_entries.is_empty() {
+            return None;
+        }
+        let resolved: i128 = if index < 0 {
+            let max_index = self
+                .pipestatus_entries
+                .last()
+                .map(|(index, _)| *index as i128)?;
+            max_index + 1 + index
+        } else {
+            index
+        };
+        if resolved < 0 {
+            return Some(None);
+        }
+        Some(
+            self.pipestatus_entries
+                .iter()
+                .find(|(entry_index, _)| *entry_index as i128 == resolved)
+                .map(|(_, status)| status.to_string()),
+        )
     }
 }
 
@@ -301,13 +338,16 @@ impl Executor {
             // frozen by a valueless declaration) reads as unset, not
             // as a fabricated 0 (rubash#1363/#1364).
             "PIPESTATUS" => match self.shell_state.pipestatus_shape {
-                crate::shell::state::PipestatusShape::LiveArray => Some(
-                    self.shell_state
-                        .pipestatus
-                        .first()
-                        .map(i32::to_string)
-                        .unwrap_or_default(),
-                ),
+                // Element 0 BY INDEX (rubash#1364 R3): on a sparse
+                // live array whose smallest index is above 0 the
+                // element is unset — the first entry's value is some
+                // other pipeline slot's status, never $PIPESTATUS.
+                crate::shell::state::PipestatusShape::LiveArray => self
+                    .shell_state
+                    .pipestatus
+                    .iter()
+                    .find(|(index, _)| *index == 0)
+                    .map(|(_, status)| status.to_string()),
                 crate::shell::state::PipestatusShape::Scalar => {
                     self.shell_state.env_vars.get("PIPESTATUS").cloned()
                 }
@@ -528,10 +568,11 @@ impl Executor {
                 let cflag = flag(CAPCASE_VARS, "c");
                 match self.shell_state.pipestatus_shape {
                     crate::shell::state::PipestatusShape::LiveArray => {
+                        // Real indices (rubash#1364 R3): a sparse
+                        // cell declares as ([2]="0"), never renumbered.
                         let elements = self
-                            .pipestatus_values()
+                            .pipestatus_entries()
                             .iter()
-                            .enumerate()
                             .map(|(index, status)| {
                                 format!("[{index}]={}", sh_double_quote_text(status))
                             })
@@ -696,7 +737,22 @@ impl Executor {
                     .unwrap_or_default()
             }),
             debug_trap_command: self.shell_state.debug_trap_command.borrow().clone(),
-            pipestatus_first: self.shell_state.pipestatus.first().copied().unwrap_or(0),
+            // Arithmetic $PIPESTATUS is element 0 BY INDEX
+            // (rubash#1364 R3), 0 when that element is unset.
+            pipestatus_first: self
+                .shell_state
+                .pipestatus
+                .iter()
+                .find(|(index, _)| *index == 0)
+                .map(|(_, status)| *status)
+                .unwrap_or(0),
+            pipestatus_entries: if self.shell_state.pipestatus_shape
+                == crate::shell::state::PipestatusShape::LiveArray
+            {
+                self.shell_state.pipestatus.clone()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -885,6 +941,12 @@ impl Executor {
         name: &str,
         index: i128,
     ) -> Option<String> {
+        // PIPESTATUS is the one dynamic array whose elements are NOT
+        // a contiguous 0..n render (rubash#1364 R3): subscripts name
+        // sparse indices and resolve against the maximum index.
+        if self.resolved_variable_name(name).as_deref() == Some("PIPESTATUS") {
+            return self.pipestatus_element(index);
+        }
         let values = self.dynamic_stack_array_values(name)?;
         dense_view_element(&values, index)
     }
@@ -913,7 +975,18 @@ impl Executor {
         let name = self.resolved_variable_name(name)?;
         let name = name.as_str();
         match name {
-            "PIPESTATUS" => return Some(format_indexed_array_values(self.pipestatus_values())),
+            // Real indices in the storage render (rubash#1364 R3):
+            // every storage-mediated read — ${!PIPESTATUS[@]}, slices
+            // via array_parameter_slice, mirror subscripts — then
+            // sees the sparse cell as GNU's ARRAY object.
+            "PIPESTATUS" => {
+                let entries = self
+                    .pipestatus_entries()
+                    .into_iter()
+                    .map(|(index, value)| (index as usize, value))
+                    .collect();
+                return Some(format_indexed_array_storage(entries));
+            }
             "FUNCNAME" => {
                 // Same att_invisibility as the scalar read above
                 // (variables.c:1812 make_funcname_visible): outside any

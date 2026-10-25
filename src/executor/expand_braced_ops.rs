@@ -124,6 +124,11 @@ impl Executor {
                 };
                 return Some(self.group_value_at(index).unwrap_or_default());
             }
+            // rubash#1364 R3: PIPESTATUS subscripts resolve against
+            // the sparse cell (silent posture, like the dynamic leg).
+            if self.resolved_variable_name(array_name).as_deref() == Some("PIPESTATUS") {
+                return Some(self.pipestatus_element(index).unwrap_or_default());
+            }
             // rubash#375: dynamic stack arrays read the element straight
             // from the live view (silent None posture, same as the storage
             // path this replaces).

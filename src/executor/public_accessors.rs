@@ -1,6 +1,17 @@
 use super::*;
 use crate::shell::var_table::VarTable;
 
+/// array.c:516 array_insert over the sparse PIPESTATUS entry list:
+/// an element already living at `index` is replaced in place (the
+/// element count does not change); otherwise the entry is inserted
+/// keeping the list sorted by index (rubash#1364 R3).
+fn pipestatus_insert_or_replace(entries: &mut Vec<(i64, i32)>, index: i64, status: i32) {
+    match entries.binary_search_by_key(&index, |(entry_index, _)| *entry_index) {
+        Ok(position) => entries[position].1 = status,
+        Err(position) => entries.insert(position, (index, status)),
+    }
+}
+
 /// Stamp a line-number env key without allocating when the value is
 /// unchanged. Byte-identical inserts are idempotent, so the equality gate
 /// is behavior-neutral; it exists because a loop body re-stamps the same
@@ -1420,16 +1431,46 @@ impl Executor {
                     crate::executor::UNSET_DYNAMIC_VARS,
                     "PIPESTATUS",
                 );
+                // make_new_array_variable creates an EMPTY array
+                // object; entries left over from the unbound cell are
+                // gone with it.
+                self.shell_state.pipestatus.clear();
             }
             crate::shell::state::PipestatusShape::LiveArray => {}
             crate::shell::state::PipestatusShape::Scalar
             | crate::shell::state::PipestatusShape::Valueless
             | crate::shell::state::PipestatusShape::ValuelessArray => return,
         }
-        self.shell_state.pipestatus.clear();
-        self.shell_state.pipestatus.extend(statuses);
-        if self.shell_state.pipestatus.is_empty() {
-            self.shell_state.pipestatus.push(0);
+        // The write itself is variables.c:6291 set_pipestatus_array
+        // over the sparse ARRAY object (rubash#1364 R3): an empty
+        // array takes the statuses at indices 0..n; otherwise the
+        // existing elements are replaced IN INDEX ORDER (which also
+        // covers the count==1 fast case) and any remaining statuses
+        // are written AT THEIR INDEX via array_insert (array.c:516)
+        // — an insert landing on an occupied index replaces it, so a
+        // sparse cell keeps its indices and its element count can
+        // stay below the status count. Only when the cell holds MORE
+        // elements than statuses does GNU delete: array_flush plus a
+        // dense rebuild at 0..n, indices NOT preserved.
+        let statuses: Vec<i32> = statuses.into_iter().collect();
+        let statuses: &[i32] = if statuses.is_empty() { &[0] } else { &statuses };
+        let entries = &mut self.shell_state.pipestatus;
+        let count = entries.len();
+        if count == 0 || count > statuses.len() {
+            entries.clear();
+            entries.extend(
+                statuses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, status)| (index as i64, *status)),
+            );
+        } else {
+            for (position, entry) in entries.iter_mut().enumerate() {
+                entry.1 = statuses[position];
+            }
+            for index in count..statuses.len() {
+                pipestatus_insert_or_replace(entries, index as i64, statuses[index]);
+            }
         }
     }
 
@@ -1465,13 +1506,14 @@ impl Executor {
                 crate::executor::UNSET_DYNAMIC_VARS,
                 "PIPESTATUS",
             );
-            let entries = indexed_array_entries(&stored);
-            let len = entries.keys().max().map(|max| max + 1).unwrap_or(0);
-            let mut vector = vec![0i32; len];
-            for (index, element) in &entries {
-                vector[*index] = element.trim().parse::<i32>().unwrap_or(0);
-            }
-            self.shell_state.pipestatus = vector;
+            // The stored form IS the array object here (bind_variable
+            // wrote it), so sync index-for-index: a sparse bind stays
+            // sparse in the status state (rubash#1364 R3) instead of
+            // collapsing into a dense vector with zero-filled holes.
+            self.shell_state.pipestatus = indexed_array_entries(&stored)
+                .into_iter()
+                .map(|(index, element)| (index as i64, element.trim().parse::<i32>().unwrap_or(0)))
+                .collect();
         } else if self.shell_state.pipestatus_shape
             != crate::shell::state::PipestatusShape::LiveArray
         {
@@ -1558,7 +1600,8 @@ impl Executor {
                         .get("PIPESTATUS")
                         .cloned()
                         .unwrap_or_default();
-                    self.shell_state.pipestatus = vec![scalar.trim().parse::<i32>().unwrap_or(0)];
+                    self.shell_state.pipestatus =
+                        vec![(0, scalar.trim().parse::<i32>().unwrap_or(0))];
                     self.shell_state.pipestatus_shape =
                         crate::shell::state::PipestatusShape::LiveArray;
                 }
@@ -1658,9 +1701,84 @@ impl Executor {
                 .shell_state
                 .pipestatus
                 .iter()
-                .map(i32::to_string)
+                .map(|(_, status)| status.to_string())
                 .collect(),
         }
+    }
+
+    /// Index-preserving sibling of `pipestatus_values`: the cell's
+    /// elements as (index, value) pairs in ascending index order. A
+    /// scalar cell is its value at index 0; valueless/absent cells
+    /// have no elements (rubash#1364 R3).
+    pub(in crate::executor) fn pipestatus_entries(&self) -> Vec<(i64, String)> {
+        match self.shell_state.pipestatus_shape {
+            crate::shell::state::PipestatusShape::Scalar => vec![(
+                0,
+                self.shell_state
+                    .env_vars
+                    .get("PIPESTATUS")
+                    .cloned()
+                    .unwrap_or_default(),
+            )],
+            crate::shell::state::PipestatusShape::Valueless
+            | crate::shell::state::PipestatusShape::ValuelessArray
+            | crate::shell::state::PipestatusShape::Absent => Vec::new(),
+            crate::shell::state::PipestatusShape::LiveArray => self
+                .shell_state
+                .pipestatus
+                .iter()
+                .map(|(index, status)| (*index, status.to_string()))
+                .collect(),
+        }
+    }
+
+    /// GNU arrayfunc.c array_reference over the PIPESTATUS cell: a
+    /// non-negative subscript names an INDEX (a sparse hole reads as
+    /// unset, silently); a negative subscript resolves against the
+    /// MAXIMUM index (max_index + 1 + subscript) and also reads as
+    /// unset when the resolution lands on a hole or below zero — the
+    /// caller decides whether an unresolvable negative subscript is
+    /// the diagnostic-bearing case (see pipestatus_subscript_resolves).
+    /// Non-array shapes keep the dense single-value view the generic
+    /// paths used before the sparse rework (rubash#1364 R3).
+    pub(in crate::executor) fn pipestatus_element(&self, index: i128) -> Option<String> {
+        if self.shell_state.pipestatus_shape != crate::shell::state::PipestatusShape::LiveArray {
+            return dense_view_element(&self.pipestatus_values(), index);
+        }
+        let entries = &self.shell_state.pipestatus;
+        let resolved: i128 = if index < 0 {
+            let max_index = entries.last().map(|(index, _)| *index as i128)?;
+            max_index + 1 + index
+        } else {
+            index
+        };
+        if resolved < 0 {
+            return None;
+        }
+        entries
+            .iter()
+            .find(|(entry_index, _)| *entry_index as i128 == resolved)
+            .map(|(_, status)| status.to_string())
+    }
+
+    /// Whether a subscript on the PIPESTATUS cell resolves at all:
+    /// only a negative subscript whose max-index resolution falls
+    /// below zero is unresolvable — GNU's INDEX_ERROR posture in
+    /// array_value_internal (array.c), which the subscript-fetch
+    /// sites render as `bad array subscript`. Missing elements at a
+    /// resolvable index read as unset with no diagnostic.
+    pub(in crate::executor) fn pipestatus_subscript_resolves(&self, index: i128) -> bool {
+        if index >= 0 {
+            return true;
+        }
+        if self.shell_state.pipestatus_shape == crate::shell::state::PipestatusShape::LiveArray {
+            return self
+                .shell_state
+                .pipestatus
+                .last()
+                .is_some_and(|(max_index, _)| *max_index as i128 + 1 + index >= 0);
+        }
+        self.pipestatus_values().len() as i128 + index >= 0
     }
 
     /// GNU error.c get_name_for_error's interactive branch: `base_pathname

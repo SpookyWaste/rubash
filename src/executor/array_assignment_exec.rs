@@ -964,20 +964,22 @@ impl Executor {
             // it wholesale (rubash#1364).
             self.shell_state.pipestatus_shape = crate::shell::state::PipestatusShape::LiveArray;
             unmark_env_name(&mut self.shell_state.env_vars, UNSET_DYNAMIC_VARS, name);
-            let entries = indexed_array_entries(
+            // Index-for-index sync (rubash#1364 R3): the stored form
+            // is the array object the element assignment just wrote,
+            // so a sparse element assignment (`PIPESTATUS[2]=5`)
+            // stays sparse instead of collapsing to a dense vector
+            // with zero-filled holes.
+            self.shell_state.pipestatus = indexed_array_entries(
                 &self
                     .shell_state
                     .env_vars
                     .get("PIPESTATUS")
                     .cloned()
                     .unwrap_or_default(),
-            );
-            let len = entries.keys().max().map(|max| max + 1).unwrap_or(0);
-            let mut vector = vec![0i32; len];
-            for (index, element) in &entries {
-                vector[*index] = element.trim().parse::<i32>().unwrap_or(0);
-            }
-            self.shell_state.pipestatus = vector;
+            )
+            .into_iter()
+            .map(|(index, element)| (index as i64, element.trim().parse::<i32>().unwrap_or(0)))
+            .collect();
         }
         self.exit_code = 0;
         true
