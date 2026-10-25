@@ -1262,6 +1262,78 @@ impl Executor {
         has
     }
 
+    /// rubash#1563: GNU's dynamic `exit_immediately_on_error`
+    /// (execute_cmd.c:5011-5016 sets it 0 for a framed eval/source body,
+    /// :5110 restores it at builtin completion) — the errexit option as
+    /// gated by an active CMD_IGNORE_RETURN frame. Distinct from
+    /// errexit_enabled(), the raw option: exempt positions do not clear
+    /// the dynamic flag, but the eval/source frame does, and a `set -e`
+    /// executed inside the frame updates the option without re-arming
+    /// the print-time exit (flags.c:262 change_flag consults
+    /// builtin_ignoring_errexit). Diagnostic print sites that GNU routes
+    /// through error.c report_error's exit check must read this, not the
+    /// option.
+    pub(in crate::executor) fn exit_immediately_on_error(&self) -> bool {
+        self.errexit_enabled() && self.errexit_ignore_frame == 0
+    }
+
+    /// rubash#1563: true when a DISCARD raised now would land on a
+    /// parse_and_execute catch — an eval/source body whose frame was
+    /// entered at the CURRENT subshell_depth. A `( )` region entered
+    /// since the frame bumps subshell_depth and installs
+    /// execute_in_subshell's preserving catch, so the depths differ and
+    /// the fold must not fire (execute_cmd.c:1821-1825).
+    pub(in crate::executor) fn in_parse_and_execute_frame(&self) -> bool {
+        self.parse_and_execute_frames.last() == Some(&self.shell_state.subshell_depth.get())
+    }
+
+    /// rubash#1563: true when this executor is executing a subshell
+    /// environment's body — a `( )` region or command-substitution body
+    /// on this executor, or a fork copy (pipeline stage, process
+    /// substitution, substitution child), whose constructor bumps
+    /// subshell_depth. GNU's parse_and_execute DISCARD arm checks the
+    /// same condition (`subshell_environment`, evalstring.c:427-450):
+    /// there the folded DISCARD re-jumps to the enclosing catch instead
+    /// of returning from parse_and_execute.
+    pub(in crate::executor) fn in_subshell_environment(&self) -> bool {
+        self.shell_state.subshell_depth.get() > 0
+            || self.shell_state.in_command_substitution.get()
+            || self
+                .shell_state
+                .env_vars
+                .contains_key("__RUBASH_COMSUB_BODY")
+    }
+
+    /// rubash#1563: enter a parse_and_execute body (an eval string or a
+    /// sourced file). Pushes the frame — GNU evalstring.c
+    /// parse_and_execute, reached from eval_builtin and from
+    /// evalfile.c source_file — and, when the invoking builtin was
+    /// itself dispatched under CMD_IGNORE_RETURN (rubash's
+    /// suppress_errexit raised at entry) outside a subshell environment,
+    /// raises the errexit ignore frame for the body's duration
+    /// (execute_cmd.c:5004-5016: the frame applies only when
+    /// `subshell == 0` and the builtin is eval/source under
+    /// CMD_IGNORE_RETURN / CMD_COMMAND_BUILTIN). Returns the saved
+    /// counters for exit_parse_and_execute_frame; every exit path of the
+    /// body must restore them.
+    pub(crate) fn enter_parse_and_execute_frame(&mut self) -> (usize, usize) {
+        let saved = (
+            self.parse_and_execute_frames.len(),
+            self.errexit_ignore_frame,
+        );
+        self.parse_and_execute_frames
+            .push(self.shell_state.subshell_depth.get());
+        if self.suppress_errexit > 0 && !self.in_subshell_environment() {
+            self.errexit_ignore_frame += 1;
+        }
+        saved
+    }
+
+    pub(crate) fn exit_parse_and_execute_frame(&mut self, saved: (usize, usize)) {
+        self.parse_and_execute_frames.truncate(saved.0);
+        self.errexit_ignore_frame = saved.1;
+    }
+
     /// rubash#1542: the FINAL status a failed `${var:=word}`/`${var=word}`
     /// assignment produces in the current frame, given the class's
     /// pre-set status (`class_status`: EX_BADUSAGE 2 for a readonly
@@ -1274,23 +1346,26 @@ impl Executor {
     /// report_error exit_shells on the spot when
     /// exit_immediately_on_error is live, with the status current at
     /// print time: the pre-bind `$?` (0 remapped to EXECUTION_FAILURE)
-    /// for readonly, 1 for special. The flag is the raw option: errexit
-    /// -exempt positions do not clear it, so they die too. Without
-    /// errexit the DISCARD proceeds with the pre-set status, folded to
-    /// EXECUTION_FAILURE inside a command-substitution body
-    /// (discard_fold_frame).
+    /// for readonly, 1 for special. The flag is the DYNAMIC
+    /// exit_immediately_on_error: errexit-exempt positions do not clear
+    /// it, so they die too, but the eval/source CMD_IGNORE_RETURN frame
+    /// does (execute_cmd.c:5004-5016, rubash#1563). Without the
+    /// print-time exit the DISCARD proceeds with the pre-set status,
+    /// folded to EXECUTION_FAILURE at a parse_and_execute catch — a
+    /// command-substitution body (discard_fold_frame) or an eval/source
+    /// body (in_parse_and_execute_frame).
     pub(in crate::executor) fn param_assign_discard_status(
         &self,
         class_status: i32,
         prev_status: i32,
     ) -> i32 {
-        if self.errexit_enabled() {
+        if self.exit_immediately_on_error() {
             if class_status == 1 || prev_status == 0 {
                 1
             } else {
                 prev_status
             }
-        } else if self.discard_fold_frame() {
+        } else if self.discard_fold_frame() || self.in_parse_and_execute_frame() {
             1
         } else {
             class_status

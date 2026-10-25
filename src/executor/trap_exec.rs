@@ -617,7 +617,14 @@ impl Executor {
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
         let saved_read_generation = self.enter_read_unit();
+        // rubash#1563: the string runs through GNU's parse_and_execute
+        // (evalstring.c) — push its frame (the DISCARD fold catch, and
+        // the CMD_IGNORE_RETURN errexit-clearing frame when this eval
+        // was itself dispatched from an exempt position) for the body's
+        // duration, restored on every path below.
+        let saved_frame = self.enter_parse_and_execute_frame();
         let result = self.execute_eval_source_inner(source, caller_line, cmd);
+        self.exit_parse_and_execute_frame(saved_frame);
         self.exit_read_unit(saved_read_generation);
         // rubash#846: eval runs its string as a fresh frame (GNU evalstring
         // parse_and_execute) — an inner compound's own redirect failure
@@ -788,6 +795,18 @@ impl Executor {
             // absorbs its own ExpansionFailure before it can reach here,
             // matching GNU's forked-subshell re-jump.
             Err(ExecuteError::ExpansionFailure(code)) => {
+                // rubash#1563: in a subshell environment GNU's
+                // parse_and_execute DISCARD arm does NOT return — it
+                // folds the status and re-jumps to the enclosing catch
+                // (evalstring.c:427-450 should_jump_to_top_level), so
+                // the enclosing body (comsub body, `( )` region) is
+                // abandoned with the folded status instead of
+                // continuing past the eval. The class cleanup still
+                // runs (pe_dispose), then the Err keeps unwinding.
+                if self.in_subshell_environment() {
+                    self.absorb_failglob_discard();
+                    return Err(ExecuteError::ExpansionFailure(code));
+                }
                 self.exit_code = code;
                 // rubash#753: the escaped Err can only be a failglob /
                 // redirect-no-match discard raised where the eval'd list's

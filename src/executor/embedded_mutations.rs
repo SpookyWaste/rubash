@@ -2243,6 +2243,17 @@ impl Executor {
                 // it armed past the loop's end).
                 let body_status = if executor.evalerror_exit_toomany_pending.get() {
                     1
+                } else if body_status == 2 && executor.command_expansion_failed.get() {
+                    // rubash#1563: the same catch folds the param-assign
+                    // DISCARD class (`${var:=word}` against a readonly
+                    // target, subst.c's EX_BADUSAGE preset): the body's
+                    // last command died on the failed bind
+                    // (command_expansion_failed is reset per command, so
+                    // it names that command's class), and the catch the
+                    // DISCARD lands on is this body's parse_and_execute
+                    // frame. A plain status-2 command (exit 2, a failing
+                    // test) carries no expansion failure and keeps 2.
+                    1
                 } else {
                     body_status
                 };
@@ -2459,7 +2470,11 @@ impl Executor {
         };
         // rubash#1541: same parse_and_execute catch fold as the AST
         // substitution above — the trap below runs on the caught status.
+        // rubash#1563: the param-assign DISCARD class folds there too
+        // (see the AST substitution tail for the discriminator).
         let body_status = if self.evalerror_exit_toomany_pending.get() {
+            1
+        } else if body_status == 2 && self.command_expansion_failed.get() {
             1
         } else {
             body_status

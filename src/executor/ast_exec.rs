@@ -1865,12 +1865,33 @@ impl Executor {
                     // of a failed `${var:=word}` bind to EXECUTION_FAILURE
                     // — `x=$(echo ${v:=x})` on a readonly `v` substitutes
                     // with status 1, not 2 (see discard_fold_frame).
-                    let code = if code == 2 && self.discard_fold_frame() {
+                    // rubash#1563: an eval/source body's catch is the same
+                    // parse_and_execute catch — fold there too
+                    // (in_parse_and_execute_frame), e.g. a DISCARD inside
+                    // a brace group or function called from the string.
+                    let code = if code == 2
+                        && (self.discard_fold_frame() || self.in_parse_and_execute_frame())
+                    {
                         1
                     } else {
                         code
                     };
                     self.exit_code = code;
+                    // rubash#1563: at an eval/source boundary inside a
+                    // subshell environment, GNU's parse_and_execute
+                    // DISCARD arm folds and RE-JUMPS instead of
+                    // returning (evalstring.c:427-450
+                    // should_jump_to_top_level): the enclosing body is
+                    // abandoned with the folded status. Absorbing here
+                    // would let a command-substitution body continue
+                    // past a failed eval/source (`x=$(eval ': ${v:=x}'
+                    // || true; echo IN)` prints IN in the old code, GNU
+                    // substitutes nothing and the body dies at 1).
+                    if self.eval_list_depth.get() == Some(self.evalerror_exec_depth.get())
+                        && self.in_subshell_environment()
+                    {
+                        return Err(ExecuteError::ExpansionFailure(code));
+                    }
                     // GNU 5.3.20: under `set -e` a bad-substitution or
                     // failglob word-expansion failure exits the script
                     // (probe 2026-09-02: `set -e; echo ${#:}; echo after`

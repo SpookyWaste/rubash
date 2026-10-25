@@ -1469,6 +1469,11 @@ impl Executor {
                 subshell.execute_ast(&ast)
             } else {
                 subshell.suppress_errexit = 0;
+                // rubash#1563: subst.c:7356-7360 — the child also clears
+                // builtin_ignoring_errexit (and its own 'e' flag below),
+                // so an inherited CMD_IGNORE_RETURN frame ends at the
+                // substitution boundary.
+                subshell.errexit_ignore_frame = 0;
                 crate::builtins::set::set_shell_option(
                     &mut subshell.shell_state.env_vars,
                     "errexit",
@@ -1698,6 +1703,22 @@ impl Executor {
             conditional_output_procsubs: Vec::new(),
             pending_scalar_assignment: false,
             suppress_errexit: self.suppress_errexit,
+            // rubash#1563: a fork copy inherits the parent's GNU frame
+            // state verbatim (builtin_ignoring_errexit is process memory);
+            // the parse_and_execute frame entries renumber with the
+            // child's subshell_depth (+1 above), so an inherited frame
+            // still compares current inside a pipeline element — GNU's
+            // element child keeps the parent's parse_and_execute catch
+            // (evalstring.c:423-450) and folds there. The command-
+            // substitution child proper resets the ignore frame where it
+            // clears the option (subst.c:7356-7360), at the body sites
+            // below, not here.
+            errexit_ignore_frame: self.errexit_ignore_frame,
+            parse_and_execute_frames: self
+                .parse_and_execute_frames
+                .iter()
+                .map(|depth| depth + 1)
+                .collect(),
             command_builtin_depth: self.command_builtin_depth,
             builtin_wrapper_depth: self.builtin_wrapper_depth,
             standard_path_scope: self.standard_path_scope.clone(),
@@ -1891,6 +1912,11 @@ impl Executor {
                 // clears the -e flag for the body (same adjustment as
                 // command_substitute's fork).
                 subshell.suppress_errexit = 0;
+                // rubash#1563: subst.c:7356-7360 — the child also clears
+                // builtin_ignoring_errexit (and its own 'e' flag below),
+                // so an inherited CMD_IGNORE_RETURN frame ends at the
+                // substitution boundary.
+                subshell.errexit_ignore_frame = 0;
                 crate::builtins::set::set_shell_option(
                     &mut subshell.shell_state.env_vars,
                     "errexit",

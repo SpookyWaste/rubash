@@ -428,6 +428,8 @@ impl Executor {
             conditional_output_procsubs: Vec::new(),
             pending_scalar_assignment: false,
             suppress_errexit: 0,
+            errexit_ignore_frame: 0,
+            parse_and_execute_frames: Vec::new(),
             command_builtin_depth: 0,
             builtin_wrapper_depth: 0,
             standard_path_scope: None,
