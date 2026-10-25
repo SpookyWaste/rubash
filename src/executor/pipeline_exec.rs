@@ -894,6 +894,10 @@ impl Executor {
         let mut hoisted_time_inverted = false;
         let mut deferred_time_report: Option<(super::read_helpers::TimeCommandStart, bool)> = None;
         let mut input = String::new();
+        // rubash#1552: stderr bytes of non-final stages under an ambient
+        // `2>&1` binding — they ride the pipeline's output stream (see
+        // the stage-loop merge), never the inter-stage pipe.
+        let mut ambient_stderr = String::new();
         let mut statuses = Vec::new();
         let mut first_stage = 0usize;
         // rubash#1141: production timing of the stream each stage reads.
@@ -919,10 +923,13 @@ impl Executor {
                 // A prefix member carrying `|&` was normalized to a
                 // trailing `2>&1` and declined admission, so the only stderr
                 // merge left here is the ambient `exec 2>&1` fd-table
-                // binding (fd 2 already on fd 1's object).
+                // binding (fd 2 already on fd 1's object). Ambient bytes
+                // ride the pipeline's OUTPUT stream, not the pipe payload
+                // the remaining stages read (rubash#1552 — same fd model
+                // as the stage-loop merge below).
                 if self.fd_table.write_endpoint(2) == Some(FdWriteEndpoint::Stdout) {
                     input = prefix_output;
-                    input.push_str(&prefix_stderr);
+                    ambient_stderr.push_str(&prefix_stderr);
                 } else if !prefix_stderr.is_empty() {
                     std::io::stderr().write_all(
                         &crate::executor::substitution_metadata::shell_text_to_raw_bytes(
@@ -1132,10 +1139,28 @@ impl Executor {
             // disjunct: a compound stage's group redirect and a simple
             // stage's route_pipeline_stage_streams both resolve the dup
             // against the pipe-bound fd 1, and the stderr bytes arrive
-            // already merged. The ambient `exec 2>&1` fd-table binding
-            // (every stage's fd 2 on fd 1's object) keeps appending here.
+            // already merged (next_stderr empty). What remains here is
+            // the AMBIENT binding — an enclosing compound's or `exec`'s
+            // `2>&1` — and its fd model differs: GNU binds the stage's
+            // fd 2 to the fd-1 object the pipeline INHERITED (the
+            // enclosing stream), not to the inter-stage pipe bound to
+            // the stage's own fd 1 (execute_cmd.c:2620 execute_pipeline
+            // connects the elements first, each element keeping the
+            // shell's remaining fds). Folding those bytes into
+            // next_input hands them to the next stage as its stdin,
+            // where they die unread whenever that stage never consumes
+            // it (rubash#1552: `{ time '-p' true | cat; } 2>&1` lost
+            // the first stage's `command not found`). They belong to
+            // the pipeline's own output stream: non-final stages
+            // accumulate theirs in stage order, and only the final
+            // stage's may join next_input — there next_input IS the
+            // pipeline output.
             if self.fd_table.write_endpoint(2) == Some(FdWriteEndpoint::Stdout) {
-                next_input.push_str(&next_stderr);
+                if last_stage {
+                    next_input.push_str(&next_stderr);
+                } else {
+                    ambient_stderr.push_str(&next_stderr);
+                }
             } else if !next_stderr.is_empty() {
                 std::io::stderr().write_all(
                     &crate::executor::substitution_metadata::shell_text_to_raw_bytes(&next_stderr),
@@ -1211,7 +1236,16 @@ impl Executor {
         // rubash#1141: hand the enclosing stream's timing back.
         self.timed_stdin = entry_timed_stdin;
         let final_command = commands.last().expect("pipeline has at least one stage");
-        self.write_pipeline_output(final_command, &input, true)?;
+        // rubash#1552: ambient-`2>&1` stage stderr precedes the final
+        // stage's output on the shared stream (GNU starts the elements
+        // concurrently, so a non-final element's diagnostic is written
+        // while the final element is still producing).
+        if ambient_stderr.is_empty() {
+            self.write_pipeline_output(final_command, &input, true)?;
+        } else {
+            let combined = format!("{ambient_stderr}{input}");
+            self.write_pipeline_output(final_command, &combined, true)?;
+        }
         if !time_report_routed {
             if let Some(prefix) = &time_prefix {
                 if let Some(started) = time_prefix_started {
