@@ -1619,11 +1619,17 @@ impl Executor {
             }
             // The µs race (delivery lands between the take above and
             // observe's own take) surfaces as the untrapped error; fold it
-            // into the same abort instead of an exit jump.
+            // into the same abort instead of an exit jump — but only for
+            // a kernel-caused delivery (rubash#1640): a shell-only
+            // kill(2) SIGINT leaves GNU's real child running, and the
+            // interrupt observe just consumed is forgotten, so the
+            // virtual child sleeps on to completion (rc=0).
             #[cfg(unix)]
             match self.observe_signals_while_blocked() {
                 Err(ExecuteError::ExitCode(code)) if code == 128 + libc::SIGINT => {
-                    return Ok(Some(libc::SIGINT));
+                    if crate::builtins::kill::last_delivery_kernel_caused(libc::SIGINT) {
+                        return Ok(Some(libc::SIGINT));
+                    }
                 }
                 other => other?,
             }

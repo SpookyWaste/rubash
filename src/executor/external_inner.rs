@@ -1701,7 +1701,20 @@ impl ForegroundBuiltinSigintGuard {
         let mut rest = Vec::new();
         let mut interrupted = false;
         for signal in pending {
-            if signal == libc::SIGINT && crate::builtins::kill::kernel_handler_installed(signal) {
+            // rubash#1640: only a KERNEL-caused SIGINT (the terminal
+            // driver's group delivery, ^C) kills the virtual child —
+            // that is the delivery GNU's real foreground child dies
+            // from. A kill(2) addressed to the shell alone leaves the
+            // real child running, so it is not an abort: put it back
+            // for observe_signals_while_blocked, which consumes it
+            // without ending the wait (the recorded interrupt is
+            // forgotten when the child completes normally, exactly
+            // like the trapped path's origin check in
+            // sleep_interruptibly).
+            if signal == libc::SIGINT
+                && crate::builtins::kill::kernel_handler_installed(signal)
+                && crate::builtins::kill::last_delivery_kernel_caused(signal)
+            {
                 interrupted = true;
             } else {
                 rest.push(signal);
