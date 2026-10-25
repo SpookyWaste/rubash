@@ -308,6 +308,47 @@ pub(super) fn parse_case_command(
         let pattern_close_delimiter_metadata = build_keyword_metadata(&tokens[i]);
         i += 1;
 
+        // GNU parse.y:1227-1236 pattern_list: after the pattern's
+        // closing `)' the grammar admits only a compound_list or a
+        // newline_list (the bodyless alternative); compound_list
+        // (parse.y:1262) is `newline_list list0', and no list can begin
+        // with `)'. A second `)' — `x))', `(x))', `x|y))' — is a
+        // syntax error at that token (rubash#1641; verified vs GNU
+        // 5.3.20: `syntax error near unexpected token `)'', rc 2, and
+        // the clause never executes). Report it through the same
+        // pattern-position error channel as the extglob `(' above, and
+        // consume only through this case's `esac` so commands after
+        // the case stay separate units.
+        let mut body_head = i;
+        while body_head < tokens.len()
+            && tokens[body_head].kind == TokenKind::Semicolon
+            && tokens[body_head].line_break
+        {
+            body_head += 1;
+        }
+        if is_keyword(tokens, body_head, ")") {
+            let mut command = CommandNode::new();
+            command.line = tokens.get(start).map(|token| token.position);
+            command.logical_line = tokens.get(start).map(|token| token.logical_line);
+            command.insert_assignment(
+                "__RUBASH_PARSE_ERROR_NEAR__".to_string(),
+                format!(
+                    "){}{}",
+                    crate::executor::markers::PARSE_ERROR_FIELD_SEP,
+                    tokens[body_head].position
+                ),
+            );
+            command.insert_assignment(
+                "__RUBASH_PARSE_SOURCE__".to_string(),
+                pattern_error_line_text(tokens, body_head),
+            );
+            return Some(finish_compound_command(
+                command,
+                tokens,
+                case_command_end_index(tokens, start),
+            ));
+        }
+
         let body_start = i;
         i = case_body_end(tokens, i);
         let body = super::parse_loop::parse_body_with_diagnostics(
