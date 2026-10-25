@@ -150,28 +150,20 @@ fn issue1537_glued_close_then_andand_continues_the_conditional() {
 #[test]
 fn issue1537_glued_close_script_form_reads_next_line() {
     // Script form: the cond reader consumes the NEXT line's first
-    // token (`echo') before erroring. The `syntax error near' line is
-    // asserted only in shape here: GNU reports near `echo', but the
-    // lexer currently drops the leading whitespace of every token on
-    // the line following a `=~'-group line whose `]]' was glued (the
-    // tokens reach the near-token walk-back as if glued, so rubash
-    // reports `echoa') — a separate pre-existing lexer divergence,
-    // recorded in the cluster report; the message, echo line and rc
-    // below are the GNU-exact parts this issue owns.
+    // token (`echo') before erroring. The near line is asserted
+    // byte-exact now: the glued-`]]' lexer state residue that used to
+    // glue it into `echoa' (the following line's tokens lost their
+    // leading whitespace) was fixed as rubash#1553.
     let (stdout, stderr, code) = run_rubash_file("[[ a =~ (b)]]\necho after\n", "script");
     assert_eq!(stdout, "");
-    let diags = diag_lines(&stderr);
-    assert_eq!(diags.len(), 3);
-    assert_eq!(
-        diags[0],
-        "line 1: syntax error in conditional expression: unexpected token `echo'"
+    expect_diags(
+        &stderr,
+        &[
+            "line 1: syntax error in conditional expression: unexpected token `echo'",
+            "line 2: syntax error near `echo'",
+            "line 2: `echo after'",
+        ],
     );
-    assert!(
-        diags[1].starts_with("line 2: syntax error near `echo"),
-        "near line shape: {}",
-        diags[1]
-    );
-    assert_eq!(diags[2], "line 2: `echo after'");
     assert_eq!(code, Some(2));
 }
 
