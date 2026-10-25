@@ -20,6 +20,12 @@ pub(crate) struct ArithDynamicContext {
     /// never carries pipeline results — the completion writer updates
     /// the cell state only.
     pipestatus_entries: Vec<(i64, i32)>,
+    /// The PIPESTATUS cell's scalar text when its shape is Scalar
+    /// (rubash#1555): a tempenv/local scalar shadow is VT_VARIABLE in
+    /// arithmetic too (get_array_value -> array_value_internal), so
+    /// element 0 is the text and a negative subscript is INDEX_ERROR
+    /// rather than a dense rebase onto the value.
+    pipestatus_scalar: Option<String>,
 }
 
 impl ArithDynamicContext {
@@ -81,6 +87,16 @@ impl ArithDynamicContext {
     /// resolving against the maximum index exactly like
     /// array_reference (a miss reads as unset, i.e. empty text).
     pub(in crate::executor) fn pipestatus_element(&self, index: i128) -> Option<Option<String>> {
+        if let Some(scalar) = &self.pipestatus_scalar {
+            // VT_VARIABLE cell (arrayfunc.c array_value_internal via
+            // get_array_value): element 0 is the whole string, every
+            // other subscript is unset — negatives never rebase.
+            return Some(if index == 0 {
+                Some(scalar.clone())
+            } else {
+                None
+            });
+        }
         if self.pipestatus_entries.is_empty() {
             return None;
         }
@@ -102,6 +118,25 @@ impl ArithDynamicContext {
                 .find(|(entry_index, _)| *entry_index as i128 == resolved)
                 .map(|(_, status)| status.to_string()),
         )
+    }
+
+    /// Whether a negative subscript on the PIPESTATUS cell is the
+    /// INDEX_ERROR case (arrayfunc.c:1580-1586 via get_array_value):
+    /// scalar and absent/valueless cells never rebase, so every
+    /// negative subscript is bad; a live array rebases against its
+    /// maximum index and is bad only when the resolution still
+    /// falls below zero (rubash#1555).
+    pub(in crate::executor) fn pipestatus_negative_is_bad(&self, index: i128) -> bool {
+        if index >= 0 {
+            return false;
+        }
+        if self.pipestatus_scalar.is_some() {
+            return true;
+        }
+        match self.pipestatus_entries.last() {
+            Some((max_index, _)) => *max_index as i128 + 1 + index < 0,
+            None => true,
+        }
     }
 }
 
@@ -752,6 +787,19 @@ impl Executor {
                 self.shell_state.pipestatus.clone()
             } else {
                 Vec::new()
+            },
+            pipestatus_scalar: if self.shell_state.pipestatus_shape
+                == crate::shell::state::PipestatusShape::Scalar
+            {
+                Some(
+                    self.shell_state
+                        .env_vars
+                        .get("PIPESTATUS")
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+            } else {
+                None
             },
         }
     }

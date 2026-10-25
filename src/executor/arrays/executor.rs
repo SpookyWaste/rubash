@@ -600,11 +600,19 @@ impl Executor {
         {
             // GNU subst.c get_var_and_type: a scalar base is VT_VARIABLE, so
             // element 0 is the whole string and no other element exists.
-            // A negative subscript that cannot resolve yields empty
-            // (arrayfunc.c INDEX_ERROR) — the `bad array subscript`
-            // diagnostic is emitted once, by the braced-operator value arm
-            // that owns this reference (expand_braced_ops), so this
-            // lower-level fetcher stays silent to avoid a double report.
+            // A negative subscript yields empty with the `bad array
+            // subscript` diagnostic: array_value_internal
+            // (arrayfunc.c:1580-1586) rebases a negative subscript ONLY
+            // for array_p(var), so on a scalar (or unset/valueless) base
+            // every negative subscript is INDEX_ERROR — err_badarraysub
+            // fires inside the fetch itself, which is why the operator,
+            // pattern, replacement and substring arms all report it in
+            // GNU. This fetcher therefore owns the report, exactly like
+            // its dynamic and mirror sibling legs below; the
+            // braced-operator integer arm (expand_braced_ops) defers to
+            // it (rubash#1555 — previously only the plain form reported,
+            // via that arm, and the operator/pattern/substring fetches
+            // stayed silent).
             // The scalar text must never be re-parsed as a list
             // (rubash#755). A dynamic scalar (RANDOM/SECONDS/...) reads
             // live: element 0 is the current dynamic value, shadowing
@@ -622,6 +630,9 @@ impl Executor {
                     return None;
                 }
                 return Some(crate::executor::shell_safe_value(&storage));
+            }
+            if index < 0 {
+                eprintln!("{}{}: bad array subscript", self.error_prefix(), array_name);
             }
             return None;
         }
