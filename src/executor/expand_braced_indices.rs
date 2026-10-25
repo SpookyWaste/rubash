@@ -542,11 +542,59 @@ impl Executor {
                 .to_string();
         }
         if let Some((array_name, index)) = parse_array_integer_subscript(var_name) {
+            // GNU subst.c:7488 array_length_reference: an absent or
+            // invisible (declared-unset) variable returns 0 BEFORE the
+            // subscript is adjudicated — no diagnostic even for a
+            // negative subscript.
+            if is_marked_var(&self.shell_state.env_vars, DECLARED_UNSET_VARS, array_name) {
+                return "0".to_string();
+            }
+            // PIPESTATUS elements live in the cell, never in the env
+            // mirror, so the mirror legs below read 0 for every live
+            // element; adjudicate through the shape machinery instead
+            // (rubash#1555: live lengths, and the scalar-shape window
+            // form ${#PIPESTATUS[-1]} is the bad-subscript case).
+            if self.resolved_variable_name(array_name).as_deref() == Some("PIPESTATUS") {
+                use crate::shell::state::PipestatusShape;
+                let shape = self.shell_state.pipestatus_shape;
+                if shape == PipestatusShape::Absent {
+                    return "0".to_string();
+                }
+                if let Some(element) = self.pipestatus_element(index) {
+                    return parameter_char_length(&element).to_string();
+                }
+                if index < 0
+                    && matches!(shape, PipestatusShape::Scalar | PipestatusShape::LiveArray)
+                    && !self.pipestatus_subscript_resolves(index)
+                {
+                    self.write_diagnostic_fd2(
+                        format!("{}[{}]: bad array subscript\n", self.error_prefix(), index)
+                            .as_bytes(),
+                    );
+                    self.shell_state.arithmetic_nonfatal_error.set(true);
+                    return String::new();
+                }
+                return "0".to_string();
+            }
             // GNU subst.c:7561-7569: negative subscripts to indexed arrays
             // count back from end; if still negative, err_badarraysub is
             // called and the expansion returns empty (array.tests:232-240
             // ${#xpath[-10]} with max_index=5 -> -4 -> bad array subscript,
-            // echo produces an empty line, not "0").
+            // echo produces an empty line, not "0"). The rebase is gated
+            // on array_p(var) (subst.c:7563), so a SCALAR base with a
+            // negative subscript takes the same error return
+            // (rubash#1555: ${#v[-1]} printed the scalar's length via
+            // the dense mirror resolve instead).
+            if index < 0 && !self.parameter_is_array_variable(array_name) {
+                if self.shell_state.env_vars.get(array_name).is_none() {
+                    return "0".to_string();
+                }
+                self.write_diagnostic_fd2(
+                    format!("{}[{}]: bad array subscript\n", self.error_prefix(), index).as_bytes(),
+                );
+                self.shell_state.arithmetic_nonfatal_error.set(true);
+                return String::new();
+            }
             if let Some(value) = self.shell_state.env_vars.get(array_name) {
                 if let Some(resolved) = resolve_indexed_array_subscript(value, index) {
                     if let Some(element) = array_value_at(value, resolved) {

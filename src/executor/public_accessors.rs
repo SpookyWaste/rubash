@@ -1785,11 +1785,22 @@ impl Executor {
     /// unset when the resolution lands on a hole or below zero — the
     /// caller decides whether an unresolvable negative subscript is
     /// the diagnostic-bearing case (see pipestatus_subscript_resolves).
-    /// Non-array shapes keep the dense single-value view the generic
-    /// paths used before the sparse rework (rubash#1364 R3).
+    /// Non-array shapes follow the VT_VARIABLE arm of
+    /// array_value_internal (arrayfunc.c:1571-1586, 1627-1628): the
+    /// rebase is gated on array_p(var), so a scalar cell never rebases
+    /// a negative subscript — element 0 is the value, every other
+    /// subscript reads as unset, and a negative subscript is the
+    /// INDEX_ERROR case (rubash#1555; the dense single-value view the
+    /// generic paths used before the sparse rework wrongly rebased
+    /// -1 onto the scalar value).
     pub(in crate::executor) fn pipestatus_element(&self, index: i128) -> Option<String> {
         if self.shell_state.pipestatus_shape != crate::shell::state::PipestatusShape::LiveArray {
-            return dense_view_element(&self.pipestatus_values(), index);
+            if self.shell_state.pipestatus_shape == crate::shell::state::PipestatusShape::Scalar
+                && index == 0
+            {
+                return self.shell_state.env_vars.get("PIPESTATUS").cloned();
+            }
+            return None;
         }
         let entries = &self.shell_state.pipestatus;
         let resolved: i128 = if index < 0 {
@@ -1810,9 +1821,13 @@ impl Executor {
     /// Whether a subscript on the PIPESTATUS cell resolves at all:
     /// only a negative subscript whose max-index resolution falls
     /// below zero is unresolvable — GNU's INDEX_ERROR posture in
-    /// array_value_internal (array.c), which the subscript-fetch
-    /// sites render as `bad array subscript`. Missing elements at a
-    /// resolvable index read as unset with no diagnostic.
+    /// array_value_internal (arrayfunc.c:1580-1586), which the
+    /// subscript-fetch sites render as `bad array subscript`. Missing
+    /// elements at a resolvable index read as unset with no
+    /// diagnostic. The rebase exists only for the array shape: a
+    /// scalar/valueless/absent cell is VT_VARIABLE, where ANY
+    /// negative subscript is unresolvable (rubash#1555 — the old
+    /// dense-length formula let -1 "resolve" onto a scalar cell).
     pub(in crate::executor) fn pipestatus_subscript_resolves(&self, index: i128) -> bool {
         if index >= 0 {
             return true;
@@ -1824,7 +1839,7 @@ impl Executor {
                 .last()
                 .is_some_and(|(max_index, _)| *max_index as i128 + 1 + index >= 0);
         }
-        self.pipestatus_values().len() as i128 + index >= 0
+        false
     }
 
     /// GNU error.c get_name_for_error's interactive branch: `base_pathname

@@ -5,7 +5,7 @@ use crate::executor::arithmetic::{
 use crate::executor::{
     array_value_at, assoc_entries, assoc_value_at, current_epoch_seconds,
     env_derived_dynamic_parameter_value, format_assoc_storage, format_indexed_array_storage,
-    indexed_array_entries, is_marked_var, is_noassign_bash_array, is_shell_name,
+    indexed_array_entries, is_array_storage, is_marked_var, is_noassign_bash_array, is_shell_name,
     is_shell_name_char, mark_env_name, next_random_from_state, next_srandom_from_state,
     parse_array_subscript, resolve_indexed_array_subscript, set_process_env,
     sync_shell_assignment_process_env, unmark_env_name, ARRAY_VARS, ASSOC_128_VARS, ASSOC_VARS,
@@ -28,10 +28,56 @@ impl ConditionalArithParser<'_> {
                 return verdict;
             }
         }
+        // GNU get_array_value -> arrayfunc.c:1580-1586
+        // array_value_internal: a negative subscript rebases ONLY
+        // against a real array cell; a scalar (or unset) base keeps
+        // the negative index, which is INDEX_ERROR and reads as
+        // unset. The mirror resolve below is dense (it rebases
+        // against the storage length), so guard the non-array base
+        // here; the diagnostic itself is the caller's (see
+        // arith_negative_subscript_is_bad, rubash#1555).
+        if index < 0 && !self.arith_base_is_array(name) {
+            return None;
+        }
         self.env_vars.get(name).and_then(|value| {
             resolve_indexed_array_subscript(value, index)
                 .and_then(|resolved| array_value_at(value, resolved))
         })
+    }
+
+    /// Whether the arithmetic base cell for `name` is a real array
+    /// (GNU array_p(var)): the ARRAY_VARS mark or array-shaped
+    /// mirror storage. Assoc cells take the string-key paths and
+    /// never reach the indexed reads.
+    fn arith_base_is_array(&self, name: &str) -> bool {
+        is_marked_var(self.env_vars, ARRAY_VARS, name)
+            || self
+                .env_vars
+                .get(name)
+                .is_some_and(|value| is_array_storage(value))
+    }
+
+    /// GNU array_value_internal's INDEX_ERROR verdict for a
+    /// negative arithmetic subscript (rubash#1555): a non-array base
+    /// is always bad; an array base is bad only when the max-index
+    /// rebase still lands below zero (an empty array is bad for
+    /// every negative subscript).
+    fn arith_negative_subscript_is_bad(&self, name: &str, index: i128) -> bool {
+        if name == "PIPESTATUS" {
+            return self
+                .dynamic_values
+                .is_none_or(|context| context.pipestatus_negative_is_bad(index));
+        }
+        if !self.arith_base_is_array(name) {
+            return true;
+        }
+        let Some(value) = self.env_vars.get(name) else {
+            return true;
+        };
+        match indexed_array_entries(value).into_iter().last() {
+            Some((max_index, _)) => max_index as i128 + 1 + index < 0,
+            None => true,
+        }
     }
 
     pub(super) fn lvalue_value(&mut self, lvalue: &ArithLValue) -> Option<i128> {
@@ -45,6 +91,14 @@ impl ConditionalArithParser<'_> {
             ArithLValue::Scalar(name) => self.variable_value(name),
             ArithLValue::Indexed { name, index } => {
                 let value = self.indexed_element_text(name, *index);
+                // GNU get_array_value -> array_value_internal
+                // INDEX_ERROR: an unresolvable negative subscript
+                // reports `name: bad array subscript` and reads as 0
+                // (rubash#1555; the dense mirror resolve used to hand
+                // back the scalar value / stay silent).
+                if *index < 0 && self.arith_negative_subscript_is_bad(name, *index) {
+                    self.diags.push(ArithEvalDiag::BadSubscript(name.clone()));
+                }
                 let value = value.unwrap_or_default();
                 self.evaluate_variable_text(&format!("{name}[{index}]"), &value)
             }
@@ -55,6 +109,9 @@ impl ConditionalArithParser<'_> {
                 // increments i once (verified GNU 5.3).
                 let index = self.eval_subscript_index(subscript)?;
                 let value = self.indexed_element_text(name, index);
+                if index < 0 && self.arith_negative_subscript_is_bad(name, index) {
+                    self.diags.push(ArithEvalDiag::BadSubscript(name.clone()));
+                }
                 let value = value.unwrap_or_default();
                 self.evaluate_variable_text(&format!("{name}[{index}]"), &value)
             }

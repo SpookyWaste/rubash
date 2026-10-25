@@ -137,17 +137,19 @@ impl Executor {
             }
             if !self.parameter_is_array_variable(array_name) {
                 // Scalar base is GNU VT_VARIABLE: element 0 holds the whole
-                // string, every other index is absent, an unresolvable
-                // negative reports `bad array subscript` (rubash#755).
+                // string, every other index is absent (rubash#755). An
+                // unresolvable negative reports `bad array subscript`
+                // inside the element fetch itself (arrayfunc.c
+                // array_value_internal INDEX_ERROR), and the indexed arm
+                // of the braced chain has already run that fetch — and
+                // its report — before this arm is consulted, so this arm
+                // stays silent to avoid a double report (rubash#1555).
                 if index == 0 {
                     return Some(
                         self.parameter_array_storage(array_name)
                             .map(|value| shell_safe_value(&value))
                             .unwrap_or_default(),
                     );
-                }
-                if index < 0 {
-                    eprintln!("{}{}: bad array subscript", self.error_prefix(), array_name);
                 }
                 return Some(String::new());
             }
