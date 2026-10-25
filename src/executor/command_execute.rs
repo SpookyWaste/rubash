@@ -985,6 +985,23 @@ impl Executor {
         &mut self,
         cmd: &'a CommandNode,
     ) -> std::borrow::Cow<'a, CommandNode> {
+        let (stripped, diagnostics) = self.strip_invalid_env_assignment_prefixes_collecting(cmd);
+        for line in &diagnostics {
+            let _ = std::io::stderr().write_all(line.as_bytes());
+        }
+        stripped
+    }
+
+    /// The strip core, with the diagnostics returned instead of
+    /// written: pipeline stages route them through the ambient fd 2
+    /// (write_default_stderr) because GNU reports them during the
+    /// element's word expansion, before the element's own
+    /// redirections apply (execute_cmd.c:4617) — the same routing as
+    /// the stage expansion-error checks (rubash#1568).
+    pub(in crate::executor) fn strip_invalid_env_assignment_prefixes_collecting<'a>(
+        &mut self,
+        cmd: &'a CommandNode,
+    ) -> (std::borrow::Cow<'a, CommandNode>, Vec<String>) {
         // Find the run of leading array-style assignment words.
         let mut prefix_end = 0usize;
         for index in 0..cmd.words.len() {
@@ -992,6 +1009,33 @@ impl Executor {
                 break;
             }
             prefix_end += 1;
+        }
+        // rubash#1568: when EVERY word is an assignment word (the
+        // element run plus a following plain-assignment run), there
+        // is no command word at all — GNU's assignment()
+        // (general.c:480) classifies them all as assignment words,
+        // so the node is an assignment STATEMENT whose words all
+        // bind permanently (execute_mixed_assignment_statement),
+        // never an invalidid prefix in front of a command. Leave
+        // the node untouched (and silent) for that arm.
+        if prefix_end > 0 {
+            // The continuation run uses the mixed-statement
+            // admission's own classification (a plain word of any
+            // value shape, or another element word) — NOT the
+            // harvest's, which additionally refuses compound values
+            // it cannot move.
+            let mut rest_run = 0usize;
+            for index in prefix_end..cmd.words.len() {
+                let is_assignment_word = split_assignment_word(&cmd.words[index]).is_some()
+                    || command_word_is_array_element_assignment(cmd, index);
+                if !is_assignment_word {
+                    break;
+                }
+                rest_run += 1;
+            }
+            if prefix_end + rest_run == cmd.words.len() {
+                return (std::borrow::Cow::Borrowed(cmd), Vec::new());
+            }
         }
         // Only strip when there is at least one remaining command word.
         // If all words are array-style assignments, the command is
@@ -1004,13 +1048,14 @@ impl Executor {
         // instead of cloning (Cow; the copy exists only when words are
         // actually removed).
         if prefix_end == 0 || prefix_end >= cmd.words.len() {
-            return std::borrow::Cow::Borrowed(cmd);
+            return (std::borrow::Cow::Borrowed(cmd), Vec::new());
         }
         // Report the diagnostic for each invalid identifier, mirroring
         // GNU assign_in_env -> sh_invalidid -> builtin_error. The name is
         // everything before `=` (with `+` stripped for append), which for
         // array-style words like `var[0]=X` is `var[0]` -- not a valid
         // identifier because `[` and `]` are not legal variable characters.
+        let mut diagnostics = Vec::new();
         for word in &cmd.words[..prefix_end] {
             let Some((left, _)) = word.split_once('=') else {
                 continue;
@@ -1023,7 +1068,7 @@ impl Executor {
                     self.diagnostic_prefix(),
                     name
                 );
-                let _ = std::io::stderr().write_all(line.as_bytes());
+                diagnostics.push(line);
             }
         }
         // rubash#1556: the parser's assignment-run classification
@@ -1061,7 +1106,25 @@ impl Executor {
             stripped.word_metadata = cmd.word_metadata[skip..].to_vec();
         }
         stripped.assignments.extend(harvested);
-        std::borrow::Cow::Owned(stripped)
+        // rubash#1568: the parser's array-element records address
+        // words by index; dropping the leading run leaves those
+        // indexes pointing at the wrong words (a later consumer
+        // re-classified the new head word `declare` as an element
+        // word from the stale record and stripped it too). Drop the
+        // removed words' records and shift the survivors' indexes.
+        stripped.array_element_assignments = cmd
+            .array_element_assignments
+            .iter()
+            .filter_map(|assignment| match assignment.word_index {
+                None => Some(assignment.clone()),
+                Some(word_index) => word_index.checked_sub(harvest_end).map(|shifted| {
+                    let mut assignment = assignment.clone();
+                    assignment.word_index = Some(shifted);
+                    assignment
+                }),
+            })
+            .collect();
+        (std::borrow::Cow::Owned(stripped), diagnostics)
     }
 }
 
