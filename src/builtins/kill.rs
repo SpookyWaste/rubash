@@ -1832,7 +1832,7 @@ mod kernel_signals {
     /// Whether the most recently drained delivery of `sig` was
     /// kernel-caused (see KERNEL_CAUSED).
     pub(super) fn last_delivery_kernel_caused(sig: i32) -> bool {
-        if !MANAGED.contains(&sig) {
+        if !is_managed(sig) {
             return false;
         }
         KERNEL_CAUSED.load(Ordering::Relaxed) & bit(sig) != 0
@@ -1842,20 +1842,33 @@ mod kernel_signals {
     /// shell alone) supersedes the origin record for `sig`: it is by
     /// construction NOT a kernel/group delivery.
     pub(super) fn note_self_delivery(sig: i32) {
-        if MANAGED.contains(&sig) {
+        if is_managed(sig) {
             KERNEL_CAUSED.fetch_and(!bit(sig), Ordering::Relaxed);
         }
     }
 
-    /// The seven signals the backend manages dispositions for (the
-    /// signal_hook-catchable subset of GNU's terminating set that a trap can
-    /// name and the executor can dispatch). SIGPIPE joined the set with
-    /// rubash#1333: it used to be deliberately excluded because the Rust
-    /// runtime pre-ignores it (see capture_entry_and_policy, which resets
-    /// it to SIG_DFL), but GNU leaves SIGPIPE at SIG_DFL in a script shell,
-    /// so an untrapped delivery must kill the shell (exit 141) and a PIPE
-    /// trap must fire.
-    const MANAGED: [i32; 7] = [
+    /// The named signals the backend manages dispositions for (the
+    /// signal_hook-catchable set a trap can name and the executor can
+    /// dispatch). SIGPIPE joined the set with rubash#1333: it used to be
+    /// deliberately excluded because the Rust runtime pre-ignores it
+    /// (see capture_entry_and_policy, which resets it to SIG_DFL), but
+    /// GNU leaves SIGPIPE at SIG_DFL in a script shell, so an untrapped
+    /// delivery must kill the shell (exit 141) and a PIPE trap must
+    /// fire.
+    ///
+    /// rubash#1511 extends the original seven (HUP/INT/QUIT/TERM/USR1/
+    /// USR2/PIPE) to every remaining trappable signal: until then a trap
+    /// (or `trap ''`) on TRAP/ABRT/ALRM/STKFLT/XCPU/XFSZ/VTALRM/PROF/IO/
+    /// PWR/SYS/RT* changed nothing at the kernel, so a trapped
+    /// terminating signal still killed the shell by its default action
+    /// and a trapped URG/WINCH (default-ignore) was never delivered —
+    /// GNU installs one handler per trapped signal (sig.c:830), so all
+    /// of them run their trap. SIGSEGV/SIGBUS are NOT here: the fatal
+    /// set below routes them (rubash#1475), and rubash#1511 routes
+    /// SIGILL/SIGFPE there too (signal-hook refuses to register them).
+    /// SIGCHLD and the stop class stay unregistered for the reasons in
+    /// the module doc.
+    const MANAGED_CORE: &[i32] = &[
         libc::SIGHUP as i32,
         libc::SIGINT as i32,
         libc::SIGQUIT as i32,
@@ -1863,38 +1876,83 @@ mod kernel_signals {
         libc::SIGUSR1 as i32,
         libc::SIGUSR2 as i32,
         libc::SIGPIPE as i32,
+        libc::SIGTRAP as i32,
+        libc::SIGABRT as i32,
+        libc::SIGALRM as i32,
+        libc::SIGXCPU as i32,
+        libc::SIGXFSZ as i32,
+        libc::SIGVTALRM as i32,
+        libc::SIGPROF as i32,
+        libc::SIGIO as i32,
+        libc::SIGSYS as i32,
+        libc::SIGURG as i32,
+        libc::SIGWINCH as i32,
     ];
+
+    /// Linux/Android-only managed additions: SIGSTKFLT and SIGPWR
+    /// (no Darwin/BSD counterpart in GNU's table either) plus the
+    /// POSIX realtime block, whose bounds are runtime values (glibc
+    /// SIGRTMIN()=34, SIGRTMAX()=64; bionic 41..64; Darwin/BSD have
+    /// none, where GNU's signames.c compiles the block out too).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn extend_managed(signals: &mut Vec<i32>) {
+        signals.push(libc::SIGSTKFLT as i32);
+        signals.push(libc::SIGPWR as i32);
+        let lo = libc::SIGRTMIN();
+        let hi = libc::SIGRTMAX();
+        if lo > 0 && hi >= lo {
+            signals.extend(lo..=hi);
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn extend_managed(_signals: &mut Vec<i32>) {}
+
+    /// The full managed list: MANAGED_CORE plus the platform extras.
+    fn managed_signals() -> &'static [i32] {
+        static MANAGED: OnceLock<Vec<i32>> = OnceLock::new();
+        MANAGED.get_or_init(|| {
+            let mut signals = MANAGED_CORE.to_vec();
+            extend_managed(&mut signals);
+            signals
+        })
+    }
+
+    fn is_managed(sig: i32) -> bool {
+        managed_signals().contains(&sig)
+    }
 
     /// Bitmask (1 << index into MANAGED) of signals currently routed to the
     /// signal_hook handler.
     static HANDLER_SET: AtomicU64 = AtomicU64::new(0);
 
-    /// Packed per-signal disposition state (2 bits each: 0=Default, 1=Ignore,
-    /// 2=Handler) so the per-boundary reconcile skips unchanged signals —
-    /// no sigaction traffic on the steady-state command path.
-    static DISPOSITION_STATE: AtomicU64 = AtomicU64::new(0);
+    /// Packed per-signal disposition state (2 bits each: 0=Default,
+    /// 1=Ignore, 2=Handler) so the per-boundary reconcile skips
+    /// unchanged signals — no sigaction traffic on the steady-state
+    /// command path. Two words: rubash#1511's full managed list runs
+    /// past 32 signals (102 state bits on Linux).
+    static DISPOSITION_STATE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
-    /// The managed signals occupy state bits 0..=13 (two bits each, in
-    /// MANAGED order). All-zero means every one is at Default.
-    const MANAGED_STATE_MASK: u64 = (1u64 << (2 * MANAGED.len())) - 1;
-
-    fn state_bits(sig: i32) -> u64 {
-        let index = MANAGED
+    /// (word, shift) of `sig`'s 2-bit field in DISPOSITION_STATE (two
+    /// bits per signal, in managed_signals() order).
+    fn state_slot(sig: i32) -> (usize, u32) {
+        let bits = 2 * managed_signals()
             .iter()
             .position(|&m| m == sig)
             .expect("managed signal");
-        2 * index as u64
+        (bits / 64, (bits % 64) as u32)
     }
 
     fn current_state(sig: i32) -> u8 {
-        ((DISPOSITION_STATE.load(Ordering::Relaxed) >> state_bits(sig)) & 0b11) as u8
+        let (word, shift) = state_slot(sig);
+        ((DISPOSITION_STATE[word].load(Ordering::Relaxed) >> shift) & 0b11) as u8
     }
 
     fn store_state(sig: i32, state: u8) {
-        let bits = state_bits(sig);
-        let mask = 0b11u64 << bits;
-        let previous = DISPOSITION_STATE.fetch_and(!mask, Ordering::SeqCst);
-        DISPOSITION_STATE.fetch_or((state as u64) << bits, Ordering::SeqCst);
+        let (word, shift) = state_slot(sig);
+        let mask = 0b11u64 << shift;
+        let previous = DISPOSITION_STATE[word].fetch_and(!mask, Ordering::SeqCst);
+        DISPOSITION_STATE[word].fetch_or((state as u64) << shift, Ordering::SeqCst);
         let _ = previous;
     }
 
@@ -1940,7 +1998,7 @@ mod kernel_signals {
     }
 
     fn bit(sig: i32) -> u64 {
-        1 << MANAGED
+        1 << managed_signals()
             .iter()
             .position(|&m| m == sig)
             .expect("managed signal")
@@ -2006,9 +2064,21 @@ mod kernel_signals {
     /// recorded disposition state, so a reconcile whose wish-list is also
     /// all-Default has nothing to do. Used by the boundary-poll fast path
     /// (rubash#437) to skip the mutex + per-signal loop on the steady-state
-    /// command path. Reads the packed state word atomically; no lock.
+    /// command path. Reads the packed state words atomically; no lock.
     pub(super) fn at_default_state() -> bool {
-        DISPOSITION_STATE.load(Ordering::Relaxed) & MANAGED_STATE_MASK == 0
+        let total_bits = 2 * managed_signals().len() as u32;
+        let mask = |word: u32| -> u64 {
+            let used = total_bits.saturating_sub(64 * word);
+            if used >= 64 {
+                u64::MAX
+            } else if used == 0 {
+                0
+            } else {
+                (1u64 << used) - 1
+            }
+        };
+        DISPOSITION_STATE[0].load(Ordering::Relaxed) & mask(0) == 0
+            && DISPOSITION_STATE[1].load(Ordering::Relaxed) & mask(1) == 0
     }
 
     pub(super) fn reconcile(dispositions: &[(i32, Disposition)]) {
@@ -2090,15 +2160,15 @@ mod kernel_signals {
     /// swallows, so neither can produce a legitimate pending entry.
     pub(super) fn handler_installed(sig: i32) -> bool {
         if fatal_index(sig).is_some() {
-            // The fatal-pair handler is installed unconditionally at
-            // startup (rubash#1475); a queued entry for the pair is
+            // The fatal-set handler is installed unconditionally at
+            // startup (rubash#1475); a queued entry for the set is
             // legitimate by construction, never a stale registry flag.
             return true;
         }
-        MANAGED.contains(&sig) && HANDLER_SET.load(Ordering::Relaxed) & bit(sig) != 0
+        is_managed(sig) && HANDLER_SET.load(Ordering::Relaxed) & bit(sig) != 0
     }
 
-    /// rubash#1475: the fatal pair, SIGSEGV and SIGBUS. Both are caught
+    /// rubash#1475: the fatal set, SIGSEGV and SIGBUS. Both are caught
     /// by the Rust runtime before main() — its stack-overflow guard
     /// installs a handler for them (visible in /proc/self/status SigCgt
     /// on every rubash process) — and that handler RETURNS for a signal
@@ -2111,6 +2181,14 @@ mod kernel_signals {
     /// signal_hook cannot serve the pair: its handler is a signo queue
     /// writer with no siginfo, and returning from a handler for a
     /// synchronous fault re-executes the faulting instruction forever.
+    ///
+    /// rubash#1511 adds SIGILL and SIGFPE to the set: signal-hook's
+    /// registry flatly refuses to register them (it panics with
+    /// "Attempted to register forbidden signal"), so the managed
+    /// backend cannot route them either. They share the synchronous-
+    /// fault nature that demands the si_code split below — a SENT
+    /// delivery gets shell semantics, a genuine fault chains — so they
+    /// ride this backend rather than the signo queue.
     /// The custom handler below splits arrivals on siginfo.si_code:
     ///   - si_code <= 0 (SI_USER / SI_TKILL / SI_QUEUE / ...): the
     ///     signal was SENT. With a trap armed, count it for the boundary
@@ -2122,23 +2200,48 @@ mod kernel_signals {
     ///     Chain to the disposition saved at install time — in practice
     ///     the runtime's overflow handler — so stack-overflow detection
     ///     and genuine-fault death keep working byte for byte.
-    const FATAL: [i32; 2] = [libc::SIGSEGV as i32, libc::SIGBUS as i32];
+    const FATAL: [i32; 4] = [
+        libc::SIGSEGV as i32,
+        libc::SIGBUS as i32,
+        libc::SIGILL as i32,
+        libc::SIGFPE as i32,
+    ];
 
     /// Queued SENT deliveries per fatal signal (handler increments,
     /// drain_fatal swaps out; a plain atomic add is async-signal-safe).
-    static FATAL_PENDING: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    static FATAL_PENDING: [AtomicU64; 4] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
 
     /// Trap routing for SENT deliveries, per fatal signal:
     /// 0 = Default (die), 1 = Ignore (drop), 2 = Handler (queue).
     /// Mirrored from the trap table by reconcile_fatal.
-    static FATAL_STATE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    static FATAL_STATE: [AtomicU64; 4] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
 
     /// Dispositions saved when the fatal handler was installed — the
     /// hardware-fault chain targets. Written once inside
     /// capture_entry_and_policy's Once before the handler is installed;
     /// the Once's happens-before edge covers the handler's later reads.
-    static FATAL_PREV_HANDLER: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-    static FATAL_PREV_FLAGS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    static FATAL_PREV_HANDLER: [AtomicU64; 4] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static FATAL_PREV_FLAGS: [AtomicU64; 4] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
 
     fn fatal_index(sig: i32) -> Option<usize> {
         FATAL.iter().position(|&f| f == sig)
@@ -2199,7 +2302,7 @@ mod kernel_signals {
         }
     }
 
-    /// Install the fatal-pair handler, saving the current dispositions
+    /// Install the fatal-set handler, saving the current dispositions
     /// as the hardware-fault chain targets. Called from
     /// capture_entry_and_policy's Once, before any trap can exist, so
     /// both signals start at Default routing (an untrapped sent delivery
@@ -2226,7 +2329,7 @@ mod kernel_signals {
         }
     }
 
-    /// Drain the fatal pair's queued SENT deliveries (take_all_signals
+    /// Drain the fatal set's queued SENT deliveries (take_all_signals
     /// merges them with the managed drain).
     pub(super) fn drain_fatal() -> Vec<i32> {
         let mut signals = Vec::new();
@@ -2245,7 +2348,7 @@ mod kernel_signals {
             .any(|count| count.load(Ordering::Relaxed) > 0)
     }
 
-    /// True when both fatal signals sit at Default routing, so the
+    /// True when every fatal signal sits at Default routing, so the
     /// boundary reconcile's fast path may skip the trap-table walk.
     pub(super) fn fatal_at_default() -> bool {
         FATAL_STATE
@@ -2253,7 +2356,7 @@ mod kernel_signals {
             .all(|state| state.load(Ordering::Relaxed) == 0)
     }
 
-    /// Mirror the trap table's wishes for the fatal pair (the managed
+    /// Mirror the trap table's wishes for the fatal set (the managed
     /// reconcile's Disposition mapping): Handler queues sent deliveries
     /// for the boundary dispatcher, Ignore drops them, Default restores
     /// die-on-delivery. Entry-ignored signals stay pinned at Ignore.
@@ -2311,7 +2414,7 @@ mod kernel_signals {
             // Capture entry dispositions BEFORE changing anything:
             // signals ignored on entry must stay ignored (POSIX 2.11,
             // GNU sig.c:273).
-            for sig in MANAGED {
+            for &sig in managed_signals() {
                 if sig == libc::SIGPIPE as i32 {
                     // rubash#1333: SIGPIPE's entry disposition is
                     // unobservable — the Rust runtime sets SIG_IGN before
@@ -2462,7 +2565,7 @@ mod kernel_signals {
         let _ = KERNEL_SIGNALS.set(Mutex::new(signals));
         // Entry-ignored signals stay ignored (captured above); record their
         // state so the first reconcile does not "restore" them to SIG_DFL.
-        for sig in MANAGED {
+        for &sig in managed_signals() {
             if ENTRY_IGNORED.load(Ordering::Relaxed) & bit(sig) != 0 {
                 store_state(sig, 1);
             }
@@ -2485,7 +2588,7 @@ mod kernel_signals {
                 // it to a bare signal number. The WithOrigin slot keeps
                 // the latest origin per signal, which is exactly the
                 // granularity of this record.
-                if MANAGED.contains(&origin.signal) {
+                if is_managed(origin.signal) {
                     if matches!(origin.cause, Cause::Kernel) {
                         KERNEL_CAUSED.fetch_or(bit(origin.signal), Ordering::Relaxed);
                     } else {
@@ -2525,7 +2628,7 @@ mod kernel_signals {
         // silently by the signal). Children always start unblocked;
         // the disposition loop below gives SIGPIPE its entry default.
         block_sigpipe_on_this_thread_unblock();
-        for &sig in MANAGED.iter() {
+        for &sig in managed_signals() {
             let action = if ENTRY_IGNORED.load(Ordering::Relaxed) & bit(sig) != 0 {
                 // Ignored at shell entry: POSIX keeps it ignored for children.
                 libc::SIG_IGN
@@ -2548,22 +2651,85 @@ mod kernel_signals {
     }
 }
 
-/// The seven signals `kernel_signals` manages, paired with their trap-table
-/// short name and the literal `__RUBASH_TRAP_SIG*` env key. Static so the
-/// per-command-boundary reconcile never allocates a key string (rubash#437:
-/// the boundary poll runs once or more per loop iteration, and the old
-/// `format!("__RUBASH_TRAP_SIG{short}")` built six throwaway Strings each
-/// call — tens of thousands of allocations in a short arithmetic loop).
+/// The signals `kernel_signals` manages, paired with their trap-table
+/// short name and the literal `__RUBASH_TRAP_SIG*` env key. Built once
+/// (the realtime block's numbers and names are runtime values, so the
+/// table cannot be a const) and reused by every per-command-boundary
+/// reconcile, which never allocates a key string after init
+/// (rubash#437: the boundary poll runs once or more per loop iteration).
+/// Short names match both signal_trap_name's SIG{name} form and the
+/// SIGNALS table's spellings. rubash#1511 extends the original seven to
+/// the full managed set (see MANAGED_CORE).
 #[cfg(unix)]
-const MANAGED_TRAP_KEYS: [(i32, &str, &str); 7] = [
-    (libc::SIGHUP as i32, "HUP", "__RUBASH_TRAP_SIGHUP"),
-    (libc::SIGINT as i32, "INT", "__RUBASH_TRAP_SIGINT"),
-    (libc::SIGQUIT as i32, "QUIT", "__RUBASH_TRAP_SIGQUIT"),
-    (libc::SIGTERM as i32, "TERM", "__RUBASH_TRAP_SIGTERM"),
-    (libc::SIGUSR1 as i32, "USR1", "__RUBASH_TRAP_SIGUSR1"),
-    (libc::SIGUSR2 as i32, "USR2", "__RUBASH_TRAP_SIGUSR2"),
-    (libc::SIGPIPE as i32, "PIPE", "__RUBASH_TRAP_SIGPIPE"),
-];
+fn managed_trap_keys() -> &'static [(i32, String, String)] {
+    static KEYS: std::sync::OnceLock<Vec<(i32, String, String)>> =
+        std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        let mut keys: Vec<(i32, String, String)> = Vec::new();
+        let mut push = |keys: &mut Vec<(i32, String, String)>, sig: i32, short: &str| {
+            keys.push((sig, short.to_string(), format!("__RUBASH_TRAP_SIG{short}")));
+        };
+        push(&mut keys, libc::SIGHUP as i32, "HUP");
+        push(&mut keys, libc::SIGINT as i32, "INT");
+        push(&mut keys, libc::SIGQUIT as i32, "QUIT");
+        push(&mut keys, libc::SIGTERM as i32, "TERM");
+        push(&mut keys, libc::SIGUSR1 as i32, "USR1");
+        push(&mut keys, libc::SIGUSR2 as i32, "USR2");
+        push(&mut keys, libc::SIGPIPE as i32, "PIPE");
+        push(&mut keys, libc::SIGTRAP as i32, "TRAP");
+        push(&mut keys, libc::SIGABRT as i32, "ABRT");
+        push(&mut keys, libc::SIGALRM as i32, "ALRM");
+        push(&mut keys, libc::SIGXCPU as i32, "XCPU");
+        push(&mut keys, libc::SIGXFSZ as i32, "XFSZ");
+        push(&mut keys, libc::SIGVTALRM as i32, "VTALRM");
+        push(&mut keys, libc::SIGPROF as i32, "PROF");
+        push(&mut keys, libc::SIGIO as i32, "IO");
+        push(&mut keys, libc::SIGSYS as i32, "SYS");
+        push(&mut keys, libc::SIGURG as i32, "URG");
+        push(&mut keys, libc::SIGWINCH as i32, "WINCH");
+        extend_trap_keys(&mut keys);
+        keys
+    })
+}
+
+/// Linux/Android-only trap-key additions: SIGSTKFLT and SIGPWR plus
+/// the realtime block, spelled with the nearer-anchor form the SIGNALS
+/// table (and GNU signames.c) uses — RTMIN+k up to the midpoint,
+/// RTMAX-m above it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn extend_trap_keys(keys: &mut Vec<(i32, String, String)>) {
+    keys.push((
+        libc::SIGSTKFLT as i32,
+        "STKFLT".to_string(),
+        "__RUBASH_TRAP_SIGSTKFLT".to_string(),
+    ));
+    keys.push((
+        libc::SIGPWR as i32,
+        "PWR".to_string(),
+        "__RUBASH_TRAP_SIGPWR".to_string(),
+    ));
+    let lo = libc::SIGRTMIN();
+    let hi = libc::SIGRTMAX();
+    if lo > 0 && hi >= lo {
+        for n in lo..=hi {
+            let k = n - lo;
+            let m = hi - n;
+            let short = if k == 0 {
+                "RTMIN".to_string()
+            } else if m == 0 {
+                "RTMAX".to_string()
+            } else if k <= m {
+                format!("RTMIN+{k}")
+            } else {
+                format!("RTMAX-{m}")
+            };
+            keys.push((n, short.clone(), format!("__RUBASH_TRAP_SIG{short}")));
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn extend_trap_keys(_keys: &mut Vec<(i32, String, String)>) {}
 
 /// Map the executor's trap table onto the kernel dispositions (unix arm of
 /// rubash#226). Mirrors GNU's per-signal rules: `trap 'action' SIG` installs
@@ -2584,19 +2750,16 @@ pub fn reconcile_kernel_trap_dispositions(env_vars: &std::collections::HashMap<S
     // reverse (key present, no reset) is the common trapped case and falls
     // through anyway.
     let no_reset = !env_vars.contains_key("__RUBASH_TRAP_RESET");
-    let mut any_armed = false;
-    for &(_, _, key) in MANAGED_TRAP_KEYS.iter() {
-        if env_vars.contains_key(key) {
-            any_armed = true;
-            break;
-        }
-    }
-    // rubash#1475: a trap on the fatal pair (SIGSEGV/SIGBUS) also forces
-    // the slow path — its routing bits live outside the managed state.
-    if !any_armed {
-        any_armed = env_vars.contains_key("__RUBASH_TRAP_SIGSEGV")
-            || env_vars.contains_key("__RUBASH_TRAP_SIGBUS");
-    }
+    // Any armed signal trap forces the slow path. Every trap-table key
+    // for a signal shares the __RUBASH_TRAP_SIG prefix — the managed
+    // set's and the fatal pair's alike (rubash#1475: the pair's routing
+    // bits live outside the managed state, but their keys must still
+    // defeat this fast path). One prefix pass over the var keys, no
+    // allocation, no per-signal probing (the managed table outgrew a
+    // fixed probe list with rubash#1511).
+    let any_armed = env_vars
+        .keys()
+        .any(|key| key.starts_with("__RUBASH_TRAP_SIG"));
     // An armed EXIT trap also forces the slow path: it routes every
     // otherwise-untrapped managed signal through the handler
     // (sig.c:226-229, rubash#1332 — see the disposition loop below).
@@ -2627,9 +2790,9 @@ pub fn reconcile_kernel_trap_dispositions(env_vars: &std::collections::HashMap<S
         .get("__RUBASH_TRAP_EXIT")
         .is_some_and(|action| !action.is_empty())
         && !reset_contains(reset, "EXIT");
-    let mut dispositions = [(0i32, Disposition::Default); 7];
-    for (slot, &(sig, short, key)) in dispositions.iter_mut().zip(MANAGED_TRAP_KEYS.iter()) {
-        let want = match env_vars.get(key) {
+    let mut dispositions: Vec<(i32, Disposition)> = Vec::new();
+    for (sig, short, key) in managed_trap_keys() {
+        let want = match env_vars.get(key.as_str()) {
             // A real action and not reset-listed -> handler (trap.c
             // trap_builtin -> sig.c:830 set_signal_handler).
             Some(action) if !action.is_empty() && !reset_contains(reset, short) => {
@@ -2641,23 +2804,39 @@ pub fn reconcile_kernel_trap_dispositions(env_vars: &std::collections::HashMap<S
             // trap '' SIG: ignored (trap.def ignore path, kernel SIG_IGN).
             Some(_) => Disposition::Ignore,
             // No trap of its own: an armed EXIT trap still routes the
-            // signal through the handler (sig.c:226-229 above).
-            None if exit_armed => Disposition::Handler,
+            // signal through the handler (sig.c:226-229 above) — but
+            // only for GNU's terminating set (see exit_reroutes).
+            None if exit_armed && exit_reroutes(*sig) => Disposition::Handler,
             None => Disposition::Default,
         };
-        *slot = (sig, want);
+        dispositions.push((*sig, want));
     }
     kernel_signals::reconcile(&dispositions);
-    // rubash#1475: mirror the fatal pair's trap state into the fatal
+    // rubash#1475: mirror the fatal set's trap state into the fatal
     // handler's routing bits, with the same mapping as the managed set
     // (a reset-listed fatal trap behaves like no trap; an armed EXIT
-    // trap does NOT reroute the pair — GNU's sig.c:226-229 applies to
-    // the terminating-signal handler set, and a fatal signal's default
-    // death already runs the EXIT trap through the shell's exit path).
+    // trap does NOT reroute SIGSEGV/SIGBUS — GNU's sig.c:226-229
+    // applies to the terminating-signal handler set, and a fatal
+    // signal's default death already runs the EXIT trap through the
+    // shell's exit path. SIGILL/SIGFPE below are the exception: GNU's
+    // terminating set names them, so they use the rerouting mapping).
     let fatal_want = |short: &str, key: &str| match env_vars.get(key) {
         Some(action) if !action.is_empty() && !reset_contains(reset, short) => Disposition::Handler,
         Some(_) if reset_contains(reset, short) => Disposition::Default,
         Some(_) => Disposition::Ignore,
+        None => Disposition::Default,
+    };
+    // rubash#1511: SIGILL/SIGFPE ride the fatal backend (signal-hook
+    // refuses them), but unlike the pair they DO reroute under an
+    // armed EXIT trap — GNU's terminating set names them (oracle:
+    // EXIT trap + untrapped kill -ILL runs the EXIT trap, dies 132).
+    let fatal_want_rerouted = |short: &str, key: &str| match env_vars.get(key) {
+        Some(action) if !action.is_empty() && !reset_contains(reset, short) => {
+            Disposition::Handler
+        }
+        Some(_) if reset_contains(reset, short) => Disposition::Default,
+        Some(_) => Disposition::Ignore,
+        None if exit_armed => Disposition::Handler,
         None => Disposition::Default,
     };
     kernel_signals::reconcile_fatal(&[
@@ -2669,6 +2848,14 @@ pub fn reconcile_kernel_trap_dispositions(env_vars: &std::collections::HashMap<S
             libc::SIGBUS as i32,
             fatal_want("BUS", "__RUBASH_TRAP_SIGBUS"),
         ),
+        (
+            libc::SIGILL as i32,
+            fatal_want_rerouted("ILL", "__RUBASH_TRAP_SIGILL"),
+        ),
+        (
+            libc::SIGFPE as i32,
+            fatal_want_rerouted("FPE", "__RUBASH_TRAP_SIGFPE"),
+        ),
     ]);
 }
 
@@ -2676,11 +2863,40 @@ pub fn reconcile_kernel_trap_dispositions(env_vars: &std::collections::HashMap<S
 /// signal_trap_name's SIG{name} form minus the SIG prefix.
 #[cfg(unix)]
 fn signal_short_name(signal: i32) -> &'static str {
-    MANAGED_TRAP_KEYS
+    managed_trap_keys()
         .iter()
-        .find(|&&(sig, _, _)| sig == signal)
-        .map(|&(_, short, _)| short)
+        .find(|(sig, _, _)| *sig == signal)
+        .map(|(_, short, _)| short.as_str())
         .unwrap_or("")
+}
+
+/// Whether an armed EXIT trap reroutes `sig` through the handler
+/// (sig.c:226-229 initialize_terminating_signals). GNU's terminating
+/// set is a compile-time C table, so it cannot name the realtime
+/// signals, and it excludes the default-ignore pair — oracle-verified
+/// against GNU 5.3.20 (EXIT trap armed, untrapped self-kill): ILL, FPE,
+/// TRAP, ABRT, ALRM, XCPU, PROF and SYS run the EXIT trap and die at
+/// 128+n, while URG and WINCH are ignored outright and RTMIN dies
+/// without the EXIT trap running. rubash#1511.
+#[cfg(unix)]
+fn exit_reroutes(sig: i32) -> bool {
+    if sig == libc::SIGURG as i32 || sig == libc::SIGWINCH as i32 {
+        return false;
+    }
+    exit_reroutes_platform(sig)
+}
+
+/// The realtime half of exit_reroutes: on Linux/Android the RT block
+/// sits at SIGRTMIN() and above and never reroutes; elsewhere there
+/// is no RT block to exclude.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn exit_reroutes_platform(sig: i32) -> bool {
+    sig < libc::SIGRTMIN()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn exit_reroutes_platform(_sig: i32) -> bool {
+    true
 }
 
 #[cfg(unix)]
