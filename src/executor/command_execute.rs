@@ -721,14 +721,20 @@ impl Executor {
                     .next()
                     .and_then(|value| value.parse::<usize>().ok())
                     .unwrap_or(1);
-                eprintln!(
-                    "{}warning: here-document at line {at_line} delimited by end-of-file (wanted `{delimiter}')",
-                    self.error_prefix_for_line(warn_line)
+                self.write_diagnostic_fd2(
+                    format!(
+                        "{}warning: here-document at line {at_line} delimited by end-of-file (wanted `{delimiter}')\n",
+                        self.error_prefix_for_line(warn_line)
+                    )
+                    .as_bytes(),
                 );
             }
-            eprintln!(
-                "{}syntax error near unexpected token `{token}'",
-                self.parser_error_prefix_for_line(line)
+            self.write_diagnostic_fd2(
+                format!(
+                    "{}syntax error near unexpected token `{token}'\n",
+                    self.parser_error_prefix_for_line(line)
+                )
+                .as_bytes(),
             );
             // GNU error.c:324-327: with exit_immediately_on_error live, the
             // offending-line echo (parse.y:6814 print_offending_line) never
@@ -744,7 +750,10 @@ impl Executor {
             // parse.y:6865: no offending-line echo in an interactive shell.
             if self.offending_line_echo_enabled() {
                 if let Some(source) = cmd.get_assignment("__RUBASH_PARSE_SOURCE__") {
-                    eprintln!("{}`{}'", self.parser_error_prefix_for_line(line), source);
+                    self.write_diagnostic_fd2(
+                        format!("{}`{}'\n", self.parser_error_prefix_for_line(line), source)
+                            .as_bytes(),
+                    );
                 }
             }
             self.exit_code = 2;
@@ -757,9 +766,12 @@ impl Executor {
             // file" at the end-of-input line, with no token echo.
             self.mark_parse_error();
             let eof_line = cmd.line.map(|line| line + 1).unwrap_or(1);
-            eprintln!(
-                "{}syntax error: unexpected end of file",
-                self.parser_error_prefix_for_line(eof_line)
+            self.write_diagnostic_fd2(
+                format!(
+                    "{}syntax error: unexpected end of file\n",
+                    self.parser_error_prefix_for_line(eof_line)
+                )
+                .as_bytes(),
             );
             // Single-line parser_error: GNU error.c:324-327 still
             // exit_shell(2)s right after it under live errexit — record
@@ -853,9 +865,12 @@ impl Executor {
                     // Report only the fatal, at the offending line.
                     if let Some(line) = crate::lexer::heredoc_overflow_line() {
                         self.mark_parse_error();
-                        eprintln!(
-                            "{}maximum here-document count exceeded",
-                            self.parser_error_prefix_for_line(line)
+                        self.write_diagnostic_fd2(
+                            format!(
+                                "{}maximum here-document count exceeded\n",
+                                self.parser_error_prefix_for_line(line)
+                            )
+                            .as_bytes(),
                         );
                         self.exit_code = 2;
                         return Err(ExecuteError::ExitCode(2));
@@ -883,9 +898,12 @@ impl Executor {
                 .any(|metadata| metadata.raw.contains('(') && unterminated_extglob(&metadata.raw))
         {
             self.mark_parse_error();
-            eprintln!(
-                "{}syntax error near unexpected token `('",
-                self.parser_error_prefix()
+            self.write_diagnostic_fd2(
+                format!(
+                    "{}syntax error near unexpected token `('\n",
+                    self.parser_error_prefix()
+                )
+                .as_bytes(),
             );
             self.exit_code = 2;
             return Err(ExecuteError::ExitCode(2));
@@ -903,9 +921,12 @@ impl Executor {
             && cmd.case_command.is_none()
         {
             self.mark_parse_error();
-            eprintln!(
-                "{}syntax error near unexpected token `('",
-                self.parser_error_prefix()
+            self.write_diagnostic_fd2(
+                format!(
+                    "{}syntax error near unexpected token `('\n",
+                    self.parser_error_prefix()
+                )
+                .as_bytes(),
             );
             self.exit_code = 2;
             return Err(ExecuteError::ExitCode(2));
