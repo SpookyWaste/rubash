@@ -1578,6 +1578,9 @@ impl Executor {
                     }
                 }
                 let target = self.expand_redirect_target(redirect);
+                if crate::executor::execution_misc::is_closed_redirect_target(&target) {
+                    return Err(super::external_finish::cat_closed_stdout_error());
+                }
                 if let Some(result) = self.write_dev_stdio_redirect_output(&target, &output) {
                     result?;
                     self.exit_code = 0;
