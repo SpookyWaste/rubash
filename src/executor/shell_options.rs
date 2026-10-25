@@ -284,7 +284,10 @@ impl Executor {
     /// body reads FUNCTION_STDIN — pipe content in GNU terms
     /// (execute_cmd.c execute_pipeline binds the pipe to fd 0) — never the
     /// terminal, whatever the process stdin happens to be.
-    fn stdin_source_is_terminal(&self) -> bool {
+    // pub(in crate::executor): the jobs refresh (job_builtins.rs)
+    // also consults it — job control live on a terminal is one of
+    // GNU's state-publication events (rubash#1612).
+    pub(in crate::executor) fn stdin_source_is_terminal(&self) -> bool {
         if self.shell_state.env_vars.contains_key(FUNCTION_STDIN) {
             return false;
         }
