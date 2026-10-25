@@ -679,6 +679,26 @@ impl Executor {
         env_map.retain(|key, _| {
             !(key.starts_with("__RUBASH_TRAP") && key != "__RUBASH_TRAP_ORIG_IGN")
         });
+        // rubash#1630: dropping the table outright also dropped its
+        // VISIBILITY — GNU's forked child lists the inherited traps in
+        // reset form (`trap -p` inside `( ... ) &` prints the parent's
+        // USR1 and EXIT entries) while the dispositions stay reset, so
+        // nothing fires and the inherited EXIT trap in particular never
+        // runs in the child. The in-process subshell path gets exactly
+        // that shape from reset_for_subshell_child applied to the live
+        // table; run the same transform on a clone of the live table
+        // and forward the resulting __RUBASH_TRAP* keys, so the
+        // respawned child seeds the identical reset-but-listed table
+        // (including the save/restore idiom `eval "$(trap -p ...)"`).
+        // The retain above ran first, so only the live table's entries
+        // can land here — no stale OS-env copies.
+        let mut child_trap_table = self.shell_state.env_vars.clone();
+        crate::builtins::trap::reset_for_subshell_child(&mut child_trap_table);
+        for (key, value) in &child_trap_table {
+            if key.starts_with("__RUBASH_TRAP") {
+                env_map.insert(key.clone(), value.clone());
+            }
+        }
         // rubash#1035: GNU execute_cmd.c setup_async_signals ignores
         // SIGINT/SIGQUIT in the forked async child while job_control is off
         // (the `monitor` option is unset). A respawned `rubash -c` child
