@@ -535,6 +535,25 @@ where
             continue;
         }
 
+        // rubash#1654: a delivery addressed to the shell's own pid
+        // from inside a flat subshell layer (ancestor route armed) is
+        // judged by the top-level layer that OWNS the pid, not by the
+        // subshell layer's just-reprogrammed kernel disposition —
+        // queue it for the depth-0 boundary dispatch instead of
+        // raising it into the child's SIG_IGN / handler. Signal 0
+        // probes and non-adjudicable signals (SIGKILL, stop class)
+        // keep the raw path.
+        #[cfg(unix)]
+        if pid == std::process::id()
+            && signal != 0
+            && ancestor_route_active()
+            && boundary_adjudicable_signal(signal)
+        {
+            queue_ancestor_signal(signal);
+            any_succeeded = true;
+            continue;
+        }
+
         match deliver_rubash_signal(pid, signal) {
             Ok(true) => {
                 any_succeeded = true;
@@ -1107,6 +1126,74 @@ fn take_self_signals() -> Vec<i32> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::mem::take(&mut *queue)
+}
+
+/// rubash#1654: signals a flat subshell layer addressed to the shell's
+/// own pid (`kill -s TERM $$` inside `( ... )`). In GNU the subshell
+/// is a separate process and `$$` names the PARENT shell, whose own
+/// dispositions judge the delivery; here the layers share one process
+/// and one kernel disposition table, which the subshell body's
+/// `trap ''` / `trap '...'` may just have reprogrammed — a raw
+/// raise(2) is swallowed by the child's SIG_IGN, or queued under the
+/// child's handler and then dropped as stale once the parent boundary
+/// reconciles back. So while the ancestor route is armed (see below),
+/// the kill builtin queues such deliveries here instead, and the
+/// first depth-0 boundary poll dispatches them against the restored
+/// top-level table (trap_exec::run_pending_signal_traps): trapped ->
+/// run the action, ignored -> drop, untrapped -> the 128+sig death —
+/// exactly the verdicts the addressed process would have produced.
+static ANCESTOR_SIGNALS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn queue_ancestor_signal(signal: i32) {
+    ANCESTOR_SIGNALS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(signal);
+    #[cfg(unix)]
+    {
+        PENDING_ANY.store(true, std::sync::atomic::Ordering::Release);
+        // An in-process routed delivery is by construction not a
+        // kernel/group delivery (same record queue_self_signal makes).
+        kernel_signals::note_self_delivery(signal);
+    }
+}
+
+pub(crate) fn take_ancestor_signals() -> Vec<i32> {
+    let mut queue = ANCESTOR_SIGNALS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::mem::take(&mut *queue)
+}
+
+thread_local! {
+    /// Armed by Executor::execute_kill while the current executor is
+    /// a flat subshell layer sharing this process (rubash#1654): kill
+    /// deliveries addressed to the shell's own pid then route to
+    /// ANCESTOR_SIGNALS instead of raise(2). A Session is confined to
+    /// one thread and the builtin's delivery is synchronous, so a
+    /// thread-local flag is exact; the guard restores the prior value
+    /// so nested kill invocations cannot leak the routing.
+    static ANCESTOR_ROUTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn ancestor_route_active() -> bool {
+    ANCESTOR_ROUTE.with(|flag| flag.get())
+}
+
+/// RAII arm for the ancestor route (rubash#1654).
+pub(crate) struct AncestorRouteGuard {
+    previous: bool,
+}
+
+pub(crate) fn arm_ancestor_route() -> AncestorRouteGuard {
+    let previous = ANCESTOR_ROUTE.with(|flag| flag.replace(true));
+    AncestorRouteGuard { previous }
+}
+
+impl Drop for AncestorRouteGuard {
+    fn drop(&mut self) {
+        ANCESTOR_ROUTE.with(|flag| flag.set(self.previous));
+    }
 }
 
 // rubash#375/perf3: the per-command signal-poll's Windows-port catch_flag.
@@ -2196,6 +2283,15 @@ mod kernel_signals {
         is_managed(sig) && HANDLER_SET.load(Ordering::Relaxed) & bit(sig) != 0
     }
 
+    /// Whether the boundary dispatcher can adjudicate `sig` at all
+    /// (the managed set or the fatal set). The rubash#1654 ancestor
+    /// route queues only signals whose top-level verdict the
+    /// dispatcher owns; SIGKILL and the stop class are not adjudicable
+    /// and keep raw raise(2) semantics.
+    pub(super) fn adjudicable(sig: i32) -> bool {
+        is_managed(sig) || fatal_index(sig).is_some()
+    }
+
     /// rubash#1475: the fatal set, SIGSEGV and SIGBUS. Both are caught
     /// by the Rust runtime before main() — its stack-overflow guard
     /// installs a handler for them (visible in /proc/self/status SigCgt
@@ -2690,8 +2786,7 @@ mod kernel_signals {
 /// the full managed set (see MANAGED_CORE).
 #[cfg(unix)]
 fn managed_trap_keys() -> &'static [(i32, String, String)] {
-    static KEYS: std::sync::OnceLock<Vec<(i32, String, String)>> =
-        std::sync::OnceLock::new();
+    static KEYS: std::sync::OnceLock<Vec<(i32, String, String)>> = std::sync::OnceLock::new();
     KEYS.get_or_init(|| {
         let mut keys: Vec<(i32, String, String)> = Vec::new();
         let mut push = |keys: &mut Vec<(i32, String, String)>, sig: i32, short: &str| {
@@ -2859,9 +2954,7 @@ pub fn reconcile_kernel_trap_dispositions(env_vars: &std::collections::HashMap<S
     // armed EXIT trap — GNU's terminating set names them (oracle:
     // EXIT trap + untrapped kill -ILL runs the EXIT trap, dies 132).
     let fatal_want_rerouted = |short: &str, key: &str| match env_vars.get(key) {
-        Some(action) if !action.is_empty() && !reset_contains(reset, short) => {
-            Disposition::Handler
-        }
+        Some(action) if !action.is_empty() && !reset_contains(reset, short) => Disposition::Handler,
         Some(_) if reset_contains(reset, short) => Disposition::Default,
         Some(_) => Disposition::Ignore,
         None if exit_armed => Disposition::Handler,
@@ -2953,6 +3046,13 @@ pub fn kernel_handler_installed(signal: i32) -> bool {
 #[cfg(unix)]
 pub fn last_delivery_kernel_caused(signal: i32) -> bool {
     kernel_signals::last_delivery_kernel_caused(signal)
+}
+
+/// Whether the boundary dispatcher can adjudicate `signal` (managed or
+/// fatal set) — see kernel_signals::adjudicable (rubash#1654).
+#[cfg(unix)]
+pub fn boundary_adjudicable_signal(signal: i32) -> bool {
+    kernel_signals::adjudicable(signal)
 }
 
 /// rubash#1250: hold untrapped SIGINT at the mailbox handler across a

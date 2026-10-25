@@ -5,6 +5,16 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<i32, ExecuteError> {
+        // rubash#1654: inside a flat subshell layer (same process,
+        // depth > 0), a kill addressed to the shell's own pid must be
+        // judged by the pid's owner — the top-level layer — not by
+        // this layer's kernel dispositions. Arm the ancestor route for
+        // the whole dispatch; the builtin's delivery queues such
+        // signals for the depth-0 boundary (kill.rs ANCESTOR_SIGNALS).
+        #[cfg(unix)]
+        let _ancestor_route = (self.shell_state.subshell_depth.get() > 0
+            && self.shell_pid == std::process::id())
+        .then(crate::builtins::kill::arm_ancestor_route);
         if let Some(result) = self.intercept_fake_bashpid_kill(cmd) {
             return result;
         }
