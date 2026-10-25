@@ -882,11 +882,18 @@ fn case_command_source_text(case_command: &CaseCommand) -> String {
 
 fn coproc_command_source_text(coproc_command: &crate::parser::CoprocCommand) -> String {
     let mut text = String::from("coproc");
-    // GNU always renders the coprocess name in command displays (jobs,
-    // BASH_COMMAND): an unnamed coproc runs under the default name COPROC
-    // (execute_cmd.c coproc_setup; print_cmd.c prints the name verbatim).
-    text.push(' ');
-    text.push_str(coproc_command.name.as_deref().unwrap_or("COPROC"));
+    // GNU print_cmd.c `cm_coproc` (5.3.20) prints the name ONLY when
+    // the body is not a simple command: `coproc sleep 5` for a
+    // simple body (named or not — there is no `COPROC WORD
+    // simple_command` production, so a simple body never carries a
+    // real name), but `coproc COPROC { sleep 5; }` / `coproc C1
+    // { sleep 5; }` for compound bodies. The old comment here
+    // claimed GNU always prints the name; that matches bash 5.2's
+    // print code, not 5.3.20's (rubash#1645).
+    if coproc_command.body_kind != crate::parser::CoprocBodyKind::SimpleCommand {
+        text.push(' ');
+        text.push_str(coproc_command.name.as_deref().unwrap_or("COPROC"));
+    }
     text.push(' ');
     if let Some(body) = &coproc_command.body {
         text.push_str("{ ");
