@@ -141,6 +141,16 @@ impl SessionHistory {
         history_expand(line, &snapshot, &mut self.engine, ctx)
     }
 
+    /// readline/history.c hist_inittime: the "#<unix-seconds>" stamp
+    /// every add_history puts on a new entry.
+    fn now_stamp() -> String {
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("#{epoch}")
+    }
+
     /// bashhist.c check_history_control + history_should_ignore, then
     /// add_history with HISTSIZE stifling. Returns true when recorded.
     pub fn record(
@@ -189,11 +199,7 @@ impl SessionHistory {
         // readline/history.c:322-333 hist_inittime: every add_history stores
         // "#<unix-seconds>" on the entry regardless of whether timestamps are
         // later written to the file.
-        let epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        self.timestamps.push(format!("#{epoch}"));
+        self.timestamps.push(Self::now_stamp());
         self.stifle(histsize);
         self.lines_this_session += 1;
         true
@@ -285,9 +291,13 @@ impl SessionHistory {
                 last.push_str(line);
             } else {
                 // histfile.c:439-453: add as new entry carrying the saved
-                // timestamp (add_history_time).
+                // timestamp (add_history_time). A line with no timestamp
+                // of its own still enters through add_history, so it
+                // carries the read time (hist_inittime) — never stamp 0
+                // (rubash#1628).
                 self.entries.push(line.to_string());
-                self.timestamps.push(last_ts.clone().unwrap_or_default());
+                self.timestamps
+                    .push(last_ts.clone().unwrap_or_else(Self::now_stamp));
                 self.stifle(histsize);
                 count += 1;
             }
@@ -434,7 +444,9 @@ impl SessionHistory {
                 continue;
             }
             self.entries.push(line.to_string());
-            self.timestamps.push(last_ts.clone().unwrap_or_default());
+            // Same read-time stamp rule as load_file (rubash#1628).
+            self.timestamps
+                .push(last_ts.clone().unwrap_or_else(Self::now_stamp));
             self.stifle(histsize);
             last_ts = None;
             count += 1;
