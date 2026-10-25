@@ -367,7 +367,18 @@ impl<'a> Lexer<'a> {
         }
 
         // GNU PST_CONDCMD/PST_REGEXP port. `[[' opens the conditional
-        // (parse.y:3654), `]]' closes it; the `=~' operator arms the
+        // (parse.y:3654), `]]' closes it — but only the depth-zero `]]':
+        // under PST_REGEXP the reader absorbs an open `(' group into the
+        // ONE RHS word via parse_matched_pair (parse.y:5443-5461), so a
+        // `]]' met while the group is open is word text, never COND_END,
+        // and PST_CONDCMD stays armed until the group closes and the
+        // real closer arrives. Resetting at the data `]]' (rubash#1524)
+        // disarmed the state mid-construct: the deferred-close line then
+        // failed the tokenize driver's leading_ws admission (which reads
+        // the pass-start state), the conditional fragments lost their
+        // inter-token spacing, and the parser merged the rest of the
+        // construct into the RHS word, swallowing the syntax error.
+        // The `=~' operator arms the
         // regexp RHS word (parse.y:5169) which stays ONE GNU word —
         // read_token_word absorbs `('/`)'/`|' and everything between via
         // parse_matched_pair (parse.y:5443-5461) — until whitespace at
@@ -394,7 +405,10 @@ impl<'a> Lexer<'a> {
             self.parse_state.cond_rhs_regexp = false;
             self.parse_state.cond_rhs_started = false;
             self.parse_state.cond_rhs_paren_depth = 0;
-        } else if self.parse_state.in_cond_command && (keyword_is("]]") || word_is("]]")) {
+        } else if self.parse_state.in_cond_command
+            && (keyword_is("]]") || word_is("]]"))
+            && self.parse_state.cond_rhs_paren_depth <= 0
+        {
             self.parse_state.in_cond_command = false;
             self.parse_state.cond_rhs_regexp = false;
             self.parse_state.cond_rhs_started = false;
