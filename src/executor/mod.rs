@@ -735,6 +735,21 @@ pub struct Executor {
     /// layer's EXIT trap (a signal-killed GNU process runs none) and
     /// queues the parent-side death notice.
     subshell_signal_death: Option<(usize, i32)>,
+    /// rubash#1654: signals sent to the shell's own pid (`$$`) from
+    /// inside a flat subshell layer whose own trap table arms that
+    /// signal (action or `trap ''` ignore). GNU's subshell is a forked
+    /// process, so the delivery is judged by the PARENT's disposition
+    /// alone; here the layer shares the process, so raising at kill
+    /// time would be judged by the layer's disposition instead (an
+    /// ignore swallows it, a handler notes it and the note goes stale
+    /// at restore). The kill is therefore deferred: execute_kill
+    /// records the signal here instead of raising, and
+    /// restore_flat_subshell replays it once the depth returns to the
+    /// `$$`-owning level, after reconciling the kernel dispositions
+    /// from the restored (parent) trap table. The field lives on the
+    /// Executor, not ShellState, so the wholesale state restore at the
+    /// boundary cannot wipe it.
+    deferred_parent_signals: Vec<i32>,
     /// rubash#1175: true only on the executor that IS this OS process's
     /// shell (constructed by Executor::new for a real process root).
     /// Fork-copy clones (command_substitution_executor) construct with

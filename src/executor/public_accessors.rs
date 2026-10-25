@@ -1062,6 +1062,34 @@ impl Executor {
         if let Some(dir) = saved_cwd {
             let _ = env::set_current_dir(dir);
         }
+        // rubash#1654: replay a `$$`-kill deferred from inside a flat
+        // subshell layer (see deferred_parent_signals) once the depth
+        // returns to the `$$`-owning level — i.e. the outermost flat
+        // boundary, so nested layers still finish first. The kernel
+        // dispositions are reconciled from the restored (parent) trap
+        // table BEFORE raising, or the raise would again be judged by
+        // the dead layer's disposition. A parent with no trap dies
+        // here by the raise (128+sig, as in GNU); a parent trap action
+        // is noted by the handler for the next top-level boundary
+        // poll; a parent ignore discards it. This runs only on the
+        // process-owning executor: fork-copy clones never recorded a
+        // deferred signal (their intercept declined), so their vec is
+        // empty and this is a no-op for them.
+        if self.owns_process_image
+            && !self.deferred_parent_signals.is_empty()
+            && self.shell_state.subshell_depth.get() == self.bashpid_origin_depth
+        {
+            let signals = std::mem::take(&mut self.deferred_parent_signals);
+            #[cfg(unix)]
+            {
+                crate::builtins::kill::reconcile_kernel_trap_dispositions(
+                    &self.shell_state.env_vars,
+                );
+                for signal in signals {
+                    unsafe { libc::raise(signal) };
+                }
+            }
+        }
     }
 
     pub fn aliases_snapshot(&self) -> HashMap<String, String> {

@@ -8,6 +8,9 @@ impl Executor {
         if let Some(result) = self.intercept_fake_bashpid_kill(cmd) {
             return result;
         }
+        if let Some(result) = self.intercept_deferred_parent_signal_kill(cmd) {
+            return result;
+        }
         if let Some(status) = self.execute_tracked_background_kill(cmd)? {
             return Ok(status);
         }
@@ -86,6 +89,75 @@ impl Executor {
         }
         self.subshell_signal_death = Some((depth, request.signal));
         Some(Err(ExecuteError::ExitCode(128 + request.signal)))
+    }
+
+    /// rubash#1654: the mirror image of the fake-BASHPID intercept for
+    /// a `kill` to the shell's OWN pid (`$$`) from inside a flat
+    /// subshell layer. GNU's subshell is a forked process
+    /// (execute_cmd.c:1576 execute_in_subshell), so a signal to `$$`
+    /// is delivered to the parent process alone and judged by the
+    /// parent's trap table — the subshell's own `trap '' TERM` or
+    /// `trap '...' TERM` cannot touch it. Here the layer shares the
+    /// process, and unix delivery is a real `raise` judged by the
+    /// kernel disposition at raise time (builtins/kill.rs
+    /// signal_process): the layer's ignore discards it outright, and
+    /// the layer's handler notes it into a registry that goes stale
+    /// when the boundary restore flips the disposition back. Either
+    /// way the parent never sees the signal and survives a death it
+    /// should die (`(trap '' TERM; kill -s TERM $$; echo sub); echo
+    /// parent` prints `parent=0` instead of dying 143).
+    ///
+    /// Intercept only when the layer itself arms the signal: an
+    /// explicit entry in the layer's trap table (action or empty
+    /// ignore; get_trap_action reads reset-listed inherited traps as
+    /// unset, so a parent trap that the subshell merely inherited
+    /// keeps the legacy path — that shape already agrees with GNU,
+    /// e.g. the parent-USR1-trap case in part_060). The delivery is
+    /// recorded on the Executor (see deferred_parent_signals) and
+    /// replayed by restore_flat_subshell once the depth returns to
+    /// the `$$`-owning level, so nested layers still run to
+    /// completion before the parent is judged, as in GNU. The kill
+    /// builtin itself reports success (0): GNU's kill to a live pid
+    /// succeeds, and the parent's death is the delivery's effect,
+    /// not the builtin's status.
+    fn intercept_deferred_parent_signal_kill(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Option<Result<i32, ExecuteError>> {
+        if cfg!(not(unix)) {
+            return None;
+        }
+        let depth = self.shell_state.subshell_depth.get();
+        if depth <= self.bashpid_origin_depth || !self.owns_process_image {
+            return None;
+        }
+        let request = kill_request(&cmd.words[1..])?;
+        if request.operands.is_empty() || request.check_only || request.signal == 0 {
+            return None;
+        }
+        let real_pid = std::process::id();
+        if !request
+            .operands
+            .iter()
+            .all(|operand| operand.parse::<u32>() == Ok(real_pid))
+        {
+            return None;
+        }
+        // Same default-fatal set as the fake-BASHPID intercept; stop/
+        // cont and other non-terminating signals keep the legacy path.
+        if !matches!(
+            request.signal,
+            1 | 2 | 3 | 4 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 24 | 25 | 26 | 27
+                | 31
+        ) {
+            return None;
+        }
+        let name = super::trap_exec::signal_trap_name(request.signal)?;
+        if crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, &name).is_none() {
+            return None;
+        }
+        self.deferred_parent_signals.push(request.signal);
+        Some(Ok(0))
     }
 
     fn execute_tracked_background_kill(
