@@ -622,6 +622,29 @@ pub(crate) fn bump_hashed_path_hit(env_vars: &mut VarTable, name: &str) {
     }
 }
 
+/// GNU execute_cmd.c:5808 + findcmd.c:416-426: a `command -p` lookup
+/// that finds a pathname inserts it into the hash table (CMDSRCH_HASH
+/// is passed alongside CMDSRCH_STDPATH), overwriting any poisoned or
+/// stale entry with times_found=1 — the -p walk never consulted the
+/// table, so the insert is unconditional and the next plain lookup
+/// serves the standard-path result (rubash#1648). The internal lookup
+/// cache mirror is synced alongside, or the next plain lookup would
+/// still serve the stale hashed entry it consults first.
+pub(crate) fn record_standard_path_resolution(
+    env_vars: &mut VarTable,
+    name: &str,
+    shell_path: &str,
+) {
+    let mut table = hash_table(env_vars);
+    table.insert(
+        name.to_string(),
+        (shell_path.to_string(), 1, next_hash_seq(&table)),
+    );
+    store_hash_table(env_vars, &table);
+    let cached_path = crate::executor::path::shell_path_to_windows(shell_path, env_vars);
+    crate::executor::path::set_command_lookup_cache(name, Some(cached_path));
+}
+
 /// GNU findcmd.c:365-426: a command resolution that hits hashed_filenames
 /// bumps times_found (phash_search -> hashlib.c:254); one resolved through
 /// PATH enters the table with times_found=1 (phash_insert found=1).
