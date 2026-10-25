@@ -386,9 +386,11 @@ fn unclosed_regex_paren_line_in_raw(raw: &str, base_line: usize) -> Option<usize
     (depth > 0).then_some(open_line)
 }
 
-/// error_token_from_text (parse.y:6772-6808): the reported token extends
-/// across characters that are not ` \n\t;|&` breaks, so adjacent
-/// arguments merge into one reported string (`(x' for `(x').
+/// error_token_from_text (parse.y:6772-6808): the reported token is the
+/// run of non-break characters (` \n\t;|&` are the breaks) ending at
+/// token_end — glued fragments BEFORE the offending one merge into it
+/// whole, but past the offending token the run extends by at most the
+/// single character at the reader index (see the forward step below).
 fn walk_back_near_token(args: &[CondArg], index: usize) -> String {
     // Raw text (quote/escape forms intact): GNU's error_token_from_text
     // names the source form of the offending word (`syntax error near
@@ -411,35 +413,46 @@ fn walk_back_near_token(args: &[CondArg], index: usize) -> String {
     }
     // GNU's scan (parse.y:6787-6793) is anchored at the end of the token
     // the reader consumed and walks back over non-break characters
-    // (" \n\t;|&" are the breaks). The cond reader's token can span
-    // several collected fragments glued together with no whitespace, in
-    // either direction from the fragment the parser tripped on:
-    // fragments before it merge through the walk above, and fragments
-    // glued directly AFTER it merge here — `[[ a == (a ]]` trips on the
-    // `(' fragment but GNU reports `(a' (rubash#1125). A following
-    // fragment joins only when glued (empty leading whitespace) and not
-    // itself starting with a break character.
-    let mut end = orig;
-    while end + 1 < args.len()
-        && args[end + 1].2.is_empty()
-        && !args[end + 1]
-            .1
-            .starts_with([' ', '\t', '\n', ';', '|', '&'])
-    {
-        end += 1;
-    }
-    let mut near: String = (start..=end)
+    // (" \n\t;|&" are the breaks): fragments glued BEFORE the offending
+    // one merge through the walk above. The forward direction is NOT a
+    // walk — token_end is fixed at shell_input_line_index + 1
+    // (parse.y:6787-6789: the reader index sits on the next unread
+    // character, and that one character is included when it is not
+    // whitespace), so exactly ONE further character past the offending
+    // token can join the report: `[[ a == (a ]]` trips on the `('
+    // fragment and GNU reports `(a' (rubash#1125); `[[ a == (b) ]]`
+    // reports `(b', never `(b)' — the run ends before the reader's
+    // next token (rubash#1524). When the offending fragment is
+    // break-led, the reader's token is the break character alone and
+    // the one extra character comes from the rest of that same
+    // fragment (`5&3]]' -> `&3', rubash#1353). A glued `]]' that the
+    // lexer absorbed into a word fragment (`b]]', `3]]') IS part of
+    // GNU's reader token and stays.
+    let mut near: String = (start..orig)
         .filter_map(|i| args.get(i))
         .map(|(_, raw, _, _)| raw.as_str())
         .collect();
-    // rubash#1353: the final collected fragment can carry the `]]'
-    // closer glued onto it (`5&3]]' collects one fragment `&3]]');
-    // GNU's reader always tokenizes `]]' separately, so it is never
-    // part of the reported token (`&3', not `&3]]').
-    if end == args.len().saturating_sub(1) {
-        if let Some(stripped) = near.strip_suffix("]]") {
-            if !stripped.is_empty() {
-                near = stripped.to_string();
+    let mut extra_spent = false;
+    if break_led {
+        let mut chars = args[orig].1.chars();
+        if let Some(first) = chars.next() {
+            near.push(first);
+        }
+        if let Some(c) = chars.next() {
+            if !matches!(c, ' ' | '\t' | '\n' | ';' | '|' | '&') {
+                near.push(c);
+                extra_spent = true;
+            }
+        }
+    } else {
+        near.push_str(&args[orig].1);
+    }
+    if !extra_spent {
+        if let Some(next) = args.get(orig + 1).filter(|next| next.2.is_empty()) {
+            if let Some(c) = next.1.chars().next() {
+                if !matches!(c, ' ' | '\t' | '\n' | ';' | '|' | '&') {
+                    near.push(c);
+                }
             }
         }
     }
@@ -1172,8 +1185,14 @@ fn merge_pattern_rhs_fragments(arg_parts: Vec<CondArg>) -> Vec<CondArg> {
             continue;
         }
 
-        // The first fragment always begins the RHS word.
-        let (mut value, mut raw_text, _, line) = arg_parts[index].clone();
+        // The first fragment always begins the RHS word. The merged
+        // word keeps the first fragment's leading whitespace: it is the
+        // spacing the word actually has in the source, and consumers
+        // (the near-token walk-back, the cursor's newline model) read
+        // it as such — zeroing it fabricated a glue to the operator, so
+        // `[[ a == x) echo ]]` reported near `==x)' instead of GNU's
+        // `x)' (rubash#1524).
+        let (mut value, mut raw_text, first_ws, line) = arg_parts[index].clone();
         let mut depth = unquoted_paren_delta(&arg_parts[index]);
         index += 1;
         while index < arg_parts.len() {
@@ -1202,7 +1221,7 @@ fn merge_pattern_rhs_fragments(arg_parts: Vec<CondArg>) -> Vec<CondArg> {
             depth += unquoted_paren_delta(&arg_parts[index]);
             index += 1;
         }
-        args.push((value, raw_text, String::new(), line));
+        args.push((value, raw_text, first_ws, line));
     }
     args
 }
