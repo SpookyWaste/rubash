@@ -176,6 +176,28 @@ where
     }
 
     if matches!(filename, "/dev/stdin" | "/proc/self/fd/0" | "/dev/fd/0") {
+        // rubash#1642: an explicit stdin redirect on the source command
+        // itself wins over everything below. GNU redir.c
+        // do_redirections binds fd 0 before the builtin runs, so
+        // opening /dev/stdin reads the redirect — a here-string,
+        // heredoc, or `< file` — and the old fallthrough to the
+        // process stdin read the wrong stream (it blocked on a live
+        // stdin, or silently read EOF, whenever stdin was redirected).
+        // A failed redirect never reaches here: the simple-command
+        // dispatch reports it first (rc 1, source never runs).
+        if let Some(redirect_cmd) = redirect_cmd {
+            if executor.command_has_explicit_fd0_redirect(redirect_cmd) {
+                if let Some(text) = executor.stdin_string_for_command_mut(redirect_cmd) {
+                    return execution::execute_text_maybe_redirected(
+                        executor,
+                        &text,
+                        invocation.args,
+                        Some(redirect_cmd),
+                        Some(filename),
+                    );
+                }
+            }
+        }
         // GNU source.def opens /dev/stdin, which in a pipeline is the pipe
         // read end inherited as stdin ("echo x | . /dev/stdin" from
         // source6.sub). Read the shell's stdin instead of resolving a

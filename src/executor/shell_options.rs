@@ -1141,7 +1141,36 @@ impl Executor {
         Some(input[offset..].to_string())
     }
 
-    pub(in crate::executor) fn stdin_string_for_command_mut(
+    /// rubash#1642: whether this command carries its own fd-0 stdin
+    /// redirect. GNU redir.c do_redirections binds fd 0 before the
+    /// builtin runs, so `source /dev/stdin` with an explicit redirect
+    /// reads the redirect — a here-string, heredoc, or `< file` —
+    /// never the pipeline buffer or the process stdin the old
+    /// /dev/stdin arm fell through to (which blocked on a live stdin,
+    /// or read EOF, when stdin was redirected). Only explicit
+    /// redirects count: a bare command in a pipeline keeps the
+    /// existing FUNCTION_STDIN / process-stdin path untouched.
+    pub(crate) fn command_has_explicit_fd0_redirect(&self, cmd: &CommandNode) -> bool {
+        if fd0_stdin_redirect_winner(cmd).is_some() {
+            return true;
+        }
+        // Legacy/synthesized shapes without ordered redirect info.
+        if cmd
+            .redirect_in
+            .as_ref()
+            .is_some_and(|redirect| redirect.fd.unwrap_or(0) == 0)
+        {
+            return true;
+        }
+        if cmd.here_string.is_some() || cmd.heredoc.is_some() || cmd.heredoc_body.is_some() {
+            return true;
+        }
+        cmd.heredoc_redirects
+            .iter()
+            .any(|redirect| redirect.fd.is_none() || redirect.fd == Some(0))
+    }
+
+    pub(crate) fn stdin_string_for_command_mut(
         &mut self,
         cmd: &CommandNode,
     ) -> Option<String> {
