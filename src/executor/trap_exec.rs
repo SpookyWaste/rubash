@@ -4413,7 +4413,11 @@ impl Executor {
             }
             crate::parser::RedirectKind::DuplicateInput => {
                 if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
-                    if !self.fd_table.is_open_for_read(source_fd) {
+                    // GNU redir.c do_redirection_internal dup/move case:
+                    // the descriptor is copied wholesale — the </> letter
+                    // never gates on the source's direction, only on it
+                    // being open at all (rubash#1591).
+                    if !self.fd_table.is_open(source_fd) {
                         return Ok(true);
                     }
                     let Some(fd) = self.allocate_dynamic_fd() else {
@@ -4441,7 +4445,7 @@ impl Executor {
             }
             crate::parser::RedirectKind::DuplicateOutput => {
                 if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
-                    if !self.fd_table.is_open_for_write(source_fd) {
+                    if !self.fd_table.is_open(source_fd) {
                         return Ok(true);
                     }
                     let Some(fd) = self.allocate_dynamic_fd() else {
