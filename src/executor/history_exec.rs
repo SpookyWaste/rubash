@@ -197,6 +197,13 @@ pub(in crate::executor) fn execute_history_session(
                 "{}history: too many arguments",
                 executor.diagnostic_prefix()
             );
+            // rubash#1660: the no_args DISCARD channel, shared with
+            // `exit 1 2` and `shift 1 2` (rubash#1650): EX_BADUSAGE
+            // plus the reader-level discard — the list loop skips
+            // the rest of the failing logical line, a function body
+            // unwinds with status 2 and its caller continues.
+            executor.raise_evalerror_abort();
+            executor.evalerror_exit_toomany_pending.set(true);
             return Ok(2);
         }
     }

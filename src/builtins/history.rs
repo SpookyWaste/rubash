@@ -15,11 +15,20 @@ pub fn execute_with_io<E>(
     args: &[String],
     diagnostic_prefix: &str,
     stderr: &mut E,
-) -> io::Result<i32>
+) -> io::Result<(i32, bool)>
 where
     E: Write,
 {
-    execute_with_history(args, diagnostic_prefix, &[], &mut io::sink(), stderr)
+    let mut surplus = false;
+    let status = execute_with_history(
+        args,
+        diagnostic_prefix,
+        &[],
+        &mut io::sink(),
+        stderr,
+        &mut surplus,
+    )?;
+    Ok((status, surplus))
 }
 
 pub fn execute_with_history<E, O>(
@@ -28,6 +37,7 @@ pub fn execute_with_history<E, O>(
     entries: &[String],
     stdout: &mut O,
     stderr: &mut E,
+    surplus: &mut bool,
 ) -> io::Result<i32>
 where
     E: Write,
@@ -139,6 +149,12 @@ where
         }
         if args.get(index + 1).is_some() {
             writeln!(stderr, "{diagnostic_prefix}history: too many arguments")?;
+            // rubash#1660: the no_args class — the executor arms the
+            // reader-level DISCARD for this surplus (see the session
+            // path in history_exec.rs); the other EX_USAGE paths
+            // (numeric argument required, invalid option) keep a
+            // plain status with no discard.
+            *surplus = true;
             return Ok(EX_USAGE);
         }
     }
