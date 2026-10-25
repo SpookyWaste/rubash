@@ -3506,24 +3506,177 @@ pub(crate) fn dparen_subshell_reparse_compound_eof(input: &str, open_line: usize
 }
 
 /// Index of the first `((` on the 1-based `open_line` of `chars`, if any.
+/// Find the `((` that `open_line`'s unclosed command-`(' verdict
+/// refers to: the first arithmetic-dispatch `((` on that line.
+///
+/// GNU read_token hands a `((` to parse_dparen (parse.y:3726-3733)
+/// only at a reserved-word-acceptable position (parse.y:5899), and
+/// never inside a conditional command — the dispatch is gated on
+/// `(parser_state & (PST_CASEPAT|PST_CONDCMD)) == 0' (parse.y:3780),
+/// so inside `[[ ... ]]' the two parens are cond_term's own tokens
+/// whatever precedes them (`[[ a == ((a ]]' has no P_ARITH group even
+/// though the byte pair sits on the line, rubash#1538). The old
+/// line-local scan matched the byte pair anywhere on the line, so
+/// the diagnostic router believed a P_ARITH group was open, refused
+/// the real parser's disproof, and pre-empted the conditional's own
+/// diagnostic with the generic unclosed-`(' report.
+///
+/// This scan walks the whole input with the reserved-word machine
+/// (the same model as dparen_arith_group_open_at_end): quotes and
+/// `$(`/`${`/`$[` units are opaque, a `#` at a word start comments
+/// to end of line, separators and subshell openers restore command
+/// position, and a `[[` reserved word opens a conditional region —
+/// ended by a token-start `]]` — inside which command position
+/// never applies. An earlier line's `((` group that closes is
+/// skipped reader-style; one that never closes swallows the rest
+/// of the input, so no later line can hold the verdict's opener.
 fn dparen_open_index(chars: &[char], open_line: usize) -> Option<usize> {
-    let mut line = 1usize;
+    let len = chars.len();
     let mut index = 0usize;
-    while index < chars.len() && line < open_line {
-        if chars[index] == '\n' {
+    let mut line = 1usize;
+    let mut command_position = true;
+    let mut in_cond = false;
+    // Whether the scanner is inside a word (a word character, quote
+    // span or $-unit has been consumed since the last boundary): a
+    // `[[`/`]]` delimiter only counts at a token start, and a `(`
+    // only opens a subshell there.
+    let mut in_word = false;
+    while index < len {
+        let ch = chars[index];
+        if ch == '\n' {
             line += 1;
+            in_word = false;
+            if !in_cond {
+                command_position = true;
+            }
+            index += 1;
+            continue;
+        }
+        match ch {
+            '\\' => {
+                if chars.get(index + 1) == Some(&'\n') {
+                    line += 1;
+                }
+                in_word = true;
+                command_position = false;
+                index += 2;
+            }
+            '\'' | '"' | '`' => {
+                let quote = ch;
+                let start = index;
+                index += 1;
+                while index < len && chars[index] != quote {
+                    if quote != '\'' && chars[index] == '\\' {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+                line += chars[start..index.min(len)]
+                    .iter()
+                    .filter(|c| **c == '\n')
+                    .count();
+                in_word = true;
+                command_position = false;
+            }
+            '$' if matches!(chars.get(index + 1), Some('(' | '{' | '[')) => {
+                let (open, close) = match chars[index + 1] {
+                    '(' => ('(', ')'),
+                    '{' => ('{', '}'),
+                    _ => ('[', ']'),
+                };
+                // parse_dollar_word consumes the unit opaquely; an
+                // unterminated unit swallows the rest of the input.
+                match dollar_word_group_len(&chars, index + 1, open, close) {
+                    Some(end) => {
+                        line += chars[index..end].iter().filter(|c| **c == '\n').count();
+                        index = end;
+                    }
+                    None => return None,
+                }
+                in_word = true;
+                command_position = false;
+                continue;
+            }
+            '#' if !in_word => {
+                // parse.y:3922: a word-initial `#` comments to the
+                // end of the line (the newline is handled above).
+                while index < len && chars[index] != '\n' {
+                    index += 1;
+                }
+                continue;
+            }
+            '[' if !in_cond
+                && command_position
+                && !in_word
+                && chars.get(index + 1) == Some(&'[')
+                && chars
+                    .get(index + 2)
+                    .is_none_or(|c| matches!(c, ' ' | '\t' | '\n' | ';' | '&' | '|')) =>
+            {
+                in_cond = true;
+                command_position = false;
+                in_word = false;
+                index += 2;
+                continue;
+            }
+            ']' if in_cond && !in_word && chars.get(index + 1) == Some(&']') => {
+                in_cond = false;
+                command_position = false;
+                in_word = false;
+                index += 2;
+                continue;
+            }
+            '(' => {
+                if !in_cond && command_position && chars.get(index + 1) == Some(&'(') {
+                    if line == open_line {
+                        return Some(index);
+                    }
+                    match paren_group_close(&chars, index + 2) {
+                        None => return None,
+                        Some(close) => {
+                            line += chars[index..=close].iter().filter(|c| **c == '\n').count();
+                            index = close + 1;
+                            if chars.get(index) == Some(&')') {
+                                index += 1;
+                            }
+                        }
+                    }
+                    command_position = false;
+                    in_word = false;
+                    continue;
+                }
+                if !in_cond && !in_word {
+                    // A subshell `(' at a token start: its body is
+                    // command position again.
+                    command_position = true;
+                } else {
+                    command_position = false;
+                }
+                in_word = false;
+                index += 1;
+                continue;
+            }
+            ')' => {
+                in_word = false;
+                command_position = false;
+            }
+            ';' | '&' | '|' => {
+                in_word = false;
+                if !in_cond {
+                    command_position = true;
+                }
+            }
+            ' ' | '\t' => {
+                in_word = false;
+            }
+            _ => {
+                in_word = true;
+                command_position = false;
+            }
         }
         index += 1;
     }
-    loop {
-        if index >= chars.len() || chars[index] == '\n' {
-            return None;
-        }
-        if chars[index] == '(' && chars.get(index + 1) == Some(&'(') {
-            return Some(index);
-        }
-        index += 1;
-    }
+    None
 }
 
 /// parse_matched_pair(`(', `)', P_ARITH) from `from`: quote recursions,
