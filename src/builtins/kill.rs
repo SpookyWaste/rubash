@@ -505,10 +505,22 @@ where
             continue;
         };
 
-        // Negative pid → Unix process group.  Windows has no such target,
-        // so silently skip delivery (signal 0 already handled above for
-        // existence probes of the current group).
+        // Negative pid → Unix process group (GNU kill.def:194-216
+        // kill_pid: a valid negative number is delivered through
+        // kill(2) as-is — the negative value IS the group addressing —
+        // and a failure reports `({pid}) - {strerror}` and moves
+        // any_failed, exactly like a positive pid). Windows has no such
+        // target, so the silent skip stays there (signal 0 probes of
+        // the current group are handled above). rubash#1631.
         if pid < 0 {
+            #[cfg(unix)]
+            match signal_process_group(pid, signal) {
+                Ok(()) => any_succeeded = true,
+                Err(message) => {
+                    writeln!(stderr, "{}kill: ({pid}) - {message}", diagnostic_prefix())?;
+                    any_failed = true;
+                }
+            }
             continue;
         }
 
@@ -1747,6 +1759,22 @@ fn signal_process(pid: u32, signal: i32) -> Result<(), &'static str> {
         return Ok(());
     }
 
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Err("No such process"),
+        Some(libc::EPERM) => Err("Permission denied"),
+        _ => Err("Failed to signal process"),
+    }
+}
+
+/// kill(2) with a signed pid: a negative value addresses a process
+/// group (GNU kill.def kill_pid passes the operand through verbatim).
+/// rubash#1631.
+#[cfg(unix)]
+fn signal_process_group(pid: i32, signal: i32) -> Result<(), &'static str> {
+    let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    if result == 0 {
+        return Ok(());
+    }
     match std::io::Error::last_os_error().raw_os_error() {
         Some(libc::ESRCH) => Err("No such process"),
         Some(libc::EPERM) => Err("Permission denied"),
