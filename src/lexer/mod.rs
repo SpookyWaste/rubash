@@ -229,7 +229,14 @@ pub fn tokenize_comsub_body(
     start_line: usize,
     in_comsub: bool,
 ) -> Vec<Token> {
-    tokenize_comsub_body_with_origin(input, posix, start_line, InputOrigin::Direct, in_comsub)
+    tokenize_comsub_body_with_origin(
+        input,
+        posix,
+        start_line,
+        InputOrigin::Direct,
+        in_comsub,
+        false,
+    )
 }
 
 pub fn tokenize_comsub_body_with_origin(
@@ -238,12 +245,20 @@ pub fn tokenize_comsub_body_with_origin(
     start_line: usize,
     input_origin: InputOrigin,
     in_comsub: bool,
+    posix_locked: bool,
 ) -> Vec<Token> {
     if input.trim().is_empty() {
         return Vec::new();
     }
 
-    let mut tokens = tokenize_with_heredocs(input, posix, input_origin, start_line, in_comsub);
+    let mut tokens = tokenize_with_heredocs(
+        input,
+        posix,
+        input_origin,
+        start_line,
+        in_comsub,
+        posix_locked,
+    );
     if tokens
         .last()
         .is_some_and(|token| token.kind == TokenKind::Semicolon)
@@ -258,7 +273,27 @@ pub fn tokenize_with_initial_posix_and_origin(
     posix: bool,
     input_origin: InputOrigin,
 ) -> Vec<Token> {
-    tokenize_comsub_body_with_origin(input, posix, 1, input_origin, false)
+    tokenize_comsub_body_with_origin(input, posix, 1, input_origin, false, false)
+}
+
+/// rubash#1544: re-tokenize a compound body the parser extracted from
+/// a folded token. The body was read as part of the enclosing
+/// complete_command under the fold token's mode (`Token::posix_gate`),
+/// so the mode is LOCKED for the whole call: a `set -o/+o posix`
+/// inside the body cannot flip the body's own lexing (GNU reads the
+/// whole unit before executing any of it — parse.y read_command).
+pub fn tokenize_locked_body_with_initial_posix_and_line(
+    input: &str,
+    posix: bool,
+    start_line: usize,
+) -> Vec<Token> {
+    tokenize_comsub_body_with_origin(input, posix, start_line, InputOrigin::Direct, false, true)
+}
+
+/// The line-agnostic form of the locked folded-body re-lex, for the
+/// body sites that historically used `tokenize` (start line 1).
+pub fn tokenize_locked_body(input: &str, posix: bool) -> Vec<Token> {
+    tokenize_locked_body_with_initial_posix_and_line(input, posix, 1)
 }
 
 fn tokenize_with_heredocs(
@@ -267,9 +302,15 @@ fn tokenize_with_heredocs(
     input_origin: InputOrigin,
     start_line: usize,
     in_comsub: bool,
+    posix_locked: bool,
 ) -> Vec<Token> {
-    let mut feeder =
-        GroupScanFeeder::with_origin(initial_posix, input_origin, start_line, in_comsub);
+    let mut feeder = GroupScanFeeder::with_origin_locked(
+        initial_posix,
+        input_origin,
+        start_line,
+        in_comsub,
+        posix_locked,
+    );
     // The feeder's per-push TOKENIZE_DEPTH entry/exit reproduces the
     // original call-long bump: nothing observes the depth between pushes.
     let mut pieces = input.split('\n').peekable();
@@ -431,6 +472,27 @@ pub(crate) struct GroupScanFeeder {
     /// not the logical line's start.
     continuation_join_columns: Vec<usize>,
     parse_posix: bool,
+    /// rubash#1544: a `set -o/+o posix` flip detected while a
+    /// complete_command is still open, parked until the unit closes.
+    /// GNU's reader parses one complete_command in full before executing
+    /// any of it (parse.y read_command; evalstring.c parse_and_execute
+    /// cadence), so a `set` inside the unit cannot change the mode the
+    /// REST of the unit is read under — the mode flips only for the NEXT
+    /// unit, once this one has been read (and, in the live reader,
+    /// executed). The batch feeder lexes physical lines ahead of
+    /// execution, so the detected flip is parked here instead of applied
+    /// mid-unit; `apply_deferred_posix_at_unit_boundary` lands it at the
+    /// first commit that leaves no unit open.
+    deferred_posix: Option<bool>,
+    /// rubash#1544: this feeder tokenizes ONE compound body that the
+    /// parser extracted from a folded token. The whole body was read
+    /// (in GNU) as part of the enclosing complete_command, under the
+    /// mode stamped on that token (`Token::posix_gate`), so a `set`
+    /// inside the body must never land at all within this call — the
+    /// parked flip is dropped at `finish()`. Only the parser's
+    /// folded-body re-lexes set this; top-level batches and the group
+    /// driver leave it false (their flips land at unit boundaries).
+    posix_locked: bool,
     extglob_flips_allowed: bool,
     comsub_heredocs: Vec<ComsubHeredocHeader>,
     header_scan_from: usize,
@@ -566,6 +628,16 @@ impl GroupScanFeeder {
         start_line: usize,
         in_comsub: bool,
     ) -> Self {
+        Self::with_origin_locked(initial_posix, input_origin, start_line, in_comsub, false)
+    }
+
+    fn with_origin_locked(
+        initial_posix: bool,
+        input_origin: InputOrigin,
+        start_line: usize,
+        in_comsub: bool,
+        posix_locked: bool,
+    ) -> Self {
         let open_snapshot = (Vec::new(), None, false);
         Self {
             initial_posix,
@@ -579,6 +651,8 @@ impl GroupScanFeeder {
             continued_line: false,
             continuation_join_columns: Vec::new(),
             parse_posix: initial_posix,
+            deferred_posix: None,
+            posix_locked,
             extglob_flips_allowed: true,
             comsub_heredocs: Vec::new(),
             header_scan_from: 0,
@@ -647,6 +721,29 @@ impl GroupScanFeeder {
     /// fall back to a fresh whole-text re-lex when this is `true`.
     pub(crate) fn extglob_toggled(&self) -> bool {
         self.extglob_toggled
+    }
+
+    /// Land a parked `set -o/+o posix` flip (rubash#1544) once the reader
+    /// sits at a complete_command boundary: no keyword frame open, no
+    /// heredoc body outstanding, and the completeness summary
+    /// (`token_level_needs_more`) reporting no continuation. Called at
+    /// the commit points — a logical line's acceptance in
+    /// `push_main_line` and the last heredoc body's drain in
+    /// `feed_awaiting_body`. While a unit is open the parked flip stays
+    /// parked, so every pass of the unit lexes under the unit-start
+    /// mode: GNU's read-then-execute cadence (parse.y read_command;
+    /// evalstring.c parse_and_execute).
+    fn apply_deferred_posix_at_unit_boundary(&mut self) {
+        // rubash#1544: a locked (folded-body) feeder never lands the
+        // flip — the body was read under its fold token's mode in full.
+        if self.posix_locked {
+            return;
+        }
+        if self.awaiting_bodies.is_empty() && !self.token_level_needs_more() {
+            if let Some(updated) = self.deferred_posix.take() {
+                self.parse_posix = updated;
+            }
+        }
     }
 
     /// perf21 battery-fusion gate: the feeder's join gates (quotes +
@@ -858,6 +955,10 @@ impl GroupScanFeeder {
             self.output.push(token);
             if self.awaiting_bodies.is_empty() {
                 self.emit_line_separator();
+                // rubash#1544: the drained body completes the unit its
+                // header line belonged to — a parked posix flip lands
+                // here if that unit is now closed.
+                self.apply_deferred_posix_at_unit_boundary();
             }
         }
     }
@@ -1366,13 +1467,21 @@ impl GroupScanFeeder {
         let fold_chars = line_tokens.len() as u64;
         self.fold_pass_tokens(&line_tokens, tail_resumed);
         if let Some(updated) = line_posix_mode_change(&line_tokens) {
-            if self.parse_posix != updated {
-                // The full pass would re-lex the whole line under the new
-                // mode; a resumed tail must not mix modes.
-                self.boundary = None;
-                self.opener = None;
-            }
-            self.parse_posix = updated;
+            // rubash#1544: never apply the flip here. This pass may sit
+            // inside a still-open complete_command (an accumulating brace
+            // group re-lexes its earlier lines on every appended line;
+            // if/while/case/subshell bodies commit line by line while
+            // their unit is open), and GNU reads the whole unit under the
+            // mode in effect when the unit STARTED (parse.y read_command
+            // / evalstring.c parse_and_execute cadence) — a mid-unit
+            // application re-lexed the unit's later lines under the
+            // flipped mode (`{\nset -o posix\ntime -p true\n}` reported
+            // `time: command not found`). Park the flip; it lands at the
+            // commit that closes the unit
+            // (`apply_deferred_posix_at_unit_boundary`). A re-scan of an
+            // accumulated line re-detects the same flip, so the parked
+            // value always tracks the last `set` seen in the unit so far.
+            self.deferred_posix = Some(updated);
         }
         // rubash#131: a top-level `shopt -s/-u extglob` executes before the
         // next line parses in GNU's read-execute loop; mirror that for the
@@ -1720,6 +1829,10 @@ impl GroupScanFeeder {
         if self.awaiting_bodies.is_empty() {
             self.emit_line_separator();
         }
+        // rubash#1544: the committed line may have closed the unit a
+        // parked `set -o/+o posix` flip belongs to — land it before the
+        // next logical line's first pass.
+        self.apply_deferred_posix_at_unit_boundary();
     }
 
     /// End of input: the original loop's post-loop flush (leftover open

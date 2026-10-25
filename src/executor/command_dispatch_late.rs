@@ -387,9 +387,10 @@ impl Executor {
                 Ok(())
             }
             "dirname" => {
-                // The fast paths emulate external commands: with PATH
-                // unset they must not resolve (rubash#1126).
-                if !crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                // The fast paths emulate external commands: when the
+                // name does not resolve (PATH unset, rubash#1126; or a
+                // set PATH without it, rubash#1545) they must not run.
+                if !self.emulated_external_stands_down("dirname") {
                     if let Some(status) = self.try_execute_dirname_fast_path(cmd) {
                         self.exit_code = status;
                         return Ok(());
@@ -398,7 +399,7 @@ impl Executor {
                 self.execute_external(cmd)
             }
             "basename" => {
-                if !crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                if !self.emulated_external_stands_down("basename") {
                     if let Some(status) = self.try_execute_basename_fast_path(cmd) {
                         self.exit_code = status;
                         return Ok(());
@@ -422,21 +423,21 @@ impl Executor {
             // builtin. The `command`-builtin path (command_no_alias_late)
             // bypasses functions by definition and dispatches directly.
             "uname" => {
-                if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                if self.emulated_external_stands_down("uname") {
                     return self.execute_external(cmd);
                 }
                 self.exit_code = self.execute_identity_tool(cmd, "uname");
                 Ok(())
             }
             "arch" => {
-                if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                if self.emulated_external_stands_down("arch") {
                     return self.execute_external(cmd);
                 }
                 self.exit_code = self.execute_identity_tool(cmd, "arch");
                 Ok(())
             }
             "stty" => {
-                if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                if self.emulated_external_stands_down("stty") {
                     return self.execute_external(cmd);
                 }
                 self.exit_code = self.execute_console_mode_tool(cmd);

@@ -1047,6 +1047,137 @@ fn fold_time_pipeline_commands(commands: Vec<CommandNode>) -> Vec<CommandNode> {
         .collect()
 }
 
+/// rubash#1548: the outcome of scanning the operand tokens/words that
+/// follow a `time` head. `next` is the index of the first word of the
+/// timed command (relative to the same slice the caller scanned).
+pub(crate) struct TimePrefixScan {
+    pub next: usize,
+    pub posix_format: bool,
+    pub inverted: bool,
+}
+
+/// GNU decides which words after `time` are its OWN operands in the
+/// lexer, not at execution time (parse.y `special_case_tokens`):
+/// `-p` is returned as TIMEOPT only when the immediately preceding
+/// token was TIME, and `--` as TIMEIGN only when the preceding token
+/// was TIME or TIMEOPT; the grammar (timespec) admits at most one of
+/// each, in that order, and TIMEIGN also selects the POSIX report
+/// format (TIME TIMEIGN -> CMD_TIME_POSIX). The comparison is against
+/// the token's RAW spelling, so a quoted or escaped spelling ('-p',
+/// "-p", \-p, -'p') never matches: it is an ordinary word — the timed
+/// command's name. `!` is not part of the timespec at all (it is the
+/// pipeline's BANG); the crate folds it into the prefix, but once a
+/// `!` — or any non-option word — intervenes, the option window is
+/// closed for good: in `time ! -p x` and `time -p ! -p x` the second
+/// `-p` is the command name (oracle-verified, GNU 5.3.20).
+struct TimePrefixWindow {
+    seen_opt: bool,
+    seen_ign: bool,
+    options_open: bool,
+    posix_format: bool,
+    inverted: bool,
+}
+
+impl TimePrefixWindow {
+    fn new() -> Self {
+        Self {
+            seen_opt: false,
+            seen_ign: false,
+            options_open: true,
+            posix_format: false,
+            inverted: false,
+        }
+    }
+
+    /// Consume one PLAIN-spelled word (see the raw-spelling gate at the
+    /// call sites). Returns true when the word belongs to the prefix.
+    fn step(&mut self, text: &str) -> bool {
+        match text {
+            "-p" if self.options_open && !self.seen_opt && !self.seen_ign => {
+                self.seen_opt = true;
+                self.posix_format = true;
+                true
+            }
+            "--" if self.options_open && !self.seen_ign => {
+                self.seen_ign = true;
+                self.posix_format = true;
+                true
+            }
+            "!" => {
+                self.inverted = !self.inverted;
+                self.options_open = false;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The plain spelling of a token: its value when the raw source text
+/// is exactly the value (an unquoted token), or when no raw text was
+/// recorded (synthetic tokens keep the legacy value-based reading). A
+/// quoted/escaped token's raw text carries the quote characters, so it
+/// never reports a plain spelling for the option words.
+fn token_plain_text(token: &Token) -> Option<&str> {
+    if token.raw.is_empty() || token.raw == token.value {
+        Some(token.value.as_str())
+    } else {
+        None
+    }
+}
+
+/// Scan the tokens following the `time` token at `start`.
+pub(crate) fn scan_time_prefix_tokens(tokens: &[Token], start: usize) -> TimePrefixScan {
+    let mut window = TimePrefixWindow::new();
+    let mut next = start + 1;
+    while let Some(token) = tokens.get(next) {
+        match token_plain_text(token) {
+            Some(text) if window.step(text) => next += 1,
+            _ => break,
+        }
+    }
+    TimePrefixScan {
+        next,
+        posix_format: window.posix_format,
+        inverted: window.inverted,
+    }
+}
+
+/// Scan the words following the `time` head word of a parsed command.
+/// `metadata`, when aligned with `words`, supplies each word's raw
+/// source spelling for the same raw gate the token scanner applies;
+/// without it (synthesized words) the reading is value-based.
+pub(crate) fn scan_time_prefix_words(
+    words: &[String],
+    metadata: Option<&[WordMetadata]>,
+) -> TimePrefixScan {
+    let aligned = metadata.filter(|entries| entries.len() == words.len());
+    let mut window = TimePrefixWindow::new();
+    let mut next = 1;
+    while let Some(word) = words.get(next) {
+        let plain = match aligned {
+            Some(entries) => {
+                let raw = &entries[next].raw;
+                if raw.is_empty() || raw == word {
+                    Some(word.as_str())
+                } else {
+                    None
+                }
+            }
+            None => Some(word.as_str()),
+        };
+        match plain {
+            Some(text) if window.step(text) => next += 1,
+            _ => break,
+        }
+    }
+    TimePrefixScan {
+        next,
+        posix_format: window.posix_format,
+        inverted: window.inverted,
+    }
+}
+
 struct TimePipelinePrefix {
     keyword: String,
     keyword_metadata: Box<WordMetadata>,
@@ -1146,25 +1277,27 @@ fn time_prefix_from_command(command: &mut CommandNode) -> Option<TimePipelinePre
         return None;
     }
 
-    let mut index = 1;
-    let mut posix_format = false;
-    let mut inverted = false;
+    // rubash#1548: the operand window follows parse.y
+    // special_case_tokens (see scan_time_prefix_words): `-p`/`--` are
+    // time's own operands only in the opening window and only when
+    // spelled plainly — a quoted '-p' is the timed command's name.
+    let aligned_metadata = if command.word_metadata.len() == command.words.len() {
+        Some(command.word_metadata.as_slice())
+    } else {
+        None
+    };
+    let scan = scan_time_prefix_words(&command.words, aligned_metadata);
+    let index = scan.next;
+    let posix_format = scan.posix_format;
+    let inverted = scan.inverted;
     let mut prefix_words = Vec::new();
     let mut prefix_word_metadata = Vec::new();
-    while let Some(word) = command.words.get(index).map(String::as_str) {
-        match word {
-            "-p" | "--" | "!" => {
-                prefix_word_metadata.push(build_word_metadata(prefix_words.len(), word, word));
-                prefix_words.push(word.to_string());
-                if word == "-p" {
-                    posix_format = true;
-                } else if word == "!" {
-                    inverted = !inverted;
-                }
-                index += 1;
-            }
-            _ => break,
-        }
+    for word_index in 1..index {
+        let word = &command.words[word_index];
+        let raw =
+            aligned_metadata.map_or(word.as_str(), |entries| entries[word_index].raw.as_str());
+        prefix_word_metadata.push(build_word_metadata(prefix_words.len(), word, raw));
+        prefix_words.push(word.clone());
     }
     let keyword = command.words[0].clone();
     let keyword_metadata = Box::new(build_word_metadata(0, &keyword, &keyword));
@@ -2207,7 +2340,9 @@ pub(super) fn unclosed_brace_eof_node(
     let region: &[Token] = if inner_text.is_empty() {
         &tokens[brace_index + 1..]
     } else {
-        let mut inner = crate::lexer::tokenize(inner_text);
+        // rubash#1544: folded-body re-lex under the fold pass's posix
+        // mode, locked (see Token::posix_gate).
+        let mut inner = crate::lexer::tokenize_locked_body(inner_text, brace.posix_gate);
         for token in inner.iter_mut() {
             token.position = token.position + brace_line - 1;
         }
@@ -2755,26 +2890,22 @@ pub(super) fn parse_time_prefixed_compound_command(
     if !is_keyword(tokens, start, "time") {
         return None;
     }
-    let mut posix_format = false;
-    let mut inverted = false;
+    // rubash#1548: operand window per parse.y special_case_tokens —
+    // see scan_time_prefix_tokens. A quoted '-p' is the timed
+    // command's name, never time's option.
+    let scan = scan_time_prefix_tokens(tokens, start);
+    let posix_format = scan.posix_format;
+    let inverted = scan.inverted;
     let mut prefix_words = Vec::new();
     let mut prefix_word_metadata = Vec::new();
     let mut i = start + 1;
-    while tokens
-        .get(i)
-        .is_some_and(|token| matches!(token.value.as_str(), "-p" | "--" | "!"))
-    {
+    while i < scan.next {
         prefix_word_metadata.push(build_word_metadata(
             prefix_words.len(),
             &tokens[i].value,
             &tokens[i].raw,
         ));
         prefix_words.push(tokens[i].value.clone());
-        match tokens[i].value.as_str() {
-            "-p" => posix_format = true,
-            "!" => inverted = !inverted,
-            _ => {}
-        }
         i += 1;
     }
 
@@ -2934,13 +3065,10 @@ pub(super) fn time_prefixed_shell_command_allows_simple_pipeline(
         return false;
     }
 
-    let mut index = start + 1;
-    while tokens
-        .get(index)
-        .is_some_and(|token| matches!(token.value.as_str(), "-p" | "--" | "!"))
-    {
-        index += 1;
-    }
+    // rubash#1548: skip only the operands GNU's lexer would have
+    // claimed (scan_time_prefix_tokens) — a quoted '-p' already IS the
+    // timed command's head word.
+    let index = scan_time_prefix_tokens(tokens, start).next;
 
     let Some(token) = tokens.get(index) else {
         return true;

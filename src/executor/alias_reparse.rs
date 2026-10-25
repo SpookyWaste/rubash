@@ -729,13 +729,10 @@ fn alias_time_compound_end_word(words: &[String]) -> Option<&'static str> {
 }
 
 fn alias_time_compound_word_index(words: &[String]) -> Option<usize> {
-    let mut index = 1;
-    while matches!(
-        words.get(index).map(String::as_str),
-        Some("-p" | "--" | "!")
-    ) {
-        index += 1;
-    }
+    // rubash#1548: the prefix window follows parse.y
+    // special_case_tokens (see crate::parser::scan_time_prefix_words);
+    // these words are already decoded, so the reading is value-based.
+    let index = crate::parser::scan_time_prefix_words(words, None).next;
 
     words.get(index)?;
     Some(index)
@@ -933,13 +930,8 @@ fn source_has_matching_time_compound_end(source: &str) -> bool {
     if tokens[index].value != "time" {
         return false;
     }
-    index += 1;
-    while matches!(
-        tokens.get(index).map(|token| token.value.as_str()),
-        Some("-p" | "--" | "!")
-    ) {
-        index += 1;
-    }
+    // rubash#1548: operand window per parse.y special_case_tokens.
+    let index = crate::parser::scan_time_prefix_tokens(&tokens, index).next;
     source_tokens_have_matching_compound_end(&tokens, index)
 }
 
@@ -1033,12 +1025,13 @@ fn alias_time_command_from_words(
     command: CommandNode,
     keyword_was_plain_word: bool,
 ) -> TimeCommand {
-    let prefix_words = words
-        .iter()
-        .skip(1)
-        .take_while(|word| matches!(word.as_str(), "-p" | "--" | "!"))
-        .cloned()
-        .collect::<Vec<_>>();
+    // rubash#1548: operand window per parse.y special_case_tokens
+    // (value-based here — these words are already decoded, so a
+    // quoted '-p' in the alias text is indistinguishable; the window
+    // ORDER still applies: at most one -p, then at most one --, and
+    // nothing after a `!`).
+    let scan = crate::parser::scan_time_prefix_words(words, None);
+    let prefix_words = words[1..scan.next].to_vec();
     let prefix_word_metadata = prefix_words
         .iter()
         .enumerate()
@@ -1047,13 +1040,8 @@ fn alias_time_command_from_words(
     TimeCommand {
         keyword: "time".to_string(),
         keyword_metadata: synthetic_keyword_metadata("time"),
-        posix_format: prefix_words.iter().any(|word| word == "-p"),
-        inverted: prefix_words
-            .iter()
-            .filter(|word| word.as_str() == "!")
-            .count()
-            % 2
-            == 1,
+        posix_format: scan.posix_format,
+        inverted: scan.inverted,
         prefix_words,
         prefix_word_metadata,
         command: Box::new(command),

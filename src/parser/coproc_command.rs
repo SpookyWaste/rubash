@@ -1,6 +1,6 @@
 use super::parse_loop::{
     parse_time_prefixed_compound_command, parse_time_prefixed_shell_command,
-    time_prefixed_shell_command_allows_simple_pipeline,
+    scan_time_prefix_tokens, time_prefixed_shell_command_allows_simple_pipeline,
 };
 use super::*;
 use crate::lexer::{Token, TokenKind};
@@ -264,13 +264,9 @@ fn time_prefixed_compound_command_start(tokens: &[Token], start: usize) -> bool 
         return false;
     }
 
-    let mut index = start + 1;
-    while tokens
-        .get(index)
-        .is_some_and(|token| matches!(token.value.as_str(), "-p" | "--" | "!"))
-    {
-        index += 1;
-    }
+    // rubash#1548: same operand window as the other time-prefix
+    // scanners (parse.y special_case_tokens).
+    let index = scan_time_prefix_tokens(tokens, start).next;
 
     tokens.get(index).is_some_and(|token| {
         is_brace_group_token(token)
@@ -374,7 +370,9 @@ fn parse_inline_brace_body(token: &Token) -> Vec<CommandNode> {
         .trim_start_matches('{')
         .trim_end_matches('}')
         .trim();
-    let body_tokens = crate::lexer::tokenize(inner);
+    // rubash#1544: folded-body re-lex under the fold pass's posix
+    // mode, locked (see Token::posix_gate).
+    let body_tokens = crate::lexer::tokenize_locked_body(inner, token.posix_gate);
     parse(&body_tokens).commands
 }
 

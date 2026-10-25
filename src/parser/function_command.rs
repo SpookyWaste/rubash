@@ -280,7 +280,11 @@ pub(super) fn parse_function_command_with_diagnostic(
         let saved_extglob = crate::lexer::parse_extended_glob();
         let group_gate = tokens.get(i).map_or(true, |token| token.extglob_gate);
         crate::lexer::set_parse_extended_glob(group_gate);
-        let mut body_tokens = crate::lexer::tokenize(inner);
+        // rubash#1544: same read-time discipline for the posix mode —
+        // the folded body re-lexes under its fold pass's mode, locked
+        // (see Token::posix_gate).
+        let group_posix_gate = tokens.get(i).map_or(false, |token| token.posix_gate);
+        let mut body_tokens = crate::lexer::tokenize_locked_body(inner, group_posix_gate);
         // GNU parse.y:1264-1290 list grammar, same gate as
         // parse_brace_group_command: a body whose last significant token is
         // a dangling connector (`f() { x && }') is not a terminated list —

@@ -297,10 +297,11 @@ impl Executor {
             (first, ast.commands.get(1))
         };
         if first.words.first().map(String::as_str) != Some("cat")
-            || crate::executor::path::path_is_unset(&self.shell_state.env_vars)
+            || self.emulated_external_stands_down("cat")
         {
-            // With PATH unset, cat does not resolve (rubash#1126): the
-            // heredoc shortcut must not produce the content.
+            // When cat does not resolve (PATH unset, rubash#1126; or a
+            // set PATH without it, rubash#1545), the heredoc shortcut
+            // must not produce the content.
             return None;
         }
         // GNU redir.c expands the heredoc / here-string word in the
@@ -440,10 +441,11 @@ impl Executor {
             (first, ast.commands.get(1))
         };
         if first.words.first().map(String::as_str) != Some("cat")
-            || crate::executor::path::path_is_unset(&self.shell_state.env_vars)
+            || self.emulated_external_stands_down("cat")
         {
-            // With PATH unset, cat does not resolve (rubash#1126): the
-            // heredoc shortcut must not produce the content.
+            // When cat does not resolve (PATH unset, rubash#1126; or a
+            // set PATH without it, rubash#1545), the heredoc shortcut
+            // must not produce the content.
             return None;
         }
         // rubash#320: same admission whitelist as the typed path — a file
@@ -536,13 +538,35 @@ impl Executor {
             return None;
         }
 
+        // rubash#1548: the operand window follows parse.y
+        // special_case_tokens — at most one `-p`, then at most one
+        // `--`, and nothing once a `!` intervenes; a `-p` beyond the
+        // window is the timed command's name and must not be skipped
+        // (or counted for the report format). Nested `time` words stay
+        // transparent, as before. These words were split from the
+        // substitution body text, so the reading is value-based.
         let mut index = 1;
         let mut inverted = false;
+        let mut posix_format = false;
+        let mut seen_opt = false;
+        let mut seen_ign = false;
+        let mut options_open = true;
         while let Some(word) = words.get(index).map(String::as_str) {
             match word {
-                "-p" | "--" | "time" => index += 1,
+                "time" => index += 1,
+                "-p" if options_open && !seen_opt && !seen_ign => {
+                    seen_opt = true;
+                    posix_format = true;
+                    index += 1;
+                }
+                "--" if options_open && !seen_ign => {
+                    seen_ign = true;
+                    posix_format = true;
+                    index += 1;
+                }
                 "!" => {
                     inverted = !inverted;
+                    options_open = false;
                     index += 1;
                 }
                 _ => break,
@@ -555,15 +579,7 @@ impl Executor {
         // site keeps the raw stream write. A command substitution binds only
         // stdout — its stderr IS the shell's stderr in practice — so the
         // item-6 posix routing has no observable difference to close here.
-        print_time(
-            &self.shell_state.env_vars,
-            words
-                .iter()
-                .skip(1)
-                .take_while(|word| word.as_str() != "!")
-                .any(|word| word == "-p"),
-            started,
-        );
+        print_time(&self.shell_state.env_vars, posix_format, started);
         let status = self.last_command_substitution_status.get().unwrap_or(0);
         self.last_command_substitution_status.set(Some(if inverted {
             invert_exit_status(status)
@@ -615,7 +631,7 @@ impl Executor {
             }
             Some("tty") | Some("/bin/tty") | Some("/usr/bin/tty") => {
                 if words.first().map(String::as_str) == Some("tty")
-                    && crate::executor::path::path_is_unset(&self.shell_state.env_vars)
+                    && self.emulated_external_stands_down("tty")
                 {
                     return None;
                 }
@@ -631,8 +647,9 @@ impl Executor {
                 })
             }
             Some("cat") => {
-                // With PATH unset, cat does not resolve (rubash#1126).
-                if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                // When cat does not resolve (PATH unset, rubash#1126; or
+                // a set PATH without it, rubash#1545), decline.
+                if self.emulated_external_stands_down("cat") {
                     return None;
                 }
                 // Bare `cat` (or flag/`-` operands) reads fd 0 — the shared

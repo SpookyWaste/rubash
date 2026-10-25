@@ -64,6 +64,15 @@ pub struct Token {
     /// the body re-parse must use this snapshot, not the current value.
     /// Defaults to open so legacy producers keep accepting.
     pub extglob_gate: bool,
+    /// rubash#1544: the POSIX parse mode of the pass that produced this
+    /// token — the `extglob_gate` discipline applied to the mode: a
+    /// folded compound body is re-tokenized by the parser under the
+    /// mode in effect when the compound was READ (GNU reads a whole
+    /// complete_command before executing any of it, parse.y
+    /// read_command), and a `set -o/+o posix` inside the body must not
+    /// flip the body's own re-lex. Defaults to false (the shell's
+    /// default mode) for synthetic tokens.
+    pub posix_gate: bool,
     /// rubash#413: the word scan ended at end of input with a
     /// compound-assignment list still open (parse.y:7140
     /// parse_compound_assignment hit EOF looking for the closing `)`).
@@ -113,6 +122,7 @@ impl Token {
             leading_ws: String::new(),
             extglob_split: false,
             extglob_gate: true,
+            posix_gate: false,
             compound_unclosed: false,
             heredoc_end_line: None,
             regexp_rhs_fragment: false,
@@ -146,6 +156,7 @@ impl Token {
             leading_ws: String::new(),
             extglob_split: false,
             extglob_gate: true,
+            posix_gate: false,
             compound_unclosed: false,
             heredoc_end_line: None,
             regexp_rhs_fragment: false,
@@ -169,6 +180,7 @@ impl Token {
             leading_ws: String::new(),
             extglob_split: false,
             extglob_gate: true,
+            posix_gate: false,
             compound_unclosed: false,
             heredoc_end_line: None,
             regexp_rhs_fragment: false,
