@@ -451,7 +451,7 @@ pub fn check_setlocale_warning() {
 /// equivalent single source of truth for those readers. Unset names are
 /// removed so the next-priority category applies.
 pub fn sync_process_locale(env_vars: &std::collections::HashMap<String, String>) {
-    for name in ["LC_ALL", "LC_CTYPE", "LANG"] {
+    for name in ["LC_ALL", "LC_CTYPE", "LC_COLLATE", "LANG"] {
         match env_vars.get(name) {
             Some(value) => std::env::set_var(name, value),
             None => std::env::remove_var(name),
@@ -713,8 +713,13 @@ fn collate_locale_name() -> String {
     }
 }
 
-/// Strip the codeset and modifier suffixes and map to a host locale name:
-/// "en_US.UTF-8" -> "en-US" (Windows BCP-47) / "en_US.UTF-8" (POSIX).
+/// Map an environment locale name to the name the host collation call
+/// wants: on Windows the BCP-47 base ("en_US.UTF-8" -> "en-US"); on POSIX
+/// the name VERBATIM, because setlocale(3) resolves the full
+/// "lang_TERRITORY.codeset[@modifier]" form while the codeset-stripped
+/// base FAILS (returns NULL) whenever the locale was compiled under its
+/// full name only — the usual localedef outcome — which silently reduced
+/// every collation on such a system to byte order (rubash#1512).
 /// Returns None for the C/POSIX locale (and every `C.<codeset>` /
 /// `POSIX.<codeset>` form), where collation is plain strcmp — glibc defines
 /// the C.UTF-8 family as code-point order (verified against WSL GNU Bash
@@ -737,18 +742,18 @@ fn host_collate_name(name: &str) -> Option<String> {
     if name.is_empty() || c_family {
         return None;
     }
-    let base = name.split(['.', '@']).next().unwrap_or(name);
     #[cfg(windows)]
     {
         // glibc "en_US" -> BCP-47 "en-US"; a bare language ("en") is kept
         // as a neutral name and resolved by CompareStringEx.
+        let base = name.split(['.', '@']).next().unwrap_or(name);
         Some(base.replace('_', "-"))
     }
     #[cfg(not(windows))]
     {
-        // POSIX setlocale wants the full "lang_TERRITORY.codeset" form; the
-        // unsuffixed "en_US" form is the most portable fallback.
-        Some(base.to_string())
+        // POSIX setlocale wants the full "lang_TERRITORY.codeset[@modifier]"
+        // form exactly as named (see the doc comment above, rubash#1512).
+        Some(name.to_string())
     }
 }
 

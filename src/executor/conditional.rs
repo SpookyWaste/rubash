@@ -538,9 +538,34 @@ impl Executor {
             "!=" if extglob => !extglob_case_pattern_matches(&right_pattern, &left),
             "!=" => !conditional_pattern_or_string_matches(&left, &right_pattern, nocasematch),
             "=~" => self.conditional_regex_match(&left, &right),
-            "<" => left < right,
-            ">" => left > right,
+            // GNU test.c:404-425 binary_test, reached from
+            // execute_cmd.c:4110 which always passes TEST_LOCALE for
+            // `[[ ]]`: string `<`/`>` compare with strcoll(3) when
+            // posixly_correct or the shell compatibility level is above
+            // 40, and with strcmp otherwise. (The `test`/`[` builtin
+            // reaches binary_test WITHOUT TEST_LOCALE — test.c:472 — and
+            // is implemented separately in builtins/test.rs, so it keeps
+            // byte order; do not route it through here.)
+            "<" => self.conditional_string_less(&left, &right),
+            ">" => self.conditional_string_less(&right, &left),
             _ => false,
+        }
+    }
+
+    /// The `<` half of the `[[ ]]` string-order comparison (see the
+    /// binary_test citation at the call site): strcoll under the active
+    /// LC_COLLATE when the GNU gate is open, plain byte order otherwise.
+    /// `crate::locale::strcoll` itself falls back to byte order under the
+    /// C/POSIX collation family and for unresolvable locales, so the C
+    /// locale stays byte-identical to strcmp.
+    fn conditional_string_less(&self, a: &str, b: &str) -> bool {
+        let locale_compare =
+            crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "posix")
+                || crate::builtins::shopt::compatibility_level(&self.shell_state.env_vars) > 40;
+        if locale_compare {
+            crate::locale::strcoll(a, b) == std::cmp::Ordering::Less
+        } else {
+            a < b
         }
     }
 
