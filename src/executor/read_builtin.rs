@@ -38,6 +38,17 @@ fn is_valid_read_name(
 
 impl Executor {
     pub(in crate::executor) fn execute_read(&mut self, cmd: &CommandNode) -> i32 {
+        // GNU redir.c do_redirections opens EVERY redirection before
+        // the builtin runs: output targets are created/truncated and a
+        // failed open aborts the command (rubash#1593 — `read l >f1`
+        // created nothing and `read l >sub/f1` failed silently). The
+        // fd-0 input probe below owns only the input side; this walk
+        // performs the remaining opens in list order.
+        match self.apply_redirect_setup_side_effects(cmd) {
+            Ok(true) => return 1,
+            Ok(false) => {}
+            Err(_) => return 1,
+        }
         // GNU execute_cmd.c do_redirections applies redirects before the
         // builtin runs: a failed input open aborts the command — read's
         // variables stay unset and the diagnostic is the redirect's

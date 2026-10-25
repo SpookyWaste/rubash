@@ -27,6 +27,98 @@ impl Executor {
         }
     }
 
+    /// GNU redir.c do_redirections (redir.c:260 do_redirection_internal)
+    /// runs BEFORE the command body: every redirection in the list is
+    /// opened in order, so a file target is created/truncated even when
+    /// the command itself never writes to that descriptor, and a failed
+    /// open aborts the command with the redirection_error diagnostic
+    /// (redir.c:149-176) and status 1 — the setup is never skipped and
+    /// its failure is never silent (rubash#1593). In-process execution
+    /// funnels that never bind the command's redirects into the fd
+    /// table — `execute_read` and the emulated external file builtins —
+    /// call this walk for the open side effects alone: the command body
+    /// keeps owning its fd 1/2 targets (it re-opens them when it
+    /// actually writes), dup/close entries perform no open (their
+    /// validation is the reject gate's), fd_var entries belong to
+    /// apply_dynamic_fd_var_redirects, injected group redirects are
+    /// already realized by the enclosing compound's bindings, and
+    /// /dev/fd-style aliases resolve through the fd table instead of
+    /// the filesystem. Returns Ok(true) when a failed open was
+    /// diagnosed (routed like redir.c:135) and exit_code set to 1.
+    pub(in crate::executor) fn apply_redirect_setup_side_effects(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<bool, ExecuteError> {
+        use crate::parser::RedirectKind;
+        for redirect in &cmd.redirects {
+            if redirect.fd_var.is_some()
+                || crate::executor::support_names::is_injected_group_redirect(redirect)
+            {
+                continue;
+            }
+            let target = self.expand_redirect_target(redirect);
+            // A plain file target is the only shape this walk opens:
+            // closed forms (`&-`), fd dups (`&N`), /dev/fd aliases, the
+            // null device and process substitutions perform no
+            // filesystem open here.
+            let plain_file_target = !is_closed_redirect_target(&target)
+                && redirect_target_fd(&target).is_none()
+                && crate::executor::execution_misc::dev_stdio_redirect_fd(&target).is_none()
+                && !is_null_device(&target)
+                && !target.starts_with("<(")
+                && !target.starts_with(">(");
+            let opened: Result<File, io::Error> = match redirect.kind {
+                RedirectKind::Output
+                | RedirectKind::ClobberOutput
+                | RedirectKind::CombinedOutput => {
+                    if !plain_file_target {
+                        continue;
+                    }
+                    self.create_redirect_output(&target, redirect.clobber)
+                }
+                RedirectKind::Append | RedirectKind::CombinedAppend => {
+                    if !plain_file_target {
+                        continue;
+                    }
+                    open_redirect_append(&shell_path_to_windows(
+                        &target,
+                        &self.shell_state.env_vars,
+                    ))
+                    .map_err(|e| crate::posix_errors::path_error(&target, e))
+                }
+                RedirectKind::Input => {
+                    if !plain_file_target {
+                        continue;
+                    }
+                    // probe_input_redirect's errors already carry the
+                    // `<target>: <strerror>` path_error shape.
+                    self.probe_input_redirect(&target)
+                }
+                RedirectKind::ReadWrite => {
+                    if !plain_file_target {
+                        continue;
+                    }
+                    self.probe_input_redirect_readwrite(&target)
+                        .map_err(|e| crate::posix_errors::path_error(&target, e))
+                }
+                _ => continue,
+            };
+            if let Err(error) = opened {
+                let mut line = Vec::new();
+                let _ = writeln!(
+                    &mut line,
+                    "{}{}",
+                    self.diagnostic_prefix(),
+                    crate::posix_errors::message(&error)
+                );
+                let _ = self.write_redirect_diagnostic_routed(cmd, &line);
+                self.exit_code = 1;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(in crate::executor) fn write_builtin_not_found(
         &mut self,
         cmd: &CommandNode,
