@@ -1335,6 +1335,7 @@ impl Executor {
             Some(&self.shell_state.random_state),
             Some(&left_dynamic),
             true,
+            Some(&self.shell_state.variables),
         ) else {
             self.flush_arith_diags(Some("[["));
             self.report_conditional_arithmetic_error(&left_eval);
@@ -1356,6 +1357,7 @@ impl Executor {
             Some(&self.shell_state.random_state),
             Some(&right_dynamic),
             true,
+            Some(&self.shell_state.variables),
         ) else {
             self.flush_arith_diags(Some("[["));
             self.report_conditional_arithmetic_error(&right_eval);

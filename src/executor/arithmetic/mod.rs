@@ -745,6 +745,7 @@ impl Executor {
             Some(&self.shell_state.random_state),
             dynamic_values.as_ref(),
             true,
+            Some(&self.shell_state.variables),
         );
         // Failure path: every consumer of arithmetic_last_eval_input
         // (arithmetic_aliases, embedded_mutations, parameter_core error
@@ -943,6 +944,7 @@ impl Executor {
             Some(&self.shell_state.random_state),
             Some(&dynamic_values),
             true,
+            Some(&self.shell_state.variables),
         );
         self.shell_state
             .arithmetic_last_error_category
@@ -1183,6 +1185,7 @@ impl Executor {
             Some(&self.shell_state.random_state),
             Some(&dynamic_values),
             true,
+            Some(&self.shell_state.variables),
         );
         self.shell_state
             .arithmetic_last_error_category
@@ -1754,7 +1757,8 @@ pub(crate) fn arithmetic_expansion_is_fatal(expression: &str) -> bool {
 
 pub(crate) fn arithmetic_error_category(expression: &str) -> Option<ArithmeticErrorCategory> {
     let mut env_vars = crate::shell::var_table::VarTable::default();
-    let (_, category) = eval_mutable_arith_result(expression, &mut env_vars, None, None, false);
+    let (_, category) =
+        eval_mutable_arith_result(expression, &mut env_vars, None, None, false, None);
     category
 }
 
@@ -1785,6 +1789,7 @@ pub(in crate::executor) fn trailing_input_token(
         resolving: Vec::new(),
         random_state: None,
         dynamic_values: None,
+        cells: None,
         error_category: None,
         no_expand: false,
         error: None,
@@ -1838,6 +1843,7 @@ fn indexed_noexpand_error_token(resolved: &str) -> String {
         resolving: Vec::new(),
         random_state: None,
         dynamic_values: None,
+        cells: None,
         error_category: None,
         no_expand: true,
         error: None,
@@ -1911,6 +1917,7 @@ pub(crate) fn eval_conditional_arith_value_with_writes(
     env_vars: &crate::shell::var_table::VarTable,
     random_state: Option<&RandomGen>,
     dynamic_values: Option<&super::dynamic_arrays::ArithDynamicContext>,
+    cells: Option<&crate::shell::VariableStore>,
 ) -> (Option<i128>, Vec<(String, String)>) {
     let (result, writes, _category) =
         eval_conditional_arith_value_categorized_with_writes_and_state(
@@ -1918,6 +1925,7 @@ pub(crate) fn eval_conditional_arith_value_with_writes(
             env_vars,
             random_state,
             dynamic_values,
+            cells,
         );
     (result, writes)
 }
@@ -1931,14 +1939,20 @@ pub(crate) fn eval_conditional_arith_value_categorized_with_writes_and_state(
     env_vars: &crate::shell::var_table::VarTable,
     random_state: Option<&RandomGen>,
     dynamic_values: Option<&super::dynamic_arrays::ArithDynamicContext>,
+    cells: Option<&crate::shell::VariableStore>,
 ) -> (
     Option<i128>,
     Vec<(String, String)>,
     Option<ArithmeticErrorCategory>,
 ) {
     let mut cloned = env_vars.clone();
-    let (result, category) =
-        eval_mutable_arith_value_with_random(value, &mut cloned, random_state, dynamic_values);
+    let (result, category) = eval_mutable_arith_value_with_random(
+        value,
+        &mut cloned,
+        random_state,
+        dynamic_values,
+        cells,
+    );
     let writes = cloned
         .iter()
         .filter(|(name, _)| name.as_str() != "__RUBASH_ARITH_SUBSCRIPT_EXPR")
@@ -1958,7 +1972,7 @@ pub(crate) fn eval_conditional_arith_value_categorized(
     env_vars: &crate::shell::var_table::VarTable,
 ) -> (Option<i128>, Option<ArithmeticErrorCategory>) {
     let mut env_vars = env_vars.clone();
-    eval_mutable_arith_result(value, &mut env_vars, None, None, false)
+    eval_mutable_arith_result(value, &mut env_vars, None, None, false, None)
 }
 
 /// `eval_conditional_arith_value_categorized` plus the write-capture of
@@ -1975,7 +1989,7 @@ pub(crate) fn eval_conditional_arith_value_categorized_with_writes(
     Option<ArithmeticErrorCategory>,
 ) {
     let mut cloned = env_vars.clone();
-    let (result, category) = eval_mutable_arith_result(value, &mut cloned, None, None, false);
+    let (result, category) = eval_mutable_arith_result(value, &mut cloned, None, None, false, None);
     let writes = cloned
         .iter()
         .filter(|(name, _)| name.as_str() != "__RUBASH_ARITH_SUBSCRIPT_EXPR")
@@ -2979,7 +2993,7 @@ fn eval_mutable_arith_value(
     value: &str,
     env_vars: &mut crate::shell::var_table::VarTable,
 ) -> Option<i128> {
-    eval_mutable_arith_value_with_random(value, env_vars, None, None).0
+    eval_mutable_arith_value_with_random(value, env_vars, None, None, None).0
 }
 
 pub(super) fn eval_mutable_arith_value_with_random(
@@ -2987,8 +3001,16 @@ pub(super) fn eval_mutable_arith_value_with_random(
     env_vars: &mut crate::shell::var_table::VarTable,
     random_state: Option<&RandomGen>,
     dynamic_values: Option<&super::dynamic_arrays::ArithDynamicContext>,
+    cells: Option<&crate::shell::VariableStore>,
 ) -> (Option<i128>, Option<ArithmeticErrorCategory>) {
-    eval_mutable_arith_value_with_random_flags(value, env_vars, random_state, dynamic_values, false)
+    eval_mutable_arith_value_with_random_flags(
+        value,
+        env_vars,
+        random_state,
+        dynamic_values,
+        false,
+        cells,
+    )
 }
 
 pub(super) fn eval_mutable_arith_value_with_random_flags(
@@ -2997,6 +3019,7 @@ pub(super) fn eval_mutable_arith_value_with_random_flags(
     random_state: Option<&RandomGen>,
     dynamic_values: Option<&super::dynamic_arrays::ArithDynamicContext>,
     no_expand: bool,
+    cells: Option<&crate::shell::VariableStore>,
 ) -> (Option<i128>, Option<ArithmeticErrorCategory>) {
     // GNU Bash's subexpr() treats an empty arithmetic expression as zero.
     // This matters for expansion and variable contexts, where an empty
@@ -3006,7 +3029,14 @@ pub(super) fn eval_mutable_arith_value_with_random_flags(
     // eval_mutable_arith_result performs both, so this wrapper only passes
     // the flags through (the former duplicate normalize was one of the
     // ~10 full-string scans per `(( ))` evaluation; rubash#156).
-    eval_mutable_arith_result(value, env_vars, random_state, dynamic_values, no_expand)
+    eval_mutable_arith_result(
+        value,
+        env_vars,
+        random_state,
+        dynamic_values,
+        no_expand,
+        cells,
+    )
 }
 
 fn eval_mutable_arith_result(
@@ -3015,6 +3045,7 @@ fn eval_mutable_arith_result(
     random_state: Option<&RandomGen>,
     dynamic_values: Option<&super::dynamic_arrays::ArithDynamicContext>,
     no_expand: bool,
+    cells: Option<&crate::shell::VariableStore>,
 ) -> (Option<i128>, Option<ArithmeticErrorCategory>) {
     // Fresh evaluation: a stale record/diagnostic from an earlier
     // expression must not label this one (early-return paths below never
@@ -3059,6 +3090,7 @@ fn eval_mutable_arith_result(
         resolving: Vec::new(),
         random_state,
         dynamic_values,
+        cells,
         error_category: None,
         no_expand,
         error: None,
