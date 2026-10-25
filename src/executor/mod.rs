@@ -769,6 +769,16 @@ pub struct Executor {
     /// word expansion where it cannot return an error, so it latches here
     /// and execute_prepared_command raises ExpansionFailure(1).
     parameter_assignment_failure: Cell<bool>,
+    /// rubash#1542: `$?` as it stood when the latched
+    /// `parameter_assignment_failure` bind was attempted — GNU prints the
+    /// readonly diagnostic from inside bind_variable (variables.c
+    /// err_readonly -> error.c report_error), BEFORE subst.c
+    /// parameter_brace_expand_rhs writes EX_BADUSAGE into
+    /// last_command_exit_value, and report_error's errexit branch
+    /// exit_shells with that earlier value (0 remapped to
+    /// EXECUTION_FAILURE). Captured by the := applier before the bind
+    /// attempts, consumed beside `parameter_assignment_failure`.
+    parameter_assignment_failure_prev_status: Cell<Option<i32>>,
     /// rubash#1109: an extract_dollar_brace_string failure (subst.c:1954
     /// span rules) latched by the expansion walkers — DISCARD semantics
     /// in every mode, consumed beside the bad-substitution checks.

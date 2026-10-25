@@ -2190,6 +2190,20 @@ impl Executor {
         // status becoming the substitution's status. It must run before
         // restore_flat_subshell, which is the in-place fork boundary that
         // discards the child's trap table.
+        // errpath2 (#1541/#1542): this body runs in place on the caller's
+        // executor, but GNU runs it in the forked substitution child
+        // (subst.c:7143 command_substitute), whose frame folds DISCARD-class
+        // statuses (evalstring.c:423-426 catch) and whose expansion-error
+        // latches die with the child — this fn's own boundary comment above
+        // already promises latch isolation, and the ShellState clone does
+        // not cover the Executor-side latch cells. Carry the same
+        // __RUBASH_COMSUB_BODY frame mark the forked-child path inserts for
+        // the body's duration (restore_flat_subshell rolls the env back),
+        // and bracket the discard latches explicitly.
+        let saved_discard_latches = self.snapshot_discard_latches();
+        self.shell_state
+            .env_vars
+            .insert("__RUBASH_COMSUB_BODY".to_string(), "1".to_string());
         let mut trap_status: Option<i32> = None;
         let (thread_captured, result) = crate::executor::shell_options::capture_stdout(|| {
             // GNU subst.c:7413 parse_and_execute ("command substitution") →
@@ -2208,6 +2222,22 @@ impl Executor {
                     | Err(ExecuteError::ExitCode(status))
                     | Err(ExecuteError::ExpansionFailure(status)) => *status,
                     Err(_) => 1,
+                };
+                // rubash#1541: a no_args DISCARD raised inside this
+                // in-place body folds at the body's parse_and_execute
+                // catch (builtins/evalstring.c:423-426) to
+                // EXECUTION_FAILURE, and the EXIT trap below runs on
+                // the CAUGHT status (subst.c:7340-7341). The walk's own
+                // tail conversion cannot see this case: it is gated on
+                // the reader-top frame, and this body runs nested
+                // inside the caller's walk on the shared executor. A
+                // too-many pending that survives to here was raised by
+                // the body and never consumed (a loop abandon leaves
+                // it armed past the loop's end).
+                let body_status = if executor.evalerror_exit_toomany_pending.get() {
+                    1
+                } else {
+                    body_status
                 };
                 if let Ok(exit_status) = executor.run_exit_trap_for_status(body_status) {
                     trap_status = Some(exit_status);
@@ -2239,6 +2269,7 @@ impl Executor {
         }
 
         self.restore_flat_subshell(saved_state, saved_dir);
+        self.restore_discard_latches(&saved_discard_latches);
         self.fd_table = saved_fd_table;
         // rubash#846: the substitution body ran in a fork-equivalent child
         // frame (GNU subst.c:7143 command_substitute has no :1831-style
@@ -2366,6 +2397,20 @@ impl Executor {
         // in-place call runs on this executor, but the wholesale state
         // restore at the end rolls the parent's trap table back.
         crate::builtins::trap::reset_for_subshell(&mut self.shell_state.env_vars);
+        // errpath2 (#1541/#1542): this body runs in place on the caller's
+        // executor, but GNU runs it in the forked substitution child
+        // (subst.c:7143 command_substitute), whose frame folds DISCARD-class
+        // statuses (evalstring.c:423-426 catch) and whose expansion-error
+        // latches die with the child — this fn's own boundary comment above
+        // already promises latch isolation, and the ShellState clone does
+        // not cover the Executor-side latch cells. Carry the same
+        // __RUBASH_COMSUB_BODY frame mark the forked-child path inserts for
+        // the body's duration (restore_flat_subshell rolls the env back),
+        // and bracket the discard latches explicitly.
+        let saved_discard_latches = self.snapshot_discard_latches();
+        self.shell_state
+            .env_vars
+            .insert("__RUBASH_COMSUB_BODY".to_string(), "1".to_string());
         let (thread_captured, result) = crate::executor::shell_options::capture_stdout(|| {
             // GNU runs `$(f)` through command_substitute → parse_and_execute
             // → evalstring, whose reader bumps indirection_level
@@ -2405,6 +2450,13 @@ impl Executor {
             | Err(ExecuteError::ExpansionFailure(status)) => *status,
             Err(_) => 1,
         };
+        // rubash#1541: same parse_and_execute catch fold as the AST
+        // substitution above — the trap below runs on the caught status.
+        let body_status = if self.evalerror_exit_toomany_pending.get() {
+            1
+        } else {
+            body_status
+        };
         let mut trap_status: Option<i32> = None;
         let (trap_thread_captured, _) = crate::executor::shell_options::capture_stdout(|| {
             if let Ok(exit_status) = self.run_exit_trap_for_status(body_status) {
@@ -2424,6 +2476,7 @@ impl Executor {
             Err(_) => trap_status.unwrap_or(1),
         };
         self.restore_flat_subshell(saved_state, saved_dir);
+        self.restore_discard_latches(&saved_discard_latches);
         // Same rubash#485 reap contract as the AST substitution tail above:
         // the substitution's status is the executor's $? the moment the
         // child is reaped, before the enclosing command runs.

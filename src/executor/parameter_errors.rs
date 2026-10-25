@@ -994,6 +994,64 @@ impl Executor {
         }
     }
 
+    /// True when this executor's top frame is a command-substitution body
+    /// reader — GNU runs the body through parse_and_execute inside the
+    /// forked child (subst.c:7413 command_substitute), whose DISCARD catch
+    /// (builtins/evalstring.c:423-426) forces
+    /// `last_result = last_command_exit_value = EXECUTION_FAILURE` and, in
+    /// a subshell environment, stops the body outright. A DISCARD-class
+    /// abandonment raised anywhere in the child's clone tree (eval/source
+    /// frames, function bodies, `( )` regions, pipeline elements) therefore
+    /// surfaces as status 1 at the substitution boundary, never as the
+    /// pre-set EX_BADUSAGE 2 a script-level reader_loop catch preserves
+    /// (eval.c:111-118) — rubash#1541/#1542. The marker lives only in the
+    /// comsub child's cloned env (command_substitution.rs inserts
+    /// `__RUBASH_COMSUB_BODY`), so the main executor and `( )`-only
+    /// subshells (execute_in_subshell keeps the pre-set status,
+    /// execute_cmd.c:1821-1825) never fold.
+    pub(in crate::executor) fn discard_fold_frame(&self) -> bool {
+        let has = self
+            .shell_state
+            .env_vars
+            .contains_key("__RUBASH_COMSUB_BODY");
+        has
+    }
+
+    /// rubash#1542: the FINAL status a failed `${var:=word}`/`${var=word}`
+    /// assignment produces in the current frame, given the class's
+    /// pre-set status (`class_status`: EX_BADUSAGE 2 for a readonly
+    /// bind, subst.c parameter_brace_expand_rhs; EXECUTION_FAILURE 1
+    /// for a special/positional target, subst.c:10402-10404) and `$?`
+    /// from before the expansion (`prev_status`). GNU prints the
+    /// diagnostic through error.c report_error — from inside
+    /// bind_variable for the readonly class (variables.c err_readonly),
+    /// immediately after set_exit_status(1) for the special class — and
+    /// report_error exit_shells on the spot when
+    /// exit_immediately_on_error is live, with the status current at
+    /// print time: the pre-bind `$?` (0 remapped to EXECUTION_FAILURE)
+    /// for readonly, 1 for special. The flag is the raw option: errexit
+    /// -exempt positions do not clear it, so they die too. Without
+    /// errexit the DISCARD proceeds with the pre-set status, folded to
+    /// EXECUTION_FAILURE inside a command-substitution body
+    /// (discard_fold_frame).
+    pub(in crate::executor) fn param_assign_discard_status(
+        &self,
+        class_status: i32,
+        prev_status: i32,
+    ) -> i32 {
+        if self.errexit_enabled() {
+            if class_status == 1 || prev_status == 0 {
+                1
+            } else {
+                prev_status
+            }
+        } else if self.discard_fold_frame() {
+            1
+        } else {
+            class_status
+        }
+    }
+
     /// GNU's `interactive_shell` at the word-expansion error sites — the
     /// branch that decides expand_*_error (DISCARD) vs expand_*_fatal
     /// (FORCE_EOF):
