@@ -1,5 +1,5 @@
 use super::brace_scan_cache::{BraceScanCache, HeredocOpEntry, HeredocOpScanResume};
-use super::classification::{is_brace_expansion, is_word_delimiter};
+use super::classification::{is_brace_expansion, is_keyword, is_word_delimiter};
 use super::quotes::normalize_backtick_command_substitution;
 use super::token::{Token, TokenKind};
 use crate::token_str::TokStr;
@@ -453,9 +453,48 @@ impl<'a> Lexer<'a> {
                     Some((TokenKind::Word, prev)) if prev == "-p"
                 );
 
+        // rubash#1370: GNU produces a reserved-word TOKEN (COPROC,
+        // TIME, IF, ...) only when the word is read where a reserved
+        // word is acceptable — CHECK_FOR_RESERVED_WORD (parse.y:3168)
+        // runs read_token_word's result through
+        // reserved_word_acceptable(last_read_token) (parse.y:5899);
+        // anywhere else the reader returns a plain WORD, and it is the
+        // PRODUCED token that last_read_token then names. Rubash's word
+        // path marks every keyword-VALUED word TokenKind::Keyword and
+        // lets the parser demote it, so the reader HISTORY must record
+        // the same demotion: a word-path keyword token that was not
+        // itself read in a reserved position is recorded as a Word.
+        // Without this, `command coproc C { ...; }` left
+        // (Keyword, "coproc") in token_before_that,
+        // reserved_word_position() treated the `{` after the coproc
+        // NAME as a group opener and folded the group into one word —
+        // GNU keeps `{`/`}` as word text there and syntax-errors on
+        // the stray `}`.
+        //
+        // The demotion is restricted to word-path keywords
+        // (classification::is_keyword — exactly the set GNU produces
+        // through read_token_word + CHECK_FOR_RESERVED_WORD). The
+        // earlier 830774bd attempt demoted EVERY Keyword token,
+        // including the dedicated-branch `(`/`)` tokens after a
+        // function NAME: the recorded (Word, ")") broke the reserved
+        // chain for the body `{`, the group opener stopped folding,
+        // and the parser's brace-end fallback mis-sliced a later
+        // definition — an ordinary `f() { ...; }` followed by a
+        // function definition inside a subshell died with a spurious
+        // syntax error. Structural tokens (`{`, `}`, `(`, `)`, `!`,
+        // folded groups) are produced by dedicated scan branches whose
+        // kind never depends on the word-position check, so their
+        // history kind is recorded verbatim.
+        let history_kind = if token.kind == TokenKind::Keyword
+            && is_keyword(&token.value)
+            && !self.reserved_word_position()
+        {
+            TokenKind::Word
+        } else {
+            token.kind.clone()
+        };
         self.parse_state.token_before_that = self.parse_state.last_token.take();
-        self.parse_state.last_token =
-            Some((token.kind.clone(), TokStr::from(token.value.as_str())));
+        self.parse_state.last_token = Some((history_kind, TokStr::from(token.value.as_str())));
     }
 
     #[inline]
