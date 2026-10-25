@@ -176,7 +176,10 @@ enum CondOffending {
     Index(usize),
     VirtualNewline(usize),
     Eof,
-    End,
+    /// The `]]' closer itself: the index of the collected `]]'
+    /// argument when it is a real argument, None for the virtual
+    /// end-of-arguments closer.
+    End(Option<usize>),
     /// A pre-shaped near token (rubash#1353's IO_NUMBER form): the text
     /// is the exact `syntax error near' payload and the index names the
     /// argument whose line the report uses.
@@ -192,7 +195,7 @@ impl CondOffending {
         match tok {
             CondTok::Eof => CondOffending::Eof,
             CondTok::Newline => CondOffending::VirtualNewline(anchor),
-            CondTok::End => CondOffending::End,
+            CondTok::End => CondOffending::End(index),
             _ => CondOffending::Index(index.unwrap_or(0)),
         }
     }
@@ -247,7 +250,17 @@ impl CondFail {
                 args[*index].3,
             ),
             CondOffending::Fixed(text, index) => (text.clone(), args[*index].3, args[*index].3),
-            CondOffending::End => ("]]".to_string(), last_line, last_line),
+            CondOffending::End(end_index) => {
+                // GNU's reader stopped AT the offending `]]', so the
+                // near report uses that argument's own line — an
+                // unclosed collect that swallowed later lines' tokens
+                // (rubash#1554's two-line form) still reports the
+                // closer's line, not the last argument's.
+                let end_line = end_index
+                    .and_then(|index| args.get(index))
+                    .map_or(last_line, |arg| arg.3);
+                (end_near_token(args), end_line, end_line)
+            }
             CondOffending::VirtualNewline(anchor) => {
                 let last = (*anchor).min(args.len()).saturating_sub(1);
                 (
@@ -463,6 +476,40 @@ fn walk_back_near_token(args: &[CondArg], index: usize) -> String {
     near
 }
 
+/// The near token for a `]]' (COND_END) offender. error_token_from_text
+/// (parse.y:6772-6808) walks the SOURCE TEXT backward from the end of
+/// the offending token over non-break characters (` \n\t;|&' break),
+/// stopping ON the first break character — which is therefore part of
+/// the report when it is not whitespace (`&]]'), and glued word
+/// fragments before it join the run (`(]]'). The collected arguments'
+/// (leading_ws, raw) pairs reconstruct that source text exactly over
+/// the span the walk can reach. Falls back to the bare `]]' when the
+/// closer is the virtual end-of-arguments token rather than a
+/// collected argument (rubash#1554).
+fn end_near_token(args: &[CondArg]) -> String {
+    if !args.last().is_some_and(|(_, raw, _, _)| raw == "]]") {
+        return "]]".to_string();
+    }
+    let text: String = args
+        .iter()
+        .flat_map(|(_, raw, ws, _)| [ws.as_str(), raw.as_str()])
+        .collect();
+    let bytes = text.as_bytes();
+    let token_end = bytes.len();
+    let mut i = token_end - 1;
+    // Backward over the non-break run (parse.y:6787-6793): `i' lands on
+    // the break character that stopped the walk, or on the first byte.
+    while i > 0 && !matches!(bytes[i], b' ' | b'\n' | b'\t' | b';' | b'|' | b'&') {
+        i -= 1;
+    }
+    // Forward over whitespace only (parse.y:6795-6796): a non-whitespace
+    // break character stays as the report's first character.
+    while i < token_end && matches!(bytes[i], b' ' | b'\n' | b'\t' | b'\r' | 0x0b | 0x0c) {
+        i += 1;
+    }
+    text[i..token_end].to_string()
+}
+
 /// The GNU yacc-level token for one collected argument. Shell metacharacters
 /// are structural only when unquoted (raw == value); `!` negates even quoted
 /// (parse.y:5115 checks the WORD's text). End-of-input presents as a virtual
@@ -653,7 +700,7 @@ fn cond_term(cursor: &mut CondCursor) -> Result<(), CondFail> {
         // prints nothing and yyerror reports `syntax error near `]]''.
         CondTok::End => Err(CondFail {
             messages: Vec::new(),
-            offending: CondOffending::End,
+            offending: CondOffending::End(index),
         }),
         CondTok::Eof => Err(CondFail {
             messages: vec![(

@@ -2354,9 +2354,10 @@ fn command_paren_verdict_disproved_by_parser(input: &str, parse_posix: bool) -> 
     let Some(unclosed) = crate::lexer::unclosed_input_close_char_posix(input, parse_posix) else {
         return false;
     };
-    if unclosed.close != ')' || !unclosed.command {
+    if unclosed.close != ')' {
         return false;
     }
+    let command_position = unclosed.command;
     let open_line = unclosed.open_line;
     // The router's higher-priority EOF families own the diagnostic before
     // any parser-marker event: an unclosed `[` subscript (parse.y:5635-5651
@@ -2386,6 +2387,24 @@ fn command_paren_verdict_disproved_by_parser(input: &str, parse_posix: bool) -> 
             source_line_offset: 0,
         },
     );
+    if !command_position {
+        // rubash#1554: a `((` inside a conditional is not a command
+        // paren, so the close-char scanner's verdict says command=false
+        // and the disproof above never applied — the route then printed
+        // its own `unexpected EOF while looking for matching `)'' for
+        // `[[ x && ((a ]]'. But the scanner has no conditional model:
+        // when the real parser's ONLY error event in the whole tree is
+        // the conditional's own marker, GNU's first error event is the
+        // cond_term diagnostic (parse.y:5074-5247, the group frames'
+        // `expected `)'` sequence), so yield the route exactly then.
+        // Any other marker family present (subshell, compound
+        // assignment, ...) keeps the route's diagnostic.
+        return ast.commands.iter().any(command_tree_has_cond_marker)
+            && !ast
+                .commands
+                .iter()
+                .any(command_tree_has_non_cond_parse_error);
+    }
     if !ast.commands.iter().any(command_tree_has_parse_error) {
         return true;
     }
@@ -2423,6 +2442,30 @@ fn command_tree_has_pre_eof_event_marker(command: &CommandNode) -> bool {
         return true;
     }
     command_tree_walk_nested(command, command_tree_has_pre_eof_event_marker)
+}
+
+/// True when this command (or any nested command) carries the
+/// conditional's own parse-error marker (`__RUBASH_PARSE_ERROR_COND__`).
+fn command_tree_has_cond_marker(command: &CommandNode) -> bool {
+    if command
+        .assignments
+        .iter()
+        .any(|(name, _)| name == "__RUBASH_PARSE_ERROR_COND__")
+    {
+        return true;
+    }
+    command_tree_walk_nested(command, command_tree_has_cond_marker)
+}
+
+/// True when this command (or any nested command) carries a parse-error
+/// marker of any family OTHER than the conditional's own.
+fn command_tree_has_non_cond_parse_error(command: &CommandNode) -> bool {
+    if command.assignments.iter().any(|(name, _)| {
+        name.starts_with("__RUBASH_PARSE_ERROR") && name.as_str() != "__RUBASH_PARSE_ERROR_COND__"
+    }) {
+        return true;
+    }
+    command_tree_walk_nested(command, command_tree_has_non_cond_parse_error)
 }
 
 /// True when this command node, or any command nested inside it (pipeline
