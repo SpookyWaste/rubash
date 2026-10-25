@@ -26,7 +26,16 @@ impl Executor {
             _ => args,
         };
         let Some(name) = args.first().map(String::as_str) else {
-            self.exit_code = 0;
+            // rubash#1643: a bare `builtin` is still a simple command,
+            // and GNU execute_builtin applies its redirections before
+            // the (no-op) builtin runs — `builtin > f` creates/truncates
+            // f, `builtin >> f` creates it, `builtin 2> e` creates e.
+            // The early return skipped that pass entirely, so only the
+            // bare form dropped output redirections (`command` and `:`
+            // take their own redirect passes and agreed with GNU).
+            // Mirror the `:` arm below: same helper, same status rule.
+            let redirect_failed = self.apply_no_output_builtin_redirects_with_status(cmd)?;
+            self.exit_code = if redirect_failed { 1 } else { 0 };
             return Ok(());
         };
 
