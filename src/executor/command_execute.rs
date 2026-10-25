@@ -1277,6 +1277,30 @@ impl Executor {
         // DISCARD, abandoning the current command list while the script
         // continues.
         if self.parameter_assignment_failure.replace(false) {
+            let prev_status = self.parameter_assignment_failure_prev_status.take();
+            // rubash#1542: the readonly diagnostic printed from inside
+            // bind_variable (variables.c err_readonly -> error.c
+            // report_error), and report_error exit_shells on the spot
+            // when exit_immediately_on_error is live — with the status
+            // from BEFORE the bind (EXECUTION_FAILURE when it was 0),
+            // never reaching the EX_BADUSAGE write or the DISCARD. The
+            // check reads the flag only: errexit-exempt positions
+            // (|| / && elements, `!`, if conditions, function bodies
+            // called there) do NOT clear exit_immediately_on_error, so
+            // they all die (GNU 5.3.20 probes: exit = prev $? in every
+            // such position). The frames that DO clear it are the
+            // eval/source CMD_IGNORE_RETURN frame (execute_cmd.c:
+            // 5004-5016) and the comsub child (subst.c:7356-7359, whose
+            // option table rubash clears the same way, so
+            // errexit_enabled is false there unless inherit_errexit).
+            if self.errexit_enabled() {
+                let code = self.param_assign_discard_status(2, prev_status.unwrap_or(0));
+                self.exit_code = code;
+                // rubash#439: expansion error, not a failed command — no
+                // ERR trap (report_error exits before any trap site).
+                self.command_expansion_failed.set(true);
+                return Err(ExecuteError::ExitCode(code));
+            }
             // GNU reports expansion failures with EX_BADUSAGE (2), matching
             // `${var?msg}` / bad-substitution status, not the builtin-failure
             // status 1.

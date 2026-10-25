@@ -386,8 +386,21 @@ impl Executor {
         }
         let status = match (result, trap_result) {
             (Ok(()), Ok(trap_status)) => trap_status,
-            (Err(ExecuteError::ExitCode(code)), Ok(_))
-            | (Err(ExecuteError::ExpansionFailure(code)), Ok(_)) => code,
+            (Err(ExecuteError::ExitCode(code)), Ok(_)) => code,
+            // rubash#1542: an expansion-phase DISCARD harvested from the
+            // element clone keeps its pre-set class status (EX_BADUSAGE
+            // 2 for a failed `${var:=word}` bind) — except when this
+            // pipeline itself runs inside a command-substitution body,
+            // where the body's parse_and_execute catch
+            // (builtins/evalstring.c:423-426) folds it to
+            // EXECUTION_FAILURE like every DISCARD in that frame.
+            (Err(ExecuteError::ExpansionFailure(code)), Ok(_)) => {
+                if code == 2 && self.discard_fold_frame() {
+                    1
+                } else {
+                    code
+                }
+            }
             // rubash#1423: the element runs in a subshell — a `return`
             // raised by the element body ends the element with that
             // status instead of unwinding the enclosing function.
@@ -527,8 +540,21 @@ impl Executor {
         crate::executor::shell_options::restore_stdout_capture(saved_capture);
         let status = match (result, trap_result) {
             (Ok(()), Ok(trap_status)) => trap_status,
-            (Err(ExecuteError::ExitCode(code)), Ok(_))
-            | (Err(ExecuteError::ExpansionFailure(code)), Ok(_)) => code,
+            (Err(ExecuteError::ExitCode(code)), Ok(_)) => code,
+            // rubash#1542: an expansion-phase DISCARD harvested from the
+            // element clone keeps its pre-set class status (EX_BADUSAGE
+            // 2 for a failed `${var:=word}` bind) — except when this
+            // pipeline itself runs inside a command-substitution body,
+            // where the body's parse_and_execute catch
+            // (builtins/evalstring.c:423-426) folds it to
+            // EXECUTION_FAILURE like every DISCARD in that frame.
+            (Err(ExecuteError::ExpansionFailure(code)), Ok(_)) => {
+                if code == 2 && self.discard_fold_frame() {
+                    1
+                } else {
+                    code
+                }
+            }
             // rubash#1423: the element runs in a subshell — a `return`
             // raised by the element body ends the element with that
             // status instead of unwinding the enclosing function.

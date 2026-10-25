@@ -1859,6 +1859,17 @@ impl Executor {
                         && !self.inside_compound_condition.get()
                         && self.at_discard_boundary() =>
                 {
+                    // rubash#1542: inside a command-substitution body the
+                    // DISCARD catch of parse_and_execute (builtins/
+                    // evalstring.c:423-426) folds the pre-set EX_BADUSAGE 2
+                    // of a failed `${var:=word}` bind to EXECUTION_FAILURE
+                    // — `x=$(echo ${v:=x})` on a readonly `v` substitutes
+                    // with status 1, not 2 (see discard_fold_frame).
+                    let code = if code == 2 && self.discard_fold_frame() {
+                        1
+                    } else {
+                        code
+                    };
                     self.exit_code = code;
                     // GNU 5.3.20: under `set -e` a bad-substitution or
                     // failglob word-expansion failure exits the script
@@ -1945,6 +1956,15 @@ impl Executor {
                 // status but the parent script continues. Catch the error at
                 // the subshell boundary instead of propagating it.
                 Err(ExecuteError::ExpansionFailure(code)) if subshell_state.is_some() => {
+                    // rubash#1542: same parse_and_execute fold as the
+                    // discard-boundary arm — a `( )` region inside a
+                    // command-substitution body that dies on a failed
+                    // `${var:=word}` bind reports 1, not the pre-set 2.
+                    let code = if code == 2 && self.discard_fold_frame() {
+                        1
+                    } else {
+                        code
+                    };
                     self.exit_code = code;
                     while index + 1 < commands.len() && !commands[index + 1].subshell_end {
                         index += 1;
