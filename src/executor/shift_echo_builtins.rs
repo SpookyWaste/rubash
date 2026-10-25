@@ -117,21 +117,22 @@ impl Executor {
         if time_dash_word_not_keyword(cmd) {
             return self.execute_external(cmd);
         }
-        let mut index = 1;
-        let mut inverted = false;
-        while let Some(word) = cmd.words.get(index).map(String::as_str) {
-            match word {
-                "-p" | "--" => index += 1,
-                "!" => {
-                    inverted = !inverted;
-                    index += 1;
-                }
-                _ => break,
-            }
-        }
+        // rubash#1548: operand window per parse.y special_case_tokens
+        // (see crate::parser::scan_time_prefix_words) — a quoted '-p'
+        // is the timed command's name, and the report format comes
+        // from the operands actually consumed, never from a `-p`
+        // appearing later among the timed command's own words.
+        let aligned_metadata = if cmd.word_metadata.len() == cmd.words.len() {
+            Some(cmd.word_metadata.as_slice())
+        } else {
+            None
+        };
+        let scan = crate::parser::scan_time_prefix_words(&cmd.words, aligned_metadata);
+        let index = scan.next;
+        let inverted = scan.inverted;
         if index >= cmd.words.len() {
             let started = time_command_started();
-            self.print_time_shell(cmd.words.iter().skip(1).any(|word| word == "-p"), started);
+            self.print_time_shell(scan.posix_format, started);
             self.exit_code = 0;
             return Ok(());
         }
@@ -149,7 +150,7 @@ impl Executor {
         // block in GNU). Capture the execution result, print the report,
         // and only then propagate an errexit/exit unwind.
         let result = self.execute_command(&timed);
-        self.print_time_shell(cmd.words.iter().skip(1).any(|word| word == "-p"), started);
+        self.print_time_shell(scan.posix_format, started);
         if result.is_ok() && inverted {
             self.exit_code = invert_exit_status(self.exit_code);
         }
