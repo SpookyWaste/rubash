@@ -427,6 +427,22 @@ where
                         } else {
                             convert(&value)
                         }
+                    } else if value.starts_with(STORAGE_WORD_PREFIX)
+                        || (variables.is_marked(ARRAY_VARS, name) && value.starts_with('('))
+                    {
+                        // GNU apply_varcasemod converts each ELEMENT value
+                        // of an indexed array too (rubash#1619). Folding
+                        // the whole storage string instead capitalizes
+                        // nothing — the render's first character is the
+                        // prefix/`(` — and lowercases every element, so
+                        // `declare -ca a=(hello world)` stored the words
+                        // verbatim. Convert per element and re-render,
+                        // like the assoc branch above.
+                        let entries = super::storage::indexed_array_entries(&value)
+                            .into_iter()
+                            .map(|(index, element)| (index, convert(&element)))
+                            .collect::<std::collections::BTreeMap<_, _>>();
+                        super::storage::format_indexed_array_storage(entries)
                     } else {
                         convert(&value)
                     };
