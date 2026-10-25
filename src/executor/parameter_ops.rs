@@ -735,21 +735,31 @@ pub(in crate::executor) fn positional_parameter_substring(
     params.iter().skip(start).take(take).cloned().collect()
 }
 
-/// GNU subst.c:3759-3763 pos_params: `${@:0}`/`${*:0}` prepend $0
-/// (dollar_vars[0]) to the positional list before slicing.
+/// GNU subst.c:3745 pos_params builds the virtual list [$0, $1..$n]
+/// for EVERY `${@:...}`/`${*:...}` slice, not just offset 0:
+/// parameter_brace_substring (subst.c:9050) slices that list with
+/// 0-based positions, and verify_substring_values (subst.c:8395)
+/// resolves a negative offset against nargs+1 — so `${@: -3:2}` with
+/// two parameters yields $0 and $1, and a start resolved outside the
+/// list is a silent empty result (rubash#1601). The plain helper's
+/// convention (offset 1 = first element, negative counts from the
+/// end) matches the virtual list exactly once $0 is prepended and a
+/// non-negative offset is shifted by one.
 pub(in crate::executor) fn positional_parameter_substring_with_zero(
     params: &[String],
     zero: &str,
     offset: isize,
     length: Option<isize>,
 ) -> Vec<String> {
-    if offset != 0 {
-        return positional_parameter_substring(params, offset, length);
-    }
     let mut with_zero = Vec::with_capacity(params.len() + 1);
     with_zero.push(zero.to_string());
     with_zero.extend(params.iter().cloned());
-    positional_parameter_substring(&with_zero, 1, length)
+    let adjusted = if offset >= 0 {
+        offset.saturating_add(1)
+    } else {
+        offset
+    };
+    positional_parameter_substring(&with_zero, adjusted, length)
 }
 
 /// GNU subst.c:9805-9880 (extract_variable_name -> op dispatch):
