@@ -1,5 +1,62 @@
 use super::*;
 
+/// rubash#1626: pin the shell's ambient fd-table descriptors at their
+/// slot numbers in a forked child, between fork and exec — GNU's child
+/// inherits every descriptor `exec N>file` bound, at the same number.
+/// Two-phase so a pin never clobbers a not-yet-moved source: first move
+/// every source above every target with F_DUPFD_CLOEXEC, then dup2 the
+/// staged copies onto their slots (dup2 clears CLOEXEC on the target,
+/// so the descriptor survives exec). A source already sitting at its
+/// slot only needs its CLOEXEC flag cleared. Failures are ignored per
+/// pin: the child then simply lacks that descriptor — the pre-fix
+/// behavior — instead of failing the whole spawn. One target is never
+/// clobbered: an anonymous pipe the spawn machinery itself parked at
+/// that number in the child (its exec-error channel). It is
+/// recognizable as an open FIFO at the target that is not one of the
+/// pin sources; overwriting it would corrupt spawn error reporting.
+#[cfg(unix)]
+fn pin_ambient_fds_in_child(pins: &[(std::os::unix::io::RawFd, u32)]) -> std::io::Result<()> {
+    use std::os::unix::io::RawFd;
+    let sources: Vec<RawFd> = pins.iter().map(|&(source, _)| source).collect();
+    let ceiling = pins
+        .iter()
+        .map(|&(source, slot)| source.max(slot as RawFd))
+        .max()
+        .unwrap_or(2);
+    let mut staged: Vec<(RawFd, RawFd)> = Vec::with_capacity(pins.len());
+    for &(source, slot) in pins {
+        let target = slot as RawFd;
+        if source == target {
+            unsafe { libc::fcntl(source, libc::F_SETFD, 0) };
+            continue;
+        }
+        let temp = unsafe { libc::fcntl(source, libc::F_DUPFD_CLOEXEC, ceiling + 1) };
+        if temp >= 0 {
+            staged.push((temp, target));
+        }
+    }
+    for (temp, target) in staged {
+        if !sources.contains(&target) && fd_is_anonymous_pipe(target) {
+            unsafe { libc::close(temp) };
+            continue;
+        }
+        if unsafe { libc::dup2(temp, target) } >= 0 {
+            unsafe { libc::close(temp) };
+        }
+    }
+    Ok(())
+}
+
+/// Whether `fd` is currently open in this process as an anonymous pipe.
+#[cfg(unix)]
+fn fd_is_anonymous_pipe(fd: std::os::unix::io::RawFd) -> bool {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return false;
+    }
+    (stat.st_mode & libc::S_IFMT) == libc::S_IFIFO
+}
+
 impl Executor {
     /// The simple-command execution lookup. Under a `command -p`
     /// re-dispatch (standard_path_scope set) the lookup walks the
@@ -1155,6 +1212,67 @@ impl Executor {
             // fork); the dup above is what the child holds.
             drop(file);
         }
+        // rubash#1626: the env channel above only reaches rubash children
+        // (init.rs restores the named handles at startup); a foreign child
+        // — the /usr/bin/bash, cat, ls of the report — gets neither the
+        // descriptor nor a usable number, and the table's handles are all
+        // opened O_CLOEXEC, so nothing leaks through the raw fd space
+        // either: every ambient fd bound by `exec N>file` / `exec N<file`
+        // / `exec N<>file` fails EBADF there. GNU's fork simply inherits
+        // the descriptors at their numbers. Mirror that on Unix with a
+        // pre_exec pin (registered below): each fd-table entry >= 3
+        // backed by a real descriptor is dup2'ed onto its slot number in
+        // the child. Slots the command itself redirects are left alone —
+        // the command's binding is the more local one and travels the
+        // env channel / scoped paths above; pinning the ambient target
+        // under it would hand the child the wrong file.
+        #[cfg(unix)]
+        let ambient_fd_pins: Vec<(std::os::unix::io::RawFd, u32)> = {
+            let mut pins: Vec<(std::os::unix::io::RawFd, u32)> = Vec::new();
+            for (fd, entry) in &self.fd_table.entries {
+                if *fd < 3 || entry.closed {
+                    continue;
+                }
+                if cmd
+                    .redirects
+                    .iter()
+                    .any(|redirect| redirect.fd == Some(*fd))
+                {
+                    continue;
+                }
+                let mut take =
+                    |endpoint: Option<&Rc<crate::executor::fd_table::FileFd>>,
+                     pins: &mut Vec<(std::os::unix::io::RawFd, u32)>| {
+                        if let Some(file) = endpoint {
+                            let pin = (file.handle, *fd);
+                            if !pins.contains(&pin) {
+                                pins.push(pin);
+                            }
+                        }
+                    };
+                take(
+                    entry.read.as_ref().and_then(|read| match read {
+                        crate::executor::fd_table::FdReadEndpoint::File(file) => Some(file),
+                        crate::executor::fd_table::FdReadEndpoint::CoprocStdout { fd, .. } => {
+                            Some(fd)
+                        }
+                        _ => None,
+                    }),
+                    &mut pins,
+                );
+                take(
+                    entry.write.as_ref().and_then(|write| match write {
+                        crate::executor::fd_table::FdWriteEndpoint::File(file) => Some(file),
+                        crate::executor::fd_table::FdWriteEndpoint::CoprocStdin { fd, .. } => {
+                            Some(fd)
+                        }
+                        _ => None,
+                    }),
+                    &mut pins,
+                );
+            }
+            pins
+        };
         // rubash#229: restore GNU's child signal dispositions between fork
         // and exec (trap.c:1489 restore_original_signals) — without this a
         // policy/trap SIG_IGN in the shell survives exec and makes children
@@ -1163,6 +1281,18 @@ impl Executor {
         unsafe {
             use std::os::unix::process::CommandExt;
             process.pre_exec(crate::builtins::kill::child_pre_exec_reset);
+        }
+        // rubash#1626: pin the ambient descriptors at their slot numbers
+        // (see the pin table built above). Registered before the /dev/fd
+        // operand attach below so a command-scoped operand pin — the
+        // most local binding — wins any slot collision.
+        #[cfg(unix)]
+        if !ambient_fd_pins.is_empty() {
+            use std::os::unix::process::CommandExt;
+            let pins = ambient_fd_pins;
+            unsafe {
+                process.pre_exec(move || pin_ambient_fds_in_child(&pins));
+            }
         }
         // rubash#438: pin the buffered process-substitution pipe read ends at
         // their /dev/fd/N numbers in the child (fork-exec dup2), so the
