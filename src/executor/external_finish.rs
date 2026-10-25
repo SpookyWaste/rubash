@@ -2,6 +2,18 @@ use super::*;
 use crate::executor::ast_exec::is_closed_output_io_error;
 use crate::executor::markers::DATA_DOLLAR_STR;
 
+/// GNU cat.c: `cat 1>&-` runs with fd 1 closed in the child
+/// (redir.c r_close_this), so the first write fails EBADF and cat
+/// reports it against standard output. The parser mirrors the close
+/// into `redirect_out` with the literal `&-` target; opening that as a
+/// filename would create a bogus file named `&-` (rubash#1594).
+pub(in crate::executor) fn cat_closed_stdout_error() -> ExecuteError {
+    ExecuteError::IoError(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "cat: standard output: Bad file descriptor",
+    ))
+}
+
 impl Executor {
     pub(in crate::executor) fn write_cat_output(
         &mut self,
@@ -35,6 +47,9 @@ impl Executor {
         }
         if let Some(redirect) = &cmd.redirect_out {
             let target = self.expand_redirect_target(redirect);
+            if crate::executor::execution_misc::is_closed_redirect_target(&target) {
+                return Err(cat_closed_stdout_error());
+            }
             // /dev/std*, /dev/fd/N: resolve as a dup of the aliased fd's
             // current binding (implicit std fds write their default stream)
             // instead of reopening the alias as a literal Windows path
@@ -79,6 +94,9 @@ impl Executor {
             (None, Some(append)) => (self.expand_redirect_target(append), true, true),
             (None, None) => return Ok(None),
         };
+        if crate::executor::execution_misc::is_closed_redirect_target(&target) {
+            return Err(cat_closed_stdout_error());
+        }
         // fd aliases (`/dev/stdout`, `/dev/fd/N`) resolve through the fd table,
         // not a reopened path — leave those to the per-chunk path.
         if crate::executor::execution_misc::redirect_target_fd(&target).is_some() {

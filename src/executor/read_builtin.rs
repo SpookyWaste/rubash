@@ -38,6 +38,17 @@ fn is_valid_read_name(
 
 impl Executor {
     pub(in crate::executor) fn execute_read(&mut self, cmd: &CommandNode) -> i32 {
+        // GNU redir.c do_redirections opens EVERY redirection before
+        // the builtin runs: output targets are created/truncated and a
+        // failed open aborts the command (rubash#1593 — `read l >f1`
+        // created nothing and `read l >sub/f1` failed silently). The
+        // fd-0 input probe below owns only the input side; this walk
+        // performs the remaining opens in list order.
+        match self.apply_redirect_setup_side_effects(cmd) {
+            Ok(true) => return 1,
+            Ok(false) => {}
+            Err(_) => return 1,
+        }
         // GNU execute_cmd.c do_redirections applies redirects before the
         // builtin runs: a failed input open aborts the command — read's
         // variables stay unset and the diagnostic is the redirect's
@@ -2244,9 +2255,20 @@ impl Executor {
 
         if let Some(fd) = read_fd {
             if !self.read_fd_is_available(cmd, fd) {
+                // GNU read.def:378-380: sh_validfd failing means the
+                // descriptor is not open at all — "invalid file
+                // descriptor". A descriptor that IS open but not
+                // readable (write-only) passes that check and fails in
+                // the read itself — read.def:911 "read error"
+                // (rubash#1592).
+                let wording = if self.fd_table.is_open(fd) {
+                    "read error"
+                } else {
+                    "invalid file descriptor"
+                };
                 let _ = writeln!(
                     &mut stderr,
-                    "{}read: {fd}: invalid file descriptor: Bad file descriptor",
+                    "{}read: {fd}: {wording}: Bad file descriptor",
                     self.diagnostic_prefix()
                 );
                 return self.finish_read_error(cmd, &stderr, 1);

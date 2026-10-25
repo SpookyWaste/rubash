@@ -73,6 +73,16 @@ impl Executor {
                 );
             }
         }
+        // GNU redir.c do_redirections opens every redirection in the
+        // forked child before exec: file targets are created/truncated
+        // and a failed open kills the command with status 1. The
+        // emulations below re-open only their fd 1/2 mirrors when they
+        // write, so without this walk an fd>=3 target was never opened
+        // at all and a failing one was silently ignored (rubash#1593:
+        // `cat 3>f` created nothing, `cat 3>sub/f` ran with rc 0).
+        if self.apply_redirect_setup_side_effects(cmd)? {
+            return Ok(true);
+        }
         match cmd.words[0].as_str() {
             "/bin/pwd" | "/usr/bin/pwd" => {
                 let mut pwd_cmd = cmd.clone();
@@ -1568,6 +1578,9 @@ impl Executor {
                     }
                 }
                 let target = self.expand_redirect_target(redirect);
+                if crate::executor::execution_misc::is_closed_redirect_target(&target) {
+                    return Err(super::external_finish::cat_closed_stdout_error());
+                }
                 if let Some(result) = self.write_dev_stdio_redirect_output(&target, &output) {
                     result?;
                     self.exit_code = 0;
