@@ -752,8 +752,19 @@ impl Executor {
         let word = if is_output {
             let path = self.empty_process_substitution_temp().ok()?;
             let word = self.process_substitution_output_fd_word(&path);
+            // rubash#1184 f4: the body runs at finish in a spawned child;
+            // capture the constructing `[[` command's line now (the
+            // CURRENT_LINE discipline the in-process body parse seeds
+            // from, rubash#1024) so the child's diagnostics attribute to
+            // it instead of line 1.
+            let line = self
+                .shell_state
+                .env_vars
+                .get("__RUBASH_CURRENT_LINE")
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0);
             self.conditional_output_procsubs
-                .push((path, source.to_string()));
+                .push((path, source.to_string(), line));
             word
         } else {
             let output_bytes = self.process_substitution_output_bytes(source)?;

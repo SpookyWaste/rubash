@@ -549,7 +549,7 @@ pub struct Executor {
     /// command. The body runs at the command's end, reading the temp
     /// carrier (the same finish the simple-command path gives output
     /// process substitutions).
-    conditional_output_procsubs: Vec<(std::path::PathBuf, String)>,
+    conditional_output_procsubs: Vec<(std::path::PathBuf, String, Option<usize>)>,
     pending_scalar_assignment: bool,
     suppress_errexit: usize,
     /// GNU execute_cmd.c:273 `executing_command_builtin`: set while a

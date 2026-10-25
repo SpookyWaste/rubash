@@ -2874,7 +2874,12 @@ impl Executor {
     /// registered for reaping, and becomes `$!`. Returns false when the
     /// spawn could not be set up; the caller then falls back to
     /// synchronous collection.
-    fn bind_input_process_substitution_child(&mut self, fd: u32, source: &str) -> bool {
+    fn bind_input_process_substitution_child(
+        &mut self,
+        fd: u32,
+        source: &str,
+        line: Option<usize>,
+    ) -> bool {
         use std::process::{Command, Stdio};
         let exe = std::env::var_os("CARGO_BIN_EXE_rubash")
             .map(std::path::PathBuf::from)
@@ -2906,6 +2911,26 @@ impl Executor {
                 exported_function_env_name(name),
                 exported_function_env_value(&body.commands, def_redirects),
             );
+        }
+        // rubash#1184 f4: seed the child's line frame from the
+        // constructing `exec` command's line, the `&` respawn's protocol
+        // — GNU's process_substitute fork (subst.c:6362) inherits the
+        // parent's script name and line_number, so a body diagnostic
+        // (`3: Bad file descriptor` for a redirect failing inside the
+        // body) attributes to the construction line, not line 1. The
+        // body here is the raw `-c` source (functions ride BASH_FUNC
+        // entries, no prelude), so the offset is exactly line - 1.
+        // __RUBASH_SHELL_PID marks the spawn as an internal respawn —
+        // the marker the child init requires before it keeps
+        // __RUBASH_SCRIPT_NAME at all (init.rs), the same stamp the
+        // output-substitution spawn carries.
+        child.env("__RUBASH_SHELL_PID", self.shell_pid.to_string());
+        if let Some(script_name) = self.shell_state.env_vars.get("__RUBASH_SCRIPT_NAME") {
+            child.env("__RUBASH_SCRIPT_NAME", script_name);
+        }
+        if let Some(line) = line {
+            child.env("__RUBASH_CURRENT_LINE", line.to_string());
+            child.env("__RUBASH_LINE_OFFSET", line.saturating_sub(1).to_string());
         }
         child.stdin(Stdio::inherit());
         child.stdout(writer);
@@ -3232,7 +3257,7 @@ impl Executor {
                         // producer exits — forever for `tail -f`. Spawn
                         // the body as a child shell on a real pipe
                         // instead (same shape as the coproc spawn).
-                        if self.bind_input_process_substitution_child(fd, source) {
+                        if self.bind_input_process_substitution_child(fd, source, cmd.line) {
                             continue;
                         }
                         if let Some(input) = self.process_substitution_output(source) {
