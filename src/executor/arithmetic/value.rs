@@ -13,6 +13,27 @@ use crate::executor::{
 };
 
 impl ConditionalArithParser<'_> {
+    /// Element text for an indexed arithmetic read. PIPESTATUS
+    /// consults the live-cell snapshot first (rubash#1364 R3): the
+    /// env mirror never carries pipeline results — the completion
+    /// writer updates the cell state only — so the mirror leg would
+    /// read a stale assignment-era value (or nothing). Every other
+    /// array reads through the mirror storage as before.
+    fn indexed_element_text(&self, name: &str, index: i128) -> Option<String> {
+        if name == "PIPESTATUS" {
+            if let Some(verdict) = self
+                .dynamic_values
+                .and_then(|context| context.pipestatus_element(index))
+            {
+                return verdict;
+            }
+        }
+        self.env_vars.get(name).and_then(|value| {
+            resolve_indexed_array_subscript(value, index)
+                .and_then(|resolved| array_value_at(value, resolved))
+        })
+    }
+
     pub(super) fn lvalue_value(&mut self, lvalue: &ArithLValue) -> Option<i128> {
         // GNU expr.c:1164-1167 expr_streval: under noeval the whole read
         // (array lookup, subscript evaluation, dynamic special variables)
@@ -23,10 +44,7 @@ impl ConditionalArithParser<'_> {
         match lvalue {
             ArithLValue::Scalar(name) => self.variable_value(name),
             ArithLValue::Indexed { name, index } => {
-                let value = self.env_vars.get(name).and_then(|value| {
-                    resolve_indexed_array_subscript(value, *index)
-                        .and_then(|index| array_value_at(value, index))
-                });
+                let value = self.indexed_element_text(name, *index);
                 let value = value.unwrap_or_default();
                 self.evaluate_variable_text(&format!("{name}[{index}]"), &value)
             }
@@ -36,10 +54,7 @@ impl ConditionalArithParser<'_> {
                 // array_expand_index), once — `a[i++]` reads a[0] and
                 // increments i once (verified GNU 5.3).
                 let index = self.eval_subscript_index(subscript)?;
-                let value = self.env_vars.get(name).and_then(|value| {
-                    resolve_indexed_array_subscript(value, index)
-                        .and_then(|index| array_value_at(value, index))
-                });
+                let value = self.indexed_element_text(name, index);
                 let value = value.unwrap_or_default();
                 self.evaluate_variable_text(&format!("{name}[{index}]"), &value)
             }

@@ -435,7 +435,7 @@ impl Executor {
     fn expand_embedded_parameters_ordered_mut(
         &mut self,
         word: &str,
-        saved_parameter_state: Option<&(crate::shell::var_table::VarTable, Vec<i32>)>,
+        saved_parameter_state: Option<&(crate::shell::var_table::VarTable, Vec<(i64, i32)>)>,
         context: SubstitutionQuoteContext,
         heredoc: bool,
         alternate: bool,
@@ -1511,7 +1511,7 @@ impl Executor {
 
     fn expand_with_parameter_env<T>(
         &mut self,
-        saved_parameter_state: Option<&(crate::shell::var_table::VarTable, Vec<i32>)>,
+        saved_parameter_state: Option<&(crate::shell::var_table::VarTable, Vec<(i64, i32)>)>,
         expand: impl FnOnce(&mut Self) -> T,
     ) -> T {
         let Some((saved_parameter_env, saved_parameter_pipestatus)) = saved_parameter_state else {

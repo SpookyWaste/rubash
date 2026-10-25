@@ -76,9 +76,10 @@ impl Drop for Scratch {
 // The z2 verification matrix: 33 active forms (name, script, expected
 // stdout, expected stderr substring). Expectations are GNU bash 5.3.20
 // byte-for-byte on stdout; process exit status is 0 for every case.
-// Six first-touch forms and the 40th form ("elem assign fresh",
-// the R3 sparse residual) are pinned separately below as ignored
-// placeholders (open rubash#1364 territory, see FIRST_TOUCH_PENDING).
+// The six first-touch forms and the 40th form ("elem assign fresh",
+// the R3 sparse case) are pinned separately below — the first-touch
+// pins activated with PR #1526, the R3 sparse pins with the
+// sparse-representation rework (fix5/r3).
 // ---------------------------------------------------------------------
 
 const MATRIX: &[(&str, &str, &str, &str)] = &[
@@ -173,14 +174,13 @@ fn pipestatus_first_touch_forms_pending_issue1364() {
     }
 }
 
-/// R3 residual (rubash#1364): assigning a fresh sparse element
+/// R3 (rubash#1364): assigning a fresh sparse element
 /// (`PIPESTATUS[2]=5` before PIPESTATUS exists) must keep the sparse
 /// index — GNU prints `([2]="0")` both before and after the next
-/// pipeline rewrites the value. rubash's dense `Vec` cell collapses the
-/// assignment to index 0. Pinning the GNU expectation as an ignored
-/// placeholder until the sparse-representation rework lands.
+/// pipeline rewrites the value. The sparse-representation rework
+/// (variables.c:6291 set_pipestatus_array over the ARRAY object)
+/// landed with the fix5/r3 cluster, activating this pin.
 #[test]
-#[ignore = "rubash#1364 R3 residual: sparse PIPESTATUS element assignment collapses to a dense array; needs the sparse-representation rework"]
 fn pipestatus_sparse_element_assignment_keeps_index() {
     let (stdout, stderr, code) =
         rubash_c("PIPESTATUS[2]=5; declare -p PIPESTATUS; true; declare -p PIPESTATUS");
@@ -188,6 +188,88 @@ fn pipestatus_sparse_element_assignment_keeps_index() {
         stdout,
         "declare -a PIPESTATUS=([2]=\"0\")\ndeclare -a PIPESTATUS=([2]=\"0\")\n"
     );
+    assert_eq!(stderr, "");
+    assert_eq!(code, Some(0));
+}
+
+/// R3 (rubash#1364): the sparse writer's grow path — a following
+/// pipeline with MORE statuses than the cell has elements replaces the
+/// existing elements in index order and inserts the remaining statuses
+/// AT their indices (array.c:516 array_insert replaces on collision),
+/// so the sparse index survives and the count can stay below the
+/// pipeline length. A pipeline with FEWER statuses rebuilds densely.
+#[test]
+fn pipestatus_sparse_writer_grow_and_shrink_match_gnu() {
+    for (script, want) in [
+        (
+            "PIPESTATUS[2]=5; true|false; declare -p PIPESTATUS",
+            "declare -a PIPESTATUS=([1]=\"1\" [2]=\"0\")\n",
+        ),
+        (
+            "PIPESTATUS[2]=5; true|false|true; declare -p PIPESTATUS",
+            "declare -a PIPESTATUS=([1]=\"1\" [2]=\"0\")\n",
+        ),
+        (
+            "PIPESTATUS[2]=5; true|true|true|true; declare -p PIPESTATUS",
+            "declare -a PIPESTATUS=([1]=\"0\" [2]=\"0\" [3]=\"0\")\n",
+        ),
+        // Shrink: fewer statuses than elements flushes, dense rebuild.
+        (
+            "PIPESTATUS[2]=5; PIPESTATUS[0]=7; declare -p PIPESTATUS",
+            "declare -a PIPESTATUS=([0]=\"0\")\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = rubash_c(script);
+        assert_eq!(stdout, want, "script {script}");
+        assert_eq!(stderr, "", "script {script}");
+        assert_eq!(code, Some(0), "script {script}");
+    }
+}
+
+/// R3 (rubash#1364): reads on a sparse live cell resolve by INDEX —
+/// `$PIPESTATUS` and arithmetic read element 0 (unset on a sparse
+/// cell, never the first stored entry), `${PIPESTATUS[@]}` lists the
+/// values in index order, `${!PIPESTATUS[@]}` the real indices, and a
+/// negative subscript resolves against the MAXIMUM index with holes
+/// reading as unset in silence.
+#[test]
+fn pipestatus_sparse_reads_resolve_by_index() {
+    let (stdout, stderr, code) = rubash_c(
+        "PIPESTATUS[5]=3; echo \"all:[${PIPESTATUS[@]}] keys:[${!PIPESTATUS[@]}] \
+         n:${#PIPESTATUS[@]} s:[$PIPESTATUS] e5:[${PIPESTATUS[5]}]\"",
+    );
+    assert_eq!(stdout, "all:[0] keys:[5] n:1 s:[] e5:[0]\n");
+    assert_eq!(stderr, "");
+    assert_eq!(code, Some(0));
+
+    let (stdout, stderr, code) = rubash_c(
+        "PIPESTATUS[2]=5; echo \"m1:[${PIPESTATUS[-1]}] m2:[${PIPESTATUS[-2]}] \
+         m3:[${PIPESTATUS[-3]}]\"; PIPESTATUS[2]=5; false; \
+         echo \"s:[$PIPESTATUS] a:$((PIPESTATUS)) ap:$((PIPESTATUS[0])) a2:$((PIPESTATUS[2]))\"",
+    );
+    assert_eq!(stdout, "m1:[0] m2:[] m3:[]\ns:[] a:0 ap:0 a2:1\n");
+    assert_eq!(stderr, "");
+    assert_eq!(code, Some(0));
+
+    // Arithmetic element reads consult the live cell, not the env
+    // mirror (which never carries pipeline results): a dense
+    // pipeline's [1] and a sparse cell's surviving [2] both read
+    // their real statuses.
+    let (stdout, stderr, code) =
+        rubash_c("true|false; echo \"a1:$((PIPESTATUS[1])) a0:$((PIPESTATUS[0]))\"");
+    assert_eq!(stdout, "a1:1 a0:0\n");
+    assert_eq!(stderr, "");
+    assert_eq!(code, Some(0));
+}
+
+/// R3 (rubash#1364): unsetting the only sparse element empties the
+/// cell, so the unset command's own completion writes its status
+/// densely at index 0 (GNU oracle-verified).
+#[test]
+fn pipestatus_sparse_unset_element_rebuilds_dense() {
+    let (stdout, stderr, code) =
+        rubash_c("PIPESTATUS[2]=5; unset PIPESTATUS[2]; declare -p PIPESTATUS");
+    assert_eq!(stdout, "declare -a PIPESTATUS=([0]=\"0\")\n");
     assert_eq!(stderr, "");
     assert_eq!(code, Some(0));
 }
