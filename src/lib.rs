@@ -15,6 +15,7 @@
 pub mod build_info;
 pub mod builtins;
 pub mod console_readline;
+pub(crate) mod debugger;
 pub mod executor;
 pub mod expand;
 #[cfg(any(windows, unix))]
