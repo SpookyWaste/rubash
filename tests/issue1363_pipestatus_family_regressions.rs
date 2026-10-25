@@ -152,12 +152,11 @@ const FIRST_TOUCH_PENDING: &[(&str, &str, &str, &str)] = &[
 /// held a pipeline value must render in `declare -p` WITHOUT the array
 /// attribute (`declare -r` / `declare -x` / `declare --`), and a plain
 /// scalar assignment must freeze the variable (later pipelines stop
-/// rewriting it). On the baseline these six forms diverge — this is
-/// exactly the open half of #1364 (the 1364.sh/1364b.sh pins below are
-/// its other two forms), with a fix in flight; the expectations are
-/// GNU's, ready to activate by removing the ignore.
+/// rewriting it). These six forms were the open half of #1364 (the
+/// 1364.sh/1364b.sh pins below are its other two forms); the fix landed
+/// on master via PR #1526 (commit 75cbab32), so the placeholders were
+/// activated when the bf-a pins were integrated.
 #[test]
-#[ignore = "rubash#1364 first-touch family: declare -p shows -a for a never-valued PIPESTATUS cell and scalar assignment does not freeze it; fix in flight (wave-4 dcl cluster)"]
 fn pipestatus_first_touch_forms_pending_issue1364() {
     for &(name, script, want_out, want_err_part) in FIRST_TOUCH_PENDING {
         let (stdout, stderr, code) = rubash_c(script);
@@ -318,7 +317,6 @@ fn issue1363_declare_p_pipestatus_script_form() {
 }
 
 #[test]
-#[ignore = "rubash#1364 first-touch family: declare -p renders -ar for a readonly PIPESTATUS that never held a pipeline value; fix in flight (wave-4 dcl cluster)"]
 fn issue1364_readonly_pipestatus_script_form() {
     let scratch = Scratch::new("1364");
     let script = "readonly PIPESTATUS\ntrue | false\necho \"ps=${PIPESTATUS[@]}\"\ndeclare -p PIPESTATUS; echo \"rc=$?\"\n";
@@ -329,7 +327,6 @@ fn issue1364_readonly_pipestatus_script_form() {
 }
 
 #[test]
-#[ignore = "rubash#1364 first-touch family: declare -p renders -ar for a readonly PIPESTATUS that never held a pipeline value; fix in flight (wave-4 dcl cluster)"]
 fn issue1364_declare_r_pipestatus_script_form() {
     let scratch = Scratch::new("1364b");
     let script = "declare -r PIPESTATUS\ntrue | false\necho \"ps=${PIPESTATUS[@]}\"\ndeclare -p PIPESTATUS\n";
