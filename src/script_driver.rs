@@ -315,6 +315,7 @@ fn run_script_grouped_at_line_offset(
     // reason), so a previous script's trailing failglob cannot eat this
     // read's first group.
     executor.evalerror_failglob_pending.set(false);
+    executor.evalerror_arith_pending.set(false);
     let raw_lines: Vec<&str> = contents.split_inclusive('\n').collect();
     let mut index = 0usize;
     // rubash#1186: the failglob DISCARD span, as the last line of the

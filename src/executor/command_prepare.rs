@@ -604,6 +604,10 @@ impl Executor {
                     return Err(ExecuteError::ExitCode(code));
                 }
                 self.exit_code = 1;
+                // rubash#1518: arithmetic evalerror in an assignment
+                // word (`b=$((1/0))`) — pure DISCARD under `set -e`
+                // too; the reader's promotion skips this class.
+                self.evalerror_arith_pending.set(true);
                 return Err(ExecuteError::ExpansionFailure(1));
             }
             if assignment_result.arithmetic_error {
@@ -650,6 +654,9 @@ impl Executor {
                         self.shell_state.env_vars.clear_array_cells_dirty();
                     }
                 }
+                // rubash#1518: same evalerror class as the word funnel
+                // (`v=${#a[1/0]}` discards and continues under `set -e`).
+                self.evalerror_arith_pending.set(true);
                 return Err(ExecuteError::ExpansionFailure(1));
             }
             if let Some(substitution_status) = substitution_status {
@@ -1550,6 +1557,11 @@ impl Executor {
         if self.shell_state.arithmetic_nonfatal_error.take() {
             // rubash#439: expansion error, not a failed command — no ERR trap.
             self.command_expansion_failed.set(true);
+            // rubash#1518: this funnel's population is arithmetic
+            // evalerror (a subscript evaluated by evalexp, e.g.
+            // `${#a[1/0]}`) — GNU discards and continues even under
+            // `set -e`, so the reader's promotion skips the class.
+            self.evalerror_arith_pending.set(true);
             return Err(ExecuteError::ExpansionFailure(1));
         }
         // The pre-glob materialization below feeds ONLY the test/[ branch:
