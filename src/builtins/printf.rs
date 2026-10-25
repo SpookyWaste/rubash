@@ -335,6 +335,40 @@ fn resolve_printf_bind_name(env_vars: &crate::shell::var_table::VarTable, name: 
     name.to_string()
 }
 
+/// GNU builtin_bind_variable (builtins/common.c:949) -> bind_variable ->
+/// make_variable_value (variables.c:2905): a `printf -v` store runs
+/// through the TARGET's own attributes, exactly like an ordinary
+/// assignment — att_integer evaluates the formatted text with evalexp,
+/// otherwise the case attribute converts it (rubash#1616: printf -v
+/// stored the raw text for `-i`/`-l`/`-u`/`-c` targets, scalar, element
+/// and nameref alike).
+fn printf_attribute_value(
+    env_vars: &crate::shell::var_table::VarTable,
+    name: &str,
+    output: String,
+) -> String {
+    if is_marked(env_vars, "__RUBASH_INTEGER_VARS", name) {
+        return crate::executor::arithmetic::eval_conditional_arith_value(&output, env_vars)
+            .unwrap_or(0)
+            .to_string();
+    }
+    if is_marked(env_vars, "__RUBASH_UPPERCASE_VARS", name) {
+        output.to_uppercase()
+    } else if is_marked(env_vars, "__RUBASH_LOWERCASE_VARS", name) {
+        output.to_lowercase()
+    } else if is_marked(env_vars, "__RUBASH_CAPCASE_VARS", name) {
+        let mut chars = output.chars();
+        match chars.next() {
+            Some(first) => {
+                first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+            }
+            None => output,
+        }
+    } else {
+        output
+    }
+}
+
 fn assign_printf_output(
     env_vars: &mut crate::shell::var_table::VarTable,
     name: &str,
@@ -398,11 +432,13 @@ fn assign_printf_output(
             // literal.
             let key = crate::executor::arithmetic::decode_arithmetic_assoc_key(subscript)
                 .unwrap_or_else(|| subscript.to_string());
+            let output = printf_attribute_value(env_vars, base, output);
             if let Some(store) = variables.as_deref_mut() {
                 let _ = store.set_associative_element(base, &key, output.clone());
             }
             assign_printf_assoc_element(env_vars, base, &key, output);
         } else if let Some(index) = resolve_printf_indexed_subscript(env_vars, base, subscript) {
+            let output = printf_attribute_value(env_vars, base, output);
             assign_printf_indexed_element(env_vars, base, index, output);
             // rubash#616 (plan Phase 1a): rebuild the structured cell from
             // the mirror this element write just produced. A direct typed
@@ -430,6 +466,7 @@ fn assign_printf_output(
         return Ok(None);
     }
 
+    let output = printf_attribute_value(env_vars, name, output);
     if let Some(store) = variables.as_deref_mut() {
         let _ = store.set_scalar(name, output.clone());
     }
