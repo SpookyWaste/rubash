@@ -198,6 +198,33 @@ impl Executor {
                 .env_vars
                 .insert("__RUBASH_TEMP_PATH".to_string(), "1".to_string());
         }
+        // rubash#1525: a tempenv PIPESTATUS bind replaces the cell
+        // (scalar or compound) and the shape note follows the bind,
+        // but the restore below only reinstalls the saved cell — the
+        // shape (and the status vector an absorbed write may have
+        // rewritten) stayed whatever the tempenv bind left behind,
+        // so a scalar tempenv froze every later write behind a ghost
+        // cell. GNU keeps shape and value in the one SHELL_VAR the
+        // tempenv push/pop reinstalls whole (variables.c
+        // push_temp_var / pop_var_context), so snapshot the pair
+        // into the previous-list alongside the cell and mirror it
+        // for the declare promotion path.
+        if assignments
+            .iter()
+            .any(|(name, _)| assignment_name_and_append(name).0 == "PIPESTATUS")
+        {
+            let encoded = crate::shell::state::encode_pipestatus_state(
+                self.shell_state.pipestatus_shape,
+                &self.shell_state.pipestatus,
+            );
+            self.tempenv_pipestatus_state = Some(encoded.clone());
+            previous.push((
+                crate::shell::state::PIPESTATUS_STATE_SNAPSHOT_KEY.to_string(),
+                Some(encoded),
+                None,
+                None,
+            ));
+        }
         let raws_aligned = raw_rhs.is_some_and(|raws| raws.len() == assignments.len());
         let mut assignments_failed = false;
         for (index, (name, value)) in assignments.iter().enumerate() {
@@ -322,6 +349,42 @@ impl Executor {
                     base_name.to_string(),
                     crate::shell::Variable::scalar(compound.to_string()),
                 );
+                // rubash#1525: the compound tempenv binds as a
+                // literal scalar tempvar, PIPESTATUS included.
+                if base_name == "PIPESTATUS" {
+                    self.shell_state.pipestatus_shape =
+                        crate::shell::state::PipestatusShape::Scalar;
+                }
+                self.tempenv_names.push(base_name.to_string());
+                self.mark_exported(base_name);
+                continue;
+            }
+            // rubash#1525: a tempenv PIPESTATUS bind is a fresh
+            // scalar tempvar in GNU (variables.c assign_in_env
+            // creates the binding in the temporary_env table,
+            // shadowing any array cell whole), so bind the scalar
+            // directly instead of routing through the permanent
+            // bind's element-0-on-array rule. The previous entry
+            // saved above reinstalls the shadowed cell at restore,
+            // and the (shape, vector) snapshot restores the note.
+            if base_name == "PIPESTATUS" && name == "PIPESTATUS" && resolved_target.is_none() {
+                if is_marked_var(&self.shell_state.env_vars, READONLY_VARS, base_name) {
+                    let line = format!(
+                        "{}{base_name}: readonly variable\n",
+                        self.assignment_readonly_prefix()
+                    );
+                    self.emit_assignment_diag(line);
+                    assignments_failed = true;
+                    continue;
+                }
+                self.shell_state
+                    .env_vars
+                    .insert(base_name.to_string(), expanded_value.clone());
+                let _ = self.shell_state.variables.set(
+                    base_name.to_string(),
+                    crate::shell::Variable::scalar(expanded_value.clone()),
+                );
+                self.shell_state.pipestatus_shape = crate::shell::state::PipestatusShape::Scalar;
                 self.tempenv_names.push(base_name.to_string());
                 self.mark_exported(base_name);
                 continue;

@@ -309,6 +309,10 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        // rubash#1525: record the disk-command dispatch class for
+        // the enclosing simple command's PIPESTATUS completion
+        // write (see execute_materialized_command).
+        self.external_dispatch_ran.set(true);
         // rubash#815 profiler: the external-spawn seam (GNU execute_cmd.c
         // dispatches disk commands through execute_command_internal's
         // simple-command tail; this is the fork face of the attribution
@@ -706,11 +710,27 @@ impl Executor {
 
         let mut word = raw.to_string();
         for substitution in substitutions {
+            // rubash#1523: the metadata target is the RE-PRINTED span
+            // (token join — `>&3` comes back as `>& 3`), which need
+            // not occur verbatim in the raw word. Splicing by that
+            // string then silently misses, the span survives into
+            // expand_assignment_value_inner, and its cooked-pass
+            // materialize registers the SAME substitution a second
+            // time — the finish drained both carriers and the body
+            // ran twice. Register only when the splice will land;
+            // a missed span stays in the word for the cooked pass,
+            // which materializes it exactly once from the re-printed
+            // text its own scan produced.
+            if !word.contains(&substitution.target) {
+                continue;
+            }
             if substitution.output {
                 let path = self.empty_process_substitution_temp()?;
                 let word_form = self.process_substitution_output_fd_word(&path);
-                self.assignment_output_process_substitutions
-                    .insert(word_form.clone(), substitution.source);
+                self.insert_assignment_output_process_substitution(
+                    word_form.clone(),
+                    substitution.source,
+                );
                 word = word.replacen(&substitution.target, &word_form, 1);
             } else {
                 let Some(output) = self.process_substitution_output_bytes(&substitution.source)
@@ -742,8 +762,10 @@ impl Executor {
             if substitution.output {
                 let path = self.empty_process_substitution_temp()?;
                 let word_form = self.process_substitution_output_fd_word(&path);
-                self.assignment_output_process_substitutions
-                    .insert(word_form.clone(), substitution.source);
+                self.insert_assignment_output_process_substitution(
+                    word_form.clone(),
+                    substitution.source,
+                );
                 word = word.replacen(&substitution.target, &word_form, 1);
             } else {
                 let Some(output) = self.process_substitution_output_bytes(&substitution.source)
@@ -838,6 +860,23 @@ impl Executor {
         Ok(())
     }
 
+    /// Register one materialized assignment-RHS output process
+    /// substitution for its finish (rubash#1523: the queue is in
+    /// materialization order; re-registering a word form replaces
+    /// its body instead of queueing a second run).
+    fn insert_assignment_output_process_substitution(&mut self, word_form: String, source: String) {
+        if let Some(entry) = self
+            .assignment_output_process_substitutions
+            .iter_mut()
+            .find(|(key, _)| *key == word_form)
+        {
+            entry.1 = source;
+        } else {
+            self.assignment_output_process_substitutions
+                .push((word_form, source));
+        }
+    }
+
     pub(in crate::executor) fn finish_assignment_output_process_substitutions_for_command(
         &mut self,
         cmd: &CommandNode,
@@ -846,6 +885,13 @@ impl Executor {
             return Ok(());
         }
 
+        // rubash#1523: the bodies are child processes in GNU
+        // (subst.c process_substitute forks them at
+        // materialization) — what they write is observable, their
+        // statuses are not: running one must not move this
+        // command's exit status (the drain previously overwrote
+        // the enclosing command's $? with the body's).
+        let saved_exit_code = self.exit_code;
         let targets = [
             cmd.redirect_out.as_ref(),
             cmd.append.as_ref(),
@@ -857,7 +903,8 @@ impl Executor {
         .filter_map(|redirect| {
             let target = self.expand_redirect_target(redirect);
             self.assignment_output_process_substitutions
-                .contains_key(&target)
+                .iter()
+                .any(|(key, _)| key == &target)
                 .then_some(target)
         })
         .collect::<Vec<_>>();
@@ -868,13 +915,14 @@ impl Executor {
 
         let remaining_targets = self
             .assignment_output_process_substitutions
-            .keys()
-            .cloned()
+            .iter()
+            .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for target in remaining_targets {
             self.finish_assignment_output_process_substitution_target(&target)?;
         }
 
+        self.exit_code = saved_exit_code;
         Ok(())
     }
 
@@ -882,9 +930,16 @@ impl Executor {
         &mut self,
         target: &str,
     ) -> Result<(), ExecuteError> {
-        let Some(source) = self.assignment_output_process_substitutions.remove(target) else {
+        let Some(position) = self
+            .assignment_output_process_substitutions
+            .iter()
+            .position(|(key, _)| key == target)
+        else {
             return Ok(());
         };
+        let (_, source) = self
+            .assignment_output_process_substitutions
+            .remove(position);
         // rubash#355: the recorded key is the `/dev/fd/N` word form; the
         // bytes live in the fd's ProcessSubstitution write carrier (its
         // temp path), not at the word itself.
@@ -900,7 +955,12 @@ impl Executor {
             shell_path_to_windows(target, &self.shell_state.env_vars)
         };
         let input = fs::read_to_string(&path).unwrap_or_default();
-        self.execute_persistent_output_process_substitution(&source, input, None)?;
+        // rubash#1523: a failing body — including one that runs
+        // `exit` — is the child process's business, not this
+        // command's error; propagating it aborted the enclosing
+        // script with the body's status. Diagnostics the body
+        // itself prints still go out on its own stderr.
+        let _ = self.execute_persistent_output_process_substitution(&source, input, None);
         let _ = fs::remove_file(path);
         Ok(())
     }

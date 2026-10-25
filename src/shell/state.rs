@@ -311,6 +311,73 @@ pub(crate) enum PipestatusShape {
     ValuelessArray,
 }
 
+impl PipestatusShape {
+    pub(crate) fn snapshot_name(self) -> &'static str {
+        match self {
+            PipestatusShape::Absent => "Absent",
+            PipestatusShape::LiveArray => "LiveArray",
+            PipestatusShape::Scalar => "Scalar",
+            PipestatusShape::Valueless => "Valueless",
+            PipestatusShape::ValuelessArray => "ValuelessArray",
+        }
+    }
+
+    pub(crate) fn from_snapshot_name(name: &str) -> Option<Self> {
+        match name {
+            "Absent" => Some(PipestatusShape::Absent),
+            "LiveArray" => Some(PipestatusShape::LiveArray),
+            "Scalar" => Some(PipestatusShape::Scalar),
+            "Valueless" => Some(PipestatusShape::Valueless),
+            "ValuelessArray" => Some(PipestatusShape::ValuelessArray),
+            _ => None,
+        }
+    }
+}
+
+/// Scope-snapshot key under which the PIPESTATUS shape note and
+/// status vector ride through the two binding save/restore
+/// mechanisms that restore the variable CELL but historically not
+/// its shape (rubash#1525): the tempenv previous-list of
+/// apply/restore_temporary_assignments and the frame local scopes
+/// popped by restore_function_locals. GNU keeps shape and value in
+/// the one SHELL_VAR object (variables.c pop_var_context /
+/// dispose_temporary_env reinstall the saved object whole), so the
+/// pair encoded by `encode_pipestatus_state` travels with the cell
+/// snapshot and is reinstalled with it.
+pub(crate) const PIPESTATUS_STATE_SNAPSHOT_KEY: &str = "__RUBASH_PIPESSTATUS_STATE";
+
+/// Encode a (shape, status vector) pair for a scope snapshot:
+/// `Shape|i0:v0,i1:v1,...` over the sparse (index, status) vector
+/// (the vector segment is empty for no vector). Indices ride along
+/// because the live vector is sparse (rubash#1364 R3): a snapshot
+/// that densified it would resurrect unset elements on restore.
+pub(crate) fn encode_pipestatus_state(shape: PipestatusShape, vector: &[(i64, i32)]) -> String {
+    let mut out = shape.snapshot_name().to_string();
+    out.push('|');
+    for (position, (index, status)) in vector.iter().enumerate() {
+        if position > 0 {
+            out.push(',');
+        }
+        out.push_str(&index.to_string());
+        out.push(':');
+        out.push_str(&status.to_string());
+    }
+    out
+}
+
+pub(crate) fn decode_pipestatus_state(text: &str) -> Option<(PipestatusShape, Vec<(i64, i32)>)> {
+    let (name, vector_text) = text.split_once('|')?;
+    let shape = PipestatusShape::from_snapshot_name(name)?;
+    let mut vector = Vec::new();
+    if !vector_text.is_empty() {
+        for part in vector_text.split(',') {
+            let (index, status) = part.split_once(':')?;
+            vector.push((index.parse::<i64>().ok()?, status.parse::<i32>().ok()?));
+        }
+    }
+    Some((shape, vector))
+}
+
 /// Buffered contents of one materialized `<(cmd)` output — see
 /// `ShellState::procsub_streams`.
 #[derive(Debug)]

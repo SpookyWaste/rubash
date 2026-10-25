@@ -568,7 +568,33 @@ pub struct Executor {
     /// while it blocks, jobs.c:3064 — an observation point).
     foreground_wait_count: Cell<u64>,
     coproc_stderr_forwarders: HashMap<u32, std::thread::JoinHandle<Result<(), std::io::Error>>>,
-    assignment_output_process_substitutions: HashMap<String, String>,
+    /// Assignment-RHS output process substitutions awaiting their
+    /// finish, in materialization order (GNU forks left-to-right
+    /// and the bodies' observable effects order the same way,
+    /// rubash#1523). Keyed by the `/dev/fd/N` word form.
+    assignment_output_process_substitutions: Vec<(String, String)>,
+    /// rubash#1525: set by execute_external so the simple-command
+    /// funnel can tell which completion-write class a command fell
+    /// into (GNU execute_cmd.c: the tempenv of a disk command is
+    /// consumed into the child's environment, so the parent's
+    /// set_pipestatus_from_exit write lands in the real cell;
+    /// builtin/function/null commands write against the still-bound
+    /// tempenv cell). Saved/restored around each dispatch so nested
+    /// commands cannot leak their class into the enclosing one.
+    external_dispatch_ran: Cell<bool>,
+    /// rubash#1525: set by the simple-command funnel when it has
+    /// already performed this command's PIPESTATUS completion write
+    /// against the still-bound tempenv cell; the ast_exec loop's
+    /// post-command write consumes (and clears) it instead of
+    /// writing a second time against the restored cell.
+    pipestatus_write_absorbed: Cell<bool>,
+    /// rubash#1525: the (shape, vector) snapshot apply_temporary_
+    /// assignments recorded for the innermost PIPESTATUS tempenv
+    /// binding, mirrored for promote_tempenv_locals: a promoted
+    /// tempenv PIPESTATUS becomes a frame local whose frame-restore
+    /// snapshot must hold the pre-tempenv shape, not the tempenv
+    /// shape. Cleared by the restore that consumes the snapshot.
+    tempenv_pipestatus_state: Option<String>,
     /// rubash#545 (cell 2): `/dev/fd/N` input-procsub word fds created by
     /// the command CURRENTLY executing. GNU closes a process substitution's
     /// fd (and reaps its process) when the creating command finishes

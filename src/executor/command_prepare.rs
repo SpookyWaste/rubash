@@ -785,6 +785,16 @@ impl Executor {
             }
             Err(error) => return Err(error),
         }
+        // rubash#1523: an assignment-only command owns the output
+        // process substitutions its RHSs materialized — finish
+        // them here, at this command's own completion (GNU forks
+        // them at materialization, subst.c process_substitute).
+        // The funnel finish in execute_materialized_command never
+        // sees a wordless command, so the bodies previously
+        // drained at the NEXT command's finish — attributed to
+        // that command's line and polluting its status — or never
+        // ran at all when the assignment was the last command.
+        let _ = self.finish_assignment_output_process_substitutions_for_command(cmd);
         self.exit_code = status;
         if self.errexit_enabled() && self.errexit_is_active() && self.exit_code != 0 {
             // rubash#1171: GNU fires the ERR trap inside
@@ -3663,6 +3673,10 @@ impl Executor {
             // empty `$_`. Comments never execute (reader-level skip), so the
             // comment arm below keeps the previous value.
             self.bind_underscore("");
+            // rubash#1523: the word-form standalone assignment owns
+            // its RHS output process substitutions — finish them
+            // at this command (see execute_empty_words_command).
+            let _ = self.finish_assignment_output_process_substitutions_for_command(cmd);
             // GNU execute_cmd.c execute_simple_command: a failed standalone
             // assignment jumps to top level (DISCARD) — the rest of the
             // command list is discarded (`a[]=v; echo after` prints nothing).
@@ -3673,6 +3687,8 @@ impl Executor {
         }
         if self.execute_array_element_assignment(cmd) {
             self.bind_underscore("");
+            // rubash#1523: same finish as the assignment-words arm.
+            let _ = self.finish_assignment_output_process_substitutions_for_command(cmd);
             if self.exit_code != 0 {
                 self.raise_evalerror_abort();
             }
