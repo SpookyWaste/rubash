@@ -19,6 +19,11 @@
 //! thread owns one session; the only cross-thread surface is the
 //! atomic gate and stop-request flags.
 
+pub mod breakpoints;
 pub mod gate;
 
+pub use breakpoints::{
+    Breakpoint, BreakpointId, BreakpointKind, BreakpointResolution, BreakpointTable,
+    BreakpointTarget, HitFlow, HitOutcome, WatchSnapshot,
+};
 pub use gate::{GateFlag, SESSION_ACTIVE};
