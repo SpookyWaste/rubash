@@ -20,12 +20,11 @@
 //! form while the script-file form observes status 2 via `$?`. Both
 //! forms are pinned as measured here.
 //!
-//! DRIFT (found by backfill bf-c, 2026-10-25): current master makes
-//! the too-many-arguments error fatal to the WHOLE script (exit 2, no
-//! tail line runs) in BOTH forms, so all four #1066 pins below are
-//! `#[ignore]`d until the follow-up issue lands the GNU semantics:
-//! abort the enclosing loop with status 2 and continue (script file),
-//! exit 1 (`-c` string).
+//! DRIFT (found by backfill bf-c, 2026-10-25; FIXED by rubash#1519):
+//! master made the too-many-arguments error fatal to the WHOLE script
+//! (exit 2, no tail line runs) in BOTH forms. The four #1066 pins below
+//! are live again: abort the enclosing loop with status 2 and continue
+//! (script file), exit 1 (`-c` string).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -85,7 +84,6 @@ fn issue_1064_break_continue_as_pipeline_element_are_silent() {
 }
 
 #[test]
-#[ignore = "issue#1066 drift: master exits the whole script (rc=2) instead of aborting the loop and continuing; follow-up issue pending"]
 fn issue_1066_break_too_many_args_aborts_loop_with_status_2() {
     let (stdout, stderr, code) =
         run_script("for i in 1 2; do break 1 2; echo \"hi $i\"; done\necho \"rc=$?\"\n");
@@ -101,7 +99,6 @@ fn issue_1066_break_too_many_args_aborts_loop_with_status_2() {
 }
 
 #[test]
-#[ignore = "issue#1066 drift: master exits the whole script (rc=2) instead of aborting the loop and continuing; follow-up issue pending"]
 fn issue_1066_continue_too_many_args_aborts_loop_with_status_2() {
     let (stdout, stderr, code) =
         run_script("for i in 1 2; do continue 1 2; echo \"hi $i\"; done\necho \"rc=$?\"\n");
@@ -115,7 +112,6 @@ fn issue_1066_continue_too_many_args_aborts_loop_with_status_2() {
 }
 
 #[test]
-#[ignore = "issue#1066 drift: master exits the whole script (rc=2) instead of aborting the loop and continuing; follow-up issue pending"]
 fn issue_1066_nested_break_too_many_args_aborts_outer_loop() {
     let (stdout, stderr, code) = run_script(
         "for i in 1 2; do for j in 1 2; do break 2 3; echo \"inner $i $j\"; done; echo \"outer $i\"; done\necho end\n",
@@ -130,7 +126,6 @@ fn issue_1066_nested_break_too_many_args_aborts_outer_loop() {
 }
 
 #[test]
-#[ignore = "issue#1066 drift: master exits 2 for the -c form; GNU bash 5.3.20 (this environment) exits 1 — same root as the script-file drift"]
 fn issue_1066_dash_c_form_exits_without_running_the_tail() {
     let (stdout, stderr, code) =
         run_c("for i in 1 2; do break 1 2; echo \"hi $i\"; done; echo \"rc=$?\"");
