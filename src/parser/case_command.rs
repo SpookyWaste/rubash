@@ -315,6 +315,30 @@ pub(super) fn parse_case_command(
             source,
             source_line_offset,
         );
+        // rubash#1656: case_body_end stops at a stray top-level `)`
+        // (see there); GNU parse.y rejects it at parse time instead
+        // of running the truncated body, so report it with the same
+        // parse-error node shape as the pattern-position errors
+        // above (executor: syntax error near `)`, rc=2, earlier
+        // commands already ran, later ones do not).
+        if is_keyword(tokens, i, ")") {
+            let mut command = CommandNode::new();
+            command.line = tokens.get(start).map(|token| token.position);
+            command.logical_line = tokens.get(start).map(|token| token.logical_line);
+            command.insert_assignment(
+                "__RUBASH_PARSE_ERROR_NEAR__".to_string(),
+                format!(
+                    "){}{}",
+                    crate::executor::markers::PARSE_ERROR_FIELD_SEP,
+                    tokens[i].position
+                ),
+            );
+            command.insert_assignment(
+                "__RUBASH_PARSE_SOURCE__".to_string(),
+                pattern_error_line_text(tokens, i),
+            );
+            return Some(finish_compound_command(command, tokens, tokens.len()));
+        }
         let terminator_text = case_terminator(tokens, i).map(|_| tokens[i].value.clone());
         let terminator_metadata =
             case_terminator(tokens, i).map(|_| build_keyword_metadata(&tokens[i]));
@@ -625,6 +649,20 @@ pub(super) fn collect_extglob_pattern_from_bang(tokens: &[Token], i: &mut usize)
 
 pub(super) fn case_body_end(tokens: &[Token], mut index: usize) -> usize {
     let mut stack = Vec::new();
+    // rubash#1656: the boundary stack tracks if/for/case/{ frames but
+    // not subshell parens, so a bare `)` at the clause's top level
+    // used to be scanned past and the body parser silently dropped
+    // everything after it (`case x in a) echo A;\;& b) echo B;; esac`
+    // ran A and then `b` as a stray command, rc=127, instead of GNU's
+    // parse-time `syntax error near unexpected token `)'`, rc=2).
+    // Track paren depth alongside the stack: a `(` at stack-empty
+    // opens a subshell (or function/arithmetic parens, all balanced),
+    // and a `)` with nothing to close is the stray token — stop
+    // there so the caller can report it. Parens inside a nested
+    // frame (nested case patterns included — the stack is non-empty
+    // there) are left to the stack machinery and never counted,
+    // so balanced constructs inside the body are unaffected.
+    let mut paren_depth = 0usize;
     while index < tokens.len() {
         if stack.is_empty()
             && (is_case_terminator(tokens, index)
@@ -646,6 +684,17 @@ pub(super) fn case_body_end(tokens: &[Token], mut index: usize) -> usize {
             )
         {
             break;
+        }
+
+        if stack.is_empty() {
+            if is_keyword(tokens, index, "(") {
+                paren_depth += 1;
+            } else if is_keyword(tokens, index, ")") {
+                if paren_depth == 0 {
+                    break;
+                }
+                paren_depth -= 1;
+            }
         }
 
         update_compound_boundary_stack(tokens, index, &mut stack);
