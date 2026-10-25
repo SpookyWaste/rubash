@@ -363,6 +363,70 @@ pub fn process_std_handle(fd: u32) -> HANDLE {
     }
 }
 
+/// Live direction of an open descriptor: `(readable, writable)` from the
+/// F_GETFL access mode, or `None` when the descriptor is not open.
+pub fn fd_directions(fd: u32) -> Option<(bool, bool)> {
+    let flags = unsafe { libc::fcntl(fd as libc::c_int, libc::F_GETFL, 0) };
+    if flags < 0 {
+        return None;
+    }
+    match flags & libc::O_ACCMODE {
+        libc::O_RDONLY => Some((true, false)),
+        libc::O_WRONLY => Some((false, true)),
+        _ => Some((true, true)),
+    }
+}
+
+/// Descriptors >= 3 that are open in this process, each with its live
+/// direction — the process-inherited descriptor set a fresh shell starts
+/// with. GNU keeps no registry of inherited descriptors: redir.c
+/// validates a dup source against the kernel (`fcntl (redirector,
+/// F_GETFD, 0) != -1`, redir.c:1160, do_redirection_internal's r_dup
+/// arm), so kernel state IS the ground truth rubash's virtual FdTable
+/// must be seeded from at Executor::new (rubash#1557).
+///
+/// Enumeration prefers /proc/self/fd (exact at any descriptor number);
+/// the directory stream's own descriptor appears in the listing, so
+/// every candidate is validated through `fd_directions` after the
+/// stream is dropped — the stream descriptor is closed by then and
+/// drops out. Without /proc, probe 3..=1023 directly.
+pub fn inherited_open_fds() -> Vec<(u32, bool, bool)> {
+    let mut candidates: Vec<u32> = Vec::new();
+    let mut listed = false;
+    if let Ok(stream) = std::fs::read_dir("/proc/self/fd") {
+        listed = true;
+        for entry in stream.flatten() {
+            if let Ok(fd) = entry.file_name().to_string_lossy().parse::<u32>() {
+                if fd >= 3 {
+                    candidates.push(fd);
+                }
+            }
+        }
+    }
+    if !listed {
+        candidates = (3..=1023).collect();
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .filter_map(|fd| fd_directions(fd).map(|(readable, writable)| (fd, readable, writable)))
+        .collect()
+}
+
+/// Display/reopen path label for an inherited descriptor: the readlink
+/// target when it names a real filesystem object, else the /dev/fd alias
+/// (pipes, sockets and anon inodes readlink to `pipe:[...]`-style
+/// pseudo-names that no open(2) accepts).
+pub fn inherited_fd_path(fd: u32) -> std::path::PathBuf {
+    if let Ok(target) = std::fs::read_link(format!("/proc/self/fd/{fd}")) {
+        if target.is_absolute() && !target.to_string_lossy().contains(":[") {
+            return target;
+        }
+    }
+    std::path::PathBuf::from(format!("/dev/fd/{fd}"))
+}
+
 fn open_flags_for(append: bool, create_new: bool) -> (libc::c_int, libc::mode_t) {
     // Mirrors the Windows access mapping in open_file_*: read = GENERIC_READ,
     // write = GENERIC_WRITE, append = write + forced end-of-file writes.
