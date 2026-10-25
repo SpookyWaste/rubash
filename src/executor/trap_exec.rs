@@ -1292,13 +1292,31 @@ impl Executor {
         #[cfg(unix)]
         crate::builtins::kill::reconcile_kernel_trap_dispositions(&self.shell_state.env_vars);
 
+        // rubash#1654: deliveries a flat subshell addressed to the
+        // shell's own pid were queued for THIS layer's adjudication
+        // (kill.rs ANCESTOR_SIGNALS). They go first — in GNU the
+        // addressed (parent) process acts on them while the subshell
+        // is still its foreground job, ahead of anything that arrived
+        // later — and the stale-handler check does not apply: they
+        // were never routed through this layer's kernel dispositions,
+        // so the CURRENT (restored top-level) trap table below is
+        // their only judge (trapped -> run, ignored -> drop,
+        // untrapped -> the 128+sig death).
         let signals = crate::builtins::kill::take_pending_signals(std::process::id())?;
-        for signal in signals {
+        let mut queue: Vec<(i32, bool)> = Vec::with_capacity(signals.len() + 4);
+        #[cfg(unix)]
+        queue.extend(
+            crate::builtins::kill::take_ancestor_signals()
+                .into_iter()
+                .map(|signal| (signal, false)),
+        );
+        queue.extend(signals.into_iter().map(|signal| (signal, true)));
+        for (signal, stale_check) in queue {
             // Stale registry flag from a disposition flip (trap cleared while
             // a delivery raced): a signal the kernel no longer routes here
             // cannot be a legitimate pending trap.
             #[cfg(unix)]
-            if !crate::builtins::kill::kernel_handler_installed(signal) {
+            if stale_check && !crate::builtins::kill::kernel_handler_installed(signal) {
                 continue;
             }
             let Some(signal_name) = signal_trap_name(signal) else {
