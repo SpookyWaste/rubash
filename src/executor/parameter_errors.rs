@@ -204,6 +204,73 @@ fn next_quoted_parameter_expansion_start(text: &str) -> Option<usize> {
     }
     None
 }
+/// Bodies of the `$((...))` arithmetic expansions in `word` that a
+/// pure probe may evaluate: parens are balance-matched the way
+/// parse.y:3877 parse_matched_pair matches an arithmetic span, and
+/// bodies containing a command substitution are excluded (evaluating
+/// them would run the substitution — a side effect a probe must not
+/// have; subst.c:7143 command_substitute runs as the walk reaches it).
+fn speculative_arithmetic_bodies(word: &str) -> Vec<String> {
+    let bytes = word.as_bytes();
+    let mut bodies = Vec::new();
+    let mut i = 0usize;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'$' && bytes[i + 1] == b'(' && bytes[i + 2] == b'(' {
+            let mut depth = 0i32;
+            let mut j = i + 1;
+            let mut end = None;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(j);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            let Some(end) = end else { break };
+            if end >= i + 4 {
+                let body = &word[i + 3..end - 1];
+                if !body.contains("$(") && !body.contains('`') {
+                    bodies.push(body.to_string());
+                }
+            }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+    bodies
+}
+
+/// True when `word` (raw source text when available) carries a glob
+/// metacharacter outside any quoting — the failglob risk shape. A
+/// quoted metachar is a false hit, which only costs the concurrent
+/// fast path its admission.
+pub(in crate::executor) fn word_has_unquoted_glob_meta(word: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for ch in word.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if !in_single => escaped = true,
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '*' | '?' | '[' if !in_single && !in_double => return true,
+            _ => {}
+        }
+    }
+    false
+}
 
 /// Blank out (position-preserving) the spans of `word` whose `${...}`
 /// fragments are NOT expansions of the current shell: `$( )` command
@@ -970,6 +1037,65 @@ impl Executor {
             .iter()
             .chain(cmd.assignment_values())
             .any(|word| self.parameter_expansion_error_in_word(word).is_some())
+    }
+
+    /// rubash#1540: side-effect-free prediction of the two DISCARD
+    /// classes the textual pre-scan above cannot see — an arithmetic
+    /// expansion error (the scan never evaluates `$(( ))`) and a
+    /// failglob failure (pathname expansion depends on the live
+    /// directory). Used only as concurrent-pipeline admission, beside
+    /// `parameter_expansion_error_pending`: GNU forks every pipeline
+    /// element and expands its words exactly once inside the child
+    /// (execute_cmd.c:2620 execute_pipeline -> execute_simple_command
+    /// -> subst.c:11229 expand_word_internal), so a member predicted
+    /// to fail must decline the fast path BEFORE any speculative
+    /// expansion prints — the sequential stage executor then reports
+    /// the error exactly once, with the element's own status. A false
+    /// hit only costs the fast path; the sequential path is always
+    /// semantically complete.
+    pub(in crate::executor) fn pipeline_member_arith_failglob_risk(
+        &self,
+        cmd: &CommandNode,
+    ) -> bool {
+        if cmd.arithmetic_command.is_some() {
+            return false;
+        }
+        // Evaluate each command-substitution-free `$((...))` body
+        // against the current environment on the evaluator's scratch
+        // clone (its writes are dropped): the same verdict the real
+        // expansion would reach for state-independent bodies
+        // (division by zero, bad literals, syntax errors). Bodies
+        // containing `$(`/backticks are skipped — GNU runs the
+        // substitution as the expansion walk reaches it (subst.c:7143
+        // command_substitute), which a pure probe must not do; the
+        // stage-spec latch net in pipeline_exec covers those instead.
+        let mut texts: Vec<&str> = cmd.words.iter().map(String::as_str).collect();
+        texts.extend(cmd.assignment_values().map(String::as_str));
+        for text in texts {
+            for body in speculative_arithmetic_bodies(text) {
+                let (value, _writes, _category) =
+                    crate::executor::arithmetic::eval_conditional_arith_value_categorized_with_writes(
+                        &body,
+                        &self.shell_state.env_vars,
+                    );
+                if value.is_none() {
+                    return true;
+                }
+            }
+        }
+        if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "failglob") {
+            for (index, word) in cmd.words.iter().enumerate() {
+                let text = cmd
+                    .word_metadata
+                    .get(index)
+                    .map(|metadata| metadata.raw.as_str())
+                    .unwrap_or(word.as_str());
+                if word_has_unquoted_glob_meta(text) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub(in crate::executor) fn parameter_expansion_error_in_heredoc_body(

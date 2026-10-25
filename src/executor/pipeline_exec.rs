@@ -892,6 +892,16 @@ impl Executor {
             .collect();
         let commands: Vec<&CommandNode> = normalized.iter().collect();
         let first = commands[0];
+        // rubash#1540: the fast-path attempts below expand member words
+        // speculatively on this executor. When an attempt declines, its
+        // expansion must leave no trace in the DISCARD latch family —
+        // a `${var:=word}` bind failure latched by a declined spec used
+        // to survive into the parent, whose NEXT command then died on
+        // the stale latch (the enclosing list abandoned, rc 2). Any
+        // attempt that succeeds returns early above the restore, so the
+        // restore only ever runs on the all-declined path, just before
+        // the sequential stage loop re-expands every word itself.
+        let saved_discard_latches = self.snapshot_discard_latches();
         if self.execute_timed_read_pipeline(&commands)?.is_some() {
             return Ok(Some(end + 1));
         }
@@ -926,6 +936,11 @@ impl Executor {
         {
             return Ok(Some(end + 1));
         }
+        // rubash#1540: every fast path declined — drop any DISCARD
+        // latches their speculative expansions raised (see the snapshot
+        // above). The sequential stage loop below starts clean and each
+        // stage adjudicates its own failures.
+        self.restore_discard_latches(&saved_discard_latches);
 
         let time_prefix = time_pipeline_prefix(first);
         let time_prefix_started = time_prefix.as_ref().map(|_| time_command_started());
@@ -952,8 +967,16 @@ impl Executor {
         // here and continue the sequential loop from the tail with the
         // bounded captured output as its input.
         if time_prefix.is_none() {
-            if let Some((prefix_len, prefix_output, prefix_stderr, prefix_statuses)) =
-                self.execute_external_prefix_concurrently(&commands)?
+            // rubash#1540: same speculation bracket as the fast paths
+            // above — a declined prefix attempt expanded member words on
+            // this executor, and its DISCARD latches must not become the
+            // stage loop's entry state.
+            let saved_prefix_latches = self.snapshot_discard_latches();
+            let prefix_result = self.execute_external_prefix_concurrently(&commands)?;
+            if prefix_result.is_none() {
+                self.restore_discard_latches(&saved_prefix_latches);
+            }
+            if let Some((prefix_len, prefix_output, prefix_stderr, prefix_statuses)) = prefix_result
             {
                 // A prefix member carrying `|&` was normalized to a
                 // trailing `2>&1` and declined admission, so the only stderr
@@ -1385,6 +1408,24 @@ impl Executor {
         {
             return None;
         }
+        // rubash#1540: this fast path EXECUTES the producer step on the
+        // shared executor to model its output, and a later decline
+        // (unsupported consumer) lets the sequential stage loop execute
+        // it again — a word whose expansion has observable effects
+        // (a command substitution's diagnostics and side effects, an
+        // arithmetic error, a `${var:=word}` bind) would happen TWICE
+        // (`echo $(echo $((1/0))) | cat` printed the division
+        // diagnostic two times). The timing model only covers literal
+        // producers (true/:/sleep/echo with plain arguments), so admit
+        // exactly those: any word carrying an expansion introducer
+        // declines the step before anything is expanded.
+        if command
+            .words
+            .iter()
+            .any(|word| word.contains('$') || word.contains('`'))
+        {
+            return None;
+        }
         let name = self.expand_word(command.words.first()?);
         match name.as_str() {
             "true" | ":" => Some(()),
@@ -1664,9 +1705,17 @@ impl Executor {
             // silently expanded `$p`. Decline to the sequential stage
             // executor, whose gates report the error per element. The probe
             // is the side-effect-free twin of the reporting scan.
-            || commands
-                .iter()
-                .any(|command| self.parameter_expansion_error_pending(command))
+            // rubash#1540: the twin cannot see arithmetic-expansion or
+            // failglob failures; the risk probe covers those two classes
+            // the same way, before any speculative spec expansion prints.
+            // The failing-`${var:=word}`-bind class has its own pure
+            // scan (parameter_assignment_error) that neither the twin
+            // nor the reporting scan consults — wire it in here too.
+            || commands.iter().any(|command| {
+                self.parameter_expansion_error_pending(command)
+                    || self.parameter_assignment_error(command).is_some()
+                    || self.pipeline_member_arith_failglob_risk(command)
+            })
         {
             return Ok(None);
         }
@@ -2213,6 +2262,24 @@ impl Executor {
         // syntax. GNU never re-parses argv text between pipeline elements
         // (execute_cmd.c:2620 -> expand_words once; subst.c:4807
         // dequote_string removes only CTLESC escapes).
+        // rubash#1540: snapshot the DISCARD latch family before the
+        // speculative expansion — if expanding this member's words
+        // raises one (an arithmetic body the admission probe skipped
+        // because it embeds a command substitution, a failglob whose
+        // pattern only appears after parameter expansion, a bind
+        // failure the textual scan could not predict), the fields just
+        // built are the failure's empty product, not a runnable argv:
+        // decline so the sequential stage executor reports the error
+        // as the element's own status. The latches are restored to
+        // their entry values, except the arithmetic print latch: the
+        // diagnostic already printed once above, and holding that
+        // latch keeps the stage's re-expansion from printing it again
+        // (the same latch-held handoff execute_timed_read_pipeline
+        // documents for the nounset class).
+        let spec_saved_arith = self.snapshot_arithmetic_error_flags();
+        let spec_saved_discard = self.snapshot_discard_latches();
+        let spec_saved_no_closing_brace = self.no_closing_brace_failure.get();
+        let _speculative_guard = SpeculativeExpansionGuard::new();
         let mut first_fields = self.expand_stage_first_word(command);
         let expanded_name = first_fields.first().cloned().unwrap_or_default();
         // GNU runs every pipeline member through execute_disk_command
@@ -2274,6 +2341,27 @@ impl Executor {
         }
         let mut args: Vec<String> = first_fields.into_iter().skip(1).collect();
         args.extend(self.expand_stage_tail_words(command));
+        // rubash#1540: the latch net described at the snapshot above —
+        // a DISCARD-class failure raised anywhere in this member's
+        // speculative expansion voids the spec.
+        let spec_expansion_failed = (self.parameter_assignment_failure.get()
+            && !spec_saved_discard.0)
+            || (self.evalerror_failglob_pending.get() && !spec_saved_discard.2)
+            || (self.no_closing_brace_failure.get() && !spec_saved_no_closing_brace)
+            || (self.shell_state.arithmetic_fatal_error.get() && !spec_saved_arith.2)
+            || (self.shell_state.arithmetic_nonfatal_error.get() && !spec_saved_arith.1)
+            || (self.shell_state.arithmetic_nounset_error.get() && !spec_saved_arith.3);
+        if spec_expansion_failed {
+            self.restore_discard_latches(&spec_saved_discard);
+            self.no_closing_brace_failure
+                .set(spec_saved_no_closing_brace);
+            // Restore the arithmetic verdict flags but keep the print
+            // latch exactly as the expansion left it (see above).
+            let printed = self.shell_state.arithmetic_expansion_error.get();
+            self.restore_arithmetic_error_flags(&spec_saved_arith);
+            self.shell_state.arithmetic_expansion_error.set(printed);
+            return None;
+        }
         // Same child-argv contract as the sequential spawn path
         // (pipeline_stages.rs execute_external_pipeline_stage_inner):
         // decode the lexer's C0 data carriers exactly once so the
@@ -3039,13 +3127,23 @@ impl Executor {
             // (nounset unbound in an argument, heredoc body or here-string
             // word) takes the sequential stage path so its gate reports
             // the error instead of the fast path expanding it away.
-            || commands
-                .iter()
-                .any(|command| self.parameter_expansion_error_pending(command))
+            // rubash#1540: same arithmetic/failglob risk extension as
+            // the first admission, plus the failing-bind scan.
+            || commands.iter().any(|command| {
+                self.parameter_expansion_error_pending(command)
+                    || self.parameter_assignment_error(command).is_some()
+                    || self.pipeline_member_arith_failglob_risk(command)
+            })
         {
             return Ok(None);
         }
 
+        // rubash#1540: latch snapshot for the spec net below (the twin
+        // of the net inside concurrent_external_stage_spec).
+        let spec_saved_arith = self.snapshot_arithmetic_error_flags();
+        let spec_saved_discard = self.snapshot_discard_latches();
+        let spec_saved_no_closing_brace = self.no_closing_brace_failure.get();
+        let _speculative_guard = SpeculativeExpansionGuard::new();
         let mut specs = Vec::with_capacity(commands.len());
         for command in commands {
             if command.words.is_empty() {
@@ -3098,6 +3196,29 @@ impl Executor {
                 *arg = super::execution_misc::restore_command_substitution_output(arg);
             }
             specs.push((program, expanded_name, args));
+        }
+        // rubash#1540: a DISCARD-class failure raised while building
+        // any member's spec voids the whole concurrent run — the
+        // fields are the failure's empty product, not runnable argv.
+        // Decline to the sequential stage executor (the caller's
+        // bracket restores the remaining latch state); keep only the
+        // arithmetic print latch as the expansions left it, so the
+        // stage's re-expansion does not print the diagnostic twice.
+        let spec_expansion_failed = (self.parameter_assignment_failure.get()
+            && !spec_saved_discard.0)
+            || (self.evalerror_failglob_pending.get() && !spec_saved_discard.2)
+            || (self.no_closing_brace_failure.get() && !spec_saved_no_closing_brace)
+            || (self.shell_state.arithmetic_fatal_error.get() && !spec_saved_arith.2)
+            || (self.shell_state.arithmetic_nonfatal_error.get() && !spec_saved_arith.1)
+            || (self.shell_state.arithmetic_nounset_error.get() && !spec_saved_arith.3);
+        if spec_expansion_failed {
+            self.restore_discard_latches(&spec_saved_discard);
+            self.no_closing_brace_failure
+                .set(spec_saved_no_closing_brace);
+            let printed = self.shell_state.arithmetic_expansion_error.get();
+            self.restore_arithmetic_error_flags(&spec_saved_arith);
+            self.shell_state.arithmetic_expansion_error.set(printed);
+            return Ok(None);
         }
 
         let (stage0_input, stage0_stdin_base) = self.initial_pipeline_input(commands[0]);
@@ -3399,7 +3520,24 @@ impl Executor {
                 }
                 match glob::pathname_expand_word(&expanded, &self.shell_state.env_vars) {
                     glob::PathnameExpansion::Matches(matches) => out.extend(matches),
-                    glob::PathnameExpansion::NoMatch | glob::PathnameExpansion::Fail(_) => {
+                    glob::PathnameExpansion::NoMatch => {
+                        out.push(expanded.replace(crate::executor::markers::CTLESC, ""))
+                    }
+                    // rubash#1540: failglob in a pipeline element was
+                    // silently degraded to the literal word (no
+                    // diagnostic, element ran, status 0). GNU's
+                    // failglob_error (subst.c -> expand_word_error)
+                    // reports and DISCARDs the element. Report through
+                    // the same funnel the simple-command path uses and
+                    // latch the pending; the stage wrapper converts it
+                    // to the element's (empty, 1) result. The replace
+                    // guard keeps a second failing word in the same
+                    // stage from printing again — GNU abandons the
+                    // word list at the first failure.
+                    glob::PathnameExpansion::Fail(pattern) => {
+                        if !self.evalerror_failglob_pending.replace(true) {
+                            self.report_failglob(&pattern);
+                        }
                         out.push(expanded.replace(crate::executor::markers::CTLESC, ""))
                     }
                 }
@@ -3466,6 +3604,26 @@ impl Executor {
         // error flags around the stage so the outer word-expansion check in
         // command_execute never observes them.
         let saved = self.snapshot_arithmetic_error_flags();
+        // rubash#1540: the same fork containment for the rest of the
+        // DISCARD latch family. The stage runs in place on this
+        // executor (its inline arms expand the element's words here;
+        // the helper stages run on clones), so snapshot the latches,
+        // clear the adjudication inputs, and at exit convert whatever
+        // the stage raised into the element's own (output, status) —
+        // GNU's element child dies on its expansion error
+        // (execute_cmd.c:2620 execute_pipeline -> execute_simple_command
+        // -> subst.c:11229 expand_word_internal -> expand_word_error ->
+        // jump_to_top_level(DISCARD)) with the class's pre-set status
+        // and no output, and the parent never learns it happened.
+        // command_expansion_failed is snapshot/restore only: it gates
+        // the PARENT's ERR-trap adjudication, which an element's
+        // failure must not suppress.
+        let saved_discard = self.snapshot_discard_latches();
+        self.parameter_assignment_failure.set(false);
+        self.parameter_assignment_failure_prev_status.set(None);
+        self.evalerror_failglob_pending.set(false);
+        self.evalerror_pending.set(false);
+        self.evalerror_exit_toomany_pending.set(false);
         // GNU forks a <( ) / >( ) child while expanding the pipeline
         // element's words inside that element's subshell (subst.c
         // process_substitute, execute_cmd.c). The builtin/function/external
@@ -3571,6 +3729,18 @@ impl Executor {
             old_stdin_offset,
         );
         self.shell_state.random_state.restore_state(&saved_random);
+        // rubash#1540: harvest the DISCARD latches this stage raised
+        // (they were cleared at entry), then restore the entry state so
+        // nothing leaks to the parent. The arithmetic verdict delta is
+        // read before restore_arithmetic_error_flags puts the entry
+        // values back.
+        let stage_param_assign_failed = self.parameter_assignment_failure.get();
+        let stage_param_assign_prev = self.parameter_assignment_failure_prev_status.get();
+        let stage_failglob_failed = self.evalerror_failglob_pending.get();
+        let stage_toomany_raised = self.evalerror_exit_toomany_pending.get();
+        let stage_arith_failed = (self.shell_state.arithmetic_fatal_error.get() && !saved.2)
+            || (self.shell_state.arithmetic_nonfatal_error.get() && !saved.1);
+        self.restore_discard_latches(&saved_discard);
         let nounset_hit = self.restore_arithmetic_error_flags(&saved);
         match result {
             Ok(Some((output, stderr, _status))) if nounset_hit => {
@@ -3580,6 +3750,40 @@ impl Executor {
                 self.shell_state.arithmetic_expansion_error.set(false);
                 Ok(Some((output, stderr, 127)))
             }
+            // rubash#1540/#1542: a failed `${var:=word}` bind raised
+            // while expanding this element's words on the shared
+            // executor. GNU's element child prints the diagnostic from
+            // inside bind_variable (variables.c err_readonly ->
+            // error.c report_error): under a live errexit flag
+            // report_error exit_shells the child with the pre-bind
+            // status (EXECUTION_FAILURE for 0); otherwise the DISCARD
+            // keeps the pre-set EX_BADUSAGE 2 — folded to 1 when this
+            // pipeline itself runs inside a command-substitution body
+            // (the parse_and_execute catch, builtins/evalstring.c:
+            // 423-426). The element produces no output.
+            Ok(Some((_, stderr, _))) if stage_param_assign_failed => {
+                let code =
+                    self.param_assign_discard_status(2, stage_param_assign_prev.unwrap_or(0));
+                Ok(Some((String::new(), stderr, code)))
+            }
+            // rubash#1540: an arithmetic expansion error in the
+            // element's words — the pre-set status is EXECUTION_FAILURE
+            // (subst.c:4295-4296 set_exit_status before the DISCARD),
+            // and the failed expansion's empty product must not run.
+            Ok(Some((_, stderr, _))) if stage_arith_failed => Ok(Some((String::new(), stderr, 1))),
+            // rubash#1540: a failglob failure in the element's words —
+            // subst.c failglob_error -> expand_word_error (DISCARD)
+            // with the pre-set status 1, no output.
+            Ok(Some((_, stderr, _))) if stage_failglob_failed => {
+                Ok(Some((String::new(), stderr, 1)))
+            }
+            // rubash#1540: a no_args DISCARD (break/continue/exit/
+            // return with too many arguments) raised by an inline stage
+            // arm on this executor — inside the forked element the
+            // execute_subshell_builtin_or_function trampoline
+            // (execute_cmd.c) converts it to subshell_exit(1). Helper
+            // stages running on clones fold at their own harvest.
+            Ok(Some((output, stderr, _))) if stage_toomany_raised => Ok(Some((output, stderr, 1))),
             other => other,
         }
     }
@@ -3591,6 +3795,13 @@ impl Executor {
         stdin_inherit: bool,
         streaming_stdin: bool,
     ) -> Result<Option<(String, String, i32)>, ExecuteError> {
+        // rubash#1540: entry snapshot for the post-scan adjudication
+        // below — the no-fields scan expands every word with the full
+        // walker, and the arithmetic verdict flags / brace latch it
+        // may raise are delta-checked there (the wrapper owns the
+        // restore side).
+        let inner_saved_arith = self.snapshot_arithmetic_error_flags();
+        let inner_saved_no_closing_brace = self.no_closing_brace_failure.get();
         if let Some(time_command) = &command.time_command {
             let started = time_command_started();
             let Some((output, stderr, status)) =
@@ -3784,6 +3995,78 @@ impl Executor {
             });
         if stage_expands_to_no_fields {
             return Ok(Some((String::new(), String::new(), 0)));
+        }
+
+        // rubash#1540: the scan above expanded every word on this
+        // executor with the full mutable walker. If that expansion
+        // raised a DISCARD-class failure — a failed `${var:=word}`
+        // bind, an arithmetic error, a failglob, an unterminated
+        // `${` — GNU's element dies at expand_words, BEFORE dispatch
+        // (execute_cmd.c:4617 execute_simple_command): no route below
+        // (inline arm, external spawn, builtin/function clone) may
+        // run the command with the failure's empty product. The
+        // diagnostic already printed during the scan's expansion,
+        // exactly once (the print sites are latch-guarded), so
+        // convert the latch to the element's (empty, status) result
+        // here. Class order mirrors expand_word_internal: word
+        // expansion failures before pathname expansion (failglob).
+        if self.parameter_assignment_failure.get() {
+            let prev = self.parameter_assignment_failure_prev_status.get();
+            return Ok(Some((
+                String::new(),
+                String::new(),
+                self.param_assign_discard_status(2, prev.unwrap_or(self.exit_code)),
+            )));
+        }
+        // The scan's walker defers ${var:=word} binds (its products are
+        // advisory), so a failed bind may leave no latch even though the
+        // element's real expansion would raise it. The textual predictor
+        // the command validators use (parameter_assignment_error) is the
+        // authority for the readonly/special classes: report it here,
+        // exactly once, and kill the element the same way.
+        if let Some((name, message)) = self.parameter_assignment_error(command) {
+            let class = if message == "readonly variable" { 2 } else { 1 };
+            let line = format!("{}{}: {}\n", self.error_prefix(), name, message);
+            self.write_diagnostic_fd2(line.as_bytes());
+            return Ok(Some((
+                String::new(),
+                String::new(),
+                self.param_assign_discard_status(class, self.exit_code),
+            )));
+        }
+        if (self.shell_state.arithmetic_fatal_error.get() && !inner_saved_arith.2)
+            || (self.shell_state.arithmetic_nonfatal_error.get() && !inner_saved_arith.1)
+            || (self.no_closing_brace_failure.get() && !inner_saved_no_closing_brace)
+        {
+            return Ok(Some((String::new(), String::new(), 1)));
+        }
+        if self.evalerror_failglob_pending.get() {
+            return Ok(Some((String::new(), String::new(), 1)));
+        }
+        // Same deferred-walker caveat for pathname expansion: the
+        // scan does not glob, so a failglob verdict leaves no latch.
+        // For a LITERAL glob word (no expansion introducers — its
+        // expanded form is itself) the production verdict applies
+        // directly: pathname_expand_word returns Fail only when
+        // failglob is set and the pattern matched nothing (subst.c
+        // failglob_error -> expand_word_error, DISCARD, pre-set
+        // status 1). Value-dependent patterns (from $-expansions)
+        // stay with the stage routes, as before.
+        for word in &command.words {
+            if !crate::executor::parameter_errors::word_has_unquoted_glob_meta(word)
+                || word.contains('$')
+                || word.contains('`')
+            {
+                continue;
+            }
+            if let glob::PathnameExpansion::Fail(pattern) =
+                glob::pathname_expand_word(word, &self.shell_state.env_vars)
+            {
+                if !self.evalerror_failglob_pending.replace(true) {
+                    self.report_failglob(&pattern);
+                }
+                return Ok(Some((String::new(), String::new(), 1)));
+            }
         }
 
         // GNU execute_cmd.c:4649 (execute_simple_command): every pipeline
@@ -5222,4 +5505,33 @@ fn tput_inline_stage(command: &CommandNode) -> bool {
 #[allow(dead_code)]
 fn tput_inline_stage(_command: &CommandNode) -> bool {
     false
+}
+
+thread_local! {
+    /// Set while a concurrent-pipeline spec expansion runs: that
+    /// expansion is speculative (the sequential stage executor
+    /// re-expands on decline), so its failglob verdict must stay
+    /// silent — the same contract `expansion_probe_active` gives the
+    /// #809 async gate (rubash#1540).
+    static SPECULATIVE_EXPANSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(in crate::executor) fn speculative_expansion_active() -> bool {
+    SPECULATIVE_EXPANSION.with(|flag| flag.get())
+}
+
+/// RAII scope for [`SPECULATIVE_EXPANSION`]; restores the prior value
+/// on drop, so early returns inside a spec build are covered.
+pub(in crate::executor) struct SpeculativeExpansionGuard(bool);
+
+impl SpeculativeExpansionGuard {
+    pub(in crate::executor) fn new() -> Self {
+        Self(SPECULATIVE_EXPANSION.with(|flag| flag.replace(true)))
+    }
+}
+
+impl Drop for SpeculativeExpansionGuard {
+    fn drop(&mut self) {
+        SPECULATIVE_EXPANSION.with(|flag| flag.set(self.0));
+    }
 }
