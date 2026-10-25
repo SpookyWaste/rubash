@@ -1541,6 +1541,14 @@ pub fn stdin_source_needs_more_posix(source: &str, posix: bool) -> bool {
     if stdin_source_text_needs_more(source, posix) {
         return true;
     }
+    // rubash#1573: an unterminated `[[` holds the group open (the
+    // conditional is one command; see GroupScanFeeder::
+    // token_level_needs_more for the parked-feeder arm of this rule —
+    // both halves of the completeness test ask the scanner's PST_CONDCMD
+    // state so their answers agree).
+    if crate::lexer::source_ends_in_cond_command(source, posix) {
+        return true;
+    }
 
     let tokens = tokenize(source);
     let mut stack = Vec::new();
