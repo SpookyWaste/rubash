@@ -824,6 +824,11 @@ impl Executor {
             // niubash#345: a broken pipe escaping an in-process child script
             // is the child's SIGPIPE-shaped status (141).
             ExecuteError::BrokenPipe => Ok(141),
+            // rubash#1639: a SIGINT line discard inside the child script
+            // ends the child's current unit with the recorded 130 — the
+            // child-process analogue of the reader discard (the parent's
+            // list only ever sees the child's 130 status).
+            ExecuteError::SigintUnwind => Ok(130),
             // Loop control can never escape a child process.
             ExecuteError::Break(_) | ExecuteError::Continue(_) => Ok(1),
             ExecuteError::CommandNotFound(name) => {
