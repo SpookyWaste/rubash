@@ -120,9 +120,16 @@ impl Executor {
                 // the rubash#720 fork-collapse this frame performs no
                 // wait-side adjudication at all (execute_cmd.c:662-663
                 // skips wait_for) — the failure is observed one frame up.
-                if !self.subshell_fork_collapse.get() {
+                // rubash#1611: the timed-dispatch depth gate is the
+                // same single-adjudication rule as in
+                // execute_materialized_command's tail.
+                if !self.subshell_fork_collapse.get() && self.timed_dispatch_depth.get() == 0 {
                     self.maybe_run_error_trap(cmd)?;
                 }
+                // rubash#1611: conversion of a completed subshell's
+                // status, not a jump out of it — mark for
+                // execute_time_ast_command's report adjudication.
+                self.errexit_status_converted.set(true);
                 return Err(ExecuteError::ExitCode(self.exit_code));
             }
             return result;
@@ -325,6 +332,9 @@ impl Executor {
             // command binds `$_` to the null string.
             self.bind_underscore("");
             if self.errexit_enabled() && self.errexit_is_active() && self.exit_code != 0 {
+                // rubash#1611: conversion of a completed command's
+                // status — mark for execute_time_ast_command.
+                self.errexit_status_converted.set(true);
                 return Err(ExecuteError::ExitCode(self.exit_code));
             }
             return Ok(());
@@ -425,7 +435,16 @@ impl Executor {
                     // command is a failed command — GNU fires the ERR
                     // trap before the ERREXIT jump; the Ok path below
                     // lets the ast_exec loop fire instead.
-                    self.maybe_run_error_trap(&cmd)?;
+                    // rubash#1611: inside a timed dispatch the ERR trap
+                    // is adjudicated once by the ast_exec time branch
+                    // (rubash#1277) — firing here too would double it.
+                    if self.timed_dispatch_depth.get() == 0 {
+                        self.maybe_run_error_trap(&cmd)?;
+                    }
+                    // rubash#1611: the command completed (with a
+                    // redirection failure status) — mark the conversion
+                    // for execute_time_ast_command.
+                    self.errexit_status_converted.set(true);
                     return Err(ExecuteError::ExitCode(1));
                 }
                 Ok(())
