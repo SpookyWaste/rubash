@@ -645,6 +645,15 @@ impl Executor {
         // and function-local restores both emit). A restore that removed
         // the variable takes the `v == 0` arm (flags off, no diagnostic).
         let touched_bashcompat = previous.iter().any(|(name, ..)| name == "BASH_COMPAT");
+        // rubash#1525: this restore consumes the PIPESTATUS (shape,
+        // vector) snapshot apply_temporary_assignments recorded, so
+        // the promotion mirror of it has served its purpose.
+        if previous
+            .iter()
+            .any(|(name, ..)| name == crate::shell::state::PIPESTATUS_STATE_SNAPSHOT_KEY)
+        {
+            self.tempenv_pipestatus_state = None;
+        }
         // GNU variables.c:2615-2631 make_local_variable (was_tmpvar): a
         // declare/typeset/local operand bound by this command's prefix was
         // promoted to a frame local — its env binding must survive this
@@ -653,6 +662,26 @@ impl Executor {
         let mut deferred_attrs = Vec::new();
         for (name, value, typed_value, saved_attrs) in previous.into_iter().rev() {
             self.tempenv_previous.remove(&name);
+            // rubash#1525: the PIPESTATUS shape/vector snapshot is
+            // not a variable binding — reinstall the pair directly.
+            // A promoted PIPESTATUS keeps the tempenv shape: its
+            // binding survives as a frame local, and the frame's own
+            // snapshot governs the shape when the frame pops.
+            if name == crate::shell::state::PIPESTATUS_STATE_SNAPSHOT_KEY {
+                if !promoted
+                    .iter()
+                    .any(|promoted_name| promoted_name == "PIPESTATUS")
+                {
+                    if let Some((shape, vector)) = value
+                        .as_deref()
+                        .and_then(crate::shell::state::decode_pipestatus_state)
+                    {
+                        self.shell_state.pipestatus_shape = shape;
+                        self.shell_state.pipestatus = vector;
+                    }
+                }
+                continue;
+            }
             // GNU variables.c:4485-4525 push_posix_temp_var: a propagated
             // binding descended into the caller's context — the caller's
             // tempenv restore must not touch it, and it keeps the tempvar's

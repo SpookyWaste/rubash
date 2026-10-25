@@ -1673,6 +1673,21 @@ impl Executor {
                 if let Some(attr_scope) = self.shell_state.local_attr_scopes.last_mut() {
                     attr_scope.insert(name.clone(), attrs);
                 }
+                // rubash#1525: a promoted PIPESTATUS local's frame
+                // snapshot must hold the pre-tempenv (shape,
+                // vector) apply_temporary_assignments recorded, so
+                // the frame pop restores them with the cell.
+                if name == "PIPESTATUS" {
+                    if let Some(encoded) = self.tempenv_pipestatus_state.clone() {
+                        if let Some(scope) = self.shell_state.local_var_scopes.last_mut() {
+                            scope
+                                .entry(
+                                    crate::shell::state::PIPESTATUS_STATE_SNAPSHOT_KEY.to_string(),
+                                )
+                                .or_insert(Some(encoded));
+                        }
+                    }
+                }
             }
         }
     }

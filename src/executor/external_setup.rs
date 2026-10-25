@@ -309,6 +309,10 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        // rubash#1525: record the disk-command dispatch class for
+        // the enclosing simple command's PIPESTATUS completion
+        // write (see execute_materialized_command).
+        self.external_dispatch_ran.set(true);
         // rubash#815 profiler: the external-spawn seam (GNU execute_cmd.c
         // dispatches disk commands through execute_command_internal's
         // simple-command tail; this is the fork face of the attribution
