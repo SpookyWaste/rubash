@@ -801,6 +801,23 @@ impl ConditionalArithParser<'_> {
             self.set_variable(&base_target.to_string(), numeric);
             return;
         }
+        // GNU expr.c: an unsubscripted array name in arithmetic denotes
+        // element 0 for writes as well as reads — the bind lands on that
+        // element and the remaining elements survive; rebinding the name
+        // to the scalar text collapses the whole array (rubash#1614). An
+        // associative name takes key "0" the same way (verified GNU
+        // 5.3.20: declare -A m=([x]=1 [y]=2); $((m=5)) leaves
+        // m=([0]="5" [y]="2" [x]="1")).
+        if is_marked_var(self.env_vars, ARRAY_VARS, name) {
+            let numeric = value.parse::<i128>().unwrap_or(0);
+            self.set_array_element(name, 0, numeric);
+            return;
+        }
+        if is_marked_var(self.env_vars, ASSOC_VARS, name) {
+            let numeric = value.parse::<i128>().unwrap_or(0);
+            self.set_assoc_element(name, "0", numeric);
+            return;
+        }
         let old_value = self.env_vars.get(name).cloned();
         self.env_vars.insert(name.to_string(), value.clone());
         super::super::record_arith_write(name, old_value);
