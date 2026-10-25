@@ -1361,6 +1361,36 @@ impl Executor {
         }
     }
 
+    /// rubash#1597: a triggered `=`/`:=` bind through the all-elements
+    /// spelling (`name[@]` / `name[*]`) on a non-associative base has
+    /// no element to bind — GNU parameter_brace_expand's `case '='`
+    /// (subst.c:10346) routes the still-subscripted name to
+    /// parameter_brace_expand_rhs (subst.c:8096) and the bind fails
+    /// with `name[@]: bad array subscript`, EX_BADUSAGE. An associative
+    /// base is the one legal case (the literal "@" / "*" text is a
+    /// key); apply_array_element_parameter_assignment has already
+    /// claimed it by the time this runs. Contexts the textual pre-scan
+    /// (parameter_assignment_error_in_word) covers never reach the
+    /// apply path — the command is discarded first — so reporting here
+    /// cannot double-print.
+    fn reject_bad_array_subscript_assignment(&mut self, name: &str, prev_status: i32) -> bool {
+        let Some(base) = name
+            .strip_suffix("[@]")
+            .or_else(|| name.strip_suffix("[*]"))
+        else {
+            return false;
+        };
+        let resolved_base = self
+            .nameref_target_name(base)
+            .unwrap_or_else(|| base.to_string());
+        if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, &resolved_base) {
+            return false;
+        }
+        eprintln!("{}{}: bad array subscript", self.error_prefix(), name);
+        self.latch_parameter_assignment_failure(prev_status);
+        true
+    }
+
     fn apply_parameter_assignment_expansion_with_context(
         &mut self,
         inner: &str,
@@ -1438,6 +1468,9 @@ impl Executor {
             if self.apply_array_element_parameter_assignment(name, bound.clone()) {
                 return;
             }
+            if self.reject_bad_array_subscript_assignment(name, prev_status) {
+                return;
+            }
             if self.apply_indirect_parameter_assignment(name, bound.clone()) {
                 return;
             }
@@ -1469,6 +1502,9 @@ impl Executor {
             // rubash#1542: same pre-bind `$?` snapshot as the `:=` arm.
             let prev_status = self.exit_code;
             if self.apply_array_element_parameter_assignment(name, bound.clone()) {
+                return;
+            }
+            if self.reject_bad_array_subscript_assignment(name, prev_status) {
                 return;
             }
             if self.apply_indirect_parameter_assignment(name, bound.clone()) {

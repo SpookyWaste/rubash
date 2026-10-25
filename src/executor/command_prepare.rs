@@ -435,7 +435,11 @@ impl Executor {
             // rubash#1542: `$?` before this arm overwrites it — the
             // status GNU's report_error would exit_shell with (below).
             let prev_status = self.exit_code;
-            let status = if message == "readonly variable" { 2 } else { 1 };
+            let status = if matches!(message, "readonly variable" | "bad array subscript") {
+                2
+            } else {
+                1
+            };
             self.exit_code = status;
             // POSIX-mode notes item 36, parameter-expansion assignment arm:
             // `: ${v:=val}` against a readonly v before the special builtin
@@ -858,7 +862,11 @@ impl Executor {
             // rubash#1542: same report_error errexit overlay as the
             // twin arm above — capture the pre-expansion `$?` first.
             let prev_status = self.exit_code;
-            let status = if message == "readonly variable" { 2 } else { 1 };
+            let status = if matches!(message, "readonly variable" | "bad array subscript") {
+                2
+            } else {
+                1
+            };
             self.exit_code = status;
             // POSIX-mode notes item 36, parameter-expansion assignment arm:
             // `: ${v:=val}` against a readonly v before the special builtin

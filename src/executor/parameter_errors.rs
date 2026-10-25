@@ -376,6 +376,13 @@ impl Executor {
         if !word.as_bytes().contains(&b'$') {
             return None;
         }
+        // rubash#1597: the bad-array-subscript class is adjudicated by
+        // the shared helper below (also consulted by the word scan
+        // behind for-list / case / [[ ]] positions); the
+        // readonly/positional arms keep their own loop further down.
+        if let Some(name) = self.bad_array_subscript_assignment_in_word(word) {
+            return Some((name, "bad array subscript"));
+        }
         let word = word
             .strip_prefix(crate::executor::markers::QUOTED_WORD_PREFIX)
             .or_else(|| word.strip_prefix(STORAGE_WORD_PREFIX))
@@ -438,6 +445,68 @@ impl Executor {
                 // substitution" while `${@=x}` expanded silently empty.
                 if self.special_assignment_required(name, require_non_empty) {
                     return Some((format!("${name}"), "cannot assign in this way"));
+                }
+            }
+            rest = &after_start[end + 1..];
+        }
+        None
+    }
+
+    /// rubash#1597: the name (as written) of a triggered `=` / `:=`
+    /// whose left-hand side is the all-elements spelling (`name[@]` /
+    /// `name[*]`) on a base that is NOT an associative array. GNU
+    /// parameter_brace_expand's `case '='` (subst.c:10346) hands the
+    /// RHS to parameter_brace_expand_rhs (subst.c:8096) with the
+    /// subscript text still attached, and the bind fails with
+    /// `name[@]: bad array subscript` (EX_BADUSAGE). The one legal
+    /// base is an associative array, where the literal "@" / "*" text
+    /// is just a key. The trigger test is the operator's own set/null
+    /// test over the joined elements (parameter_assignment_required),
+    /// so a set array whose elements are non-null never reaches the
+    /// bind. Shared by the simple-command pre-scan and the word scan
+    /// behind for-list / case / [[ ]] positions
+    /// (parameter_expansion_error_in_word_context).
+    pub(in crate::executor) fn bad_array_subscript_assignment_in_word(
+        &self,
+        word: &str,
+    ) -> Option<String> {
+        if !word.as_bytes().contains(&b'$') || !word.contains('=') {
+            return None;
+        }
+        let word = word
+            .strip_prefix(crate::executor::markers::QUOTED_WORD_PREFIX)
+            .or_else(|| word.strip_prefix(STORAGE_WORD_PREFIX))
+            .unwrap_or(word);
+        // Same #1542 masking discipline as the sibling scan: fragments
+        // inside a command-substitution span belong to the child.
+        let masked;
+        let word = if word.contains("$(") || word.contains('`') || word.contains('\'') {
+            masked = mask_nonlocal_expansion_spans(word);
+            &masked
+        } else {
+            word
+        };
+        let mut rest = word;
+        while let Some(start) = rest.find("${") {
+            let after_start = &rest[start + 2..];
+            let Some(end) = matching_parameter_brace(after_start) else {
+                return None;
+            };
+            let inner = &after_start[..end];
+            if let Some((name, require_non_empty)) = parse_parameter_assignment_operator(inner) {
+                if let Some(base) = name
+                    .strip_suffix("[@]")
+                    .or_else(|| name.strip_suffix("[*]"))
+                {
+                    let resolved_base = self
+                        .nameref_target_name(base)
+                        .unwrap_or_else(|| base.to_string());
+                    let base_is_assoc =
+                        is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, &resolved_base);
+                    if !base_is_assoc && self.parameter_assignment_required(name, require_non_empty)
+                    {
+                        return Some(name.to_string());
+                    }
                 }
             }
             rest = &after_start[end + 1..];
@@ -1179,10 +1248,13 @@ impl Executor {
         }
         self.exit_code = status;
         self.command_expansion_failed.set(true);
-        if status == 1 {
-            return Err(ExecuteError::ExpansionFailure(status));
-        }
-        Err(ExecuteError::ExitCode(status))
+        // Every lesser class abandons the current command list with its
+        // status (the ExpansionFailure vehicle) — status 1 (substring /
+        // bad substitution) and status 2 (the rubash#1597 bad array
+        // subscript, EX_BADUSAGE) alike. ExitCode is reserved for the
+        // FATAL class above; routing a lesser class through it aborted
+        // the whole script from compound positions (for / case).
+        Err(ExecuteError::ExpansionFailure(status))
     }
 
     /// The single owner of the fatal-expansion exit status (FORCE_EOF
@@ -1444,6 +1516,14 @@ impl Executor {
         // marker disambiguates the legacy enclosing form from this Bash error.
         if word.contains("${|") {
             return None;
+        }
+        // rubash#1597: a triggered `=`/`:=` on the all-elements
+        // spelling errors in EVERY word position GNU expands (for-list
+        // words, the case subject, [[ ]] operands reach this scan, not
+        // the simple-command pre-scan). EX_BADUSAGE, like the readonly
+        // assignment class.
+        if let Some(name) = self.bad_array_subscript_assignment_in_word(word) {
+            return Some((name, "bad array subscript".to_string(), 2));
         }
         if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "nounset") {
             if let Some(name) = self.nounset_unbound_parameter(word) {
@@ -3097,7 +3177,20 @@ impl Executor {
                 if let Some(value) = self.array_element_parameter_value(name) {
                     return Some(value);
                 }
-                self.shell_state.env_vars.get(name).cloned()
+                // GNU var_is_set/var_is_null on a BARE array name read
+                // element 0 (variables.c get_string_value; assoc: key
+                // "0"): an assoc without key "0", or a sparse indexed
+                // array with no element 0, is NULL for the error
+                // operators even though other elements exist. The raw
+                // storage string is non-empty for any non-empty array,
+                // so reading it directly made `${m:?}`/`${a:?}` on such
+                // arrays silently pass (rubash#1597).
+                match self.shell_state.env_vars.get(name) {
+                    Some(value) if self.parameter_is_array_variable(name) => {
+                        self.scalar_parameter_value(name, value)
+                    }
+                    value => value.cloned(),
+                }
             }
         }
     }
