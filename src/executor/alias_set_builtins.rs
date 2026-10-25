@@ -114,11 +114,15 @@ impl Executor {
     ) -> Result<i32, ExecuteError> {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        // rubash#1569: the bare listing renders the bindings
+        // underneath this command's own tempenv frame.
+        let underlay = self.tempenv_listing_underlay();
         let status = crate::builtins::set::set_with_io(
             cmd.words[1..].iter().map(String::as_str),
             &mut self.shell_state.env_vars,
             &mut stdout,
             &mut stderr,
+            &underlay,
         )?;
         if cmd.words.len() == 1 && !self.posix_mode_enabled() {
             // GNU set.def set_builtin with no arguments calls

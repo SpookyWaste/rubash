@@ -47,6 +47,7 @@ pub fn export(
         &mut stderr,
         &mut oob_word,
         None,
+        &crate::shell::var_table::TempenvListingUnderlay::new(),
     )?;
     // No abort channel here (test-only path in practice): keep the bare
     // report_error diagnostic plus the failure status so a direct caller
@@ -105,6 +106,7 @@ pub fn readonly(
         None,
         &mut oob_word,
         None,
+        &crate::shell::var_table::TempenvListingUnderlay::new(),
     )?;
     // Same direct-path diagnostic as export above (no Executor to abort).
     if let Some(word) = oob_word {
@@ -126,6 +128,7 @@ pub(crate) fn export_with_io<'a, I, W, E>(
     stderr: &mut E,
     oob_word: &mut Option<String>,
     traced: Option<&mut Vec<(String, bool, String)>>,
+    underlay: &crate::shell::var_table::TempenvListingUnderlay,
 ) -> io::Result<i32>
 where
     I: IntoIterator<Item = &'a str>,
@@ -199,6 +202,7 @@ where
             env_vars.get("__RUBASH_POSIX_MODE").map(String::as_str) == Some("1"),
             array,
             assoc,
+            underlay,
             stdout,
         )?;
         return Ok(EXECUTION_SUCCESS);
@@ -256,6 +260,7 @@ pub(crate) fn readonly_with_io<'a, I, W, E>(
     context_name: Option<&str>,
     oob_word: &mut Option<String>,
     traced: Option<&mut Vec<(String, bool, String)>>,
+    underlay: &crate::shell::var_table::TempenvListingUnderlay,
 ) -> io::Result<i32>
 where
     I: IntoIterator<Item = &'a str>,
@@ -316,6 +321,7 @@ where
             array,
             assoc,
             env_vars.get("__RUBASH_POSIX_MODE").map(String::as_str) == Some("1"),
+            underlay,
             stdout,
         )?;
         return Ok(EXECUTION_SUCCESS);

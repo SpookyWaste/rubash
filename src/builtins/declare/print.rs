@@ -21,6 +21,7 @@ pub(super) fn print_declare_names<W, E>(
     plain: bool,
     mut status: i32,
     dynamic_views: &[(String, String)],
+    underlay: &crate::shell::var_table::TempenvListingUnderlay,
     stdout: &mut W,
     stderr: &mut E,
 ) -> io::Result<i32>
@@ -28,6 +29,16 @@ where
     W: Write,
     E: Write,
 {
+    // rubash#1569: the underlay applies to LISTINGS only. An explicit
+    // `declare -p name` lookup goes through find_variable, which sees
+    // the tempvar (variables.c:1980) — only the all-variables listing
+    // (print_var_list over the real contexts) skips it.
+    let empty_underlay = crate::shell::var_table::TempenvListingUnderlay::new();
+    let underlay = if names.is_empty() {
+        underlay
+    } else {
+        &empty_underlay
+    };
     let filter_exported = options.export;
     let filter_readonly = options.readonly;
     let filter_array = options.array;
@@ -84,6 +95,38 @@ where
                 listed.push(view_name.clone());
             }
         }
+        // rubash#1569: adjudicate the listing against the pre-frame
+        // bindings for names the current command's own tempenv frame
+        // bound — frame-created names vanish; shadowed names pass or
+        // fail the attribute filters by their UNDERLYING attributes
+        // and render from the snapshot in the loop below. Names whose
+        // underlying binding has no table cell (a declared-but-unset
+        // variable) are added here when they pass.
+        if !underlay.is_empty() {
+            let passes_under = |attrs: &crate::shell::var_table::VarAttrs| {
+                (!filter_exported || attrs.exported)
+                    && (!filter_readonly || attrs.readonly)
+                    && (!filter_array || attrs.array)
+                    && (!filter_assoc || attrs.assoc)
+                    && (!filter_integer || attrs.integer)
+                    && (!filter_uppercase || attrs.uppercase)
+                    && (!filter_lowercase || attrs.lowercase)
+                    && (!filter_nameref || attrs.nameref)
+            };
+            listed.retain(|name| match underlay.get(name) {
+                None => true,
+                Some(None) => false,
+                Some(Some((_, attrs))) => passes_under(attrs),
+            });
+            for (name, under) in underlay.iter() {
+                let Some((_, attrs)) = under else {
+                    continue;
+                };
+                if passes_under(attrs) && !listed.iter().any(|listed| listed == name) {
+                    listed.push(name.clone());
+                }
+            }
+        }
         listed.sort();
         listed
     } else {
@@ -94,6 +137,95 @@ where
             .map(|name| name.strip_suffix('+').unwrap_or(name))
             .map(str::to_string)
             .collect()
+    };
+    // rubash#1569: for names the current command's own tempenv frame
+    // bound, the per-name attributes come from the pre-frame snapshot,
+    // not the tempvar's live marks (capcase has no VarAttrs slot and
+    // stays live — a case-converted underlying keeps its mark, which
+    // is exactly the attribute the pre-frame binding carries).
+    let (
+        exported,
+        readonly,
+        arrays,
+        assocs,
+        integers,
+        uppercase,
+        lowercase,
+        namerefs,
+        declared_unset,
+    ) = if underlay.is_empty() {
+        (
+            exported,
+            readonly,
+            arrays,
+            assocs,
+            integers,
+            uppercase,
+            lowercase,
+            namerefs,
+            declared_unset,
+        )
+    } else {
+        let mut exported = exported;
+        let mut readonly = readonly;
+        let mut arrays = arrays;
+        let mut assocs = assocs;
+        let mut integers = integers;
+        let mut uppercase = uppercase;
+        let mut lowercase = lowercase;
+        let mut namerefs = namerefs;
+        let mut declared_unset = declared_unset;
+        for (name, under) in underlay.iter() {
+            exported.remove(name);
+            readonly.remove(name);
+            arrays.remove(name);
+            assocs.remove(name);
+            integers.remove(name);
+            uppercase.remove(name);
+            lowercase.remove(name);
+            namerefs.remove(name);
+            declared_unset.remove(name);
+            if let Some((_, a)) = under {
+                if a.exported {
+                    exported.insert(name.clone());
+                }
+                if a.readonly {
+                    readonly.insert(name.clone());
+                }
+                if a.array {
+                    arrays.insert(name.clone());
+                }
+                if a.assoc {
+                    assocs.insert(name.clone());
+                }
+                if a.integer {
+                    integers.insert(name.clone());
+                }
+                if a.uppercase {
+                    uppercase.insert(name.clone());
+                }
+                if a.lowercase {
+                    lowercase.insert(name.clone());
+                }
+                if a.nameref {
+                    namerefs.insert(name.clone());
+                }
+                if a.declared_unset {
+                    declared_unset.insert(name.clone());
+                }
+            }
+        }
+        (
+            exported,
+            readonly,
+            arrays,
+            assocs,
+            integers,
+            uppercase,
+            lowercase,
+            namerefs,
+            declared_unset,
+        )
     };
     for name in names_to_print {
         let attrs = DeclarationAttrs {
@@ -106,7 +238,10 @@ where
             lowercase: lowercase.contains(&name),
             capcase: capcase.contains(&name),
             nameref: namerefs.contains(&name),
-            trace: variables.is_marked(super::TRACE_VARS, &name),
+            trace: match underlay.get(&name) {
+                Some(under) => under.as_ref().is_some_and(|(_, a)| a.trace),
+                None => variables.is_marked(super::TRACE_VARS, &name),
+            },
         };
         // A dynamic variable's cell is whatever the last bind stored; GNU's
         // declare -p reads the dynamic_value getter, so the CURRENT dynamic
@@ -118,6 +253,24 @@ where
             .map(|(_, text)| text)
         {
             writeln!(stdout, "{rendered}")?;
+        } else if let Some(Some((under_value, _))) = underlay.get(&name) {
+            // rubash#1569: render the pre-frame binding's stored text;
+            // a binding that existed without env text (declared but
+            // unset) renders as an unset declaration with the snapshot
+            // attributes computed above.
+            match under_value {
+                Some(value) => {
+                    let nbuckets = crate::executor::assoc_nbuckets(variables, &name);
+                    if plain {
+                        print_plain_declaration(&name, value, attrs, nbuckets, stdout)?;
+                    } else {
+                        print_declaration(&name, value, attrs, nbuckets, stdout)?;
+                    }
+                }
+                None => {
+                    print_unset_declaration(&name, attrs, stdout)?;
+                }
+            }
         } else if let Some(value) = variables.get(&name) {
             let nbuckets = crate::executor::assoc_nbuckets(variables, &name);
             if plain {

@@ -328,6 +328,7 @@ fn wait_for_windows_pipeline_member(
         std::thread::sleep(POLL_INTERVAL);
     }
 }
+use crate::executor::command_prepare::mixed_assignment_statement_admission;
 use crate::executor::external_setup::shared_combined_output_process_substitution;
 use crate::executor::markers::STORAGE_WORD_PREFIX;
 
@@ -1002,7 +1003,51 @@ impl Executor {
         // outer consumer's pipe to its own stages. Clear it across the whole
         // nested pipeline and restore afterwards.
         let saved_stdin_stream = self.pipeline_stdin_stream.take();
-        let result = self.execute_simple_pipeline_inner(commands, index);
+        // rubash#1568: GNU classifies each pipeline element's words
+        // independently (execute_cmd.c execute_pipeline -> the forked
+        // element's execute_simple_command), so an array-element
+        // assignment prefix on an element gets the same invalidid
+        // strip the top-level funnel applies — the routes below that
+        // never re-enter the top-level funnel (concurrent external,
+        // streaming tail) would otherwise dispatch `a[0]=5` as a
+        // command name. The strip is idempotent (a stripped element
+        // no longer starts with an element word), so the sequential
+        // route's own stage-level pass stays a no-op. Diagnostics go
+        // to the ambient fd 2: GNU reports them during the element's
+        // word expansion, before its own redirections apply.
+        let mut stripped_commands: Option<Vec<CommandNode>> = None;
+        if commands
+            .get(index)
+            .is_some_and(|member| member.pipe.is_some())
+        {
+            let mut end = index;
+            loop {
+                let Some(member) = commands.get(end) else {
+                    break;
+                };
+                let qualifies =
+                    !member.words.is_empty() && command_word_is_array_element_assignment(member, 0);
+                if qualifies {
+                    let (stripped, diagnostics) =
+                        self.strip_invalid_env_assignment_prefixes_collecting(member);
+                    for line in &diagnostics {
+                        self.write_default_stderr(line.as_bytes())?;
+                    }
+                    if matches!(stripped, std::borrow::Cow::Owned(_)) {
+                        let owned = stripped_commands.get_or_insert_with(|| commands.to_vec());
+                        owned[end] = stripped.into_owned();
+                    }
+                }
+                if member.pipe.is_none() {
+                    break;
+                }
+                end += 1;
+            }
+        }
+        let result = match &stripped_commands {
+            Some(commands) => self.execute_simple_pipeline_inner(commands, index),
+            None => self.execute_simple_pipeline_inner(commands, index),
+        };
         self.pipeline_stdin_stream = saved_stdin_stream;
         result
     }
@@ -4098,6 +4143,40 @@ impl Executor {
                 .execute_compound_pipeline_stage(command, input, streaming_stdin)
                 .map(Some);
         }
+
+        // rubash#1568: an element that is entirely assignment words
+        // is an assignment STATEMENT in the element's subshell (GNU
+        // execute_simple_command's WORDS==0 arm in the forked child):
+        // every word binds there permanently and nothing leaks to
+        // the parent. The compound route supplies the subshell
+        // isolation and capture plumbing; the clone's own funnel
+        // runs the mixed-statement arm.
+        if mixed_assignment_statement_admission(command) {
+            return self
+                .execute_compound_pipeline_stage(command, input, streaming_stdin)
+                .map(Some);
+        }
+
+        // rubash#1568: the pipeline-level strip covers the common
+        // routes; a `time`-wrapped element reaches this point with
+        // its prefix intact (the time arm above re-dispatches the
+        // inner command), so apply the same strip here. Diagnostics
+        // route to the ambient fd 2, matching the expansion-error
+        // checks below (GNU reports them during the element's word
+        // expansion, before its own redirections apply).
+        let stage_stripped;
+        let command =
+            if !command.words.is_empty() && command_word_is_array_element_assignment(command, 0) {
+                let (stripped, diagnostics) =
+                    self.strip_invalid_env_assignment_prefixes_collecting(command);
+                for line in &diagnostics {
+                    self.write_default_stderr(line.as_bytes())?;
+                }
+                stage_stripped = stripped;
+                &stage_stripped
+            } else {
+                command
+            };
 
         // GNU execute_cmd.c:4617 expand_words runs BEFORE the element's own
         // do_redirections (execute_builtin_or_function execute_cmd.c:5606),

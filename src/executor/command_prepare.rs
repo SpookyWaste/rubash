@@ -3734,6 +3734,15 @@ impl Executor {
             }
             return true;
         }
+        if self.execute_mixed_assignment_statement(cmd) {
+            self.bind_underscore("");
+            // rubash#1523: same finish as the assignment-words arm.
+            let _ = self.finish_assignment_output_process_substitutions_for_command(cmd);
+            if self.exit_code != 0 {
+                self.raise_evalerror_abort();
+            }
+            return true;
+        }
         if self.execute_array_element_assignment(cmd) {
             self.bind_underscore("");
             // rubash#1523: same finish as the assignment-words arm.
@@ -3748,6 +3757,80 @@ impl Executor {
             return true;
         }
         false
+    }
+
+    /// rubash#1568: execute a mixed assignment STATEMENT — a command
+    /// whose words are ALL assignment words (plain `name=value` and
+    /// array-element `name[sub]=value` mixed). GNU assignment()
+    /// (general.c:480) classifies every one of them as an assignment
+    /// word, so with no command word the node takes
+    /// execute_simple_command's WORDS==0 arm and every word binds
+    /// PERMANENTLY, in textual order, with no invalidid diagnostic
+    /// (the diagnostic exists only on the tempenv path,
+    /// assign_in_env). Rubash's parser peels only the leading plain
+    /// run into cmd.assignments — its run stops at the first element
+    /// word — so a mixed statement strands its plain words in
+    /// cmd.words, where dispatch used to read the first as a command
+    /// name (`a[0]=5 b=2` reported `b=2: command not found`).
+    pub(in crate::executor) fn execute_mixed_assignment_statement(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> bool {
+        if !mixed_assignment_statement_admission(cmd) {
+            return false;
+        }
+        // Textual order: the peeled leading plain run (cmd.assignments)
+        // precedes every word left in cmd.words.
+        let raws = (cmd.assignment_raws.len() == cmd.assignments.len())
+            .then(|| cmd.assignment_raws.as_slice());
+        if !cmd.assignments.is_empty() && !self.apply_permanent_assignments(&cmd.assignments, raws)
+        {
+            return true;
+        }
+        for index in 0..cmd.words.len() {
+            if command_word_is_array_element_assignment(cmd, index) {
+                // Mirror execute_array_element_assignment's own
+                // multi-word arm: one single-word clone per element
+                // word, its parser records filtered by word text and
+                // reindexed to 0.
+                let mut single = cmd.clone();
+                single.words = vec![cmd.words[index].clone()];
+                single.assignments = Vec::new();
+                single.assignment_raws = Vec::new();
+                single.array_element_assignments = cmd
+                    .array_element_assignments
+                    .iter()
+                    .filter(|assignment| {
+                        assignment
+                            .word_index
+                            .and_then(|word_index| cmd.words.get(word_index))
+                            .is_some_and(|word| word == &cmd.words[index])
+                    })
+                    .cloned()
+                    .map(|mut assignment| {
+                        assignment.word_index = Some(0);
+                        assignment
+                    })
+                    .collect();
+                if !self.execute_array_element_assignment(&single) {
+                    // Admission already classified the word; a refusal
+                    // here means the clone's records were lost — treat
+                    // the statement as handled rather than dispatching
+                    // an assignment word as a command name.
+                    return true;
+                }
+                if self.exit_code != 0 {
+                    return true;
+                }
+            } else if let Some((name, value)) = split_assignment_word(&cmd.words[index]) {
+                let assignment = vec![(name.to_string(), value.to_string())];
+                if !self.apply_permanent_assignments(&assignment, None) {
+                    return true;
+                }
+            }
+        }
+        self.exit_code = 0;
+        true
     }
 
     pub(in crate::executor) fn report_failglob(&mut self, pattern: &str) {
@@ -3775,6 +3858,27 @@ impl Executor {
         }
         self.exit_code = 1;
     }
+}
+
+/// rubash#1568 admission for the mixed assignment statement: every
+/// word is an assignment word (plain via split_assignment_word, or an
+/// array-element word via the parser's records / cooked-text rule)
+/// and at least one word is an element word. Plain-only statements
+/// are peeled into cmd.assignments by the parser and never reach
+/// here; a node with any non-assignment word is a command.
+pub(in crate::executor) fn mixed_assignment_statement_admission(cmd: &CommandNode) -> bool {
+    if cmd.words.is_empty() {
+        return false;
+    }
+    let mut has_element = false;
+    for index in 0..cmd.words.len() {
+        if command_word_is_array_element_assignment(cmd, index) {
+            has_element = true;
+        } else if split_assignment_word(&cmd.words[index]).is_none() {
+            return false;
+        }
+    }
+    has_element
 }
 
 fn assignment_builtin_receives_assignment_word(

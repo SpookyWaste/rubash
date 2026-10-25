@@ -3432,6 +3432,9 @@ impl Executor {
             builtin,
             crate::builtins::complete::CompletionBuiltin::Compgen
         ) {
+            // rubash#1569: compgen -e/-v/-A candidates adjudicate
+            // names bound by this command's own tempenv frame.
+            let underlay = self.tempenv_listing_underlay();
             crate::builtins::complete::execute_compgen_with_dynamic(
                 &cmd.words[1..],
                 &self.shell_state.env_vars,
@@ -3440,6 +3443,7 @@ impl Executor {
                 &job_names,
                 &diagnostic_prefix,
                 dynamic,
+                &underlay,
                 &mut stdout,
                 &mut stderr,
             )?

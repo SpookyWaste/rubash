@@ -202,6 +202,28 @@ impl Executor {
             self.shell_state.last_background_pid = Some(std::process::id());
             self.exit_code = 0;
         }
+        // rubash#1567: the saved pre-tempenv entries for the merge in
+        // merge_converted_tempenv_bindings (declare.def:1045-1083
+        // absorption / posix merge rebind through the underlying
+        // variable). Built before the restore below consumes the
+        // vector; only kept commands can convert a binding.
+        let tempenv_saved: std::collections::HashMap<
+            String,
+            (
+                Option<String>,
+                Option<crate::shell::Variable>,
+                Option<VarAttrs>,
+            ),
+        > = if keep_temporary_assignments {
+            temporary_assignments
+                .iter()
+                .map(|(name, env, typed, attrs)| {
+                    (name.clone(), (env.clone(), typed.clone(), *attrs))
+                })
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
         if !keep_temporary_assignments {
             self.restore_temporary_assignments(temporary_assignments);
         } else if Self::attribute_builtin_absorbs_named_tempenv(cmd) {
@@ -249,6 +271,12 @@ impl Executor {
             for name in &absorbed {
                 self.mark_exported(name);
             }
+            // GNU declare.def:1045-1083: the absorbed tempvar is
+            // rebound through the underlying variable, so a conversion
+            // attribute there recomputes the window value and the
+            // surviving attribute word is saved | tempvar's — merge
+            // the shadow back (rubash#1567).
+            self.merge_converted_tempenv_bindings(&absorbed, &tempenv_saved);
             // rubash#1110 item 2: at compat <= 44 the absorbed tempvar is
             // converted in the GLOBAL context even inside a function (the
             // pre-4.4 set_var_attribute behavior bash 4.4 gated behind
@@ -282,6 +310,15 @@ impl Executor {
             // tempenv restore (`var=inner export var` inside `var=func f`).
             // A binding that lands on a local dies with its frame instead
             // (func2's `var=global :` on `local var`).
+            // The merge binds through bind_variable (variables.c:4501),
+            // so conversion attributes recompute the value before the
+            // propagation capture below reads the cell (rubash#1567).
+            let merge_names: std::collections::HashSet<String> = cmd
+                .assignments
+                .iter()
+                .map(|(name, _)| assignment_name_and_append(name).0.to_string())
+                .collect();
+            self.merge_converted_tempenv_bindings(&merge_names, &tempenv_saved);
             for (name, _) in &cmd.assignments {
                 let (base, _) = assignment_name_and_append(name);
                 let is_local = self
@@ -306,6 +343,18 @@ impl Executor {
                     ));
                 }
             }
+        } else {
+            // Remaining keep forms (posix special builtin at top level,
+            // the eval append keep): the bindings stay as they lie, but
+            // a conversion attribute on an underlying variable still
+            // rebinds the window value in GNU (merge_temporary_env ->
+            // bind_variable), so merge those names back (rubash#1567).
+            let merge_names: std::collections::HashSet<String> = cmd
+                .assignments
+                .iter()
+                .map(|(name, _)| assignment_name_and_append(name).0.to_string())
+                .collect();
+            self.merge_converted_tempenv_bindings(&merge_names, &tempenv_saved);
         }
         // rubash#1525: the tempenv completion write above is this
         // command's one PIPESTATUS write; tell the ast_exec loop
@@ -414,5 +463,112 @@ impl Executor {
             return result;
         }
         self.execute_late_builtin_command(cmd, word)
+    }
+}
+
+impl Executor {
+    /// GNU declare.def:1045-1083 + variables.c:4662 merge_temporary_env:
+    /// when a tempenv binding is CONVERTED into a real binding — an
+    /// attribute builtin absorbing its named operands (declare -x /
+    /// export / readonly on a tempvar), or a posix-mode keep where the
+    /// tempenv merges into the context — the window value is rebound
+    /// through the UNDERLYING variable (bind_variable runs
+    /// make_variable_value), so a conversion attribute on that variable
+    /// (integer/case) recomputes the value and the surviving attribute
+    /// word is saved | tempvar's. The tempenv shadow (rubash#1567,
+    /// #1556) keeps the window value verbatim with fresh exported-only
+    /// marks, so a converted name whose saved entry carries a
+    /// conversion attribute must be merged back here, or
+    /// `declare -i s=5; s=007 declare -x s` would persist
+    /// `declare -x s="007"` instead of GNU's `declare -ix s="7"`.
+    /// Array underlyings keep the shadow outcome (bind_variable's
+    /// element-0 rule for an absorbed array tempvar is a separate
+    /// surface); names without a saved binding (fresh tempvars)
+    /// persist as the shadow they are.
+    pub(in crate::executor) fn merge_converted_tempenv_bindings(
+        &mut self,
+        names: &std::collections::HashSet<String>,
+        saved: &std::collections::HashMap<
+            String,
+            (
+                Option<String>,
+                Option<crate::shell::Variable>,
+                Option<VarAttrs>,
+            ),
+        >,
+    ) {
+        for name in names {
+            let Some((saved_env, saved_typed, saved_attrs)) = saved.get(name) else {
+                continue;
+            };
+            let Some(saved_attrs) = saved_attrs else {
+                continue;
+            };
+            if saved_env.is_none() && saved_typed.is_none() {
+                continue;
+            }
+            if !(saved_attrs.integer || saved_attrs.uppercase || saved_attrs.lowercase) {
+                continue;
+            }
+            if saved_attrs.array || saved_attrs.assoc {
+                continue;
+            }
+            let Some(window_value) = self.shell_state.env_vars.get(name).cloned() else {
+                continue;
+            };
+            if matches!(
+                self.shell_state.variables.get(name).map(|v| &v.value),
+                Some(
+                    crate::shell::ShellValue::IndexedArray(_)
+                        | crate::shell::ShellValue::AssociativeArray(_)
+                )
+            ) {
+                continue;
+            }
+            let merged_value = if saved_attrs.integer {
+                match self.eval_integer_assignment_checked(&window_value) {
+                    Some(result) => result.to_string(),
+                    None => {
+                        // bind_variable failed (evalerror already
+                        // reported): GNU leaves the underlying variable
+                        // untouched — reinstall the saved binding
+                        // wholesale instead of merging.
+                        match saved_env {
+                            Some(value) => {
+                                self.shell_state
+                                    .env_vars
+                                    .insert(name.clone(), value.clone());
+                                set_process_env(name, value);
+                            }
+                            None => {
+                                self.shell_state.env_vars.remove(name);
+                                crate::executor::local_helpers::unset_process_env(name);
+                            }
+                        }
+                        self.restore_typed_temporary_value(name, saved_typed.clone());
+                        set_var_attrs(&mut self.shell_state.env_vars, name, *saved_attrs);
+                        continue;
+                    }
+                }
+            } else if saved_attrs.uppercase {
+                window_value.to_uppercase()
+            } else {
+                window_value.to_lowercase()
+            };
+            let current_attrs = capture_var_attrs(&self.shell_state.env_vars, name);
+            let mut merged_attrs = *saved_attrs;
+            merged_attrs.exported = saved_attrs.exported || current_attrs.exported;
+            merged_attrs.readonly = saved_attrs.readonly || current_attrs.readonly;
+            merged_attrs.declared_unset = false;
+            self.shell_state
+                .env_vars
+                .insert(name.clone(), merged_value.clone());
+            let _ = self.shell_state.variables.set(
+                name.clone(),
+                crate::shell::Variable::scalar(merged_value.clone()),
+            );
+            set_var_attrs(&mut self.shell_state.env_vars, name, merged_attrs);
+            sync_shell_assignment_process_env(&self.shell_state.env_vars, name, &merged_value);
+        }
     }
 }

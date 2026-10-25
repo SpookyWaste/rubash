@@ -1020,6 +1020,9 @@ impl Executor {
                 // the generator on every read — GNU declare -p draws once,
                 // a plain declare draws never).
                 let print_requested = declare_args_request_print(&args);
+                // rubash#1569: listing forms render the bindings
+                // underneath this command's own tempenv frame.
+                let underlay = self.tempenv_listing_underlay();
                 let dynamic_views: Vec<(String, String)> = if print_requested {
                     let mut views: Vec<(String, String)> = args
                         .iter()
@@ -1039,8 +1042,14 @@ impl Executor {
                         .iter()
                         .all(|arg| arg.starts_with('-') || arg.starts_with('+'));
                     if listing {
-                        if let Some(text) = self.dynamic_declaration_view("PIPESTATUS") {
-                            views.push(("PIPESTATUS".to_string(), text));
+                        // rubash#1569: a PIPESTATUS bound by this very
+                        // command's prefix renders from the underlay
+                        // snapshot (its pre-frame storage), not the
+                        // live dynamic view.
+                        if !underlay.contains_key("PIPESTATUS") {
+                            if let Some(text) = self.dynamic_declaration_view("PIPESTATUS") {
+                                views.push(("PIPESTATUS".to_string(), text));
+                            }
                         }
                     }
                     views
@@ -1057,6 +1066,7 @@ impl Executor {
                     self.shell_state.function_depth > 0,
                     &frame_locals,
                     &dynamic_views,
+                    &underlay,
                     &mut oob_word,
                 )?;
                 // GNU err_badarraysub + any_failed (arrayfunc.c:804-809,
@@ -1489,6 +1499,8 @@ impl Executor {
                     Vec::new()
                 };
                 let mut oob_word = None;
+                // rubash#1569: same listing underlay as declare.
+                let underlay = self.tempenv_listing_underlay();
                 let builtin_status = crate::builtins::declare::execute_with_io_named_in_context(
                     "local",
                     &args,
@@ -1498,6 +1510,7 @@ impl Executor {
                     true,
                     &frame_locals,
                     &dynamic_views,
+                    &underlay,
                     &mut oob_word,
                 )?;
                 let status = if local_blocked.is_empty() && print_missing.is_empty() {

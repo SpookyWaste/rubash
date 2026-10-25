@@ -473,6 +473,126 @@ impl Executor {
                     continue;
                 }
             }
+            // rubash#1567: GNU variables.c:3536 assign_in_env creates
+            // EVERY tempenv binding as a fresh scalar in the separate
+            // temporary_env table (make_new_variable + var_setvalue,
+            // attributes att_exported|att_tempvar only) — the found
+            // variable's attribute semantics apply ONLY to an append's
+            // value computation (make_variable_value with ASS_APPEND
+            // against the found var). The fallthrough below instead
+            // routes an attributed scalar target (declare -i/-l/-u)
+            // through the permanent bind, which evaluates/converts the
+            // window value in place and leaks the attribute marks into
+            // window reads (`declare -i s=5; s=007 declare -p s` printed
+            // `declare -ix s="7"`; GNU prints `declare -x s="007"`).
+            // Shadow such targets exactly like the array branch above:
+            // verbatim scalar + fresh exported-only attrs for a plain
+            // word; for an append, run the permanent bind (its
+            // attribute evaluation IS the GNU append computation, and
+            // the name-keyed hooks — sv_locale mirrors, dynamic
+            // seeding — stay on their funnel) and then reset the marks
+            // to the tempvar shape. Name-keyed dynamic variables keep
+            // the permanent funnel entirely: their hooks ARE the
+            // assignment semantics (compare bind_marks_free_scalar's
+            // exclusion list in apply_shell_assignment_inner).
+            {
+                let (_, append) = assignment_name_and_append(name);
+                let target = resolved_target
+                    .clone()
+                    .unwrap_or_else(|| base_name.to_string());
+                let target_attrs = capture_var_attrs(&self.shell_state.env_vars, &target);
+                if !name.contains('[')
+                    && !target.contains('[')
+                    && !matches!(
+                        target.as_str(),
+                        "OPTIND"
+                            | "IGNOREEOF"
+                            | "ignoreeof"
+                            | "SECONDS"
+                            | "RANDOM"
+                            | "SRANDOM"
+                            | "BASHPID"
+                            | "BASH_SUBSHELL"
+                            | "FUNCNAME"
+                            | "LINENO"
+                            | "BASH_COMMAND"
+                            | "BASH_ARGC"
+                            | "BASH_ARGV"
+                            | "BASH_LINENO"
+                            | "BASH_SOURCE"
+                            | "PIPESTATUS"
+                    )
+                    && !target_attrs.array
+                    && !target_attrs.assoc
+                    && (target_attrs.integer
+                        || target_attrs.uppercase
+                        || target_attrs.lowercase
+                        || target_attrs.trace
+                        || target_attrs.declared_unset)
+                {
+                    if is_marked_var(&self.shell_state.env_vars, READONLY_VARS, &target) {
+                        // GNU err_readonly for a tempenv bind carries
+                        // no command-name segment (the permanent-bind
+                        // path's plain form), same ruling as the array
+                        // branch above.
+                        let line = format!("{}{target}: readonly variable\n", self.error_prefix());
+                        self.emit_assignment_diag(line);
+                        assignments_failed = true;
+                        continue;
+                    }
+                    if append {
+                        // The permanent bind computes the append
+                        // against the found variable's attributes
+                        // (make_variable_value ASS_APPEND) and fires
+                        // every name-keyed hook; only the attribute
+                        // marks it leaves on the cell are the leak, so
+                        // reset them to the fresh tempvar shape.
+                        if !self.apply_shell_assignment(name, expanded_value) {
+                            assignments_failed = true;
+                        } else {
+                            set_var_attrs(
+                                &mut self.shell_state.env_vars,
+                                &target,
+                                VarAttrs {
+                                    exported: true,
+                                    ..VarAttrs::default()
+                                },
+                            );
+                        }
+                        self.tempenv_names.push(target.clone());
+                        self.mark_exported(&target);
+                        continue;
+                    }
+                    self.shell_state
+                        .env_vars
+                        .insert(target.clone(), expanded_value.clone());
+                    let _ = self.shell_state.variables.set(
+                        target.clone(),
+                        crate::shell::Variable::scalar(expanded_value.clone()),
+                    );
+                    set_var_attrs(
+                        &mut self.shell_state.env_vars,
+                        &target,
+                        VarAttrs {
+                            exported: true,
+                            ..VarAttrs::default()
+                        },
+                    );
+                    // The permanent funnel's tail mirrors gate names
+                    // to the process environment (the #1531 sv_locale
+                    // family reads its categories from there); keep
+                    // the same mirror for the shadow so an attributed
+                    // locale name still drives the window's locale.
+                    // Restore re-syncs the previous process value.
+                    sync_shell_assignment_process_env(
+                        &self.shell_state.env_vars,
+                        &target,
+                        &expanded_value,
+                    );
+                    self.tempenv_names.push(target);
+                    continue;
+                }
+            }
             // GNU variables.c bind_variable (ASS_MKLOCAL tempenv path): a
             // failed bind (readonly violation via ASSIGN_DISALLOWED, expansion
             // error) reports and keeps going through the REST of the operand
@@ -814,7 +934,10 @@ impl Executor {
     /// (`declare -i x; x=4+; x+=7; echo after` prints the diagnostic, leaves
     /// x alone, and never reaches `echo after`). Returns None on failure
     /// after reporting and arming the evalerror abort.
-    fn eval_integer_assignment_checked(&mut self, value: &str) -> Option<i128> {
+    pub(in crate::executor) fn eval_integer_assignment_checked(
+        &mut self,
+        value: &str,
+    ) -> Option<i128> {
         if let Some(result) = crate::executor::arithmetic::eval_conditional_arith_value(
             value,
             &self.shell_state.env_vars,

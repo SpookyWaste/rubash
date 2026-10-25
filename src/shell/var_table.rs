@@ -54,6 +54,14 @@ use crate::executor::{
 /// att_* port). Captured and restored as one unit by function frames
 /// (`local_attr_scopes`), tempenv snapshots, and `declare -g` save/restore.
 ///
+/// The listing underlay for the innermost tempenv frame (rubash#1569):
+/// for each name bound by the frame, `None` when no binding existed
+/// before the frame (listings must hide the name) or `Some((env text,
+/// attrs))` for the pre-frame binding a listing must render instead of
+/// the live tempvar cell. See Executor::tempenv_listing_underlay.
+pub type TempenvListingUnderlay =
+    std::collections::HashMap<String, Option<(Option<String>, VarAttrs)>>;
+
 /// `pub` because builtin dispatch entries (`set::set`, `declare::execute`,
 /// ...) take `&mut VarTable`; every method stays crate-visible.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
