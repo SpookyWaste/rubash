@@ -403,6 +403,18 @@ impl Executor {
     /// `$(( ${ number; } ))` is 123, not 0). The payload escapes the embedded
     /// walker leaves behind are decoded before evaluation.
     pub(crate) fn expand_arithmetic_expression_mut(&mut self, expression: &str) -> String {
+        // rubash#1588: a `${name:=word}` fragment inside arithmetic text
+        // binds in GNU (the text is expanded like a double-quoted word
+        // before evaluation), but the embedded expansion below runs on
+        // &self paths that drop the bind. The word-level pre-scan skips
+        // `$((...))` spans as command-substitution frames, so this entry
+        // — the one &mut pass arithmetic text goes through — applies
+        // the binds first. Re-application on a later evaluation of the
+        // same text is inert: the apply arms re-test the operator and
+        // find the variable already set.
+        if expression.contains("${") {
+            self.apply_parameter_assignment_expansions_in_word(expression);
+        }
         let routed = self.route_current_shell_substitutions(expression);
         let expanded = self.expand_arithmetic_special_parameters(&routed);
         crate::executor::execution_misc::restore_command_substitution_output(
