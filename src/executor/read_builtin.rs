@@ -2255,9 +2255,20 @@ impl Executor {
 
         if let Some(fd) = read_fd {
             if !self.read_fd_is_available(cmd, fd) {
+                // GNU read.def:378-380: sh_validfd failing means the
+                // descriptor is not open at all — "invalid file
+                // descriptor". A descriptor that IS open but not
+                // readable (write-only) passes that check and fails in
+                // the read itself — read.def:911 "read error"
+                // (rubash#1592).
+                let wording = if self.fd_table.is_open(fd) {
+                    "read error"
+                } else {
+                    "invalid file descriptor"
+                };
                 let _ = writeln!(
                     &mut stderr,
-                    "{}read: {fd}: invalid file descriptor: Bad file descriptor",
+                    "{}read: {fd}: {wording}: Bad file descriptor",
                     self.diagnostic_prefix()
                 );
                 return self.finish_read_error(cmd, &stderr, 1);
