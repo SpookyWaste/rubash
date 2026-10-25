@@ -1601,11 +1601,18 @@ impl Executor {
             }
             // The µs race (delivery lands between the take above and
             // observe's own take) surfaces as the untrapped error; fold it
-            // into the same abort instead of an exit jump.
+            // into the same abort instead of an exit jump — but only
+            // for a kernel-caused (terminal) delivery. A kill(2)
+            // delivery requeued by the take above is drained by this
+            // observe and must NOT abort either (rubash#1640): it is
+            // consumed here, matching GNU's ignore of a shell-directed
+            // INT during an external wait, and the sleep runs on.
             #[cfg(unix)]
             match self.observe_signals_while_blocked() {
                 Err(ExecuteError::ExitCode(code)) if code == 128 + libc::SIGINT => {
-                    return Ok(Some(libc::SIGINT));
+                    if crate::builtins::kill::last_delivery_kernel_caused(libc::SIGINT) {
+                        return Ok(Some(libc::SIGINT));
+                    }
                 }
                 other => other?,
             }

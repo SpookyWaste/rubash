@@ -1689,6 +1689,14 @@ impl ForegroundBuiltinSigintGuard {
     /// would silently drop the trap. kernel_handler_installed rejects stale
     /// registry flags (same stale rule observe uses); anything else goes
     /// back for the trapped-abort check and observe.
+    /// rubash#1640: the abort additionally requires a KERNEL-caused
+    /// delivery (terminal ^C, si_code SI_KERNEL). A kill(2) delivery
+    /// addressed to this shell alone must NOT end the virtual sleep:
+    /// GNU's real foreground child survives it, so the sleep completes
+    /// with rc=0 and the signal stays recorded for boundary handling.
+    /// Such a delivery goes back with the rest instead of aborting —
+    /// otherwise the observe call right after this one would raise
+    /// the same untrapped 130 and defeat the gate.
     pub(in crate::executor) fn take_sigint_abort(&self) -> bool {
         if !self.armed {
             return false;
@@ -1701,7 +1709,10 @@ impl ForegroundBuiltinSigintGuard {
         let mut rest = Vec::new();
         let mut interrupted = false;
         for signal in pending {
-            if signal == libc::SIGINT && crate::builtins::kill::kernel_handler_installed(signal) {
+            if signal == libc::SIGINT
+                && crate::builtins::kill::kernel_handler_installed(signal)
+                && crate::builtins::kill::last_delivery_kernel_caused(signal)
+            {
                 interrupted = true;
             } else {
                 rest.push(signal);
