@@ -2957,12 +2957,33 @@ impl Executor {
                 };
                 let joined = values.join(&separator);
                 let null = joined.is_empty();
+                // rubash#1598: these values are the FINAL fields of the
+                // word, so an UNQUOTED site still owes them GNU's
+                // post-expansion field splitting (subst.c
+                // expand_word_internal -> list_string / field splitting
+                // of the unquoted result): each [@] element re-splits on
+                // IFS and empty results vanish, and the [*] joined
+                // string splits as one string. The plain `${a[@]}`
+                // path (array_at_word_values) already applies
+                // field_split_array_values_with_ifs for exactly this;
+                // the operator path skipped it and froze the element
+                // boundaries. A quoted site keeps the elements verbatim.
+                let split_if_unquoted = |values: Vec<String>| {
+                    if was_quoted {
+                        values
+                    } else {
+                        field_split_array_values_with_ifs(
+                            values,
+                            self.shell_state.env_vars.get("IFS").map(String::as_str),
+                        )
+                    }
+                };
                 if is_at {
                     if !values.is_empty() && !(require_non_empty && null) {
-                        return Some(values);
+                        return Some(split_if_unquoted(values));
                     }
                 } else if !null || (!require_non_empty && !values.is_empty()) {
-                    return Some(vec![joined]);
+                    return Some(split_if_unquoted(vec![joined]));
                 }
                 // unset, or empty under `:-`: the alternate word is used.
                 // The scalar parameter_operator_value below cannot see a
