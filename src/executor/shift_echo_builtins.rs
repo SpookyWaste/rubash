@@ -22,6 +22,17 @@ impl Executor {
             crate::builtins::shift::ShiftAction::Complete(status) => {
                 self.exit_code = status;
             }
+            crate::builtins::shift::ShiftAction::TooManyArguments => {
+                // GNU builtins/common.c no_args (the surplus-operand
+                // class, rubash#705 machinery): $? is EX_BADUSAGE (2)
+                // and a DISCARD jump abandons the rest of the current
+                // list — script readers resume at the next line, a `-c`
+                // string is abandoned whole (rubash#1650, the #1240
+                // sibling for shift).
+                self.exit_code = 2;
+                self.raise_evalerror_abort();
+                self.evalerror_exit_toomany_pending.set(true);
+            }
             crate::builtins::shift::ShiftAction::Shift(amount) => {
                 if amount > self.shell_state.positional_len() {
                     // GNU general.c:112 (posix_initialize): `set -o posix'

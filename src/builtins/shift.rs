@@ -8,6 +8,11 @@ use std::io::{self, Write};
 pub enum ShiftAction {
     Complete(i32),
     Shift(usize),
+    /// Surplus operands: GNU's no_args failure (builtins/common.c)
+    /// longjmps DISCARD, abandoning the rest of the current command
+    /// list — distinct from the non-numeric EX_USAGE failure, which is
+    /// an ordinary error return (rubash#1650).
+    TooManyArguments,
 }
 
 /// GNU error.h: EX_USAGE (2) marks a usage error, EXECUTION_FAILURE (1) a
@@ -50,8 +55,9 @@ where
     if args.len() > 1 {
         writeln!(stderr, "{}shift: too many arguments", diagnostic_prefix())?;
         // get_numeric_arg (builtins/common.c:511) ends the operand walk with
-        // no_args(), whose surplus-argument failure is EX_BADUSAGE.
-        return Ok(ShiftAction::Complete(EX_USAGE));
+        // no_args(), whose surplus-argument failure is EX_BADUSAGE — and a
+        // DISCARD jump, not a plain return (rubash#1650).
+        return Ok(ShiftAction::TooManyArguments);
     }
 
     let amount = match args.first() {
