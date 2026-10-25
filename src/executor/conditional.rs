@@ -1070,7 +1070,11 @@ impl Executor {
         // operand). rubash#729 widened the protected byte set, so this
         // decode boundary is what keeps the sentinel out of regcomp.
         let pattern = crate::executor::execution_misc::decode_command_substitution_payload(pattern);
-        let pattern = translate_posix_bracket_classes(&pattern);
+        // In a UTF-8 locale the bracket classes expand to Unicode
+        // tables (glibc regcomp resolves them through wctype); in byte
+        // mode they pass through to the regex crate's ASCII classes,
+        // which are exactly the single-byte tables (rubash#1621).
+        let pattern = translate_posix_bracket_classes(&pattern, !byte_mode);
         // GNU regcomp rejects an unknown `[:name:]` with REG_ECTYPE
         // ("Invalid character class name"); the regex crate parses the
         // span as a nested class instead, so validate names before
@@ -1782,7 +1786,7 @@ fn ere_interval_at(chars: &[char], start: usize) -> Option<(usize, u64, Option<u
 /// Index just past the bracket expression at chars[start] == '[', or
 /// None when it never closes (the `[` is then literal text).
 fn bracket_expression_end(chars: &[char], start: usize) -> Option<usize> {
-    translate_bracket_expression(chars, start).map(|(next, _)| next)
+    translate_bracket_expression(chars, start, false).map(|(next, _)| next)
 }
 
 /// glibc regcomp (REG_BADRPT): a repetition operator with no
@@ -2310,7 +2314,7 @@ fn posix_bracket_class_names_valid(pattern: &str) -> bool {
     true
 }
 
-fn translate_posix_bracket_classes(pattern: &str) -> String {
+fn translate_posix_bracket_classes(pattern: &str, unicode_classes: bool) -> String {
     let chars: Vec<char> = pattern.chars().collect();
     let mut out = String::with_capacity(pattern.len());
     let mut index = 0usize;
@@ -2322,7 +2326,9 @@ fn translate_posix_bracket_classes(pattern: &str) -> String {
             continue;
         }
         if chars[index] == '[' {
-            if let Some((next, translated)) = translate_bracket_expression(&chars, index) {
+            if let Some((next, translated)) =
+                translate_bracket_expression(&chars, index, unicode_classes)
+            {
                 out.push_str(&translated);
                 index = next;
                 continue;
@@ -2338,7 +2344,11 @@ fn translate_posix_bracket_classes(pattern: &str) -> String {
 /// index just past its closing ] and the regex-crate text with [=c=] and
 /// [.s.] spans rewritten. Returns None when the bracket is unterminated,
 /// in which case the caller emits the [ literally.
-fn translate_bracket_expression(chars: &[char], start: usize) -> Option<(usize, String)> {
+fn translate_bracket_expression(
+    chars: &[char],
+    start: usize,
+    unicode_classes: bool,
+) -> Option<(usize, String)> {
     let mut out = String::from("[");
     let mut index = start + 1;
     if index < chars.len() && chars[index] == '^' {
@@ -2371,7 +2381,7 @@ fn translate_bracket_expression(chars: &[char], start: usize) -> Option<(usize, 
             continue;
         }
         if c == '[' {
-            if let Some((next, text)) = translate_bracket_prefix(chars, index) {
+            if let Some((next, text)) = translate_bracket_prefix(chars, index, unicode_classes) {
                 out.push_str(&text);
                 index = next;
                 continue;
@@ -2402,8 +2412,14 @@ fn translate_bracket_expression(chars: &[char], start: usize) -> Option<(usize, 
 /// Handles the three [-led bracket prefixes at index. Returns None for a
 /// plain literal [ member. [=c=] becomes the equivalent character, [.s.]
 /// the collating symbol, and [:class:] passes through verbatim (the regex
-/// crate understands POSIX classes).
-fn translate_bracket_prefix(chars: &[char], index: usize) -> Option<(usize, String)> {
+/// crate understands POSIX classes) — except in a UTF-8 locale, where
+/// [:class:] expands to the locale's Unicode tables instead
+/// (rubash#1621, [`posix_class_unicode_expansion`]).
+fn translate_bracket_prefix(
+    chars: &[char],
+    index: usize,
+    unicode_classes: bool,
+) -> Option<(usize, String)> {
     let close = |open: char, from: usize| -> Option<usize> {
         let mut scan = from;
         while scan + 1 < chars.len() {
@@ -2439,6 +2455,12 @@ fn translate_bracket_prefix(chars: &[char], index: usize) -> Option<(usize, Stri
         }
         Some(':') => {
             let end = close(':', index + 2)?;
+            if unicode_classes {
+                let name: String = chars[index + 2..end - 2].iter().collect();
+                if let Some(expanded) = posix_class_unicode_expansion(&name) {
+                    return Some((end, expanded));
+                }
+            }
             // The body spans from the leading [ (already part of the text) so
             // it is passed through verbatim without prepending another one.
             let body: String = chars[index..end].iter().collect();
@@ -2446,6 +2468,41 @@ fn translate_bracket_prefix(chars: &[char], index: usize) -> Option<(usize, Stri
         }
         _ => None,
     }
+}
+
+/// The regex-crate text for one POSIX class under a UTF-8 locale,
+/// mirroring [`crate::locale::utf8_posix_class_matches`] — the pattern
+/// matcher's predicate form of the same glibc tables (rubash#1621).
+/// `print`/`graph`/`punct` come out as single negated classes by De
+/// Morgan: graph = print minus blank, punct = graph minus alnum.
+/// `digit`, `xdigit` and `ascii` return None: the crate's own
+/// [:name:] classes already are glibc's ASCII-only tables there.
+fn posix_class_unicode_expansion(class: &str) -> Option<String> {
+    const BLANK_ITEMS: &str = "\\t \\u{1680}\\u{2000}-\\u{200A}\\u{205F}\\u{3000}";
+    const CNTRL_ITEMS: &str = "\\p{Cc}\\u{2028}\\u{2029}";
+    Some(match class {
+        "upper" => "\\p{Uppercase}".to_string(),
+        "lower" => "\\p{Lowercase}".to_string(),
+        "alpha" => format!(
+            "\\p{{Alphabetic}}{}",
+            crate::locale::non_ascii_nd_class_items()
+        ),
+        "alnum" => "\\p{Alphabetic}\\p{Nd}".to_string(),
+        "word" => "\\p{Alphabetic}\\p{Nd}_".to_string(),
+        "cntrl" => CNTRL_ITEMS.to_string(),
+        "print" => format!("[^{}]", CNTRL_ITEMS),
+        "graph" => format!("[^{}{}]", CNTRL_ITEMS, BLANK_ITEMS),
+        "punct" => format!(
+            "[^{}{}\\p{{Alphabetic}}\\p{{Nd}}]",
+            CNTRL_ITEMS, BLANK_ITEMS
+        ),
+        "space" => {
+            "\\t\\n\\x0B\\f\\r \\u{1680}\\u{2000}-\\u{200A}\\u{2028}\\u{2029}\\u{205F}\\u{3000}"
+                .to_string()
+        }
+        "blank" => BLANK_ITEMS.to_string(),
+        _ => return None,
+    })
 }
 
 fn escape_bracket_char(c: char) -> Vec<char> {
