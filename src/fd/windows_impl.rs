@@ -1139,6 +1139,28 @@ pub fn process_std_handle(fd: u32) -> HANDLE {
     unsafe { GetStdHandle(n) }
 }
 
+/// Inherited-descriptor surface (rubash#1557) — Windows annotation only.
+/// HANDLEs have no enumerable small-integer namespace (they are opaque
+/// kernel-object values, and inheritance is opt-in per handle through
+/// PROC_THREAD_ATTRIBUTE_HANDLE_LIST), so there is no process-start
+/// descriptor set to probe the way POSIX enumerates /proc/self/fd.
+/// Cross-process fd state on Windows arrives exclusively through the
+/// `__RUBASH_FD_*` env channel (executor/init.rs). These stubs keep the
+/// `crate::fd` surface identical across platforms and always report
+/// "nothing inherited / not open"; the POSIX implementations live in
+/// unix.rs and are the measured ones.
+pub fn fd_directions(_fd: u32) -> Option<(bool, bool)> {
+    None
+}
+
+pub fn inherited_open_fds() -> Vec<(u32, bool, bool)> {
+    Vec::new()
+}
+
+pub fn inherited_fd_path(fd: u32) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("/dev/fd/{fd}"))
+}
+
 /// `NUL` device handle (child stdio for a null-redirected fd).
 pub fn open_null_device() -> std::io::Result<HANDLE> {
     let h = unsafe {

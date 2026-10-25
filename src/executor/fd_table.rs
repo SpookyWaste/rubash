@@ -357,6 +357,51 @@ impl FdTable {
         table
     }
 
+    /// rubash#1557: adopt the descriptors the process inherited open
+    /// (fd >= 3), snapshotted by `crate::fd::inherited_open_fds` at the
+    /// top of Executor::new. GNU keeps no registry to consult — redir.c
+    /// validates a dup source against the kernel itself
+    /// (`fcntl (redirector, F_GETFD, 0) != -1`, redir.c:1160), so an
+    /// inherited descriptor is simply usable (`rubash -c 'echo x >&3'
+    /// 3>file`). The virtual table must therefore be seeded from kernel
+    /// state: each inherited fd becomes a File endpoint over its own
+    /// raw descriptor, the read/write arms following the F_GETFL access
+    /// mode, both arms sharing ONE FileFd for O_RDWR (a single open
+    /// file description — the offset is shared, as dup requires).
+    ///
+    /// Slots already claimed (the `__RUBASH_FD_*` respawn restore in
+    /// init.rs runs first) keep their restored endpoints. A snapshotted
+    /// fd is re-validated before adoption: a transient descriptor that
+    /// has since closed is skipped, and the live direction wins over
+    /// the snapshot's. The FileFd drop closes the raw descriptor when
+    /// the slot's last reference goes away — exactly the `exec N>&-`
+    /// contract (GNU closes the kernel descriptor, and later references
+    /// report Bad file descriptor).
+    ///
+    /// On Windows the snapshot is always empty (handle inheritance is
+    /// opt-in per handle; see the annotated stubs in
+    /// fd/windows_impl.rs), so this is a no-op there.
+    pub(crate) fn register_inherited_process_fds(&mut self, snapshot: &[(u32, bool, bool)]) {
+        for &(fd, _, _) in snapshot {
+            if self.entries.contains_key(&fd) {
+                continue;
+            }
+            let Some((readable, writable)) = crate::fd::fd_directions(fd) else {
+                continue;
+            };
+            let file = Rc::new(FileFd {
+                handle: fd as crate::fd::HANDLE,
+                path: crate::fd::inherited_fd_path(fd),
+            });
+            if readable {
+                self.open_input(fd, FdReadEndpoint::File(file.clone()), false);
+            }
+            if writable {
+                self.open_output(fd, FdWriteEndpoint::File(file), false);
+            }
+        }
+    }
+
     /// Dynamic-fd ceiling when no `ulimit -n` value is in force. GNU has no
     /// table cap of its own — fcntl F_DUPFD (redir.c:940) hands out the
     /// lowest free descriptor >= SHELL_FD_BASE below the RLIMIT_NOFILE soft

@@ -47,6 +47,15 @@ impl Executor {
     }
 
     fn new_inner(process_exit: bool) -> Self {
+        // rubash#1557: snapshot the process-inherited descriptor set
+        // (fd >= 3) before anything in this constructor can open or
+        // close a descriptor of our own (the signal-mailbox thread, env
+        // import, ...). Registration happens at the end of construction,
+        // after the __RUBASH_FD_* respawn restore, and re-validates each
+        // descriptor live — a transient fd captured here but closed by
+        // then is skipped. GNU has no such snapshot because it has no
+        // table: redir.c checks the kernel per redirect (redir.c:1160).
+        let inherited_fds_snapshot = crate::fd::inherited_open_fds();
         let process_env_snapshot: HashMap<String, String> = if process_exit {
             HashMap::new()
         } else {
@@ -566,6 +575,12 @@ impl Executor {
                     .open_output(fd, FdWriteEndpoint::File(rc), false);
             }
         }
+        // rubash#1557: adopt whatever descriptors the process itself
+        // inherited open (CI log channels, socket activation, a parent
+        // shell's `3>file`) that the respawn channel did not claim.
+        executor
+            .fd_table
+            .register_inherited_process_fds(&inherited_fds_snapshot);
         executor
     }
 
