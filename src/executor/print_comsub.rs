@@ -253,7 +253,11 @@ impl ComsubPrinter {
         if let Some(pipeline) = &command.pipeline_command {
             for (index, stage) in pipeline.stages.iter().enumerate() {
                 if index > 0 {
-                    self.cprintf(" ");
+                    // print_cmd.c pipeline printing joins stages with
+                    // " | " (rubash#1664: a bare space dropped the pipe,
+                    // so a respawned background child re-parsed
+                    // `$(echo hi | cat)` as `$(echo hi cat)`).
+                    self.cprintf(" | ");
                     self.skip_this_indent += 1;
                 }
                 self.print_command(stage);
