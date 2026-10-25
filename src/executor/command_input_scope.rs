@@ -153,6 +153,65 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<Option<CommandFd0InputGuard>, ExecuteError> {
+        // rubash#1141: compound commands (brace group, select, loops)
+        // dispatch BEFORE the simple-command materialization gate, so
+        // their `< <(...)` redirect_in can still carry the raw
+        // substitution form here and the registered-stream branch below
+        // never sees it — the node fell through to command_input_redirect,
+        // whose loop_redirect_input slurps the body UNTIMED into
+        // FUNCTION_STDIN and clears timed_stdin, so TMOUT could never
+        // fire for the compound's reads/selects. Materialize the body
+        // with its production schedule (the same timed variant the
+        // prepare path runs for simple commands) and bind fd 0 to the
+        // timed endpoint directly; the endpoint is private to this
+        // compound scope, so no stream registration or offset write-back
+        // is needed. A body that fails to materialize falls through to
+        // the existing paths unchanged.
+        if let Some(redirect) = &cmd.redirect_in {
+            if redirect.fd.unwrap_or(0) == 0
+                && redirect.fd_var.is_none()
+                && redirect.kind == crate::parser::RedirectKind::Input
+            {
+                if let Some(source) = redirect
+                    .target
+                    .strip_prefix("<(")
+                    .and_then(|target| target.strip_suffix(')'))
+                    .map(str::to_string)
+                {
+                    if let Some((output, body_timing)) =
+                        self.process_substitution_output_bytes_timed(&source)
+                    {
+                        let saved_fd0_entry = self.fd_table.entries.get(&0).cloned();
+                        let saved_function_stdin =
+                            self.shell_state.env_vars.get(FUNCTION_STDIN).cloned();
+                        let saved_function_stdin_offset = self
+                            .shell_state
+                            .env_vars
+                            .get(FUNCTION_STDIN_OFFSET)
+                            .cloned();
+                        self.fd_table.open_input(
+                            0,
+                            FdReadEndpoint::process_substitution_bytes(output),
+                            false,
+                        );
+                        self.fd_table.set_input_offset(0, 0);
+                        if let Some(timing) = body_timing {
+                            self.fd_table.set_input_timing(0, timing);
+                        }
+                        return Ok(Some(CommandFd0InputGuard {
+                            saved_fd0_entry,
+                            saved_function_stdin,
+                            saved_function_stdin_offset,
+                            // The text channel is untouched in this
+                            // branch, so its timing stays valid; restore
+                            // writes the same value back.
+                            saved_timed_stdin: self.timed_stdin.clone(),
+                            procsub_stream_path: None,
+                        }));
+                    }
+                }
+            }
+        }
         // rubash#1141: a `< <(...)` redirect whose target materialized to
         // a registered process-substitution stream binds fd 0 to the
         // stream's fd-table endpoint — not to a FileFd on the temp
