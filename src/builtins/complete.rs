@@ -696,6 +696,7 @@ where
             job_names,
             diagnostic_prefix,
             None,
+            &crate::shell::var_table::TempenvListingUnderlay::new(),
             stdout,
             stderr,
         ),
@@ -715,6 +716,7 @@ pub(crate) fn execute_compgen_with_dynamic<E>(
     job_names: &[String],
     diagnostic_prefix: &str,
     dynamic: Option<CompgenDynamic>,
+    underlay: &crate::shell::var_table::TempenvListingUnderlay,
     stdout: &mut E,
     stderr: &mut E,
 ) -> io::Result<i32>
@@ -729,6 +731,7 @@ where
         job_names,
         diagnostic_prefix,
         dynamic,
+        underlay,
         stdout,
         stderr,
     )
@@ -804,6 +807,7 @@ pub(crate) fn apply_completion_actions(
     aliases: &HashMap<String, Alias>,
     function_names: &[String],
     job_names: &[String],
+    underlay: &crate::shell::var_table::TempenvListingUnderlay,
 ) -> Vec<String> {
     let mut candidates: Vec<String> = Vec::new();
     for &(actname, actbit, _) in COMPACTS {
@@ -812,7 +816,9 @@ pub(crate) fn apply_completion_actions(
         }
         match actname {
             "alias" => candidates.extend(alias_completion_candidates(aliases)),
-            "arrayvar" => candidates.extend(array_variable_completion_candidates(env_vars)),
+            "arrayvar" => {
+                candidates.extend(array_variable_completion_candidates(env_vars, underlay))
+            }
             "binding" => candidates.extend(READLINE_BINDINGS.iter().map(|s| s.to_string())),
             "builtin" => candidates.extend(SHELL_BUILTINS.iter().map(|s| s.to_string())),
             "command" => candidates.extend(command_completion_candidates(
@@ -836,7 +842,9 @@ pub(crate) fn apply_completion_actions(
             }
             "disabled" => candidates.extend(disabled_builtin_completion_candidates(env_vars)),
             "enabled" => candidates.extend(enabled_builtin_completion_candidates(env_vars)),
-            "export" => candidates.extend(exported_variable_completion_candidates(env_vars)),
+            "export" => {
+                candidates.extend(exported_variable_completion_candidates(env_vars, underlay))
+            }
             "helptopic" => candidates.extend(HELP_TOPIC_COMPLETIONS.iter().map(|s| s.to_string())),
             "hostname" => candidates.extend(hostname_completion_candidates(env_vars)),
             "function" => candidates.extend(function_completion_candidates(function_names)),
@@ -849,7 +857,7 @@ pub(crate) fn apply_completion_actions(
             "signal" => candidates.extend(signal_completion_candidates()),
             "stopped" => {}
             "user" => candidates.extend(user_completion_candidates(env_vars)),
-            "variable" => candidates.extend(variable_completion_candidates(env_vars)),
+            "variable" => candidates.extend(variable_completion_candidates(env_vars, underlay)),
             _ => {}
         }
     }
@@ -968,6 +976,7 @@ pub(crate) fn complete_line_candidates_with_dynamic(
                 aliases,
                 function_names,
                 job_names,
+                &crate::shell::var_table::TempenvListingUnderlay::new(),
             ));
         }
         if let Some(globpat) = cs.globpat.as_deref() {
@@ -1083,6 +1092,7 @@ fn execute_compgen<E>(
     job_names: &[String],
     diagnostic_prefix: &str,
     dynamic: Option<CompgenDynamic>,
+    underlay: &crate::shell::var_table::TempenvListingUnderlay,
     stdout: &mut E,
     stderr: &mut E,
 ) -> io::Result<i32>
@@ -1115,6 +1125,7 @@ where
         aliases,
         function_names,
         job_names,
+        underlay,
     );
 
     if let Some(glob_pattern) = parsed.globpat.as_deref() {
@@ -1502,7 +1513,10 @@ fn services_db_path() -> std::path::PathBuf {
     root.join(r"System32\drivers\etc\services")
 }
 
-fn variable_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<String> {
+fn variable_completion_candidates(
+    env_vars: &HashMap<String, String>,
+    underlay: &crate::shell::var_table::TempenvListingUnderlay,
+) -> Vec<String> {
     // GNU variables.c:511-526 (initialize_shell_variables): invalid-name
     // environment entries live in the invisible invalid_env table and are
     // never shell variables, so they are not completion candidates either.
@@ -1519,6 +1533,12 @@ fn variable_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<Str
         .filter(|name| valid_identifier(name))
         .filter(|name| !name.starts_with("__RUBASH_"))
         .filter(|name| name.as_str() != "FUNCNAME")
+        // rubash#1569: a name created by the current command's own
+        // tempenv frame is not a context variable, so it is not a
+        // candidate; a shadowed name stays (its underlying binding is
+        // one). The dynamic names appended below are context variables
+        // by construction and stay unconditional.
+        .filter(|name| !matches!(underlay.get(name.as_str()), Some(None)))
         .cloned()
         .collect();
     candidates.extend(
@@ -1545,6 +1565,7 @@ fn variable_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<Str
 
 fn array_variable_completion_candidates(
     env_vars: &crate::shell::var_table::VarTable,
+    underlay: &crate::shell::var_table::TempenvListingUnderlay,
 ) -> Vec<String> {
     // GNU pcomplete.c it_init_arrayvariables lists visible array/assoc
     // variables. GROUPS is a dynamic array cell (variables.c get_
@@ -1559,13 +1580,28 @@ fn array_variable_completion_candidates(
     candidates.remove("FUNCNAME");
     candidates.remove("PIPESTATUS");
     candidates.insert("GROUPS".to_string());
+    // rubash#1569: same own-frame adjudication as the other listings.
+    candidates.retain(|name| match underlay.get(name) {
+        None => true,
+        Some(None) => false,
+        Some(Some((_, attrs))) => attrs.array || attrs.assoc,
+    });
     candidates.into_iter().collect()
 }
 
 fn exported_variable_completion_candidates(
     env_vars: &crate::shell::var_table::VarTable,
+    underlay: &crate::shell::var_table::TempenvListingUnderlay,
 ) -> Vec<String> {
     let mut candidates = env_vars.marked_names(EXPORTED_VARS);
+    // rubash#1569: compgen -e lists the exported CONTEXT variables;
+    // a name bound by the current command's own tempenv frame counts
+    // only through its pre-frame binding.
+    candidates.retain(|name| match underlay.get(name) {
+        None => true,
+        Some(None) => false,
+        Some(Some((_, attrs))) => attrs.exported,
+    });
     candidates.sort();
     candidates.dedup();
     candidates

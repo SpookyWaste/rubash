@@ -15,6 +15,7 @@ pub(super) fn print_readonly<W>(
     array_filter: bool,
     assoc_filter: bool,
     posix_mode: bool,
+    underlay: &crate::shell::var_table::TempenvListingUnderlay,
     stdout: &mut W,
 ) -> io::Result<()>
 where
@@ -30,6 +31,97 @@ where
     let mut names: Vec<_> = readonly.into_iter().collect();
     names.sort();
     for name in names {
+        // rubash#1569: a name bound by the current command's own
+        // tempenv frame renders its pre-frame binding (or nothing, when
+        // the frame created it / the pre-frame binding was not
+        // readonly) — the tempvar itself is never listed.
+        if let Some(under) = underlay.get(&name) {
+            let Some((under_value, under_attrs)) = under else {
+                continue;
+            };
+            if !under_attrs.readonly {
+                continue;
+            }
+            let is_array = under_attrs.array || under_value.as_deref().is_some_and(is_array_value);
+            let is_assoc = under_attrs.assoc;
+            if array_filter && !is_array {
+                continue;
+            }
+            if assoc_filter && !is_assoc {
+                continue;
+            }
+            if !valid_identifier(&name) {
+                continue;
+            }
+            match under_value {
+                Some(value) if is_array => {
+                    if value.is_empty() {
+                        if posix_mode {
+                            writeln!(stdout, "readonly -a {name}")?;
+                        } else {
+                            let attrs = setattr_array_attrs_for(
+                                true,
+                                under_attrs.exported,
+                                under_attrs.integer,
+                                under_attrs.uppercase,
+                                under_attrs.lowercase,
+                            );
+                            writeln!(stdout, "declare {attrs} {name}")?;
+                        }
+                        continue;
+                    }
+                    if posix_mode {
+                        writeln!(stdout, "readonly -a {name}={}", format_array_value(value))?;
+                        continue;
+                    }
+                    let attrs = setattr_array_attrs_for(
+                        true,
+                        under_attrs.exported,
+                        under_attrs.integer,
+                        under_attrs.uppercase,
+                        under_attrs.lowercase,
+                    );
+                    writeln!(
+                        stdout,
+                        "declare {attrs} {name}={}",
+                        format_array_value(value)
+                    )?;
+                }
+                Some(value) => {
+                    if posix_mode {
+                        writeln!(stdout, "readonly {name}=\"{}\"", quote_export_value(value))?;
+                        continue;
+                    }
+                    let attrs = setattr_scalar_attrs_for(
+                        true,
+                        under_attrs.exported,
+                        under_attrs.integer,
+                        under_attrs.uppercase,
+                        under_attrs.lowercase,
+                    );
+                    writeln!(
+                        stdout,
+                        "declare {attrs} {name}={}",
+                        quote_listing_value(value)
+                    )?;
+                }
+                None => {
+                    if posix_mode && is_array {
+                        writeln!(stdout, "readonly -a {name}")?;
+                    } else {
+                        let attrs = setattr_scalar_attrs_for(
+                            true,
+                            under_attrs.exported,
+                            under_attrs.integer,
+                            under_attrs.uppercase,
+                            under_attrs.lowercase,
+                        );
+                        writeln!(stdout, "declare {attrs} {name}")?;
+                    }
+                }
+            }
+            continue;
+        }
         // GNU setattr.def: 'readonly -a'/'readonly -A' without names list
         // only the readonly indexed/associative arrays, while 'readonly -p'
         // lists every readonly variable. The -a/-A attribute flags double as
@@ -137,6 +229,7 @@ pub(super) fn print_exported<W>(
     posix_mode: bool,
     filter_array: bool,
     filter_assoc: bool,
+    underlay: &crate::shell::var_table::TempenvListingUnderlay,
     stdout: &mut W,
 ) -> io::Result<()>
 where
@@ -154,6 +247,22 @@ where
     // only exported indexed/assoc arrays, not all exported vars).
     let filter_by_type = filter_array || filter_assoc;
     names.retain(|name| {
+        // rubash#1569: a name bound by the current command's own
+        // tempenv frame is adjudicated by its pre-frame binding, not
+        // by the tempvar's live marks.
+        if let Some(under) = underlay.get(name) {
+            let Some((_, attrs)) = under else {
+                return false;
+            };
+            if !attrs.exported {
+                return false;
+            }
+            if !filter_by_type {
+                return true;
+            }
+            return (!filter_array || (attrs.array && !attrs.assoc))
+                && (!filter_assoc || attrs.assoc);
+        }
         if !filter_by_type {
             return true;
         }
@@ -176,6 +285,62 @@ where
         // `declare -x CommonProgramFiles(x86)=...` is a bash syntax error,
         // which broke Hermes env snapshots (niubash issue #102).
         if !valid_identifier(&name) {
+            continue;
+        }
+        // rubash#1569: render the pre-frame binding for a name the
+        // current command's own tempenv frame bound (the retain above
+        // already dropped the names with no exported pre-frame
+        // binding, and the names the frame created).
+        if let Some(Some((under_value, under_attrs))) = underlay.get(&name) {
+            match under_value {
+                Some(value) if under_attrs.array || under_attrs.assoc || is_array_value(value) => {
+                    if posix_mode {
+                        writeln!(stdout, "export -a {name}={}", format_array_value(value))?;
+                    } else {
+                        let attrs = setattr_array_attrs_for(
+                            under_attrs.readonly,
+                            true,
+                            under_attrs.integer,
+                            under_attrs.uppercase,
+                            under_attrs.lowercase,
+                        );
+                        writeln!(
+                            stdout,
+                            "declare {attrs} {name}={}",
+                            format_array_value(value)
+                        )?;
+                    }
+                }
+                Some(value) => {
+                    if posix_mode {
+                        writeln!(stdout, "export {name}=\"{}\"", quote_export_value(value))?;
+                    } else {
+                        let attrs = setattr_scalar_attrs_for(
+                            under_attrs.readonly,
+                            true,
+                            under_attrs.integer,
+                            under_attrs.uppercase,
+                            under_attrs.lowercase,
+                        );
+                        writeln!(
+                            stdout,
+                            "declare {attrs} {}={}",
+                            name,
+                            quote_listing_value(value)
+                        )?;
+                    }
+                }
+                None => {
+                    let attrs = setattr_scalar_attrs_for(
+                        under_attrs.readonly,
+                        true,
+                        under_attrs.integer,
+                        under_attrs.uppercase,
+                        under_attrs.lowercase,
+                    );
+                    writeln!(stdout, "declare {attrs} {name}")?;
+                }
+            }
             continue;
         }
         if let Some(value) = env_vars.get(&name) {
@@ -232,6 +397,51 @@ where
     }
 
     Ok(())
+}
+
+/// Bool-flag form of `setattr_scalar_attrs` for callers that hold a
+/// VarAttrs instead of the marked-name sets (the tempenv underlay
+/// renders in print_exported/print_readonly, rubash#1569). The flag
+/// order matches the set-based form exactly (i, r, x, l, u).
+fn setattr_scalar_attrs_for(
+    readonly: bool,
+    exported: bool,
+    integer: bool,
+    uppercase: bool,
+    lowercase: bool,
+) -> String {
+    let mut attrs = String::from("-");
+    if integer {
+        attrs.push('i');
+    }
+    if readonly {
+        attrs.push('r');
+    }
+    if exported {
+        attrs.push('x');
+    }
+    if lowercase {
+        attrs.push('l');
+    }
+    if uppercase {
+        attrs.push('u');
+    }
+    attrs
+}
+
+fn setattr_array_attrs_for(
+    readonly: bool,
+    exported: bool,
+    integer: bool,
+    uppercase: bool,
+    lowercase: bool,
+) -> String {
+    let mut attrs = String::from("-a");
+    attrs.push_str(
+        setattr_scalar_attrs_for(readonly, exported, integer, uppercase, lowercase)
+            .trim_start_matches('-'),
+    );
+    attrs
 }
 
 fn setattr_scalar_attrs(

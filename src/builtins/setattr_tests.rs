@@ -17,6 +17,7 @@ fn exports_assignment() {
         &mut stderr,
         &mut None,
         None,
+        &crate::shell::var_table::TempenvListingUnderlay::new(),
     )
     .unwrap();
 
@@ -39,6 +40,7 @@ fn rejects_invalid_identifier() {
         &mut stderr,
         &mut None,
         None,
+        &crate::shell::var_table::TempenvListingUnderlay::new(),
     )
     .unwrap();
 
@@ -56,8 +58,16 @@ fn prints_exported_variables() {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
 
-    let status =
-        export_with_io(["-p"], &mut vars, &mut stdout, &mut stderr, &mut None, None).unwrap();
+    let status = export_with_io(
+        ["-p"],
+        &mut vars,
+        &mut stdout,
+        &mut stderr,
+        &mut None,
+        None,
+        &crate::shell::var_table::TempenvListingUnderlay::new(),
+    )
+    .unwrap();
 
     assert_eq!(status, EXECUTION_SUCCESS);
     assert_eq!(

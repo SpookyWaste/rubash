@@ -109,6 +109,7 @@ pub fn set(args: &[String], env_vars: &mut crate::shell::var_table::VarTable) ->
         env_vars,
         &mut stdout,
         &mut stderr,
+        &crate::shell::var_table::TempenvListingUnderlay::new(),
     )
 }
 
@@ -154,6 +155,7 @@ pub(crate) fn set_with_io<'a, I, W, E>(
     env_vars: &mut crate::shell::var_table::VarTable,
     stdout: &mut W,
     stderr: &mut E,
+    underlay: &crate::shell::var_table::TempenvListingUnderlay,
 ) -> io::Result<i32>
 where
     I: IntoIterator<Item = &'a str>,
@@ -163,7 +165,7 @@ where
     let args: Vec<&str> = args.into_iter().collect();
 
     if args.is_empty() {
-        print_shell_variables(env_vars, stdout)?;
+        print_shell_variables(env_vars, underlay, stdout)?;
         return Ok(EXECUTION_SUCCESS);
     }
 
@@ -362,6 +364,7 @@ where
 /// `set_builtin ((WORD_LIST *)NULL)`), so the two listings stay identical.
 pub(crate) fn print_shell_variables<W>(
     env_vars: &crate::shell::var_table::VarTable,
+    underlay: &crate::shell::var_table::TempenvListingUnderlay,
     stdout: &mut W,
 ) -> io::Result<()>
 where
@@ -391,6 +394,43 @@ where
         // them. They still reach child processes through the export
         // environment (maybe_make_export_env, variables.c:5064).
         if !valid_identifier(name) {
+            continue;
+        }
+        // rubash#1569: a name bound by the current command's own
+        // tempenv frame renders its pre-frame binding: frame-created
+        // names vanish, and a pre-frame binding without env text is
+        // var_isset-false (variables.c:1912) so print_assignment skips
+        // it. Array/assoc form comes from the snapshot attributes.
+        if let Some(under) = underlay.get(name) {
+            let Some((under_value, under_attrs)) = under else {
+                continue;
+            };
+            let Some(value) = under_value else {
+                continue;
+            };
+            if value.is_empty() && (under_attrs.assoc || under_attrs.array) {
+                continue;
+            }
+            if under_attrs.assoc {
+                let nbuckets = crate::executor::assoc_nbuckets(env_vars, name);
+                writeln!(
+                    stdout,
+                    "{}={}",
+                    name,
+                    crate::builtins::declare::format_assoc_for_output(value, nbuckets)
+                )?;
+                continue;
+            }
+            if under_attrs.array {
+                writeln!(
+                    stdout,
+                    "{}={}",
+                    name,
+                    crate::builtins::declare::format_array_for_output(value)
+                )?;
+                continue;
+            }
+            writeln!(stdout, "{}={}", name, shell_quote(value))?;
             continue;
         }
         // GNU variables.c:1096-1104 print_assignment: array and assoc cells
@@ -532,6 +572,7 @@ mod tests {
             &mut env_vars,
             &mut stdout,
             &mut stderr,
+            &crate::shell::var_table::TempenvListingUnderlay::new(),
         )
         .unwrap();
         (
@@ -578,7 +619,14 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         assert_eq!(
-            set_with_io(["-r"], &mut env_vars, &mut stdout, &mut stderr).unwrap(),
+            set_with_io(
+                ["-r"],
+                &mut env_vars,
+                &mut stdout,
+                &mut stderr,
+                &crate::shell::var_table::TempenvListingUnderlay::new(),
+            )
+            .unwrap(),
             EXECUTION_SUCCESS
         );
         assert!(shell_option_enabled(&env_vars, "restricted"));
@@ -591,7 +639,14 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         assert_eq!(
-            set_with_io(["+r"], &mut env_vars, &mut stdout, &mut stderr).unwrap(),
+            set_with_io(
+                ["+r"],
+                &mut env_vars,
+                &mut stdout,
+                &mut stderr,
+                &crate::shell::var_table::TempenvListingUnderlay::new(),
+            )
+            .unwrap(),
             EXECUTION_FAILURE
         );
         assert!(shell_option_enabled(&env_vars, "restricted"));

@@ -180,13 +180,7 @@ where
                 }
                 let converted = env_vars.contains_key(name);
                 let (new_value, bound_array) = array_attribute_assignment_value(
-                    assigned,
-                    array,
-                    assoc,
-                    append,
-                    env_vars,
-                    name,
-                    oob_word,
+                    assigned, array, assoc, append, env_vars, name, oob_word,
                 );
                 env_vars.insert(name.to_string(), new_value);
                 // GNU setattr.def binds the operand before removing

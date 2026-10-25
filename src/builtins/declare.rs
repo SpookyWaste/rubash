@@ -441,6 +441,7 @@ where
         false,
         &[],
         &[],
+        &crate::shell::var_table::TempenvListingUnderlay::new(),
         oob_word,
     )
 }
@@ -459,6 +460,7 @@ pub(crate) fn execute_with_io_named_in_context<W, E>(
     in_function: bool,
     frame_locals: &[String],
     dynamic_views: &[(String, String)],
+    underlay: &crate::shell::var_table::TempenvListingUnderlay,
     oob_word: &mut Option<String>,
 ) -> io::Result<i32>
 where
@@ -1246,7 +1248,7 @@ where
         || trace;
     let plain = names.is_empty() && !had_name_args && !print && !flags_on;
     if plain {
-        crate::builtins::set::print_shell_variables(variables, stdout)?;
+        crate::builtins::set::print_shell_variables(variables, underlay, stdout)?;
         return Ok(attr_status);
     }
     if names.is_empty() && !had_name_args {
@@ -1265,6 +1267,7 @@ where
         plain,
         attr_status,
         dynamic_views,
+        underlay,
         stdout,
         stderr,
     )

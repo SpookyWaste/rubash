@@ -129,15 +129,27 @@ fn supports_shell_option_unary_operator() {
     let mut env_vars = crate::shell::var_table::VarTable::default();
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    crate::builtins::set::set_with_io(["-o", "errexit"], &mut env_vars, &mut stdout, &mut stderr)
-        .unwrap();
+    crate::builtins::set::set_with_io(
+        ["-o", "errexit"],
+        &mut env_vars,
+        &mut stdout,
+        &mut stderr,
+        &crate::shell::var_table::TempenvListingUnderlay::new(),
+    )
+    .unwrap();
 
     assert_eq!(
         run_with_env(&["-o", "errexit"], false, &env_vars).0,
         EXECUTION_SUCCESS
     );
-    crate::builtins::set::set_with_io(["+o", "errexit"], &mut env_vars, &mut stdout, &mut stderr)
-        .unwrap();
+    crate::builtins::set::set_with_io(
+        ["+o", "errexit"],
+        &mut env_vars,
+        &mut stdout,
+        &mut stderr,
+        &crate::shell::var_table::TempenvListingUnderlay::new(),
+    )
+    .unwrap();
     assert_eq!(
         run_with_env(&["-o", "errexit"], false, &env_vars).0,
         EXECUTION_FAILURE

@@ -54,6 +54,9 @@ impl Executor {
             .map(String::as_str);
         let mut oob_word = None;
         let mut traced_assignments = Vec::new();
+        // rubash#1569: the -p listing renders the bindings underneath
+        // this command's own tempenv frame, never the tempvars.
+        let underlay = self.tempenv_listing_underlay();
         let status = crate::builtins::setattr::readonly_with_io(
             args.iter().map(String::as_str),
             &mut self.shell_state.env_vars,
@@ -62,6 +65,7 @@ impl Executor {
             context_name,
             &mut oob_word,
             Some(&mut traced_assignments),
+            &underlay,
         )?;
         // GNU subst.c:3580: per-assignment xtrace lines, as in
         // execute_export (rubash#1340).
