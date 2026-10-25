@@ -626,6 +626,108 @@ impl Executor {
             == Some("1")
     }
 
+    /// GNU variables.c + execute_cmd.c: a listing builtin (export -p,
+    /// declare -p, readonly -p, bare set, compgen -e/-v) iterates the
+    /// real variable contexts (all_shell_variables / vapply); a
+    /// `name=value cmd` binding lives in the separate temporary_env
+    /// table and reaches a listing ONLY when it was pushed into a
+    /// context (function call via push_context, eval/source via a
+    /// VC_BLTNENV scope) — never for the very command whose prefix
+    /// carries it (find_variable still finds it for explicit-name
+    /// lookups, variables.c:1980). Rubash's single table flattens the
+    /// two, so a listing executed by the carrying command must render
+    /// the binding UNDERNEATH the innermost tempenv frame instead:
+    /// for each name the innermost active apply frame bound, the
+    /// pre-frame snapshot from tempenv_previous when a binding existed
+    /// (env text + attrs), or None when the frame created the name
+    /// (listings hide it). Names bound by OUTER frames are not in the
+    /// innermost slice and render live — exactly the context-pushed
+    /// visibility GNU gives them (rubash#1569).
+    pub(in crate::executor) fn tempenv_listing_underlay(
+        &self,
+    ) -> crate::shell::var_table::TempenvListingUnderlay {
+        let mut underlay = crate::shell::var_table::TempenvListingUnderlay::new();
+        let Some(mark) = self.tempenv_marks.last() else {
+            return underlay;
+        };
+        for name in &self.tempenv_names[*mark..] {
+            if underlay.contains_key(name) {
+                continue;
+            }
+            // rubash#1569/#1525: a PIPESTATUS tempvar's pre-frame
+            // state is the (shape, vector) snapshot the apply
+            // recorded, not the env/typed pair — the cell's value
+            // lives in the shape machinery, so rebuild the listing
+            // entry from the snapshot in the storage form the table
+            // holds for the underlying cell.
+            if name == "PIPESTATUS" {
+                if let Some(entry) = self.pipestatus_listing_underlay_entry() {
+                    underlay.insert(name.clone(), entry);
+                    continue;
+                }
+            }
+            let entry = self
+                .tempenv_previous
+                .get(name)
+                .and_then(|(env, typed, attrs)| {
+                    (env.is_some() || typed.is_some() || !attrs.is_empty())
+                        .then(|| (env.clone(), *attrs))
+                });
+            underlay.insert(name.clone(), entry);
+        }
+        underlay
+    }
+
+    fn pipestatus_listing_underlay_entry(
+        &self,
+    ) -> Option<Option<(Option<String>, crate::shell::var_table::VarAttrs)>> {
+        use crate::shell::state::PipestatusShape;
+        let encoded = self.tempenv_pipestatus_state.as_ref()?;
+        let (shape, vector) = crate::shell::state::decode_pipestatus_state(encoded)?;
+        let mut attrs = self
+            .tempenv_previous
+            .get("PIPESTATUS")
+            .map(|(_, _, attrs)| *attrs)
+            .unwrap_or_default();
+        let entry = match shape {
+            PipestatusShape::Absent => None,
+            PipestatusShape::LiveArray => {
+                attrs.array = true;
+                attrs.assoc = false;
+                let entries: std::collections::BTreeMap<usize, String> = vector
+                    .iter()
+                    .filter(|(index, _)| *index >= 0)
+                    .map(|(index, status)| (*index as usize, status.to_string()))
+                    .collect();
+                Some((
+                    Some(super::arrays::format_indexed_array_storage(entries)),
+                    attrs,
+                ))
+            }
+            PipestatusShape::ValuelessArray => {
+                attrs.array = true;
+                attrs.assoc = false;
+                Some((None, attrs))
+            }
+            PipestatusShape::Valueless => {
+                attrs.array = false;
+                attrs.assoc = false;
+                Some((None, attrs))
+            }
+            PipestatusShape::Scalar => {
+                attrs.array = false;
+                attrs.assoc = false;
+                let text = vector
+                    .iter()
+                    .find(|(index, _)| *index == 0)
+                    .map(|(_, status)| status.to_string())
+                    .unwrap_or_default();
+                Some((Some(text), attrs))
+            }
+        };
+        Some(entry)
+    }
+
     pub(in crate::executor) fn restore_temporary_assignments(
         &mut self,
         previous: Vec<(
@@ -776,7 +878,7 @@ impl Executor {
         }
     }
 
-    fn restore_typed_temporary_value(
+    pub(in crate::executor) fn restore_typed_temporary_value(
         &mut self,
         name: &str,
         typed_value: Option<crate::shell::Variable>,
