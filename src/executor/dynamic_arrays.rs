@@ -171,6 +171,10 @@ pub(in crate::executor) fn env_derived_dynamic_parameter_value(
             let micros = current_epoch_micros();
             Some(format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000))
         }
+        // rubash#1649: GNU variables.c get_monoseconds (bash 5.3) —
+        // CLOCK_MONOTONIC seconds, gettimeofday fallback inside
+        // current_monotonic_seconds.
+        "BASH_MONOSECONDS" => Some(current_monotonic_seconds().to_string()),
         "SECONDS" => {
             let start = env_vars
                 .get(SHELL_START_EPOCH)
@@ -267,6 +271,7 @@ impl Executor {
             "SECONDS"
                 | "EPOCHSECONDS"
                 | "EPOCHREALTIME"
+                | "BASH_MONOSECONDS"
                 | "RANDOM"
                 | "SRANDOM"
                 | "BASHPID"
@@ -289,7 +294,7 @@ impl Executor {
             return None;
         }
         match name {
-            "SECONDS" | "EPOCHSECONDS" | "EPOCHREALTIME" => {
+            "SECONDS" | "EPOCHSECONDS" | "EPOCHREALTIME" | "BASH_MONOSECONDS" => {
                 env_derived_dynamic_parameter_value(&self.shell_state.env_vars, name)
             }
             "RANDOM" => Some(self.next_random_value().to_string()),
@@ -658,8 +663,8 @@ impl Executor {
                     crate::shell::state::PipestatusShape::Absent => None,
                 }
             }
-            "EPOCHSECONDS" | "EPOCHREALTIME" | "LINENO" | "BASH_SUBSHELL" | "BASH_ARGV0"
-            | "BASH_COMMAND" => {
+            "EPOCHSECONDS" | "EPOCHREALTIME" | "BASH_MONOSECONDS" | "LINENO" | "BASH_SUBSHELL"
+            | "BASH_ARGV0" | "BASH_COMMAND" => {
                 let flags = format!("{readonly}{exported}");
                 let flags = if flags.is_empty() {
                     "--".to_string()
@@ -717,6 +722,7 @@ impl Executor {
             name,
             "EPOCHSECONDS"
                 | "EPOCHREALTIME"
+                | "BASH_MONOSECONDS"
                 | "SECONDS"
                 | "RANDOM"
                 | "SRANDOM"
