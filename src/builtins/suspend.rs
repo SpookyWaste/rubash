@@ -84,10 +84,21 @@ where
                 // the tgkill return-to-userspace path, before any further
                 // command executes. On SIGCONT both stops release and the
                 // builtin returns success as before.
-                let pid = unsafe { libc::getpid() };
-                let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
+                // SYS_gettid/SYS_tgkill are Linux-only; macOS libc has
+                // neither constant (E0425 on the macos cross-check),
+                // pthread_kill on the calling thread is the same
+                // thread-directed SIGSTOP.
+                #[cfg(target_os = "linux")]
+                {
+                    let pid = unsafe { libc::getpid() };
+                    let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
+                    unsafe {
+                        libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGSTOP);
+                    }
+                }
+                #[cfg(target_os = "macos")]
                 unsafe {
-                    libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGSTOP);
+                    libc::pthread_kill(libc::pthread_self(), libc::SIGSTOP);
                 }
             }
         }
