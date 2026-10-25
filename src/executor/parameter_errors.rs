@@ -560,8 +560,31 @@ impl Executor {
     /// instead, inverting `${!assoc[@]:-d}` outcomes and leaking marker
     /// bytes into the `invalid variable name` diagnostic.
     pub(in crate::executor) fn indirect_source_scalar_value(&self, name: &str) -> Option<String> {
-        let value = self.shell_state.env_vars.get(name)?;
-        self.scalar_parameter_value(name, value)
+        if let Some(value) = self.shell_state.env_vars.get(name) {
+            return self.scalar_parameter_value(name, value);
+        }
+        // The PIPESTATUS cell lives in shell_state in its array form —
+        // env_vars carries it only for a user-assigned scalar shape —
+        // so the scalar-form value (array element 0, what
+        // parameter_brace_find_indir reads for an array source) comes
+        // from the state cell (rubash#1566).
+        if name == "PIPESTATUS" {
+            return self.pipestatus_element(0);
+        }
+        None
+    }
+
+    /// Whether `name` names the materialized PIPESTATUS cell. GNU
+    /// set_pipestatus_array (variables.c:6291) writes the PIPESTATUS
+    /// ARRAY object directly, so find_variable finds the variable
+    /// whenever the cell exists — every completed command materializes
+    /// it — even though rubash keeps that form in shell_state rather
+    /// than env_vars. An Absent shape (no command has completed yet,
+    /// or an `unset` the next completion has not yet undone) is
+    /// genuinely unset, matching GNU's lazy creation (rubash#1566).
+    pub(in crate::executor) fn pipestatus_cell_exists(&self, name: &str) -> bool {
+        name == "PIPESTATUS"
+            && self.shell_state.pipestatus_shape != crate::shell::state::PipestatusShape::Absent
     }
 
     fn indirect_parameter_operator_value(&self, name: &str) -> Option<Option<String>> {
@@ -609,6 +632,16 @@ impl Executor {
                 indirect_name,
             ) {
                 return Some(None);
+            }
+            // The PIPESTATUS state cell is a materialized source too
+            // (rubash#1566): adjudicate the operator through its
+            // scalar-form value, exactly like the env-backed path
+            // below the gate.
+            if self.pipestatus_cell_exists(indirect_name) {
+                return match self.indirect_source_scalar_value(indirect_name) {
+                    Some(t) => Some(self.indirect_target_values(&t).into_iter().next()),
+                    None => Some(None),
+                };
             }
             return None;
         };
@@ -1494,6 +1527,7 @@ impl Executor {
                                     DECLARED_UNSET_VARS,
                                     indirect,
                                 )
+                                || self.pipestatus_cell_exists(indirect)
                         }
                         NamerefResolution::Unresolved
                         | NamerefResolution::Circular
@@ -1554,6 +1588,7 @@ impl Executor {
                         )
                         && self.shell_state.env_vars.get(head).is_none()
                         && self.shell_state.variables.get(head).is_none()
+                        && !self.pipestatus_cell_exists(head)
                     {
                         return Some((
                             head.to_string(),
@@ -1577,22 +1612,36 @@ impl Executor {
                         // names `head + tail[..close]`, not the whole body
                         // (rubash#1147: unset m with `[@]:-` was silent).
                         if let Some(close) = Self::skip_indirect_array_subscript(tail) {
+                            // The PURE keys form — the `[@]`/`[*]` group
+                            // closes the body — never reaches
+                            // parameter_brace_expand_indir at all: GNU
+                            // parameter_brace_expand (subst.c:10016)
+                            // dispatches it to array_keys first, which
+                            // reports an absent variable's keys as the
+                            // empty list, so there is no base-existence
+                            // error to mirror (rubash#1566). An operator
+                            // tail after the group (`${!m[@]:-x}`) is
+                            // NOT the pure form and keeps the error.
+                            let pure_keys_form =
+                                close == tail.len() && matches!(&tail[1..close - 1], "@" | "*");
                             let base_exists = match self.nameref_resolution(head) {
                                 NamerefResolution::Target(target) => {
                                     let base = target.split('[').next().unwrap_or(target.as_str());
                                     self.shell_state.env_vars.contains_key(base)
                                         || self.shell_state.variables.get(base).is_some()
+                                        || self.pipestatus_cell_exists(base)
                                 }
                                 NamerefResolution::NotNameref => {
                                     self.shell_state.env_vars.contains_key(head)
                                         || self.shell_state.variables.get(head).is_some()
+                                        || self.pipestatus_cell_exists(head)
                                 }
                                 // Unresolved (empty/unresolvable cell), Circular,
                                 // and MaxDepth all mean find_variable returned
                                 // NULL for the base.
                                 _ => false,
                             };
-                            if !base_exists {
+                            if !base_exists && !pure_keys_form {
                                 return Some((
                                     format!("{}{}", head, &tail[..close]),
                                     "invalid indirect expansion".to_string(),
@@ -1663,7 +1712,22 @@ impl Executor {
                     let open = indirect.find('[').unwrap_or(0);
                     let base = &indirect[..open];
                     if !base.is_empty() && is_shell_name(base) {
-                        if let Some(value) = self.shell_state.env_vars.get(base) {
+                        // The PIPESTATUS array object lives in
+                        // shell_state, not env_vars (rubash#1566): its
+                        // storage render comes from
+                        // parameter_array_storage, so the t-join
+                        // adjudication below sees the same element
+                        // values GNU joins.
+                        let pipestatus_storage;
+                        let base_value = match self.shell_state.env_vars.get(base) {
+                            Some(value) => Some(value),
+                            None if self.pipestatus_cell_exists(base) => {
+                                pipestatus_storage = self.parameter_array_storage(base);
+                                pipestatus_storage.as_ref()
+                            }
+                            None => None,
+                        };
+                        if let Some(value) = base_value {
                             // GNU's t here is the dollar_at join of the
                             // variable's ELEMENT VALUES (array_value with
                             // AV_ALLOWALL, arrayfunc.c:1563), and validity

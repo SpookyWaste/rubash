@@ -283,6 +283,28 @@ impl Executor {
     }
 
     pub(in crate::executor) fn indirect_target_values(&self, target_expr: &str) -> Vec<String> {
+        // A numeric target designates a positional parameter (the
+        // subst.c:7955 re-expansion the plain leg in
+        // expand_braced_special mirrors); index 0 is $0, which lives
+        // outside the $1.. positional window. Without this arm a
+        // PIPESTATUS indirection's operator adjudication saw its
+        // target — element 0, most often "0" — as an unset variable
+        // (rubash#1566). The leading-zero guard matches the plain
+        // leg's: "007" is not a positional designator here.
+        if let Ok(index) = target_expr.parse::<usize>() {
+            if !target_expr.starts_with('0') || target_expr == "0" {
+                if index == 0 {
+                    return vec![self.script_name_value()];
+                }
+                return self
+                    .shell_state
+                    .positional_window()
+                    .get(index - 1)
+                    .cloned()
+                    .into_iter()
+                    .collect();
+            }
+        }
         if let Some(array_name) = target_expr
             .strip_suffix("[@]")
             .or_else(|| target_expr.strip_suffix("[*]"))
