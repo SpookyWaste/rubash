@@ -1713,19 +1713,18 @@ impl Executor {
         &mut self,
         time_command: &TimeCommand,
     ) -> Result<(), ExecuteError> {
-        // rubash#1218: the parser folds `time` prefixes without knowing
-        // the posix-mode grammar rule — in posix mode a dash word right
-        // after `time` means `time` was never a keyword (GNU parse.y),
-        // so the reconstructed command (`time`, the prefix words, then
-        // the inner command's words) dispatches as an ordinary command
+        // rubash#1218: in posix mode a dash word right after `time`
+        // means `time` was never a keyword (GNU parse.y), so the
+        // reconstructed command (`time`, the prefix words, then the
+        // inner command's words) dispatches as an ordinary command
         // named `time` (PATH-resolved; 127 when absent). Only the simple
         // inner shape is rebuilt; pipeline/compound inners keep the
         // timed path.
-        if self.posix_mode_enabled()
-            && time_command
-                .prefix_words
-                .first()
-                .is_some_and(|word| word.len() > 1 && word.starts_with('-'))
+        // rubash#1520: the verdict is the parse-time-frozen one recorded
+        // on the node (keyword_was_plain_word), never the live mode —
+        // the parser folds only keyword heads, so a same-unit `set -o
+        // posix` that executed after the fold cannot reach this branch.
+        if time_command.keyword_was_plain_word
             && time_command.command.pipeline_command.is_none()
             && !time_command.command.words.is_empty()
         {
@@ -1845,7 +1844,10 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
-        let inverted = time_prefix_parts(&cmd.words, self.posix_mode_enabled())
+        // Classification already applied the parse-time-frozen #1218
+        // decision (command_is_time_prefixed_compound, rubash#1520), so
+        // prefix extraction here must not re-veto against the live mode.
+        let inverted = time_prefix_parts(&cmd.words, false)
             .map(|parts| parts.inverted)
             .unwrap_or(false);
         let started = time_command_started();
@@ -1869,8 +1871,7 @@ impl Executor {
             Ok(())
         };
         self.print_time_shell(
-            time_prefix_parts(&cmd.words, self.posix_mode_enabled())
-                .is_some_and(|parts| parts.posix_format),
+            time_prefix_parts(&cmd.words, false).is_some_and(|parts| parts.posix_format),
             started,
         );
         result?;
@@ -1901,7 +1902,12 @@ impl Executor {
         {
             return Ok(None);
         }
-        let Some(prefix) = time_prefix_parts(&command.words, self.posix_mode_enabled()) else {
+        // rubash#1520: classification uses the parse-time-frozen #1218
+        // decision recorded on the node, not the live mode.
+        if time_dash_word_not_keyword(command) {
+            return Ok(None);
+        }
+        let Some(prefix) = time_prefix_parts(&command.words, false) else {
             return Ok(None);
         };
         if !matches!(
@@ -4026,13 +4032,12 @@ impl Executor {
     }
 }
 
-pub(in crate::executor) fn command_is_time_prefixed_compound(
-    cmd: &CommandNode,
-    posix_mode: bool,
-) -> bool {
+pub(in crate::executor) fn command_is_time_prefixed_compound(cmd: &CommandNode) -> bool {
     // rubash#1218: the posix dash-word rule applies to compounds too —
-    // `time -p ( ... )` in posix mode is not the time keyword.
-    !posix_time_dash_word(&cmd.words, posix_mode)
+    // `time -p ( ... )` parsed under posix mode is not the time keyword.
+    // rubash#1520: the decision is the parse-time-frozen one recorded on
+    // the node, never re-derived from the live mode.
+    !time_dash_word_not_keyword(cmd)
         && cmd.words.first().map(String::as_str) == Some("time")
         && (cmd.for_command.is_some()
             || cmd.if_command.is_some()
@@ -4298,6 +4303,23 @@ pub(in crate::executor) fn posix_time_dash_word(words: &[String], posix_mode: bo
         && words
             .get(1)
             .is_some_and(|word| word.len() > 1 && word.starts_with('-'))
+}
+
+/// rubash#1520: the parse-time-frozen form of the #1218 veto, for nodes
+/// the parser produced. GNU decides whether `time` is the reserved word
+/// when the token is READ (parse.y:3286 `time_command_acceptable`, via
+/// `CHECK_FOR_RESERVED_WORD` at parse.y:3179), under the mode in effect
+/// for that reader unit; the lexer freezes that outcome into the token
+/// kind (see `freeze_posix_time_dash_tokens`) and the parser stamps it
+/// onto the node (`time_head_plain_word`) as the head word is recorded.
+/// A head token recorded as a plain Word — reclassified by the lexer
+/// under a POSIX pass because a dash word followed, or quoted in the
+/// source — means the command is an ordinary external command named
+/// `time`, whatever follows it and no matter how the live mode changed
+/// after the unit was parsed. Synthesized nodes (never stamped) keep
+/// the keyword reading, matching the pre-#1520 behaviour.
+pub(in crate::executor) fn time_dash_word_not_keyword(cmd: &CommandNode) -> bool {
+    cmd.words.first().map(String::as_str) == Some("time") && cmd.time_head_plain_word
 }
 
 fn time_prefix_parts(words: &[String], posix_mode: bool) -> Option<TimePrefixParts> {

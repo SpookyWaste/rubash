@@ -202,7 +202,7 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Option<Result<(), ExecuteError>> {
-        if command_is_time_prefixed_compound(cmd, self.posix_mode_enabled()) {
+        if command_is_time_prefixed_compound(cmd) {
             return Some(self.execute_time_prefixed_compound_command(cmd));
         }
         // GNU execute_cmd.c:485 (shell_control_structure) counts cm_arith,
@@ -1074,6 +1074,10 @@ impl Executor {
         if Self::preserves_word_metadata(cmd) {
             expanded.word_metadata = cmd.word_metadata.clone();
         }
+        // rubash#1520: like the slow path, the frozen `time`-head
+        // verdict is carried explicitly — it is a parse-time decision
+        // dispatch must still see after expansion.
+        expanded.time_head_plain_word = cmd.time_head_plain_word;
         expanded.pipe = cmd.pipe;
         expanded.background = cmd.background;
         expanded.and_or = cmd.and_or;
@@ -1265,6 +1269,9 @@ impl Executor {
         if Self::preserves_word_metadata(cmd) {
             expanded.word_metadata = cmd.word_metadata.clone();
         }
+        // rubash#1520: carry the frozen `time`-head verdict like the
+        // other expansion constructions (see expand_command_words).
+        expanded.time_head_plain_word = cmd.time_head_plain_word;
         expanded.line = cmd.line;
         expanded.logical_line = cmd.logical_line;
         expanded.pipe = cmd.pipe;
@@ -1442,6 +1449,10 @@ impl Executor {
                 Vec::new()
             },
             word_kinds: Vec::new(),
+            // rubash#1520: the frozen `time`-head verdict rides on the
+            // node — word expansion clears word_kinds, so carry the
+            // verdict explicitly or it would be lost before dispatch.
+            time_head_plain_word: cmd.time_head_plain_word,
             assignments,
             // Keep the verbatim RHS aligned with the cloned assignments: the
             // assignment-procsub materialization (GNU subst.c:11349-11378

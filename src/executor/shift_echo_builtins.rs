@@ -110,7 +110,11 @@ impl Executor {
         // reserved-word status (GNU parse.y) — the whole command is an
         // ordinary external command named `time` (PATH-resolved, 127
         // when absent), never the timing keyword.
-        if posix_time_dash_word(&cmd.words, self.posix_mode_enabled()) {
+        // rubash#1520: GNU makes that call at parse time
+        // (parse.y:3286 time_command_acceptable), so consult the frozen
+        // decision recorded on the node — the live mode here may already
+        // have been flipped by an earlier command in the same unit.
+        if time_dash_word_not_keyword(cmd) {
             return self.execute_external(cmd);
         }
         let mut index = 1;
