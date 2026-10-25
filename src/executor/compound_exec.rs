@@ -1877,7 +1877,7 @@ impl Executor {
         // Classification already applied the parse-time-frozen #1218
         // decision (command_is_time_prefixed_compound, rubash#1520), so
         // prefix extraction here must not re-veto against the live mode.
-        let inverted = time_prefix_parts(&cmd.words, false)
+        let inverted = time_prefix_parts(cmd, false)
             .map(|parts| parts.inverted)
             .unwrap_or(false);
         let started = time_command_started();
@@ -1901,7 +1901,7 @@ impl Executor {
             Ok(())
         };
         self.print_time_shell(
-            time_prefix_parts(&cmd.words, false).is_some_and(|parts| parts.posix_format),
+            time_prefix_parts(cmd, false).is_some_and(|parts| parts.posix_format),
             started,
         );
         result?;
@@ -1937,7 +1937,7 @@ impl Executor {
         if time_dash_word_not_keyword(command) {
             return Ok(None);
         }
-        let Some(prefix) = time_prefix_parts(&command.words, false) else {
+        let Some(prefix) = time_prefix_parts(command, false) else {
             return Ok(None);
         };
         if !matches!(
@@ -4351,7 +4351,8 @@ pub(in crate::executor) fn time_dash_word_not_keyword(cmd: &CommandNode) -> bool
     cmd.words.first().map(String::as_str) == Some("time") && cmd.time_head_plain_word
 }
 
-fn time_prefix_parts(words: &[String], posix_mode: bool) -> Option<TimePrefixParts> {
+fn time_prefix_parts(cmd: &CommandNode, posix_mode: bool) -> Option<TimePrefixParts> {
+    let words = &cmd.words;
     if words.first().map(String::as_str) != Some("time") {
         return None;
     }
@@ -4359,27 +4360,19 @@ fn time_prefix_parts(words: &[String], posix_mode: bool) -> Option<TimePrefixPar
         return None;
     }
 
-    let mut index = 1;
-    let mut inverted = false;
-    let mut posix_format = false;
-    while let Some(word) = words.get(index).map(String::as_str) {
-        match word {
-            "-p" => {
-                posix_format = true;
-                index += 1;
-            }
-            "--" => index += 1,
-            "!" => {
-                inverted = !inverted;
-                index += 1;
-            }
-            _ => break,
-        }
-    }
+    // rubash#1548: operand window per parse.y special_case_tokens —
+    // a quoted '-p' is the timed command's name, never time's option
+    // (see crate::parser::scan_time_prefix_words).
+    let aligned_metadata = if cmd.word_metadata.len() == words.len() {
+        Some(cmd.word_metadata.as_slice())
+    } else {
+        None
+    };
+    let scan = crate::parser::scan_time_prefix_words(words, aligned_metadata);
     Some(TimePrefixParts {
-        command_index: index,
-        inverted,
-        posix_format,
+        command_index: scan.next,
+        inverted: scan.inverted,
+        posix_format: scan.posix_format,
     })
 }
 

@@ -5012,23 +5012,18 @@ fn time_pipeline_prefix(command: &CommandNode) -> Option<TimePipelinePrefix> {
         return None;
     }
 
-    let mut index = 1;
-    let mut inverted = false;
-    let mut posix_format = false;
-    while let Some(word) = command.words.get(index).map(String::as_str) {
-        match word {
-            "-p" => {
-                posix_format = true;
-                index += 1;
-            }
-            "--" => index += 1,
-            "!" => {
-                inverted = !inverted;
-                index += 1;
-            }
-            _ => break,
-        }
-    }
+    // rubash#1548: operand window per parse.y special_case_tokens —
+    // a quoted '-p' is the timed command's name, never time's option
+    // (see crate::parser::scan_time_prefix_words).
+    let aligned_metadata = if command.word_metadata.len() == command.words.len() {
+        Some(command.word_metadata.as_slice())
+    } else {
+        None
+    };
+    let scan = crate::parser::scan_time_prefix_words(&command.words, aligned_metadata);
+    let index = scan.next;
+    let inverted = scan.inverted;
+    let posix_format = scan.posix_format;
     if index >= command.words.len() {
         return None;
     }

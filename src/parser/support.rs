@@ -898,8 +898,12 @@ fn word_command_open_brace(tokens: &[Token], index: usize) -> bool {
                 _ => return false,
             },
             TokenKind::Word => match prev.value.as_str() {
-                // `time -p` / `time --` options (TIMEOPT/TIMEIGN).
-                "-p" | "--" => j -= 1,
+                // `time -p` / `time --` options (TIMEOPT/TIMEIGN) —
+                // only when spelled plainly: a quoted '-p' is a
+                // command name, so the `{` after it is an argument,
+                // not a group opener (parse.y special_case_tokens,
+                // rubash#1548).
+                "-p" | "--" if prev.raw.is_empty() || prev.raw == prev.value => j -= 1,
                 _ => {
                     // A WORD directly before `{` is a command argument
                     // (`echo a {`) unless it is a coproc/function name,
