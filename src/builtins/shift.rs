@@ -8,6 +8,13 @@ use std::io::{self, Write};
 pub enum ShiftAction {
     Complete(i32),
     Shift(usize),
+    /// Surplus operands: GNU builtins/common.c no_args() — the
+    /// diagnostic, EX_BADUSAGE, then jump_to_top_level (DISCARD).
+    /// Kept distinct from Complete(2) because the other EX_USAGE
+    /// paths (non-numeric operand, --help) return a plain status
+    /// with no discard; only the no_args class abandons the rest
+    /// of the current list (rubash#1650).
+    TooManyArguments,
 }
 
 /// GNU error.h: EX_USAGE (2) marks a usage error, EXECUTION_FAILURE (1) a
@@ -17,7 +24,7 @@ pub enum ShiftAction {
 /// (builtins/common.c `set_exit_status (EX_BADUSAGE)`), so both exit 2;
 /// only the shift-count-out-of-range erange path returns
 /// EXECUTION_FAILURE.
-const EX_USAGE: i32 = 2;
+pub(crate) const EX_USAGE: i32 = 2;
 
 pub fn execute(args: &[String]) -> io::Result<ShiftAction> {
     let mut stdout = io::stdout().lock();
@@ -50,8 +57,10 @@ where
     if args.len() > 1 {
         writeln!(stderr, "{}shift: too many arguments", diagnostic_prefix())?;
         // get_numeric_arg (builtins/common.c:511) ends the operand walk with
-        // no_args(), whose surplus-argument failure is EX_BADUSAGE.
-        return Ok(ShiftAction::Complete(EX_USAGE));
+        // no_args(), whose surplus-argument failure is EX_BADUSAGE
+        // followed by a DISCARD jump — the executor arms that discard
+        // for this action (rubash#1650).
+        return Ok(ShiftAction::TooManyArguments);
     }
 
     let amount = match args.first() {
