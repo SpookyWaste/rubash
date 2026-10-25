@@ -20,10 +20,15 @@
 //! atomic gate and stop-request flags.
 
 pub mod breakpoints;
+pub mod event;
 pub mod gate;
 
 pub use breakpoints::{
     Breakpoint, BreakpointId, BreakpointKind, BreakpointResolution, BreakpointTable,
     BreakpointTarget, HitFlow, HitOutcome, WatchSnapshot,
+};
+pub use event::{
+    DebugEvent, ExceptionKind, ExceptionSite, FrameReturn, OutputStream, ReturnRoute, SeamKind,
+    SourceLocation, StopInfo, StopReason, SynthesizedFrameKind, WatchChange,
 };
 pub use gate::{GateFlag, SESSION_ACTIVE};
