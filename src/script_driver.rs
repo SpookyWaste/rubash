@@ -2402,14 +2402,23 @@ fn command_paren_verdict_disproved_by_parser(input: &str, parse_posix: bool) -> 
         .any(command_tree_has_pre_eof_event_marker)
 }
 
-/// True when this command (or any nested command) carries one of the two
+/// True when this command (or any nested command) carries one of the
 /// pre-EOF event markers the unclosed-`(` parse can raise ahead of the
 /// eof-from-`(` report: `__RUBASH_PARSE_ERROR_NEAR__` (word after a nested
-/// subshell's closer) and `__RUBASH_PARSE_ERROR_EOF_PAREN__` (compound
-/// assignment never closed).
+/// subshell's closer), `__RUBASH_PARSE_ERROR_EOF_PAREN__` (compound
+/// assignment never closed) and `__RUBASH_PARSE_ERROR_COND__` (a
+/// conditional's own diagnostic). The COND marker belongs here because
+/// the text-level close-char verdict has no conditional model: a `(`
+/// pair inside `[[ ... ]]` reads as an unclosed command paren to the
+/// scanner, but GNU's cond_term consumes the stream itself and its
+/// diagnostic is the first error event (parse.y:5074-5247 — e.g.
+/// `[[ a == ((a ]]' reports the operator-slot `(', never an
+/// unclosed-`(' EOF, rubash#1538).
 fn command_tree_has_pre_eof_event_marker(command: &CommandNode) -> bool {
     if command.assignments.iter().any(|(name, _)| {
-        name == "__RUBASH_PARSE_ERROR_NEAR__" || name == "__RUBASH_PARSE_ERROR_EOF_PAREN__"
+        name == "__RUBASH_PARSE_ERROR_NEAR__"
+            || name == "__RUBASH_PARSE_ERROR_EOF_PAREN__"
+            || name == "__RUBASH_PARSE_ERROR_COND__"
     }) {
         return true;
     }

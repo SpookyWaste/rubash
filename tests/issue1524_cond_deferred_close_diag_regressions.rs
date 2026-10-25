@@ -310,26 +310,23 @@ fn issue1524_near_token_matrix() {
 #[test]
 fn issue1524_valid_deferred_close_forms_stay_silent() {
     // A group that closes on a later line is a valid regex word: the
-    // conditional is simply false, rc=1, no diagnostics.
-    let (stdout, stderr, code) = run_rubash_file("[[ a =~ (b\n)]] && echo T\n", "f5");
-    assert_eq!(stdout, "");
-    assert_eq!(stderr, "");
-    assert_eq!(code, Some(1));
+    // conditional is simply false, rc=1, no diagnostics. (The glued
+    // `)]]' spelling of this form is NOT valid -- the `]]' is
+    // absorbed into the regex word exactly like the single-line
+    // form, and GNU errors on the following `T': that spelling is
+    // pinned with GNU expectations in the issue1537 file.)
     let (stdout, stderr, code) = run_rubash(&["-c", "[[ a =~ (b ]\n) ]] && echo T"], None);
     assert_eq!(stdout, "");
     assert_eq!(stderr, "");
     assert_eq!(code, Some(1));
 }
 
-/// Adjacent divergence, NOT #1524's mechanism (kept on record with
-/// GNU expectations): GNU's regex word absorbs a `]]' glued directly
-/// after the group (`(b)]]` is the whole RHS word), so no COND_END
-/// remains and GNU reports an unclosed conditional; rubash's
-/// token-level end search still treats that `]]' as the closer and
-/// evaluates the conditional. Distinct root cause (matching end /
-/// word absorption), separate from the deferred-close state reset.
+/// Adjacent divergence to #1524, fixed by rubash#1537: GNU's regex
+/// word absorbs a `]]' glued directly after the group (`(b)]]` is
+/// the whole RHS word), so no COND_END remains and GNU reports an
+/// unclosed conditional; rubash's token-level end search treated
+/// that `]]' as the closer and evaluated the conditional.
 #[test]
-#[ignore = "pre-existing divergence: glued ]] after a regex group is absorbed into GNU's RHS word"]
 fn issue1524_adjacent_glued_close_after_group_is_unclosed_in_gnu() {
     let (stdout, stderr, code) = run_rubash(&["-c", "[[ a =~ (b)]]"], None);
     assert_eq!(stdout, "");
@@ -337,7 +334,7 @@ fn issue1524_adjacent_glued_close_after_group_is_unclosed_in_gnu() {
         &stderr,
         &[
             "line 1: unexpected EOF while looking for `]]'",
-            "line 2: syntax error: unexpected end of file from `[[` command on line 1",
+            "line 2: syntax error: unexpected end of file from `[[' command on line 1",
         ],
     );
     assert_eq!(code, Some(2));
