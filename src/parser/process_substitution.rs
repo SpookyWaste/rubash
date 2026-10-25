@@ -247,6 +247,74 @@ fn embedded_procsub_close(chars: &[char], open: usize) -> Option<usize> {
     None
 }
 
+/// Byte range of the next UNQUOTED `<(`/`>(` span in `text` at or after
+/// byte offset `from` whose operator matches `operator` and whose body
+/// re-prints to `source` under `process_substitution_source` — i.e. the
+/// span the metadata entry (operator, source) describes. GNU
+/// extract_process_subst (subst.c:1311) pulls the span VERBATIM out of
+/// the word string; the metadata target is a token-join RE-PRINT
+/// (`>&2` comes back as `>& 2`) that need not occur in the word at all,
+/// so a caller splicing by the target string silently misses the span
+/// (rubash#1561). The re-print comparison is the identity check: a span
+/// whose body tokenizes to a different re-print is a different
+/// substitution and is passed over. Quote/escape tracking mirrors
+/// `embedded_process_substitutions_in_raw` (parse.y:3877
+/// parse_matched_pair rules via `embedded_procsub_close`); the walk
+/// starts at the top of the word so the quote state at `from` is exact.
+pub(crate) fn verbatim_process_substitution_span(
+    text: &str,
+    from: usize,
+    operator: &str,
+    source: &str,
+) -> Option<(usize, usize)> {
+    let want = operator.chars().next()?;
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let plain: Vec<char> = chars.iter().map(|(_, ch)| *ch).collect();
+    let mut index = 0usize;
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+    while index < chars.len() {
+        let (byte, ch) = chars[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if ch == '\\' && !single {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if ch == '\'' && !double {
+            single = !single;
+            index += 1;
+            continue;
+        }
+        if ch == '"' && !single {
+            double = !double;
+            index += 1;
+            continue;
+        }
+        if !single
+            && !double
+            && ch == want
+            && byte >= from
+            && chars.get(index + 1).is_some_and(|(_, next)| *next == '(')
+        {
+            if let Some(end) = embedded_procsub_close(&plain, index + 2) {
+                let body: String = plain[index + 2..end].iter().collect();
+                if process_substitution_source(&crate::lexer::tokenize(&body)) == source {
+                    let end_byte = chars[end].0 + 1;
+                    return Some((byte, end_byte));
+                }
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
 /// Whether the raw word text contains a process-substitution opener that is
 /// unquoted at its position. Mirrors GNU subst.c:11349-11378
 /// (`expand_word_internal` cases '<' and '>'): a `<(`/`>(` inside single or

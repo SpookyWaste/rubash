@@ -232,8 +232,8 @@ fn issue1557_inherited_fd_comsub_body() {
 fn issue1557_inherited_fd_procsub_body() {
     // The issue's third form: the redirect rides the assignment
     // command itself; the procsub body writes to the inherited fd.
-    // (The assigned VALUE of a bare whole-RHS >(…) is a separate
-    // pre-existing gap — rubash#1561, pinned ignored below.)
+    // (The assigned VALUE of a bare whole-RHS >(…) was rubash#1561,
+    // pinned by issue1557_inherited_fd_procsub_value below.)
     let dir = tempdir("procsub");
     let out = dir.join("out.txt");
     let file = OpenOptions::new()
@@ -255,11 +255,12 @@ fn issue1557_inherited_fd_procsub_body() {
 }
 
 #[test]
-#[ignore = "value substitution for a bare whole-RHS >(…) is rubash#1561"]
 fn issue1557_inherited_fd_procsub_value() {
-    // GNU: v becomes the substitution's /dev/fd path. Rubash keeps
-    // the literal text today (the body still runs) — the gap is in
-    // assignment expansion, independent of fd inheritance (#1561).
+    // GNU: v becomes the substitution's /dev/fd path. The value
+    // materialization gap was rubash#1561 (the assignment channels
+    // spliced by the re-printed target and missed verbatim spans
+    // whose bodies re-print differently, like this `>&3` body);
+    // fixed there, so this pin now runs un-ignored.
     let dir = tempdir("procsubval");
     let out = dir.join("out.txt");
     let file = OpenOptions::new()

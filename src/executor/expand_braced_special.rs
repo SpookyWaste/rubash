@@ -298,6 +298,14 @@ impl Executor {
         // name operands through exactly this form (`case ${!OPTIND} ...`).
         if let Ok(index) = target_name.parse::<usize>() {
             if !target_name.starts_with('0') || target_name == "0" {
+                // Index 0 designates $0, which lives OUTSIDE the
+                // $1.. positional window: the saturating subtraction
+                // below silently read $1 for it. This is the target
+                // every PIPESTATUS indirection names (its element 0
+                // is a status, most often 0) — rubash#1566.
+                if index == 0 {
+                    return Some(self.script_name_value());
+                }
                 return Some(
                     self.shell_state
                         .positional_window()

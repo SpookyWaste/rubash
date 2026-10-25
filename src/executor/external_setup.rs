@@ -701,6 +701,37 @@ impl Executor {
     /// the raw RHS so the substitution sees the same text GNU extracts.
     /// Everything outside the span keeps its raw quoting, which the normal
     /// assignment-expansion chain then processes as usual.
+    /// Splice range for one assignment process substitution (rubash#1561).
+    /// The metadata target is a token-join RE-PRINT that need not occur
+    /// verbatim in the word (`>&2` re-prints as `>& 2`), so after the
+    /// exact search the span is located VERBATIM — GNU subst.c:1311
+    /// extract_process_subst pulls the span out of the word string —
+    /// and verified against the metadata source re-print. The cursor
+    /// search keeps identical spans in left-to-right order; the
+    /// from-zero retry covers metadata order differing from word order
+    /// (a token-shape span listed before an embedded span that sits
+    /// earlier in the word).
+    fn assignment_procsub_splice_range(
+        word: &str,
+        cursor: usize,
+        target: &str,
+        operator: &str,
+        source: &str,
+    ) -> Option<(usize, usize)> {
+        let exact = |from: usize| {
+            word[from..]
+                .find(target)
+                .map(|offset| (from + offset, from + offset + target.len()))
+        };
+        let verbatim = |from: usize| {
+            crate::parser::verbatim_process_substitution_span(word, from, operator, source)
+        };
+        exact(cursor)
+            .or_else(|| verbatim(cursor))
+            .or_else(|| exact(0))
+            .or_else(|| verbatim(0))
+    }
+
     pub(in crate::executor) fn materialize_assignment_process_substitutions_from_raw(
         &mut self,
         raw: &str,
@@ -709,6 +740,7 @@ impl Executor {
             .process_substitutions;
 
         let mut word = raw.to_string();
+        let mut cursor = 0usize;
         for substitution in substitutions {
             // rubash#1523: the metadata target is the RE-PRINTED span
             // (token join — `>&3` comes back as `>& 3`), which need
@@ -721,9 +753,21 @@ impl Executor {
             // a missed span stays in the word for the cooked pass,
             // which materializes it exactly once from the re-printed
             // text its own scan produced.
-            if !word.contains(&substitution.target) {
+            //
+            // rubash#1561: the splice search now falls back to the
+            // verbatim span (see assignment_procsub_splice_range), so
+            // a re-print-divergent body (`>&2`, pipes, `;`) is spliced
+            // here exactly once instead of surviving into the stored
+            // value as literal text.
+            let Some((start, end)) = Self::assignment_procsub_splice_range(
+                &word,
+                cursor,
+                &substitution.target,
+                &substitution.operator,
+                &substitution.source,
+            ) else {
                 continue;
-            }
+            };
             if substitution.output {
                 let path = self.empty_process_substitution_temp()?;
                 let word_form = self.process_substitution_output_fd_word(&path);
@@ -731,7 +775,8 @@ impl Executor {
                     word_form.clone(),
                     substitution.source,
                 );
-                word = word.replacen(&substitution.target, &word_form, 1);
+                word.replace_range(start..end, &word_form);
+                cursor = start + word_form.len();
             } else {
                 let Some(output) = self.process_substitution_output_bytes(&substitution.source)
                 else {
@@ -739,7 +784,8 @@ impl Executor {
                 };
                 self.write_process_substitution_temp_bytes(&output)?;
                 let word_form = self.process_substitution_fd_word(&output);
-                word = word.replacen(&substitution.target, &word_form, 1);
+                word.replace_range(start..end, &word_form);
+                cursor = start + word_form.len();
             }
         }
         Ok(word)
@@ -758,7 +804,22 @@ impl Executor {
             crate::parser::WordMetadata::new(0, value.to_string(), value.to_string())
                 .process_substitutions;
 
+        let mut cursor = 0usize;
         for substitution in substitutions {
+            // rubash#1561: same splice search as the raw channel — the
+            // cooked word still carries the span verbatim while the
+            // metadata target is the re-print, so a plain replacen
+            // missed and the literal span survived into the stored
+            // value. Registration still happens on a total miss (the
+            // historical cooked-pass behavior); only the splice is
+            // conditional on locating the span.
+            let range = Self::assignment_procsub_splice_range(
+                &word,
+                cursor,
+                &substitution.target,
+                &substitution.operator,
+                &substitution.source,
+            );
             if substitution.output {
                 let path = self.empty_process_substitution_temp()?;
                 let word_form = self.process_substitution_output_fd_word(&path);
@@ -766,7 +827,10 @@ impl Executor {
                     word_form.clone(),
                     substitution.source,
                 );
-                word = word.replacen(&substitution.target, &word_form, 1);
+                if let Some((start, end)) = range {
+                    word.replace_range(start..end, &word_form);
+                    cursor = start + word_form.len();
+                }
             } else {
                 let Some(output) = self.process_substitution_output_bytes(&substitution.source)
                 else {
@@ -774,7 +838,10 @@ impl Executor {
                 };
                 self.write_process_substitution_temp_bytes(&output)?;
                 let word_form = self.process_substitution_fd_word(&output);
-                word = word.replacen(&substitution.target, &word_form, 1);
+                if let Some((start, end)) = range {
+                    word.replace_range(start..end, &word_form);
+                    cursor = start + word_form.len();
+                }
             }
         }
         Ok(word)
