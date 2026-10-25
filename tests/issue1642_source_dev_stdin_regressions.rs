@@ -168,6 +168,34 @@ fn issue1642_source_dev_stdin_missing_file_never_reads_process_stdin() {
 }
 
 #[test]
+fn issue1642_source_dev_stdin_explicit_redirect_wins_over_pipe() {
+    // Shape incorporated tests-only from the single-issue PR #1685 per
+    // the 2026-10-26 fd-source ruling: the process stdin is a pipe, but
+    // the command carries its own here-string — the explicit fd-0
+    // redirection wins over the piped input (GNU: redir.c binds fd 0
+    // before the builtin runs).
+    let dir = tempdir("redirwins");
+    let run = rubash_c_with_stdin(
+        "source /dev/stdin <<< 'echo FROMREDIR'; echo \"rc=$?\"",
+        &dir,
+        "echo FROMPIPE\n",
+    );
+    assert_eq!(run.stdout, "FROMREDIR\nrc=0\n", "stderr: {}", run.stderr);
+    assert_eq!(run.code, Some(0));
+}
+
+#[test]
+fn issue1642_source_dev_fd0_alias_here_string() {
+    // Shape incorporated tests-only from the single-issue PR #1685 per
+    // the 2026-10-26 fd-source ruling: /dev/fd/0 is an alias spelling of
+    // the same fd-0 binding and must behave like /dev/stdin.
+    let dir = tempdir("fd0alias");
+    let run = rubash_c("source /dev/fd/0 <<< 'echo FD0'; echo \"rc=$?\"", &dir);
+    assert_eq!(run.stdout, "FD0\nrc=0\n", "stderr: {}", run.stderr);
+    assert_eq!(run.code, Some(0));
+}
+
+#[test]
 fn issue1642_source_plain_file_control() {
     let dir = tempdir("plain");
     seed_source_file(&dir);
