@@ -1207,6 +1207,24 @@ where
         for name in &drop_nameref_attrs {
             unmark_typed(variables, NAMEREF_VARS, name);
         }
+        // GNU variables.c:5819/5919 sv_path -> phash_flush (rubash#1551):
+        // a declare/typeset/local operand naming PATH reaches a bind (or
+        // the value-less make-variable path) and empties the command
+        // hash table — verified oracle for `declare PATH=/x`,
+        // `declare PATH`, and `local PATH` alike. The print path above
+        // is display-only and excluded (declare -p PATH keeps the
+        // table), as are attribute-only setattr operations.
+        let names_path = names.iter().any(|operand| {
+            let base = operand
+                .split_once('=')
+                .map(|(base, _)| base)
+                .unwrap_or(operand)
+                .trim_end_matches('+');
+            base.split('[').next().unwrap_or(base) == "PATH"
+        });
+        if names_path {
+            crate::builtins::hash::flush_command_hash_table(variables);
+        }
     }
 
     // GNU declare.def:373-380: with no operands, no -p, and no minus-form

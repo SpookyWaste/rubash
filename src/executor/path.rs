@@ -34,12 +34,19 @@ struct CommandLookupCache {
     results: HashMap<String, Option<PathBuf>>,
     /// Entries mirrored from the user-visible hash table (`hash -p`,
     /// BASH_CMDS assignment — set_command_lookup_cache). GNU keeps these
-    /// in hashed_filenames (findcmd.c phash_search), a table that a PATH
-    /// change does NOT flush — only `hash -r`/`hash -d` remove entries —
-    /// so the fingerprint reset that invalidates PATH-scan results must
-    /// not discard them (rubash#1137: a `hash -p` entry inserted before
-    /// the first PATH scan vanished when the scan initialized the
-    /// fingerprint, and the registered command never executed).
+    /// in hashed_filenames (findcmd.c phash_search). The fingerprint
+    /// reset that invalidates PATH-scan results must not discard them
+    /// (rubash#1137: a `hash -p` entry inserted before the first PATH
+    /// scan vanished when the scan initialized the fingerprint, and the
+    /// registered command never executed) — but a PATH *bind* must:
+    /// variables.c:5819 registers sv_path for PATH and sv_path
+    /// (variables.c:5919) is exactly hashcmd.c:57 phash_flush, so every
+    /// PATH assignment empties the whole table (rubash#1551). That
+    /// flush is an explicit bind-time action in the owning shell state
+    /// (builtins::hash::flush_command_hash_table clears the state's
+    /// table and calls flush_command_lookup_cache_hashed below); it
+    /// cannot ride the fingerprint reset because interleaved executor
+    /// states share this process-global cache.
     hashed: HashMap<String, Option<PathBuf>>,
     /// File-name listing per physical PATH directory. Replaces the PATH x
     /// PATHEXT per-candidate stat grid with one read_dir per directory
@@ -99,6 +106,57 @@ fn command_lookup_cache() -> &'static Mutex<CommandLookupCache> {
     })
 }
 
+/// Forget only the hash-table mirror entries (the `hashed` map).
+///
+/// GNU sv_path (variables.c:5919, fired by every PATH bind/unbind) is
+/// hashcmd.c:57 phash_flush: the remembered locations die, while PATH
+/// scanning itself is untouched. The scan stores here stay in place —
+/// they are fingerprint-guarded, so results computed under the old PATH
+/// are dropped by the next lookup's reset anyway (rubash#1551).
+pub(crate) fn flush_command_lookup_cache_hashed() {
+    let mut cache = command_lookup_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.hashed.clear();
+}
+
+/// RAII bracket for an in-process fork boundary (pipeline element,
+/// command substitution, `( )` subshell): snapshot the hash-table
+/// mirror on creation, restore it on drop.
+///
+/// GNU forks those children (execute_cmd.c:2620 execute_pipeline,
+/// subst.c:7143 command_substitute, execute_cmd.c:1576
+/// execute_in_subshell), so the child's hash-table writes — `hash -p`
+/// inserts and sv_path flushes alike — never reach the parent's table.
+/// Rubash runs the children in place on a shared executor and the
+/// mirror is process-global, so without this bracket a child's
+/// `PATH=` bind would flush the parent's remembered locations and a
+/// child's `hash -p` would leak into them (rubash#1551). The owning
+/// state's `__RUBASH_HASH_TABLE` env entry is already cloned/restored
+/// by the boundary's own state snapshot; this guard covers the mirror.
+/// Same guard shape as builtins::kill::sigpipe_block_guard.
+pub(crate) struct HashedCacheForkGuard {
+    saved: HashMap<String, Option<PathBuf>>,
+}
+
+pub(crate) fn hashed_cache_fork_guard() -> HashedCacheForkGuard {
+    let cache = command_lookup_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    HashedCacheForkGuard {
+        saved: cache.hashed.clone(),
+    }
+}
+
+impl Drop for HashedCacheForkGuard {
+    fn drop(&mut self) {
+        let mut cache = command_lookup_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.hashed = std::mem::take(&mut self.saved);
+    }
+}
+
 /// Forget all remembered command locations (`hash -r`, tests).
 pub(crate) fn clear_command_lookup_cache() {
     let mut cache = command_lookup_cache()
@@ -136,13 +194,17 @@ pub(crate) fn set_command_lookup_cache(name: &str, path: Option<PathBuf>) {
     let mut cache = command_lookup_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if cache.results.len() >= 4096 {
-        cache.results.clear();
+    if cache.hashed.len() >= 4096 {
+        cache.hashed.clear();
     }
-    cache.results.insert(name.to_string(), path.clone());
-    // Mirror into the hash-table map: this setter is the hash table's
-    // write path (`hash -p`, BASH_CMDS), whose entries outlive PATH-scan
-    // fingerprint resets (rubash#1137).
+    // This setter is the hash table's write path (`hash -p`, BASH_CMDS),
+    // so the entry belongs ONLY in the hash-table mirror, whose entries
+    // outlive PATH-scan fingerprint resets (rubash#1137). It must not
+    // also land in `results`: that map is fingerprint-keyed PATH-scan
+    // evidence, and a hash-table entry is not a scan result — the copy
+    // outlived phash_flush (a PATH bind clears the mirror) whenever the
+    // fingerprint later coincided, resurrecting a flushed entry
+    // (rubash#1551).
     cache.hashed.insert(name.to_string(), path);
 }
 

@@ -3384,6 +3384,9 @@ impl Executor {
         // while the shell survives.
         #[cfg(unix)]
         let _sigpipe_block = crate::builtins::kill::sigpipe_block_guard();
+        // rubash#1551: a pipeline element is a forked child (see the
+        // RANDOM bracket below) — its hash-table writes stay inside it.
+        let _hashed_fork = crate::executor::path::hashed_cache_fork_guard();
         // `|&` → trailing `2>&1` (parse.y:1470-1487; normalize_pipeerr_stage).
         // execute_simple_pipeline already normalized every gathered stage;
         // this idempotent pass covers the recursion entry points that bypass

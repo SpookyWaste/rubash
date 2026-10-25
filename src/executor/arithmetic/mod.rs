@@ -4262,6 +4262,10 @@ fn arith_parse_cache_exec_post_inc(
     env_vars.insert(var.to_string(), new_value.clone());
     record_arith_write(var, old_value);
     sync_shell_assignment_process_env(env_vars, var, &new_value);
+    // GNU variables.c:5819/5919 sv_path -> phash_flush (rubash#1551).
+    if var == "PATH" {
+        crate::builtins::hash::flush_command_hash_table(env_vars);
+    }
     Some(current)
 }
 
@@ -4318,6 +4322,10 @@ fn arith_parse_cache_exec_add_assign(
     env_vars.insert(dst.to_string(), new_value.clone());
     record_arith_write(dst, old_value);
     sync_shell_assignment_process_env(env_vars, dst, &new_value);
+    // GNU variables.c:5819/5919 sv_path -> phash_flush (rubash#1551).
+    if dst == "PATH" {
+        crate::builtins::hash::flush_command_hash_table(env_vars);
+    }
     // `((x+=i))` evaluates to the NEW value, unlike PostInc's old value.
     Some(updated)
 }

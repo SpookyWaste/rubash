@@ -643,6 +643,10 @@ impl Executor {
         // snapshot/restore (issue #67: `x=$(echo $((b)))` under `set -u`
         // prints the diagnostic, leaves x empty, keeps running).
         let saved_state = self.shell_state.snapshot_interior();
+        // rubash#1551: the fork bracket also covers the process-global
+        // hash-table mirror — the child's `hash -p` writes and PATH-bind
+        // flushes must not reach the parent's remembered locations.
+        let _hashed_fork = crate::executor::path::hashed_cache_fork_guard();
         // rubash#403: subshell_depth is NOT bumped here. GNU increments
         // subshell_level exactly once per substitution — in the CHILD
         // (execute_in_subshell; variables.c get_bash_subshell reads the

@@ -727,6 +727,14 @@ impl Executor {
                 self.shell_state.env_vars.remove(&name);
                 crate::executor::local_helpers::unset_process_env(&name);
             }
+            // GNU variables.c:5819/5919 sv_path -> phash_flush
+            // (rubash#1551): reinstalling the saved PATH binding is a
+            // re-bind — locations remembered under the temp value die
+            // with the restore (verified oracle: after `PATH=/tmp/pb
+            // /usr/bin/true` the hash table is empty).
+            if name == "PATH" {
+                crate::builtins::hash::flush_command_hash_table(&mut self.shell_state.env_vars);
+            }
             self.restore_typed_temporary_value(&name, typed_value);
             // GNU variables.c pop_scope: the saved variable object — value
             // AND attributes — is reinstalled when the tempenv pops, so an

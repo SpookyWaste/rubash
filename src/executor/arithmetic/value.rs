@@ -688,6 +688,11 @@ impl ConditionalArithParser<'_> {
                         self.env_vars.insert(name.to_string(), value.clone());
                         super::super::record_arith_write(name, old_value);
                         sync_shell_assignment_process_env(self.env_vars, name, &value);
+                        // rubash#1551 sv_path: initializing a nameref
+                        // cell named PATH is still a PATH bind.
+                        if name == "PATH" {
+                            crate::builtins::hash::flush_command_hash_table(self.env_vars);
+                        }
                     } else {
                         self.env_vars
                             .insert("__RUBASH_ARITH_NAMEREF_ERROR".to_string(), value);
@@ -747,6 +752,11 @@ impl ConditionalArithParser<'_> {
         // rule as sync_shell_assignment_process_env. `i++` in a for-update
         // paid a Win32 SetEnvironmentVariable per iteration.
         sync_shell_assignment_process_env(self.env_vars, name, &value);
+        // GNU variables.c:5819/5919 sv_path -> phash_flush (rubash#1551):
+        // an arithmetic bind of PATH is a bind.
+        if name == "PATH" {
+            crate::builtins::hash::flush_command_hash_table(self.env_vars);
+        }
     }
 
     pub(super) fn set_array_element(&mut self, name: &str, index: i128, value: i128) {

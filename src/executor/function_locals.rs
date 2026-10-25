@@ -384,6 +384,15 @@ impl Executor {
             }
             set_var_attrs(&mut self.shell_state.env_vars, &name, restored_attrs);
             remove_local_export_env_value(&mut self.shell_state.env_vars, &name);
+            // GNU variables.c:5819/5919 sv_path -> phash_flush
+            // (rubash#1551): popping a frame reinstalls the saved PATH
+            // binding (or unbinds it), which is a bind like any other —
+            // locations remembered under the local value die here
+            // (verified oracle: a caller's entries do not survive a
+            // function that declared PATH local).
+            if name == "PATH" {
+                crate::builtins::hash::flush_command_hash_table(&mut self.shell_state.env_vars);
+            }
         }
         for (name, variable) in typed_scope {
             self.shell_state.variables.remove(&name);
