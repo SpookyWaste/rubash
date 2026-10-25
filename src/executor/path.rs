@@ -355,6 +355,28 @@ pub(crate) fn path_is_unset(env_vars: &HashMap<String, String>) -> bool {
 }
 
 pub fn find_user_command(name: &str, env_vars: &HashMap<String, String>) -> Option<PathBuf> {
+    find_user_command_impl(name, env_vars, true)
+}
+
+/// The `command -p` execution lookup (rubash#1648). GNU findcmd.c
+/// search_for_command: a lookup under the default/standard path
+/// (CDESC_STDPATH, set by `command -p` since bash 5.2) walks that path
+/// only and never consults the command hash table (phash_search) — a
+/// name planted with `hash -p /bin/false myls` must NOT resolve through
+/// `command -p myls` (oracle: `command not found`, status 127), while a
+/// plain `command myls` still runs the hashed path.
+pub fn find_user_command_ignoring_hash(
+    name: &str,
+    env_vars: &HashMap<String, String>,
+) -> Option<PathBuf> {
+    find_user_command_impl(name, env_vars, false)
+}
+
+fn find_user_command_impl(
+    name: &str,
+    env_vars: &HashMap<String, String>,
+    consult_hash_table: bool,
+) -> Option<PathBuf> {
     if name.is_empty() {
         return None;
     }
@@ -400,17 +422,21 @@ pub fn find_user_command(name: &str, env_vars: &HashMap<String, String>) -> Opti
         // hashed_filenames (phash_search) before any PATH walk, and the
         // hash table survives PATH changes — consult the mirrored
         // hash-table entries first, even right after a fingerprint reset
-        // (rubash#1137).
-        if let Some(result) = cache.hashed.get(name).cloned() {
-            if let Some(path) = &result {
-                if crate::builtins::shopt::checkhash_enabled() && !cached_path_still_valid(path) {
-                    cache.hashed.remove(name);
-                    cache.results.remove(name);
+        // (rubash#1137). A `command -p` lookup (rubash#1648) skips this
+        // consult entirely: its stdpath walk below is the whole lookup.
+        if consult_hash_table {
+            if let Some(result) = cache.hashed.get(name).cloned() {
+                if let Some(path) = &result {
+                    if crate::builtins::shopt::checkhash_enabled() && !cached_path_still_valid(path)
+                    {
+                        cache.hashed.remove(name);
+                        cache.results.remove(name);
+                    } else {
+                        return Some(path.clone());
+                    }
                 } else {
-                    return Some(path.clone());
+                    return None;
                 }
-            } else {
-                return None;
             }
         }
         if cache.fingerprint == fingerprint {
