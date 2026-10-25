@@ -11,8 +11,7 @@ pub(super) fn parse_conditional_command(
         return None;
     }
 
-    let end = matching_conditional_end(tokens, start)?;
-    let merged_args = merge_pattern_rhs_fragments(collect_conditional_args(tokens, start + 1, end));
+    let (end, merged_args) = conditional_end_and_args(tokens, start)?;
     let arg_parts: Vec<(String, String)> = merged_args
         .iter()
         .map(|(value, raw, _, _)| (value.clone(), raw.clone()))
@@ -401,9 +400,14 @@ fn walk_back_near_token(args: &[CondArg], index: usize) -> String {
     // character (a single `&' or `|') BEGINS GNU's reported token — the
     // error_token_from_text scan cannot cross a break character
     // backwards, so glued predecessors stay out (`a&b' reports `&b',
-    // not `a&b'; `-n x&y' reports `&y').
+    // not `a&b'; `-n x&y' reports `&y'). The `;' separator is the same
+    // break-led shape (rubash#1537): `[[ a =~ (b)]]; ...' trips on the
+    // `;' after the absorbed regex word and GNU reports near `;'',
+    // never the glued run `(b)]];'.
     let offender_raw = &args[orig].1;
-    let break_led = (offender_raw.starts_with('&') || offender_raw.starts_with('|'))
+    let break_led = (offender_raw.starts_with('&')
+        || offender_raw.starts_with('|')
+        || offender_raw.starts_with(';'))
         && offender_raw != "&&"
         && offender_raw != "||";
     if !break_led {
@@ -1257,27 +1261,64 @@ fn strip_conditional_quote_markers(value: &str) -> String {
     value.replace(crate::executor::markers::CTLESC, "")
 }
 
-fn matching_conditional_end(tokens: &[Token], start: usize) -> Option<usize> {
-    // GNU parse.y:5443-5460 read_token_word under PST_REGEXP: after `=~'
-    // an unquoted `(' consumes its balanced `(...)' group into the regex
-    // word (parse_matched_pair), and a cond grouping `(' (parse.y:5166
-    // `cond_term: '(' cond_expr ')') does the same — so a `]]' inside an
-    // open group is regex data, not the conditional terminator
-    // (`[[ a =~ ( ]]<>;&) ]]' ends at the FINAL `]]', rubash#222). A
-    // quoted/escaped paren (raw != value) never opens a group
-    // (parse.y:5417 shellquote runs before the `(' special case).
+/// The `]]' candidates for the conditional's end, in stream order: a
+/// `]]' token at paren depth 0. GNU parse.y:5443-5460 read_token_word
+/// under PST_REGEXP: after `=~' an unquoted `(' consumes its balanced
+/// `(...)' group into the regex word (parse_matched_pair), and a cond
+/// grouping `(' (parse.y:5166 `cond_term: '(' cond_expr ')') does the
+/// same — so a `]]' inside an open group is regex data, not the
+/// conditional terminator (`[[ a =~ ( ]]<>;&) ]]' ends at the FINAL
+/// `]]', rubash#222). A quoted/escaped paren (raw != value) never opens
+/// a group (parse.y:5417 shellquote runs before the `(' special case).
+fn conditional_end_candidates(tokens: &[Token], start: usize) -> Vec<usize> {
     let mut depth = 0isize;
-    (start + 1..tokens.len()).find(|&index| {
+    let mut candidates = Vec::new();
+    for index in start + 1..tokens.len() {
         let token = &tokens[index];
         if token.kind == TokenKind::Keyword && token.raw == "(" && token.value == "(" {
             depth += 1;
         } else if token.kind == TokenKind::Keyword && token.raw == ")" && token.value == ")" {
             depth = (depth - 1).max(0);
-        } else {
-            return token.raw == "]]" && depth == 0;
+        } else if token.raw == "]]" && depth == 0 {
+            candidates.push(index);
         }
-        false
-    })
+    }
+    candidates
+}
+
+/// Find the conditional's real end and the merged argument list for it.
+///
+/// A depth-0 `]]' is only a CANDIDATE: GNU's reader delivers COND_END
+/// for a `]]' that starts a token, but a `]]' reached while a word is
+/// still being read is word text — read_token_word (parse.y:5443-5461)
+/// keeps consuming after parse_matched_pair returns, and `]' is not a
+/// shell break character, so `[[ a =~ (b)]]' has NO closer at that
+/// `]]': the regex word is `(b)]]' (rubash#1537). rubash's lexer emits
+/// the glued `]]' as its own token (its scan restarts after the `)'
+/// fragment), so candidacy is verified with the same word model the
+/// parse itself uses: collect and merge the arguments up to the
+/// candidate — if the merged list's last argument is exactly the
+/// candidate's standalone `]]', the candidate is the end; if the merge
+/// absorbed it into a right-hand-side word, the reader is still inside
+/// that word and the next candidate (if any) gets its chance. No
+/// surviving candidate means the conditional is unclosed and the
+/// caller falls back to the EOF diagnostic path.
+fn conditional_end_and_args(tokens: &[Token], start: usize) -> Option<(usize, Vec<CondArg>)> {
+    for end in conditional_end_candidates(tokens, start) {
+        let merged = merge_pattern_rhs_fragments(collect_conditional_args(tokens, start + 1, end));
+        // The collected arguments always end with the candidate token's
+        // own text (collection never drops a token), so a standalone
+        // closer is recognizable as a final argument that is exactly
+        // the `]]' token: same value/raw and the candidate's own line.
+        // An absorbed `]]' instead sits inside a longer merged word.
+        let survives = merged.last().is_some_and(|(value, raw, _, line)| {
+            value == "]]" && raw == "]]" && *line == tokens[end].position
+        });
+        if survives {
+            return Some((end, merged));
+        }
+    }
+    None
 }
 
 /// Unclosed `[[` (no `]]` in the token stream): collect the rest of the
