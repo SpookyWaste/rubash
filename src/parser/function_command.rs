@@ -68,6 +68,28 @@ pub(super) fn parse_function_command_with_diagnostic(
     // `name() { ...; }` and `function name { ...; }` forms onto a function
     // command node.
     let keyword_form = is_keyword(tokens, start, "function");
+    // Probe admission: this parser is tried at every command start, and
+    // almost every probe is an ordinary simple command. A non-`function`
+    // definition can only begin with a `<(...)' name (RedirectIn `<'
+    // directly followed by `('), a `!!' name (Keyword `!'), or a name
+    // token directly followed by `()' / `(' — every other entry walks
+    // the reassemblies and name checks below only to return None (after
+    // cloning the candidate name). Bail before that walk when none of
+    // the three shapes is present; the shapes admitted here are exactly
+    // the ones the code below can answer Some for (GNU parse.y
+    // function_def: WORD '(' ')' | `function' WORD ['(' ')']).
+    if !keyword_form {
+        let paren_follows = tokens
+            .get(start + 1)
+            .is_some_and(|token| token.value == "(" || token.value == "()");
+        let group_follows = tokens.get(start).is_some_and(|token| {
+            (token.kind == TokenKind::RedirectIn && token.value == "<")
+                || (token.kind == TokenKind::Keyword && token.value == "!")
+        });
+        if !paren_follows && !group_follows {
+            return None;
+        }
+    }
     // GNU parse.y function_def: `function' must be followed by a WORD
     // name. A bare `function' — at end of input, before a newline, or
     // before a hard `;' — is a syntax error at that token, never a
