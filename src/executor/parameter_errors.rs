@@ -1887,23 +1887,48 @@ impl Executor {
             }
             if let Some((name, offset, Some(length))) = self.parse_parameter_substring(inner) {
                 if length < 0 {
-                    // GNU subst.c:8482: for VT_POSPARMS (@/*) and VT_ARRAYVAR
-                    // (array[@]/array[*]), a negative length is unconditionally
-                    // an error. For scalar variables, the length is adjusted
-                    // by the string length and only errors if still negative.
-                    let is_pospar_or_array = matches!(name, "@" | "*")
-                        || name
-                            .strip_suffix("[@]")
-                            .or_else(|| name.strip_suffix("[*]"))
-                            .is_some();
-                    let is_invalid = is_pospar_or_array
-                        || self.parameter_error_value(name).is_some_and(|value| {
+                    // GNU subst.c:8395 verify_substring_values, reached from
+                    // parameter_brace_substring (subst.c:9050) only when the
+                    // parameter's value is non-NULL: a negative length is an
+                    // unconditional error for VT_POSPARMS (@/*) and for
+                    // VT_ARRAYVAR. The [@]/[*] spelling alone does NOT make
+                    // the operand an array — get_var_and_type resolves a
+                    // scalar base to VT_VARIABLE, so the length is adjusted
+                    // by the string length and errors only when the adjusted
+                    // end still precedes the start (rubash#1600). An unset
+                    // base (either spelling) and an array with no elements
+                    // take parameter_brace_substring's early NULL return and
+                    // never error.
+                    let array_form_base = name
+                        .strip_suffix("[@]")
+                        .or_else(|| name.strip_suffix("[*]"));
+                    let is_invalid = if matches!(name, "@" | "*") {
+                        true
+                    } else if let Some(base) = array_form_base {
+                        if self.parameter_is_array_variable(base) {
+                            // VT_ARRAYVAR: error exactly when the array
+                            // has elements (its operator value is Some).
+                            self.parameter_operator_value(name).is_some()
+                        } else {
+                            // Scalar (or unset) base under [@]/[*]:
+                            // VT_VARIABLE rules over the base's own value.
+                            self.parameter_error_value(base).is_some_and(|value| {
+                                parameter_substring_has_negative_result(
+                                    value.chars().count(),
+                                    offset,
+                                    length,
+                                )
+                            })
+                        }
+                    } else {
+                        self.parameter_error_value(name).is_some_and(|value| {
                             parameter_substring_has_negative_result(
                                 value.chars().count(),
                                 offset,
                                 length,
                             )
-                        });
+                        })
+                    };
                     if is_invalid {
                         return Some((
                             length.to_string(),

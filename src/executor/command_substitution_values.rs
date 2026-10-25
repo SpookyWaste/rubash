@@ -583,11 +583,7 @@ impl Executor {
         if let Some(base) = var_name.strip_suffix("[@]") {
             if is_shell_name(base) {
                 return self
-                    .array_subscript_range_values(
-                        base,
-                        offset,
-                        length.and_then(|length| usize::try_from(length).ok()),
-                    )
+                    .array_subscript_range_values(base, offset, length)
                     .unwrap_or_default();
             }
         }
