@@ -2348,6 +2348,46 @@ type TokenizePass = (
     bool,
 );
 
+/// GNU parse.y:3286 `time_command_acceptable()`, consulted from
+/// `CHECK_FOR_RESERVED_WORD` (parse.y:3179) at the moment the `time`
+/// token is read: when POSIX mode is in effect for the reader unit
+/// being read AND the next token in the current input line begins with
+/// `-`, `time` is not returned as the TIME reserved word (POSIX interp
+/// 267). The decision belongs to read time, under the mode the unit
+/// STARTED under — a `set -o posix` executed later in the same unit
+/// cannot reach back into it (rubash#1520). Freeze it into the token
+/// stream here, in the feeder's two pass engines (the sole producers
+/// of command token streams): under a POSIX pass, a keyword `time`
+/// directly followed by a dash word is reclassified as a plain word,
+/// which every downstream consumer already honours — the parser's
+/// `is_keyword` folds stay closed and the recorded `word_kinds[0]`
+/// tells the executor the head was an ordinary command name. The
+/// rubash#1218 execution-time recheck consulted the LIVE mode and so
+/// let a same-unit `set` leak into the decision.
+fn freeze_posix_time_dash_tokens(tokens: &mut [Token], posix: bool) {
+    if !posix {
+        return;
+    }
+    for index in 0..tokens.len() {
+        let is_time_keyword =
+            tokens[index].kind == TokenKind::Keyword && tokens[index].value == "time";
+        if !is_time_keyword {
+            continue;
+        }
+        // GNU's peek is character-level over the raw input line: skip
+        // blanks, then look at the next character. The next token's raw
+        // spelling is exactly that character run — a quoted or escaped
+        // dash (`'-p'`, `\-p`) does NOT trigger the rule, an unquoted
+        // one does, however short (`time -` included).
+        let dash_follows = tokens
+            .get(index + 1)
+            .is_some_and(|next| next.kind == TokenKind::Word && next.raw.starts_with('-'));
+        if dash_follows {
+            tokens[index].kind = TokenKind::Word;
+        }
+    }
+}
+
 fn tokenize_plain(
     input: &str,
     posix: bool,
@@ -2366,6 +2406,7 @@ fn tokenize_plain(
         }
         tokens.push(token);
     }
+    freeze_posix_time_dash_tokens(&mut tokens, posix);
     *parse_state = lexer.take_parse_state();
     let boundary = lexer.boundary_state();
     let opener = lexer
@@ -2403,6 +2444,11 @@ fn tokenize_resume_from(
         }
         tokens.push(token);
     }
+    // The checkpointed prefix came from an earlier pass over this same
+    // logical line under this same mode (a mode flip invalidates the
+    // checkpoints), so re-applying the freeze is idempotent; it also
+    // covers a `time` / dash pair straddling the resume offset.
+    freeze_posix_time_dash_tokens(&mut tokens, posix);
     *parse_state = lexer.take_parse_state();
     let boundary = lexer.boundary_state();
     let opener = lexer

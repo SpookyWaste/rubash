@@ -529,6 +529,9 @@ impl Executor {
         }
         // rubash#1218: posix mode + dash word — not the time keyword;
         // decline the shortcut so the body runs as an ordinary command.
+        // The live mode is correct HERE (unlike the node-based sites,
+        // rubash#1520): these words were split from the substitution
+        // body text at this moment, so this body's parse time is now.
         if posix_time_dash_word(words, self.posix_mode_enabled()) {
             return None;
         }

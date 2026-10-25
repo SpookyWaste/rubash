@@ -420,6 +420,16 @@ pub struct TimeCommand {
     pub command: Box<CommandNode>,
     pub posix_format: bool,
     pub inverted: bool,
+    /// rubash#1520: the parse-time-frozen #1218 verdict — true when the
+    /// `time` head was NOT the reserved word for this node (POSIX mode
+    /// in effect for the reader unit and a dash word followed, GNU
+    /// parse.y:3286 `time_command_acceptable`). Parser folds only build
+    /// a TimeCommand from a recorded keyword head, so they set false;
+    /// the executor-side alias reparse, whose parse moment is the
+    /// execution moment, records the then-live verdict instead. The
+    /// executor must never re-derive this from the live mode: a `set`
+    /// earlier in the same unit may have flipped it after parsing.
+    pub keyword_was_plain_word: bool,
 }
 
 /// Represents `command &`.
@@ -1145,6 +1155,16 @@ pub struct CommandNode {
     /// Lexer kind for each command word, used for quote-sensitive expansion
     /// decisions while the parser still stores words as strings.
     pub word_kinds: Vec<TokenKind>,
+    /// rubash#1520: parse-time-frozen #1218 verdict for a `time` head —
+    /// true when the first word was recorded as a plain word (quoted, or
+    /// reclassified by the lexer under a POSIX pass because a dash word
+    /// followed, GNU parse.y:3286 `time_command_acceptable`), i.e. the
+    /// command is an ordinary external command named `time`. Stamped by
+    /// the parser when the head word is recorded; carried on the node
+    /// itself because execution-time word expansion rebuilds `words` and
+    /// clears `word_kinds`. Never re-derived from the live mode: a `set`
+    /// earlier in the same reader unit may have flipped it after parsing.
+    pub time_head_plain_word: bool,
     /// Variable assignments
     pub assignments: Vec<(String, String)>,
     /// Raw (source-text) RHS of each assignment, index-aligned with
@@ -1317,6 +1337,7 @@ impl CommandNode {
             words: Vec::new(),
             word_metadata: Vec::new(),
             word_kinds: Vec::new(),
+            time_head_plain_word: false,
             assignments: Vec::new(),
             assignment_raws: Vec::new(),
             compound_assignments: Vec::new(),
