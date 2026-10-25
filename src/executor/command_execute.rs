@@ -120,9 +120,16 @@ impl Executor {
                 // the rubash#720 fork-collapse this frame performs no
                 // wait-side adjudication at all (execute_cmd.c:662-663
                 // skips wait_for) — the failure is observed one frame up.
-                if !self.subshell_fork_collapse.get() {
+                // rubash#1611: the timed-dispatch depth gate is the
+                // same single-adjudication rule as in
+                // execute_materialized_command's tail.
+                if !self.subshell_fork_collapse.get() && self.timed_dispatch_depth.get() == 0 {
                     self.maybe_run_error_trap(cmd)?;
                 }
+                // rubash#1611: conversion of a completed subshell's
+                // status, not a jump out of it — mark for
+                // execute_time_ast_command's report adjudication.
+                self.errexit_status_converted.set(true);
                 return Err(ExecuteError::ExitCode(self.exit_code));
             }
             return result;
@@ -325,6 +332,9 @@ impl Executor {
             // command binds `$_` to the null string.
             self.bind_underscore("");
             if self.errexit_enabled() && self.errexit_is_active() && self.exit_code != 0 {
+                // rubash#1611: conversion of a completed command's
+                // status — mark for execute_time_ast_command.
+                self.errexit_status_converted.set(true);
                 return Err(ExecuteError::ExitCode(self.exit_code));
             }
             return Ok(());
@@ -425,7 +435,16 @@ impl Executor {
                     // command is a failed command — GNU fires the ERR
                     // trap before the ERREXIT jump; the Ok path below
                     // lets the ast_exec loop fire instead.
-                    self.maybe_run_error_trap(&cmd)?;
+                    // rubash#1611: inside a timed dispatch the ERR trap
+                    // is adjudicated once by the ast_exec time branch
+                    // (rubash#1277) — firing here too would double it.
+                    if self.timed_dispatch_depth.get() == 0 {
+                        self.maybe_run_error_trap(&cmd)?;
+                    }
+                    // rubash#1611: the command completed (with a
+                    // redirection failure status) — mark the conversion
+                    // for execute_time_ast_command.
+                    self.errexit_status_converted.set(true);
                     return Err(ExecuteError::ExitCode(1));
                 }
                 Ok(())
@@ -721,14 +740,20 @@ impl Executor {
                     .next()
                     .and_then(|value| value.parse::<usize>().ok())
                     .unwrap_or(1);
-                eprintln!(
-                    "{}warning: here-document at line {at_line} delimited by end-of-file (wanted `{delimiter}')",
-                    self.error_prefix_for_line(warn_line)
+                self.write_diagnostic_fd2(
+                    format!(
+                        "{}warning: here-document at line {at_line} delimited by end-of-file (wanted `{delimiter}')\n",
+                        self.error_prefix_for_line(warn_line)
+                    )
+                    .as_bytes(),
                 );
             }
-            eprintln!(
-                "{}syntax error near unexpected token `{token}'",
-                self.parser_error_prefix_for_line(line)
+            self.write_diagnostic_fd2(
+                format!(
+                    "{}syntax error near unexpected token `{token}'\n",
+                    self.parser_error_prefix_for_line(line)
+                )
+                .as_bytes(),
             );
             // GNU error.c:324-327: with exit_immediately_on_error live, the
             // offending-line echo (parse.y:6814 print_offending_line) never
@@ -744,7 +769,10 @@ impl Executor {
             // parse.y:6865: no offending-line echo in an interactive shell.
             if self.offending_line_echo_enabled() {
                 if let Some(source) = cmd.get_assignment("__RUBASH_PARSE_SOURCE__") {
-                    eprintln!("{}`{}'", self.parser_error_prefix_for_line(line), source);
+                    self.write_diagnostic_fd2(
+                        format!("{}`{}'\n", self.parser_error_prefix_for_line(line), source)
+                            .as_bytes(),
+                    );
                 }
             }
             self.exit_code = 2;
@@ -757,9 +785,12 @@ impl Executor {
             // file" at the end-of-input line, with no token echo.
             self.mark_parse_error();
             let eof_line = cmd.line.map(|line| line + 1).unwrap_or(1);
-            eprintln!(
-                "{}syntax error: unexpected end of file",
-                self.parser_error_prefix_for_line(eof_line)
+            self.write_diagnostic_fd2(
+                format!(
+                    "{}syntax error: unexpected end of file\n",
+                    self.parser_error_prefix_for_line(eof_line)
+                )
+                .as_bytes(),
             );
             // Single-line parser_error: GNU error.c:324-327 still
             // exit_shell(2)s right after it under live errexit — record
@@ -853,9 +884,12 @@ impl Executor {
                     // Report only the fatal, at the offending line.
                     if let Some(line) = crate::lexer::heredoc_overflow_line() {
                         self.mark_parse_error();
-                        eprintln!(
-                            "{}maximum here-document count exceeded",
-                            self.parser_error_prefix_for_line(line)
+                        self.write_diagnostic_fd2(
+                            format!(
+                                "{}maximum here-document count exceeded\n",
+                                self.parser_error_prefix_for_line(line)
+                            )
+                            .as_bytes(),
                         );
                         self.exit_code = 2;
                         return Err(ExecuteError::ExitCode(2));
@@ -883,9 +917,12 @@ impl Executor {
                 .any(|metadata| metadata.raw.contains('(') && unterminated_extglob(&metadata.raw))
         {
             self.mark_parse_error();
-            eprintln!(
-                "{}syntax error near unexpected token `('",
-                self.parser_error_prefix()
+            self.write_diagnostic_fd2(
+                format!(
+                    "{}syntax error near unexpected token `('\n",
+                    self.parser_error_prefix()
+                )
+                .as_bytes(),
             );
             self.exit_code = 2;
             return Err(ExecuteError::ExitCode(2));
@@ -903,9 +940,12 @@ impl Executor {
             && cmd.case_command.is_none()
         {
             self.mark_parse_error();
-            eprintln!(
-                "{}syntax error near unexpected token `('",
-                self.parser_error_prefix()
+            self.write_diagnostic_fd2(
+                format!(
+                    "{}syntax error near unexpected token `('\n",
+                    self.parser_error_prefix()
+                )
+                .as_bytes(),
             );
             self.exit_code = 2;
             return Err(ExecuteError::ExitCode(2));

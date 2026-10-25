@@ -368,6 +368,26 @@ impl Executor {
             for name in imported_funcs.keys() {
                 mark_env_name(&mut self.shell_state.env_vars, EXPORTED_FUNCTIONS, name);
             }
+            // GNU variables.c:397-446: a successfully imported function
+            // becomes a shell function, NOT a variable — strip the
+            // BASH_FUNC_* entries from the child's env map exactly as
+            // Executor::new does at process startup, or they linger as
+            // bogus variables (niubash#102 class). A failed import keeps
+            // its raw entry (GNU bind_invalid_envvar).
+            let imported_fn_env_names: Vec<String> = self
+                .shell_state
+                .env_vars
+                .values_map()
+                .keys()
+                .filter(|env_name| {
+                    imported_function_name(env_name)
+                        .is_some_and(|name| imported_funcs.contains_key(name))
+                })
+                .cloned()
+                .collect();
+            for env_name in imported_fn_env_names {
+                self.shell_state.env_vars.remove(&env_name);
+            }
             self.shell_state.functions = imported_funcs;
             self.shell_state.function_definition_redirects = HashMap::new();
             self.shell_state.function_def_infos = imported_def_infos;
@@ -848,6 +868,29 @@ impl Executor {
                     .entry(name.to_string())
                     .or_insert_with(|| value.clone());
             }
+        }
+        // GNU variables.c make_env_array_from_var_list: exported
+        // functions cross the boundary as BASH_FUNC_<name>%% entries,
+        // exactly as the real spawn path materializes them
+        // (apply_exported_functions_to_child). The fresh-shell import
+        // in execute_direct_shell_script (like Executor::new at process
+        // startup) reads them back into the function table; without
+        // them an in-process script child imported NO functions at all
+        // (rubash#1610).
+        for name in marked_env_names(&self.shell_state.env_vars, EXPORTED_FUNCTIONS) {
+            let Some(body) = self.shell_state.functions.get(&name) else {
+                continue;
+            };
+            let def_redirects = self
+                .shell_state
+                .function_def_infos
+                .get(&name)
+                .map(|info| info.def_redirects.as_slice())
+                .unwrap_or(&[]);
+            child.insert(
+                exported_function_env_name(&name),
+                exported_function_env_value(&body.commands, def_redirects),
+            );
         }
         child.insert(EXPORTED_VARS.to_string(), exported.join(DATA_DOLLAR_STR));
         child
