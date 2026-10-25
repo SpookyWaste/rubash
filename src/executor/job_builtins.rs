@@ -2772,7 +2772,7 @@ impl Executor {
             } else {
                 provider.borrow_mut().entries()?
             };
-            let status = crate::builtins::history::execute_with_history(
+            let (status, too_many_arguments) = crate::builtins::history::execute_with_history(
                 args,
                 &self.diagnostic_prefix(),
                 &entries,
@@ -2780,14 +2780,28 @@ impl Executor {
                 &mut stderr,
             )?;
             self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+            if too_many_arguments {
+                // GNU builtins/common.c no_args (rubash#1660, the
+                // #705 DISCARD class): $? is EX_BADUSAGE (2) and the
+                // rest of the current list is abandoned.
+                self.exit_code = 2;
+                self.raise_evalerror_abort();
+                self.evalerror_exit_toomany_pending.set(true);
+            }
             return Ok(status);
         }
-        let status = crate::builtins::history::execute_with_io(
+        let (status, too_many_arguments) = crate::builtins::history::execute_with_io(
             args,
             &self.diagnostic_prefix(),
             &mut stderr,
         )?;
         self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+        if too_many_arguments {
+            // Same no_args DISCARD as the provider path above.
+            self.exit_code = 2;
+            self.raise_evalerror_abort();
+            self.evalerror_exit_toomany_pending.set(true);
+        }
         Ok(status)
     }
 

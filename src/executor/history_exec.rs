@@ -197,6 +197,14 @@ pub(in crate::executor) fn execute_history_session(
                 "{}history: too many arguments",
                 executor.diagnostic_prefix()
             );
+            // GNU builtins/common.c no_args jumps to DISCARD (the
+            // comment at the top of this block): the rest of the
+            // current list is abandoned, $? is EX_BADUSAGE (2) — the
+            // status this function returns (rubash#1660, the #705
+            // machinery; the two Cells are the &Executor-reachable
+            // half of the arming trio).
+            executor.raise_evalerror_abort();
+            executor.evalerror_exit_toomany_pending.set(true);
             return Ok(2);
         }
     }

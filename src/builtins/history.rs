@@ -11,11 +11,15 @@ const EXECUTION_SUCCESS: i32 = 0;
 const EXECUTION_FAILURE: i32 = 1;
 const EX_USAGE: i32 = 2;
 
+/// Returns (status, too_many_arguments). The flag marks GNU's
+/// no_args DISCARD class (builtins/common.c): only the surplus-operand
+/// failure in the listing path sets it; every other failure is an
+/// ordinary return (rubash#1660).
 pub fn execute_with_io<E>(
     args: &[String],
     diagnostic_prefix: &str,
     stderr: &mut E,
-) -> io::Result<i32>
+) -> io::Result<(i32, bool)>
 where
     E: Write,
 {
@@ -28,7 +32,7 @@ pub fn execute_with_history<E, O>(
     entries: &[String],
     stdout: &mut O,
     stderr: &mut E,
-) -> io::Result<i32>
+) -> io::Result<(i32, bool)>
 where
     E: Write,
     O: Write,
@@ -66,7 +70,7 @@ where
                                     "{diagnostic_prefix}history: -d: option requires an argument"
                                 )?;
                                 write_usage(stderr)?;
-                                return Ok(EX_USAGE);
+                                return Ok((EX_USAGE, false));
                             }
                         }
                     } else {
@@ -75,7 +79,7 @@ where
                     break;
                 }
                 'p' | 's' => {
-                    return Ok(EXECUTION_SUCCESS);
+                    return Ok((EXECUTION_SUCCESS, false));
                 }
                 other => {
                     writeln!(
@@ -83,7 +87,7 @@ where
                         "{diagnostic_prefix}history: -{other}: invalid option"
                     )?;
                     write_usage(stderr)?;
-                    return Ok(EX_USAGE);
+                    return Ok((EX_USAGE, false));
                 }
             }
         }
@@ -96,7 +100,7 @@ where
             stderr,
             "{diagnostic_prefix}history: cannot use more than one of -anrw"
         )?;
-        return Ok(EXECUTION_FAILURE);
+        return Ok((EXECUTION_FAILURE, false));
     }
 
     // history.def:164-264: -d validates its offset or inclusive range
@@ -112,17 +116,17 @@ where
                     stderr,
                     "{diagnostic_prefix}history: {arg}: history position out of range"
                 )?;
-                return Ok(EXECUTION_FAILURE);
+                return Ok((EXECUTION_FAILURE, false));
             }
         } else if !is_valid_number(arg) {
             writeln!(stderr, "{diagnostic_prefix}history: {arg}: invalid number")?;
-            return Ok(EXECUTION_FAILURE);
+            return Ok((EXECUTION_FAILURE, false));
         }
-        return Ok(EXECUTION_SUCCESS);
+        return Ok((EXECUTION_SUCCESS, false));
     }
 
     if file_flags != 0 {
-        return Ok(EXECUTION_SUCCESS);
+        return Ok((EXECUTION_SUCCESS, false));
     }
 
     // display_history -> get_numeric_arg(list, 0, &limit): the operand is
@@ -135,11 +139,11 @@ where
                 stderr,
                 "{diagnostic_prefix}history: {arg}: numeric argument required"
             )?;
-            return Ok(EX_USAGE);
+            return Ok((EX_USAGE, false));
         }
         if args.get(index + 1).is_some() {
             writeln!(stderr, "{diagnostic_prefix}history: too many arguments")?;
-            return Ok(EX_USAGE);
+            return Ok((EX_USAGE, true));
         }
     }
 
@@ -152,7 +156,7 @@ where
         writeln!(stdout, "{:>5}  {}", number + 1, entry)?;
     }
 
-    Ok(EXECUTION_SUCCESS)
+    Ok((EXECUTION_SUCCESS, false))
 }
 
 /// builtins/common.c valid_number(): strtoimax semantics — leading
