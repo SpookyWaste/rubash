@@ -1026,11 +1026,41 @@ impl Executor {
                 let _ = std::io::stderr().write_all(line.as_bytes());
             }
         }
-        let mut stripped = cmd.clone();
-        stripped.words = cmd.words[prefix_end..].to_vec();
-        if cmd.word_metadata.len() > prefix_end {
-            stripped.word_metadata = cmd.word_metadata[prefix_end..].to_vec();
+        // rubash#1556: the parser's assignment-run classification
+        // also stops at the first array-style word, so simple
+        // assignment words FOLLOWING the stripped run are still
+        // sitting in cmd.words (`a[0]=5 b=2 declare -p b` dispatched
+        // `b=2` as the command name and reported it not found).
+        // GNU's assignment() recognizes every leading assignment
+        // word regardless of an invalid sibling: assign_in_env
+        // skips the invalid word and the remaining words still bind
+        // as the temporary environment. Move the following
+        // simple-assignment run into the assignment list (the shape
+        // the set -k harvest uses), always keeping one word as the
+        // command name.
+        let mut harvested: Vec<(String, String)> = Vec::new();
+        let mut harvest_end = prefix_end;
+        while harvest_end + 1 < cmd.words.len() {
+            let Some((name, value)) = split_assignment_word(&cmd.words[harvest_end]) else {
+                break;
+            };
+            if value.starts_with(COMPOUND_ASSIGNMENT_MARKER) {
+                break;
+            }
+            harvested.push((name.to_string(), value.to_string()));
+            harvest_end += 1;
         }
+        let mut stripped = cmd.clone();
+        stripped.words = cmd.words[harvest_end..].to_vec();
+        if cmd.word_metadata.len() > prefix_end {
+            let skip = if cmd.word_metadata.len() == cmd.words.len() {
+                harvest_end
+            } else {
+                prefix_end
+            };
+            stripped.word_metadata = cmd.word_metadata[skip..].to_vec();
+        }
+        stripped.assignments.extend(harvested);
         std::borrow::Cow::Owned(stripped)
     }
 }

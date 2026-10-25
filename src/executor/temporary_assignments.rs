@@ -356,7 +356,22 @@ impl Executor {
                         crate::shell::state::PipestatusShape::Scalar;
                 }
                 self.tempenv_names.push(base_name.to_string());
-                self.mark_exported(base_name);
+                // rubash#1556: the tempvar is a FRESH variable in GNU
+                // (variables.c assign_in_env -> make_new_variable
+                // carries only att_exported|att_tempvar). The outer
+                // cell's marks (array/assoc/integer/nameref) must not
+                // leak into the window, or declare -p and the
+                // subscript readers keep rendering the shadow as the
+                // outer array. The VarAttrs saved in `previous`
+                // restore them after the command.
+                set_var_attrs(
+                    &mut self.shell_state.env_vars,
+                    base_name,
+                    VarAttrs {
+                        exported: true,
+                        ..VarAttrs::default()
+                    },
+                );
                 continue;
             }
             // rubash#1525: a tempenv PIPESTATUS bind is a fresh
@@ -389,6 +404,75 @@ impl Executor {
                 self.mark_exported(base_name);
                 continue;
             }
+            // rubash#1556: GNU variables.c:3536 assign_in_env creates
+            // EVERY tempenv binding as a fresh scalar in the separate
+            // temporary_env table (make_new_variable + var_setvalue,
+            // att_exported|att_tempvar only) — the outer cell is never
+            // written. The permanent bind below instead writes a plain
+            // scalar value into element 0 of an array cell in place,
+            // so window reads (declare -p, ${a[1]}, ${a[@]}, ${!a[@]})
+            // see a mutated array instead of the shadow scalar. When
+            // the effective target's cell is an array, swap in the
+            // tempvar shadow directly: scalar typed cell + mirror
+            // text + fresh exported-only attrs; the `previous`
+            // snapshot reinstalls cell, mirror and attrs at restore.
+            // Append computes against the old cell's scalar view
+            // (make_variable_value with ASS_APPEND: element 0 for an
+            // indexed array, empty for an assoc array). The dynamic
+            // stack arrays keep the permanent-bind path: they have no
+            // ordinary cell to shadow.
+            {
+                let (_, append) = assignment_name_and_append(name);
+                let target = resolved_target
+                    .clone()
+                    .unwrap_or_else(|| base_name.to_string());
+                if target != "PIPESTATUS"
+                    && !matches!(
+                        target.as_str(),
+                        "FUNCNAME"
+                            | "BASH_ARGV"
+                            | "BASH_ARGC"
+                            | "BASH_LINENO"
+                            | "BASH_SOURCE"
+                            | "GROUPS"
+                            | "DIRSTACK"
+                    )
+                    && self.tempenv_target_is_array(&target)
+                {
+                    if is_marked_var(&self.shell_state.env_vars, READONLY_VARS, &target) {
+                        // GNU err_readonly for a tempenv bind carries
+                        // no command-name segment (the permanent-bind
+                        // path's plain form), even when the command
+                        // word is a declaration builtin.
+                        let line = format!("{}{target}: readonly variable\n", self.error_prefix());
+                        self.emit_assignment_diag(line);
+                        assignments_failed = true;
+                        continue;
+                    }
+                    let window_value = if append {
+                        format!("{}{}", self.tempenv_scalar_view(&target), expanded_value)
+                    } else {
+                        expanded_value.clone()
+                    };
+                    self.shell_state
+                        .env_vars
+                        .insert(target.clone(), window_value.clone());
+                    let _ = self
+                        .shell_state
+                        .variables
+                        .set(target.clone(), crate::shell::Variable::scalar(window_value));
+                    set_var_attrs(
+                        &mut self.shell_state.env_vars,
+                        &target,
+                        VarAttrs {
+                            exported: true,
+                            ..VarAttrs::default()
+                        },
+                    );
+                    self.tempenv_names.push(target);
+                    continue;
+                }
+            }
             // GNU variables.c bind_variable (ASS_MKLOCAL tempenv path): a
             // failed bind (readonly violation via ASSIGN_DISALLOWED, expansion
             // error) reports and keeps going through the REST of the operand
@@ -409,6 +493,45 @@ impl Executor {
             self.mark_exported(&export_target);
         }
         (previous, assignments_failed)
+    }
+
+    /// Whether the tempenv target's current cell is an array
+    /// (rubash#1556): the VarTable attribute word or the typed
+    /// cell's shape. Either witness suffices — a declared but
+    /// valueless array may carry only the mark, and a materialized
+    /// array may predate its mark sync.
+    fn tempenv_target_is_array(&self, target: &str) -> bool {
+        let attrs = self.shell_state.env_vars.attr_of(target);
+        attrs.array
+            || attrs.assoc
+            || matches!(
+                self.shell_state.variables.get(target).map(|v| &v.value),
+                Some(crate::shell::ShellValue::IndexedArray(_))
+                    | Some(crate::shell::ShellValue::AssociativeArray(_))
+            )
+    }
+
+    /// The scalar view of a cell for a tempenv append (GNU
+    /// variables.c make_variable_value with ASS_APPEND, rubash#1556):
+    /// element 0 of an indexed array, empty for an assoc array,
+    /// the value itself for a scalar.
+    fn tempenv_scalar_view(&self, target: &str) -> String {
+        match self.shell_state.variables.get(target).map(|v| &v.value) {
+            Some(crate::shell::ShellValue::IndexedArray(entries)) => {
+                entries.get(&0).cloned().unwrap_or_default()
+            }
+            Some(crate::shell::ShellValue::AssociativeArray(_)) => String::new(),
+            Some(crate::shell::ShellValue::Scalar(value)) => value.clone(),
+            None => self
+                .shell_state
+                .env_vars
+                .get(target)
+                .and_then(|value| {
+                    resolve_indexed_array_subscript(value, 0)
+                        .and_then(|resolved| array_value_at(value, resolved))
+                })
+                .unwrap_or_default(),
+        }
     }
 
     /// GNU execute_cmd.c: assignment errors (readonly violation, expansion
