@@ -470,6 +470,50 @@ fn category_constant(var: &str) -> Option<libc::c_int> {
     })
 }
 
+/// Address of the calling thread's errno cell — the storage behind
+/// C's `errno` lvalue, which GNU clears before the setlocale call and
+/// reads after it (locale.c:191, in set_locale_var). The accessor's
+/// spelling is libc-specific: glibc and musl call it
+/// `__errno_location`, Darwin and FreeBSD call it `__error`, and
+/// Android's bionic calls it `__errno`. The fallthrough keeps the
+/// glibc spelling, which the remaining Unix libcs in the libc crate
+/// (DragonFly, emscripten, Fuchsia, ...) also use.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "freebsd"
+    ))
+))]
+fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "freebsd"
+    )
+))]
+fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+#[cfg(all(unix, target_os = "android"))]
+fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno() }
+}
+
 /// One real setlocale attempt, mirroring GNU locale.c set_locale_var:
 /// errno is cleared first (locale.c:191), and on failure the caller
 /// reports `strerror(errno)` only when the call left errno set — glibc
@@ -483,12 +527,12 @@ fn attempt_setlocale(category: libc::c_int, name: &str) -> Result<(), Option<Str
         return Err(None);
     };
     unsafe {
-        *libc::__errno_location() = 0;
+        *errno_location() = 0;
         let result = libc::setlocale(category, c_name.as_ptr());
         if !result.is_null() {
             return Ok(());
         }
-        let errno = *libc::__errno_location();
+        let errno = *errno_location();
         if errno == 0 {
             Err(None)
         } else {
