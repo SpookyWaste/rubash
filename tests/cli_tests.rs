@@ -698,6 +698,38 @@ fn issue1651_coproc_herestring_feeds_child_stdin() {
 }
 
 #[test]
+fn issue1651_coproc_mixed_fd0_redirects_last_one_wins() {
+    // GNU applies a command's redirects left to right, so when both
+    // an fd-0 file redirect and a here-string target the coproc
+    // child's stdin, the LATER one supplies the bytes — in both
+    // orders. (Found by comparison with the collaborator's PR
+    // #1694: the body was bound before the redirect pass, so a
+    // preceding `< file` clobbered a winning here-string.)
+    let dir = std::env::temp_dir().join(format!("rubash-cli-issue1651m-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("input.txt"), "FROMFILE\n").unwrap();
+    let output = rubash_command()
+        .current_dir(&dir)
+        .arg("-c")
+        .arg(
+            "coproc cat < input.txt <<< \"FROMHS\"; \
+             read -t 2 -u ${COPROC[0]} l; echo \"hs_last=[$l]\"; \
+             coproc cat <<< \"FROMHS\" < input.txt; \
+             read -t 2 -u ${COPROC[0]} l; echo \"file_last=[$l]\"",
+        )
+        .output()
+        .expect("run rubash");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "hs_last=[FROMHS]\nfile_last=[FROMFILE]\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
 fn issue1651_coproc_heredoc_feeds_child_stdin() {
     // The heredoc form of rubash#1651.
     let output = rubash_command()
