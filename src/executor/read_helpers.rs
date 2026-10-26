@@ -45,6 +45,64 @@ fn rusage_counters() -> RusageCounters {
     }
 }
 
+/// Accumulated CPU of reaped external children (rubash#1776): GNU
+/// getrusage(RUSAGE_CHILDREN) sums every waited child, but Windows has
+/// no such counter — each child's times must be sampled from its
+/// process handle before the executor closes it, so every reap site
+/// calls note_reaped_child_cpu while the handle is still live and
+/// rusage_counters adds the sum to the SELF half. The dedup key is
+/// (pid, process creation time): a child observed at two reap points
+/// (poll + formal wait) must count once, and a recycled pid must not
+/// be mistaken for the earlier child. Process-wide by necessity — a
+/// Windows process has one handle table, so sessions sharing a
+/// process share this sum (same caveat class as the executor's other
+/// process-global state; a per-Session split rides the 1.5.0
+/// state-view work, not this fix). Lock poisoning is tolerated: the
+/// accumulator is a sum, not guarded data.
+#[cfg(windows)]
+static REAPED_CHILDREN_CPU: std::sync::LazyLock<
+    std::sync::Mutex<(std::collections::HashSet<(u32, u64)>, RusageCounters)>,
+> = std::sync::LazyLock::new(|| {
+    std::sync::Mutex::new((std::collections::HashSet::new(), RusageCounters::default()))
+});
+
+/// Sample one reaped child's CPU into the CHILDREN accumulator. Call
+/// only at a reap point, while the Child's handle is still live (after
+/// try_wait/wait returns a status, before the Child is dropped). On
+/// non-Windows this is a no-op: getrusage(RUSAGE_CHILDREN) already
+/// covers waited children there.
+pub(in crate::executor) fn note_reaped_child_cpu(child: &std::process::Child) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::GetProcessTimes;
+        let handle = child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+        let mut creation: FILETIME = unsafe { std::mem::zeroed() };
+        let mut exit: FILETIME = unsafe { std::mem::zeroed() };
+        let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+        let mut user: FILETIME = unsafe { std::mem::zeroed() };
+        let ok =
+            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+        if ok == 0 {
+            return;
+        }
+        let ticks = |ft: FILETIME| ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64;
+        let key = (child.id(), ticks(creation));
+        let mut guard = REAPED_CHILDREN_CPU
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.0.insert(key) {
+            guard.1.user += std::time::Duration::from_nanos(ticks(user).saturating_mul(100));
+            guard.1.sys += std::time::Duration::from_nanos(ticks(kernel).saturating_mul(100));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = child;
+    }
+}
+
 #[cfg(windows)]
 fn rusage_counters() -> RusageCounters {
     // Windows has no getrusage. The SELF half of GNU's SELF+CHILDREN
@@ -52,10 +110,11 @@ fn rusage_counters() -> RusageCounters {
     // also where rubash's no-fork subshell and builtin work lands, so
     // it is the half that moves for in-process timed commands (a pure
     // builtin loop under `time` used to report user 0m0.000s here).
-    // The CHILDREN half has no accumulation point yet: a waited
-    // child's times would have to be sampled from its process handle
-    // before the executor closes it, so external commands still
-    // contribute zero on this platform.
+    // The CHILDREN half is the reap-site accumulator above
+    // (rubash#1776): external children sampled at wait time. One
+    // known gap remains: a capture pipeline's last member is consumed
+    // by wait_with_output, which closes its handle before any sample
+    // point, so that member's CPU is still missing.
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 
@@ -81,10 +140,16 @@ fn rusage_counters() -> RusageCounters {
     if ok == 0 {
         return RusageCounters::default();
     }
-    RusageCounters {
+    let mut counters = RusageCounters {
         user: ticks(user),
         sys: ticks(kernel),
-    }
+    };
+    let reaped = REAPED_CHILDREN_CPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    counters.user += reaped.1.user;
+    counters.sys += reaped.1.sys;
+    counters
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -961,8 +1026,14 @@ pub(in crate::executor) fn trim_read_input(
     // Trimming and limit math below run on the literal-char form (the
     // delimiter needle handles both transports); the storage-domain tagging
     // is the last step so every served record leaves this fn normalized.
-    let trimmed =
-        trim_read_input_literal(input, delimiter, char_limit, exact_char_limit, escape_aware, raw);
+    let trimmed = trim_read_input_literal(
+        input,
+        delimiter,
+        char_limit,
+        exact_char_limit,
+        escape_aware,
+        raw,
+    );
     tag_read_carrier_text(&trimmed)
 }
 
@@ -994,8 +1065,7 @@ fn trim_read_input_literal(
                 .or_else(|| input.split_once(delimiter))
                 .map(|(before, _)| before.len())
         } else {
-            find_unescaped_read_delimiter(&input, &needle, delimiter)
-                .map(|before| before.len())
+            find_unescaped_read_delimiter(&input, &needle, delimiter).map(|before| before.len())
         };
         if let Some(at) = split_at {
             input = if cfg!(windows) {

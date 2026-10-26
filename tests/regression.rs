@@ -3206,6 +3206,47 @@ mod k1_batch2 {
         assert_eq!(stdout, "SEEDLINE\nSEEDLINE\nerr-is:[echo SEEDLINE]\n");
     }
 
+    /// rubash#1776: `time` on Windows counted SELF only (PR #1771);
+    /// the CHILDREN half — CPU of waited external children, GNU
+    /// getrusage(RUSAGE_CHILDREN) — stayed zero because no reap site
+    /// sampled the child's handle. The pin times a nested rubash
+    /// child burning an arithmetic loop and asserts a 100ms user
+    /// threshold, not mere non-zero: the outer shell's own SELF delta
+    /// is a parse-and-spawn trifle (single-digit milliseconds), so a
+    /// threshold crossing proves the CHILDREN accumulator moved. The
+    /// nested binary path comes from CARGO_BIN_EXE_rubash (the same
+    /// binary the harness runs); forward slashes keep Windows
+    /// quoting intact. On unix this guards the getrusage path.
+    #[test]
+    fn issue1776_time_children_cpu() {
+        fn parse_time_ms(line: &str) -> Option<u64> {
+            // line: "user\t0m2.345s" (minute form, %3lU).
+            let value = line.split('\t').nth(1)?.trim().strip_suffix('s')?;
+            let (min, rest) = value.split_once('m')?;
+            let (sec, ms) = rest.split_once('.')?;
+            let ms = format!("{ms:0<3}");
+            let ms = ms.get(..3)?;
+            Some(
+                min.parse::<u64>().ok()? * 60_000
+                    + sec.parse::<u64>().ok()? * 1_000
+                    + ms.parse::<u64>().ok()?,
+            )
+        }
+        let bin = env!("CARGO_BIN_EXE_rubash").replace('\\', "/");
+        let script =
+            format!("time \"{bin}\" -c 'x=0; while [ $x -lt 300000 ]; do x=$((x+1)); done'\n");
+        let (_stdout, stderr, code) = run("k1-1776", &script);
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        let user_line = stderr
+            .lines()
+            .find(|line| line.starts_with("user"))
+            .unwrap_or("");
+        let user_ms = parse_time_ms(user_line).unwrap_or(0);
+        assert!(
+            user_ms >= 100,
+            "child CPU must clear 100ms, got: {user_line:?} ({user_ms}ms) in\n{stderr}"
+        );
+    }
     /// rubash#1212: `time` reports real CPU time (getrusage deltas), not
     /// a hard-coded user/sys of zero.
     #[test]
