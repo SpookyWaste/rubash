@@ -236,7 +236,8 @@ impl Executor {
                 }
             }
             self.shell_state.env_vars.remove(&name);
-            env::remove_var(&name);
+            // G-03: journal the frame-pop removal as this lineage's write.
+            mirror_env_remove(&name);
             mark_env_name(&mut self.shell_state.env_vars, DECLARED_UNSET_VARS, &name);
         }
     }
@@ -379,7 +380,8 @@ impl Executor {
                 }
                 None => {
                     self.shell_state.env_vars.remove(&name);
-                    env::remove_var(&name);
+                    // G-03: journal the frame-pop removal.
+                    mirror_env_remove(&name);
                 }
             }
             set_var_attrs(&mut self.shell_state.env_vars, &name, restored_attrs);

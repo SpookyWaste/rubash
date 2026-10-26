@@ -171,6 +171,80 @@ pub(in crate::executor) fn is_valid_process_env(name: &str, value: &str) -> bool
     !name.is_empty() && !name.contains(['=', '\0']) && !value.contains('\0')
 }
 
+/// G-03: the process-env write journal. Every process-env mirror write an
+/// executor lineage performs is recorded in its journal (name -> final
+/// written state, None = removed); Executor::drop then restores only the
+/// keys whose current value still equals the journal's final state, so a
+/// dropping session can no longer roll back a live sibling session's
+/// variables (the pre-G-03 Drop restored the whole birth snapshot).
+/// The stack routes writes to the lineage currently executing on this
+/// thread: execute_ast / call_function_owned push the running executor's
+/// journal, and Executor::new_inner pushes its own around the init-time
+/// clears. Writes outside any push (host bookkeeping transients) are
+/// simply not journaled.
+pub(crate) type EnvWriteJournal =
+    std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Option<String>>>>;
+
+thread_local! {
+    static ENV_JOURNAL_STACK: std::cell::RefCell<Vec<EnvWriteJournal>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// RAII push of an executor's journal onto this thread's stack. A nested
+/// push of the SAME journal (recursive execute_ast on one executor) is a
+/// no-op: the writes belong to the same lineage either way.
+pub(crate) struct EnvJournalGuard {
+    pushed: bool,
+}
+
+pub(crate) fn push_env_journal(journal: &EnvWriteJournal) -> EnvJournalGuard {
+    ENV_JOURNAL_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if stack
+            .last()
+            .is_some_and(|top| std::rc::Rc::ptr_eq(top, journal))
+        {
+            return EnvJournalGuard { pushed: false };
+        }
+        stack.push(journal.clone());
+        EnvJournalGuard { pushed: true }
+    })
+}
+
+impl Drop for EnvJournalGuard {
+    fn drop(&mut self) {
+        if self.pushed {
+            ENV_JOURNAL_STACK.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+fn record_env_write(name: &str, value: Option<&str>) {
+    ENV_JOURNAL_STACK.with(|stack| {
+        if let Some(top) = stack.borrow().last() {
+            top.borrow_mut()
+                .insert(name.to_string(), value.map(str::to_string));
+        }
+    });
+}
+
+/// Unconditional process-env write + journal record, for the scoped
+/// restore paths (subshell/function-local restores) whose direct writes
+/// the #916 assignment gate must not filter: whatever they write is this
+/// lineage's final state for the key.
+pub(crate) fn mirror_env_set(name: &str, value: &str) {
+    env::set_var(name, value);
+    record_env_write(name, Some(value));
+}
+
+/// Removal counterpart of `mirror_env_set`.
+pub(crate) fn mirror_env_remove(name: &str) {
+    env::remove_var(name);
+    record_env_write(name, None);
+}
+
 pub(crate) fn set_process_env(name: &str, value: impl AsRef<str>) {
     // #916: the process env mirrors exactly the special-name set below.
     // Every other name reaches children through the explicit env built at
@@ -184,6 +258,7 @@ pub(crate) fn set_process_env(name: &str, value: impl AsRef<str>) {
         && is_valid_process_env(name, value)
     {
         env::set_var(name, value);
+        record_env_write(name, Some(value));
     }
 }
 
@@ -200,6 +275,7 @@ pub(crate) fn set_process_env(name: &str, value: impl AsRef<str>) {
 pub(crate) fn unset_process_env(name: &str) {
     if is_valid_process_env(name, "") && env::var_os(name).is_some() {
         env::remove_var(name);
+        record_env_write(name, None);
     }
 }
 

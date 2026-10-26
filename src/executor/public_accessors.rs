@@ -923,6 +923,8 @@ impl Executor {
         // NOT restored, preserving the pre-G-02 observable shape.
         let original_cwd = self.shell_state.cwd.clone();
         EXECUTION_LOCK_DEPTH.with(|depth| depth.set(1));
+        // G-03: journal this call's mirror writes to this executor.
+        let _env_journal_guard = push_env_journal(&self.env_write_journal);
         let result = self.call_function_inner(name, args, temporary_env);
         EXECUTION_LOCK_DEPTH.with(|depth| depth.set(0));
         self.shell_state.cwd = original_cwd;
@@ -1014,7 +1016,8 @@ impl Executor {
         let old_names: Vec<String> = self.shell_state.env_vars.keys().cloned().collect();
         for name in old_names {
             if !saved_env.contains_key(&name) {
-                env::remove_var(&name);
+                // G-03: journal the removal as this lineage's write.
+                mirror_env_remove(&name);
             }
         }
 
@@ -1033,7 +1036,7 @@ impl Executor {
             if is_valid_process_env(name, value) {
                 set_process_env(name, value);
             } else {
-                env::remove_var(name);
+                mirror_env_remove(name);
             }
         }
 
@@ -2471,34 +2474,41 @@ impl Drop for Executor {
         // startup21: the process-env restore models an in-process child
         // leaving its parent's env untouched (rubash#182). The process-exit
         // executor's process dies with this drop — nothing can observe its
-        // environment afterward — so the diff + ~one putenv per startup
-        // variable (~0.45ms) is skipped there.
+        // environment afterward — so the restore is skipped there.
         if self.is_process_exit_executor {
             return;
         }
-        let current_names: Vec<String> = env::vars().map(|(name, _)| name).collect();
-        for name in current_names {
-            if !self.process_env_snapshot.contains_key(&name) {
-                env::remove_var(name);
-            }
-        }
-
-        for (name, value) in &self.process_env_snapshot {
-            // A fork-time snapshot restore is not an assignment mirror, so
-            // the #916 special-name gate in set_process_env must not apply:
-            // a comsub child that unbound an ordinary inherited name
-            // removed the real process-env copy (unset_process_env removes
-            // it now — rubash#917), and the parent's copy must come back
-            // exactly as the snapshot recorded it. TMPDIR keeps its
-            // pre-#916 exclusion (never mirrored, so leave it alone rather
-            // than restoring or removing it).
+        // G-03: the restore is scoped to this executor lineage's own
+        // process-env mirror writes (env_write_journal). The pre-G-03
+        // restore rolled EVERY name back to the birth snapshot — including
+        // names a still-live sibling session wrote after this executor was
+        // born, so the first session to Drop silently un-wrote the other
+        // sessions' variables. A journaled key returns to its snapshot
+        // state only when the current process value still equals the
+        // journal's final written state (no other writer has touched it
+        // since); otherwise the live owner's value stands. A fork-time
+        // snapshot restore is not an assignment mirror, so the #916
+        // special-name gate in set_process_env must not apply here
+        // (rubash#917). TMPDIR keeps its pre-#916 exclusion (never
+        // mirrored, so leave it alone rather than restoring or removing).
+        let journal = self.env_write_journal.borrow();
+        for (name, final_state) in journal.iter() {
             if name == "TMPDIR" {
                 continue;
             }
-            if is_valid_process_env(name, value) {
-                env::set_var(name, value);
-            } else {
-                env::remove_var(name);
+            let current = env::var_os(name).and_then(|value| value.into_string().ok());
+            if current.as_deref() != final_state.as_deref() {
+                continue;
+            }
+            match self.process_env_snapshot.get(name) {
+                Some(value) => {
+                    if is_valid_process_env(name, value) {
+                        env::set_var(name, value);
+                    } else {
+                        env::remove_var(name);
+                    }
+                }
+                None => env::remove_var(name),
             }
         }
     }

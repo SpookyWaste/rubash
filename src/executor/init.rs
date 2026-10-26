@@ -61,6 +61,13 @@ impl Executor {
         } else {
             std::env::vars().collect()
         };
+        // G-03: this executor's process-env write journal, pushed for the
+        // rest of construction so the init-time __RUBASH_* clears below
+        // are journaled as this lineage's writes (its Drop restores them
+        // against the snapshot above, conditionally — see Drop).
+        let env_write_journal: EnvWriteJournal =
+            std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
+        let _env_journal_guard = push_env_journal(&env_write_journal);
         // VarTable::from_values also imports any __RUBASH_*_VARS attribute
         // lists a parent rubash left in the environment — the structured
         // form of the cross-process attribute transport.
@@ -557,6 +564,7 @@ impl Executor {
             elevation_handler: None,
             external_file_builtins_enabled: true,
             process_env_snapshot,
+            env_write_journal,
             history_provider: None,
         };
         for (fd, (read_h, write_h, path)) in inherited_fd_handles {

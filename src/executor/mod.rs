@@ -1421,6 +1421,10 @@ pub struct Executor {
     elevation_handler: Option<ElevationHandler>,
     external_file_builtins_enabled: bool,
     process_env_snapshot: HashMap<String, String>,
+    /// G-03: this lineage's process-env mirror-write journal (see
+    /// local_helpers::EnvWriteJournal). Drop restores only journaled keys
+    /// whose current value still equals the journal's final state.
+    env_write_journal: EnvWriteJournal,
     history_provider: Option<crate::history::SharedHistoryProvider>,
 }
 

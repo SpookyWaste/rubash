@@ -1817,6 +1817,11 @@ impl Executor {
             // through the bare-$NAME std::env::var fallback in
             // embedded_parameters.rs).
             process_env_snapshot: std::env::vars().collect(),
+            // G-03: a fork copy starts a fresh journal. (When the body runs
+            // under a parent's execute_ast the journal stack attributes its
+            // writes to the parent's journal, and this one stays empty —
+            // the parent restores them at its own Drop.)
+            env_write_journal: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
             history_provider: self.history_provider.clone(),
         }
     }

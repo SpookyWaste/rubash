@@ -62,6 +62,11 @@ impl Executor {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         EXECUTION_LOCK_DEPTH.with(|depth| depth.set(1));
+        // G-03: attribute this run's process-env mirror writes to this
+        // executor's journal (nested runs on the same executor share the
+        // push; child executors running under this run journal into it as
+        // the same lineage — see local_helpers::push_env_journal).
+        let _env_journal_guard = push_env_journal(&self.env_write_journal);
         let result = self.execute_ast_inner(&ast.commands);
         EXECUTION_LOCK_DEPTH.with(|depth| depth.set(0));
         // rubash#423: GNU has no per-run cwd undo. `cd` runs chdir(2) in the
