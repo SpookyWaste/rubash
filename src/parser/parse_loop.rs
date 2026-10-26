@@ -1338,13 +1338,30 @@ fn time_prefix_from_command(command: &mut CommandNode) -> Option<TimePipelinePre
 /// applied the assignment at all.
 ///
 /// Re-run exactly the classification handle_token applies to a
-/// standalone simple command: leading words the lexer flagged
-/// TokenKind::Assignment become prefix assignments, in source order,
-/// with the same name/value/raw-RHS split token_actions performs
-/// (extglob LHS patterns recorded the same way). The token-kind gate
-/// is the classification record — a quoted 'x=1' is TokenKind::Word
-/// and stays a command name; no text-shape re-derivation (the
-/// executor's assignment_dispatch documents why that is unsound).
+/// standalone simple command: leading assignment words become prefix
+/// assignments, in source order, with the same name/value/raw-RHS
+/// split token_actions performs (extglob LHS patterns recorded the
+/// same way).
+///
+/// The classification gate has TWO recorded forms, because the first
+/// restore attempt (kind-only) never fired: the lexer DOES flag the
+/// token TokenKind::Assignment (word.rs finish_word_token, via
+/// general.c:480 assignment() on the raw token), but handle_token's
+/// Assignment arm — seeing a non-empty word list, with `time` in the
+/// name slot — records the word with word_kinds = TokenKind::Word
+/// (token_actions.rs, the pushed-word arm): in command-word position
+/// the word IS a command word, so the kind record is rewritten and
+/// the Assignment flag is lost before any fold runs (on every entry
+/// path, file and -c alike). What survives is the word's recorded
+/// RAW spelling in word_metadata, so the gate re-applies the lexer's
+/// own predicate — crate::lexer::is_assignment, the same function
+/// finish_word_token classified with — to that raw text. This is
+/// parse-time classification on the source spelling, quotes intact:
+/// a quoted 'x=1' and a quote-carrying a''=b fail the predicate exactly as
+/// the lexer judged them and stay command names. It is NOT the
+/// execution-time re-derivation from de-quoted, expanded values the
+/// executor's assignment_dispatch forbids — by the time a value is
+/// expanded the quote evidence is gone; here it is not.
 ///
 /// Two word families deliberately stay in the word list:
 /// - Array-element words (`name[sub]=v`): push_command_word records
@@ -1371,7 +1388,11 @@ pub(crate) fn reclassify_leading_assignment_words(command: &mut CommandNode) {
     }
     let metadata_aligned = command.word_metadata.len() == command.words.len();
     let mut consumed = 0usize;
-    while consumed < command.words.len() && command.word_kinds[consumed] == TokenKind::Assignment {
+    while consumed < command.words.len()
+        && (command.word_kinds[consumed] == TokenKind::Assignment
+            || (metadata_aligned
+                && crate::lexer::is_assignment(&command.word_metadata[consumed].raw)))
+    {
         let (name, value, raw_rhs) = {
             let word = &command.words[consumed];
             let Some((name, value)) = word.split_once('=') else {

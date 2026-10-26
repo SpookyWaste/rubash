@@ -166,6 +166,13 @@ impl Executor {
         if cmd.word_kinds.len() == cmd.words.len() {
             timed.word_kinds = cmd.word_kinds[index..].to_vec();
         }
+        // Keep word_metadata index-aligned with the stripped words,
+        // as the parser fold and the pipeline-prefix strip both do:
+        // the restore below reads the recorded raw spellings through
+        // it, and any other metadata consumer expects the alignment.
+        if cmd.word_metadata.len() == cmd.words.len() {
+            timed.word_metadata = cmd.word_metadata[index..].to_vec();
+        }
         // rubash#1661: nodes that reach this name-dispatch without a
         // parse-time fold carry the same displaced classification the
         // parser fold restores — the assignment words sat behind the
