@@ -635,7 +635,7 @@ impl Executor {
     /// variables.c make_variable_value with ASS_APPEND, rubash#1556):
     /// element 0 of an indexed array, empty for an assoc array,
     /// the value itself for a scalar.
-    fn tempenv_scalar_view(&self, target: &str) -> String {
+    pub(in crate::executor) fn tempenv_scalar_view(&self, target: &str) -> String {
         match self.shell_state.variables.get(target).map(|v| &v.value) {
             Some(crate::shell::ShellValue::IndexedArray(entries)) => {
                 entries.get(&0).cloned().unwrap_or_default()

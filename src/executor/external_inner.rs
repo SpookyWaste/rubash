@@ -704,7 +704,9 @@ impl Executor {
     }
 
     fn handle_host_external_command(&mut self, cmd: &CommandNode) -> Result<bool, ExecuteError> {
-        let Some(output) = self.invoke_host_external_command(cmd) else {
+        // Top-level dispatch: the dispatch seam applied this command's
+        // prefix assignments to the table before reaching here.
+        let Some(output) = self.invoke_host_external_command(cmd, true) else {
             return Ok(false);
         };
         self.write_buffered_builtin_output(cmd, &output.stdout, &output.stderr)?;
@@ -712,19 +714,24 @@ impl Executor {
         Ok(true)
     }
 
+    /// Build the env map for the embedded-host channel. `assignments_applied`
+    /// records whether the command's prefix assignments were already applied
+    /// to the shell variable table: true on the top-level dispatch path
+    /// (the dispatch seam runs apply_temporary_assignments first), false on
+    /// the pipeline-stage path (a stage's assignments live only on the
+    /// cloned command node, never on the table — the same split the stage
+    /// spawner faces). The handler contract itself
+    /// (`FnMut(&[String], &HashMap<String, String>)`) is untouched; only
+    /// the values composed into the map change (rubash#1766).
     pub(in crate::executor) fn invoke_host_external_command(
         &mut self,
         cmd: &CommandNode,
+        assignments_applied: bool,
     ) -> Option<HostExternalCommandOutput> {
         let mut env_vars = self.shell_state.env_vars.clone();
         let raws_aligned = cmd.assignment_raws.len() == cmd.assignments.len();
         for (index, (var_name, var_value)) in cmd.assignments.iter().enumerate() {
-            let (base_name, _) = assignment_name_and_append(var_name);
-            let raw = raws_aligned
-                .then(|| cmd.assignment_raws.get(index))
-                .flatten()
-                .map(String::as_str);
-            let expanded_value = self.expand_assignment_value_with_raw(var_name, var_value, raw);
+            let (base_name, append) = assignment_name_and_append(var_name);
             // GNU variables.c:3564-3578 assign_in_env -> bind_variable: a
             // prefix assignment to a nameref binds the referenced variable,
             // so the child env carries the TARGET name and the nameref's
@@ -732,6 +739,39 @@ impl Executor {
             // `ref=$ref$str printenv ref` still prints "var").
             let Some(env_name) = self.tempenv_export_name(base_name) else {
                 continue;
+            };
+            if append && assignments_applied {
+                // Top-level path: the dispatch seam already composed the
+                // append into the table, so the env clone above inherits
+                // the composed value. Re-applying the raw RHS here would
+                // overwrite it (a+=5 must see 145, not 5) — the skip the
+                // direct path (apply_external_environment) performs, and
+                // the rubash#1620 root-cause-2 shape on this channel.
+                continue;
+            }
+            let raw = raws_aligned
+                .then(|| cmd.assignment_raws.get(index))
+                .flatten()
+                .map(String::as_str);
+            let expanded_value = self.expand_assignment_value_with_raw(var_name, var_value, raw);
+            // GNU variables.c assign_in_env binds a compound `name=(...)`
+            // tempenv word as the literal list text; the internal
+            // COMPOUND_ASSIGNMENT_MARKER must not leak into the host env
+            // map (mirror of apply_external_environment, niubash#121).
+            let expanded_value = expanded_value
+                .strip_prefix(crate::executor::types::COMPOUND_ASSIGNMENT_MARKER)
+                .unwrap_or(&expanded_value);
+            let expanded_value = if append {
+                // Pipeline-stage path: the stage's assignments were never
+                // applied to the table, so the clone still holds the window
+                // value; compose it the way the stage spawner does —
+                // tempenv_scalar_view of the export target (scalar itself,
+                // indexed element 0, assoc empty) plus the stripped RHS —
+                // which reproduces the GNU oracle values (1(9), 10(30),
+                // ([j]=w)) instead of the raw RHS.
+                format!("{}{}", self.tempenv_scalar_view(&env_name), expanded_value)
+            } else {
+                expanded_value.to_string()
             };
             if is_valid_process_env(&env_name, &expanded_value) {
                 env_vars.insert(env_name, expanded_value);

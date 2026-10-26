@@ -758,7 +758,10 @@ impl Executor {
             // visible argv text, so decode the carriers here.
             .map(|word| super::execution_misc::restore_command_substitution_output(&word))
             .collect();
-        if let Some(output) = self.invoke_host_external_command(&host_cmd) {
+        // Pipeline-stage path: the stage's assignments were never applied
+        // to the table (they live only on the cloned command node), so the
+        // host channel must compose appends itself (rubash#1766).
+        if let Some(output) = self.invoke_host_external_command(&host_cmd, false) {
             return Ok(Some((
                 crate::executor::substitution_metadata::bytes_to_shell_text(&output.stdout),
                 crate::executor::substitution_metadata::bytes_to_shell_text(&output.stderr),
