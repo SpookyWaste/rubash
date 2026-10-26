@@ -460,6 +460,10 @@ pub(in crate::executor) fn execute_history_session(
                 crate::executor::path::shell_path_to_windows(&path, &executor.shell_state.env_vars)
                     .to_string_lossy()
                     .to_string();
+            // variables.c:6168 sv_histtimefmt: this same condition (the
+            // variable exists) is what arms readline's timestamp comment
+            // char; the read paths take their arming state from it
+            // (rubash#1669).
             let write_ts = write_timestamps_of(executor);
             let outcome = match mode {
                 HistoryMode::Append => shell.append_file(&path, write_ts).map(|_| 0),
@@ -470,8 +474,12 @@ pub(in crate::executor) fn execute_history_session(
                 // finish_shell of lines already written by -w
                 // (rubash#1049: GNU re-appends them at exit).
                 HistoryMode::Write => shell.write_file(&path, write_ts).map(|_| 0),
-                HistoryMode::Read => shell.read_file(&path, histsize).map(|_| 0),
-                HistoryMode::ReadNew => shell.read_new_file(&path, histsize).map(|_| 0),
+                HistoryMode::Read => shell
+                    .read_file_with_arming(&path, histsize, write_ts)
+                    .map(|_| 0),
+                HistoryMode::ReadNew => shell
+                    .read_new_file_with_arming(&path, histsize, write_ts)
+                    .map(|_| 0),
                 _ => Ok(0),
             };
             if let Err(err) = outcome {
@@ -511,10 +519,8 @@ pub(in crate::executor) fn execute_history_session(
             let timestamps = shell.timestamps.clone();
             // GNU builtins/history.def (display_history): with
             // HISTTIMEFORMAT set and non-null, each line carries the
-            // entry's timestamp rendered through strftime between the
-            // marker and the entry text (rubash#1070). An entry without a
-            // recorded stamp renders against the epoch, matching GNU's
-            // zero-initialized hist_inittime for unstamped entries.
+            // entry's timestamp rendered by histtime between the
+            // marker and the entry text (rubash#1070, #1669).
             let time_format = executor
                 .get_env("HISTTIMEFORMAT")
                 .filter(|value| !value.is_empty());
@@ -530,14 +536,14 @@ pub(in crate::executor) fn execute_history_session(
                 let mark = " ";
                 match &time_format {
                     Some(format) => {
-                        let epoch = timestamps
-                            .get(index)
-                            .and_then(|stamp| stamp.strip_prefix('#'))
-                            .and_then(|seconds| seconds.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        let rendered = crate::builtins::printf::time::format_epoch_time(
+                        // builtins/history.def histtime via
+                        // lib/readline/history.c history_get_time
+                        // (rubash#1669): strtol stamp parsing, the
+                        // `<text>: invalid timestamp` form, and `??`
+                        // for stamp-less entries.
+                        let rendered = crate::history::render_timestamp(
+                            timestamps.get(index).map(String::as_str),
                             format,
-                            epoch,
                             &executor.shell_state.env_vars,
                         );
                         let _ =

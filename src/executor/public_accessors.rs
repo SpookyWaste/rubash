@@ -767,6 +767,26 @@ impl Executor {
         self.shell_state.session_history.clone()
     }
 
+    /// Returns the session history list, creating and installing an
+    /// empty one on demand when the shell has none. This is the history
+    /// builtin's creation rule (builtins/history.def): the list exists
+    /// for history's consumers even in shells that never installed one
+    /// (the non-interactive stdin driver), but an installed host
+    /// provider IS the history list, so an auto-created empty session
+    /// must not shadow it — with a provider and no session this
+    /// returns None (rubash#1668).
+    pub fn ensure_session_history(
+        &mut self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::history::SessionHistory>>> {
+        if self.shell_state.session_history.is_none() && !self.has_history_provider() {
+            let session = std::rc::Rc::new(std::cell::RefCell::new(
+                crate::history::SessionHistory::new(),
+            ));
+            self.set_session_history(Some(session));
+        }
+        self.get_session_history()
+    }
+
     /// Run `body` with user trap delivery (DEBUG/RETURN/ERR) suspended.
     ///
     /// GNU has no notion of host housekeeping commands: when an embedding

@@ -4644,21 +4644,7 @@ pub fn run_stdin_script(executor: &mut Executor) -> i32 {
         // non-interactive stdin path, so input lines enter the history
         // list only after `set -o history' (or `-o history' at startup)
         // turns the option on (rubash#1629).
-        let remember_on_history =
-            executor.get_env("__RUBASH_SETOPT_history").as_deref() == Some("1");
-        if remember_on_history {
-            if let Some(session) = executor.get_session_history() {
-                let trimmed = pending.trim_end();
-                if !trimmed.is_empty() {
-                    let control = executor.get_env("HISTCONTROL").unwrap_or_default();
-                    let ignore = executor.get_env("HISTIGNORE").unwrap_or_default();
-                    let histsize = SessionHistory::size_limit(executor.get_env("HISTSIZE"));
-                    session
-                        .borrow_mut()
-                        .record(trimmed, &control, &ignore, histsize);
-                }
-            }
-        }
+        record_stdin_group_if_armed(executor, &pending);
 
         // eval.c:178: one current_command_number increment per command
         // list read happens in the execute_ast walk; no driver increment
@@ -4698,6 +4684,9 @@ pub fn run_stdin_script(executor: &mut Executor) -> i32 {
     if !pending.trim().is_empty() {
         // Final list gathered at EOF (e.g. no trailing newline) — still
         // one reader_loop iteration (eval.c:178); the walk increments it.
+        // The final group is read too, so the same read-time recording
+        // applies before it executes (rubash#1668).
+        record_stdin_group_if_armed(executor, &pending);
         let status = run_source_with_line_offset(
             executor,
             &pending,
@@ -4722,6 +4711,34 @@ pub fn run_stdin_script(executor: &mut Executor) -> i32 {
     let status = executor.last_exit_code();
     let interactive = executor.get_env("__RUBASH_INTERACTIVE").as_deref() == Some("1");
     finish_shell(executor, status, interactive)
+}
+
+/// bashhist.c maybe_add_history gates recording on remember_on_history
+/// — the `history' set option, which defaults OFF for a non-interactive
+/// shell. This driver is the non-interactive stdin path, so an input
+/// group enters the history list only when the option is on at read
+/// time (after `set -o history', or `-o history' at startup). The list
+/// is created on demand under the history builtin's rule: this driver
+/// installs no session up front, so without the on-demand step every
+/// line between `set -o history' and the first `history' builtin was
+/// silently dropped (rubash#1629, #1668).
+fn record_stdin_group_if_armed(executor: &mut Executor, pending: &str) {
+    if executor.get_env("__RUBASH_SETOPT_history").as_deref() != Some("1") {
+        return;
+    }
+    let Some(session) = executor.ensure_session_history() else {
+        return;
+    };
+    let trimmed = pending.trim_end();
+    if trimmed.is_empty() {
+        return;
+    }
+    let control = executor.get_env("HISTCONTROL").unwrap_or_default();
+    let ignore = executor.get_env("HISTIGNORE").unwrap_or_default();
+    let histsize = SessionHistory::size_limit(executor.get_env("HISTSIZE"));
+    session
+        .borrow_mut()
+        .record(trimmed, &control, &ignore, histsize);
 }
 
 pub fn finish_shell(executor: &mut Executor, status: i32, interactive: bool) -> i32 {
