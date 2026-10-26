@@ -39,9 +39,6 @@ after no such command: 127
 echo builtin
 after non-special builtin: 0
 after special builtin: 0
-after assignment error: 1
-after assignment statement error: 1
-variable assignment error
 after no such command: 1
 after non-special builtin: 1
 ok 1
@@ -68,8 +65,13 @@ too many arguments
 after exit: 2
 after return: 2
 after shift: 2
+after break: 2
+after continue: 2
 after exit: 2
+after return: 2
 after shift: 2
+after break: 2
+after continue: 2
 after: 1
 after: 1
 after: 1
