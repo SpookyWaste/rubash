@@ -3140,6 +3140,25 @@ pub const ASYNC_CHILD_ENV_KEY: &str = "__RUBASH_ASYNC_CHILD";
 /// Scrubs the key unconditionally afterwards so it never reaches
 /// `export -p` or grandchildren environments (kernel inheritance carries
 /// the disposition there, as fork does in GNU).
+///
+/// The async-child ignore is a setup_async_signals disposition, NOT a
+/// hard ignore: GNU's forked async child lists `trap -- '' SIGINT` yet
+/// still lets a later `trap` override it (trap.c's ASYNCSIG special-case
+/// in set_signal — the golden trap-signal-matrix fires its INT handler).
+/// The entry-disposition fold in seed_startup_traps must therefore tell
+/// this ignore apart from a foreign parent's inherited ignore, which IS
+/// hard (trap.c original_signals). This flag is the marker: it is set
+/// here, before the trap table seeds, and read only by that fold.
+#[cfg(unix)]
+static ASYNC_CHILD_ENTRY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True when this process started as an asynchronous (`&`) job child
+/// (entry SIGINT/SIGQUIT ignored by the spawn site, not by inheritance).
+#[cfg(unix)]
+pub(crate) fn async_child_entry() -> bool {
+    ASYNC_CHILD_ENTRY.load(std::sync::atomic::Ordering::Acquire)
+}
+
 #[cfg(unix)]
 pub fn apply_async_child_entry_ignores() {
     if std::env::var(ASYNC_CHILD_ENV_KEY).as_deref() != Ok("1") {
@@ -3147,6 +3166,7 @@ pub fn apply_async_child_entry_ignores() {
         return;
     }
     std::env::remove_var(ASYNC_CHILD_ENV_KEY);
+    ASYNC_CHILD_ENTRY.store(true, std::sync::atomic::Ordering::Release);
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
         libc::signal(libc::SIGQUIT, libc::SIG_IGN);
@@ -3678,7 +3698,17 @@ mod posix_sigspec_tests {
         }
         assert_eq!(translate_signal("sighup"), Some("1"));
         assert_eq!(translate_signal("SigHup"), Some("1"));
-        assert_eq!(translate_signal("sigusr1"), Some("10"));
+        // The SIGNALS table is cfg-gated per platform (USR1 is 10 on
+        // Linux/Android/Windows but 30 on macOS/FreeBSD); the test must
+        // follow the platform number, not hardcode the Linux one, and
+        // must not reach for libc: the crate is a unix-only dependency
+        // while this test module also compiles on Windows (the goldens
+        // job runs cargo test --lib there).
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        let usr1 = "30";
+        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+        let usr1 = "10";
+        assert_eq!(translate_signal("sigusr1"), Some(usr1));
     }
 
     /// rubash#1386: the EXIT pseudo-signal takes no SIG prefix in GNU
@@ -3705,6 +3735,10 @@ mod posix_sigspec_tests {
         }
         assert_eq!(signal_number_from_spec("sighup"), Some(1));
         assert_eq!(signal_number_from_spec("SigHup"), Some(1));
+        // Same platform-number note as mixed_case_prefixed_names_translate.
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        assert_eq!(signal_number_from_spec("sigusr1"), Some(30));
+        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
         assert_eq!(signal_number_from_spec("sigusr1"), Some(10));
     }
 
