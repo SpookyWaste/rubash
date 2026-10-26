@@ -384,6 +384,32 @@ fn issue1623_read_u_coproc_read_status_matches_gnu() {
 }
 
 #[test]
+fn issue1624_coproc_vars_unset_after_eof_and_reap() {
+    // GNU execute_cmd.c coproc_reap -> coproc_unsetvars: once the
+    // coproc is reaped, the name array and <name>_PID are unset — even
+    // when the user closed the write end and the read builtin's EOF
+    // handling closed the read end before the reap landed.
+    let output = rubash_command()
+        .arg("-c")
+        .arg(
+            "coproc MYC { cat; }; \
+             exec {MYC[1]}>&-; \
+             read -u ${MYC[0]} line; echo \"eof rc=$?\"; \
+             sleep 1; \
+             echo \"settled: fds=[${MYC[*]}] pid=[${MYC_PID-}]\"; \
+             read -u ${MYC[0]} again 2>/dev/null; echo \"again rc=$?\"",
+        )
+        .output()
+        .expect("run rubash");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "eof rc=1\nsettled: fds=[] pid=[]\nagain rc=1\n"
+    );
+}
+
+#[test]
 fn typed_cell_stays_consistent_across_builtin_writes() {
     // Typed-cell reads must agree with the mirror after every kind of
     // write: plain/compound/append element writes, declare/typeset/local,

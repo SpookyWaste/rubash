@@ -1382,15 +1382,23 @@ impl Executor {
     }
 
     fn retire_completed_coproc(&mut self, pid: u32) {
-        let is_coproc = self.fd_table.entries.values().any(|entry| {
-            matches!(
-                entry.read.as_ref(),
-                Some(FdReadEndpoint::CoprocStdout { pid: endpoint_pid, .. }) if *endpoint_pid == pid
-            ) || matches!(
-                entry.write.as_ref(),
-                Some(FdWriteEndpoint::CoprocStdin { pid: endpoint_pid, .. }) if *endpoint_pid == pid
-            )
-        });
+        // The spawn-time registry is the authority on "this pid is a
+        // coproc": the fd-table endpoint scan alone misses the coproc
+        // whose ends the user already closed (`exec {NAME[1]}>&-` plus
+        // the read builtin's EOF close of the read end) before the reap
+        // landed — retire then returned early and the name array and
+        // <name>_PID were never unset (rubash#1624; GNU execute_cmd.c
+        // coproc_reap -> coproc_unsetvars runs unconditionally).
+        let is_coproc = self.shell_state.coproc_names.contains_key(&pid)
+            || self.fd_table.entries.values().any(|entry| {
+                matches!(
+                    entry.read.as_ref(),
+                    Some(FdReadEndpoint::CoprocStdout { pid: endpoint_pid, .. }) if *endpoint_pid == pid
+                ) || matches!(
+                    entry.write.as_ref(),
+                    Some(FdWriteEndpoint::CoprocStdin { pid: endpoint_pid, .. }) if *endpoint_pid == pid
+                )
+            });
         if !is_coproc {
             return;
         }
