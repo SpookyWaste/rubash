@@ -21,6 +21,18 @@
 //! the errexit_status_converted mark — leaving the ast_exec time
 //! branch as the single adjudication site for timed commands.
 //!
+//! Timed-assignment follow-up (same issue): the timed
+//! assignment-only form also could not reach that conversion from
+//! the parse side — `time` occupied the simple command's name slot
+//! while tokens were classified, so the assignment token stayed a
+//! plain word and the stripped inner command dispatched it as a
+//! command name (127, the assignment never applied at all). The
+//! parser fold and the executor's `time` name-dispatch now restore
+//! the classification (parser::reclassify_leading_assignment_words)
+//! from the recorded token kinds; the scalar pins at the end cover
+//! application, status passthrough, prefix temporariness, and the
+//! quoted-word control.
+//!
 //! Expectations verified against GNU bash 5.3.20 (self-compiled
 //! oracle), script-file mode authoritative.
 
@@ -144,4 +156,44 @@ fn issue1661_timed_plain_failure_fires_err_trap_exactly_once() {
     assert_eq!(stdout, "ERRFIRED\n");
     assert!(stderr.contains("real"), "time report missing: {stderr}");
     assert_eq!(code, Some(1));
+}
+
+#[test]
+fn issue1661_timed_scalar_assignment_applies_and_reports_status() {
+    // Classification-restore pins: before the restore, the timed
+    // inner command dispatched `x=1` as a command name (127) and the
+    // assignment was never applied. GNU: a timed simple command's
+    // prefix assignments are its whole effect — applied to the
+    // shell, and the status is the substitution's status.
+    let (stdout, stderr, code) = rubash_file("time x=1\necho \"X=$x S=$?\"\n");
+    assert_eq!(stdout, "X=1 S=0\n");
+    assert!(stderr.contains("real"), "time report missing: {stderr}");
+    assert_eq!(code, Some(0));
+
+    let (stdout, _, code) = rubash_file("time x=$(exit 3)\necho \"S=$?\"\n");
+    assert_eq!(stdout, "S=3\n");
+    assert_eq!(code, Some(0));
+}
+
+#[test]
+fn issue1661_timed_assignment_prefix_is_temporary_for_a_command() {
+    // With a command name present, the restored assignments are
+    // prefix (temporary) assignments, exactly like the untimed form.
+    let (stdout, _, code) = rubash_file("x=outer\ntime x=inner true\necho \"AFTER=$x S=$?\"\n");
+    assert_eq!(stdout, "AFTER=outer S=0\n");
+    assert_eq!(code, Some(0));
+}
+
+#[test]
+fn issue1661_timed_quoted_assignment_word_stays_a_command_name() {
+    // Classification gate control: a quoted 'x=1' is a plain word
+    // (TokenKind::Word), not an assignment token — GNU looks it up
+    // as a command name and fails 127 in both shells.
+    let (stdout, stderr, code) = rubash_file("time 'x=1'\necho \"S=$?\"\n");
+    assert_eq!(stdout, "S=127\n");
+    assert!(
+        stderr.contains("command not found"),
+        "lookup diagnostic missing: {stderr}"
+    );
+    assert_eq!(code, Some(0));
 }

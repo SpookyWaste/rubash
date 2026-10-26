@@ -154,6 +154,11 @@ impl Executor {
         if cmd.word_kinds.len() == cmd.words.len() {
             timed.word_kinds = cmd.word_kinds[index..].to_vec();
         }
+        // rubash#1661: nodes that reach this name-dispatch without a
+        // parse-time fold carry the same displaced classification the
+        // parser fold restores — the assignment words sat behind the
+        // `time` name word, so handle_token never classified them.
+        crate::parser::reclassify_leading_assignment_words(&mut timed);
         let started = time_command_started();
         // GNU execute_cmd.c: the time report (print_time_info) is part of
         // executing the timed command — it is printed even when the

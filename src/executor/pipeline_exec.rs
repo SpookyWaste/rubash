@@ -5719,6 +5719,10 @@ fn time_pipeline_prefix(command: &CommandNode) -> Option<TimePipelinePrefix> {
     if command.word_metadata.len() == command.words.len() {
         stripped.word_metadata = command.word_metadata[index..].to_vec();
     }
+    // rubash#1661: same displaced classification as the parser fold —
+    // restore the stage's leading assignment words (see
+    // parser::reclassify_leading_assignment_words).
+    crate::parser::reclassify_leading_assignment_words(&mut stripped);
     Some(TimePipelinePrefix {
         command: stripped,
         inverted,
