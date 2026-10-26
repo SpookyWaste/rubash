@@ -442,6 +442,60 @@ fn issue1632_coproc_redirected_stdout_read_end_blocks_until_exit() {
 }
 
 #[test]
+fn issue1644_coproc_dup_stdout_to_stderr_reaches_shell_stderr() {
+    // GNU redir.c: `coproc CMD >&2` dup2s the shell's fd 2 onto the
+    // coproc child's stdout — the text lands on the shell's stderr,
+    // not in the coproc pipe.
+    let output = rubash_command()
+        .arg("-c")
+        .arg("coproc echo err >&2; wait $COPROC_PID")
+        .output()
+        .expect("run rubash");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "err\n");
+}
+
+#[test]
+fn issue1644_coproc_dup_stdout_to_stderr_explicit_fd_spelling() {
+    // The `1>&2` spelling takes the same dup arm as `>&2`.
+    let output = rubash_command()
+        .arg("-c")
+        .arg("coproc echo err 1>&2; wait $COPROC_PID")
+        .output()
+        .expect("run rubash");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "err\n");
+}
+
+#[test]
+fn issue1644_coproc_dup_stderr_to_stdout_joins_the_pipe() {
+    // GNU redir.c: `2>&1` dup2s the child's stdout destination — the
+    // coproc pipe — onto its stderr, so diagnostics are readable on
+    // the parent's coproc read fd.
+    let output = rubash_command()
+        .arg("-c")
+        .arg(
+            "coproc { echo out; echo err >&2; } 2>&1; \
+             read -t 2 -u ${COPROC[0]} l1; echo \"l1=[$l1]\"; \
+             read -t 2 -u ${COPROC[0]} l2; echo \"l2=[$l2]\"; \
+             wait $COPROC_PID 2>/dev/null",
+        )
+        .output()
+        .expect("run rubash");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "l1=[out]\nl2=[err]\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
 fn issue1638_append_procsub_redirect_drains_before_next_command() {
     // GNU forks the `>(...)` consumer at expansion time, so a fast
     // consumer's output is on disk when the next command runs. The
