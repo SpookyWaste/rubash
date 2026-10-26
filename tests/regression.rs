@@ -3217,6 +3217,10 @@ mod k1_batch2 {
     /// nested binary path comes from CARGO_BIN_EXE_rubash (the same
     /// binary the harness runs); forward slashes keep Windows
     /// quoting intact. On unix this guards the getrusage path.
+    /// The loop count is 20,000 (not 300,000): measured ~6.5s user /
+    /// ~18s wall on a loaded 2-core box, so the run stays far inside
+    /// the 60s harness cap while still clearing the 100ms threshold
+    /// by over an order of magnitude on any runner.
     #[test]
     fn issue1776_time_children_cpu() {
         fn parse_time_ms(line: &str) -> Option<u64> {
@@ -3234,7 +3238,7 @@ mod k1_batch2 {
         }
         let bin = env!("CARGO_BIN_EXE_rubash").replace('\\', "/");
         let script =
-            format!("time \"{bin}\" -c 'x=0; while [ $x -lt 300000 ]; do x=$((x+1)); done'\n");
+            format!("time \"{bin}\" -c 'x=0; while [ $x -lt 20000 ]; do x=$((x+1)); done'\n");
         let (_stdout, stderr, code) = run("k1-1776", &script);
         assert_eq!(code, Some(0), "stderr:\n{stderr}");
         let user_line = stderr
