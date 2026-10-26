@@ -449,6 +449,21 @@ pub enum ExecuteError {
     /// `execute_builtin_pipeline_stage`, `execute_function_pipeline_stage`)
     /// convert it to that status; it never escapes a pipeline element.
     BrokenPipe,
+    /// rubash#1639: an untrapped SIGINT killed the foreground job of an
+    /// interactive reader session — GNU jobs.c waitchld's
+    /// job-control/foreground/SIGINT block does ADDINTERRUPT and the
+    /// executing list throws to the top-level reader
+    /// (throw_to_top_level), discarding the rest of the current
+    /// command line in every frame with $? recorded as 130. (For the
+    /// in-process virtual child — the builtin sleep — the killing
+    /// delivery is the shell's own kernel-caused SIGINT receipt.)
+    /// The wait
+    /// sites only MARK the event (Executor::fg_sigint_unwind); the list
+    /// executor converts it to this error at the next command boundary
+    /// so frames cannot absorb it as a plain 130 status. Frames must
+    /// propagate it untouched (like LastpipeExit); drivers treat it as
+    /// the end of the current input unit with exit_code already 130.
+    SigintUnwind,
 }
 
 impl std::fmt::Display for ExecuteError {
@@ -470,6 +485,7 @@ impl std::fmt::Display for ExecuteError {
             }
             ExecuteError::LastpipeExit(code) => write!(f, "exit code: {}", code),
             ExecuteError::BrokenPipe => write!(f, "broken pipe"),
+            ExecuteError::SigintUnwind => write!(f, "interrupt: discarding current command line"),
         }
     }
 }
@@ -734,6 +750,16 @@ pub struct Executor {
     /// layer's EXIT trap (a signal-killed GNU process runs none) and
     /// queues the parent-side death notice.
     subshell_signal_death: Option<(usize, i32)>,
+    /// rubash#1639: a foreground wait adjudicated an untrapped SIGINT
+    /// job death for an interactive reader session (the wait sites in
+    /// trap_exec/external_inner set this; exit_code already holds
+    /// 130). The list executor converts it to
+    /// ExecuteError::SigintUnwind at the next command boundary,
+    /// discarding the rest of the current command line in every frame
+    /// (GNU wait_for's throw_to_top_level). Transient per-command
+    /// state: set only by a wait, consumed by the boundary that
+    /// immediately follows it.
+    fg_sigint_unwind: bool,
     /// rubash#1175: true only on the executor that IS this OS process's
     /// shell (constructed by Executor::new for a real process root).
     /// Fork-copy clones (command_substitution_executor) construct with

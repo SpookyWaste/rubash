@@ -1000,9 +1000,28 @@ impl Executor {
             // kills an interactive shell inside waitpid on Ctrl-C
             // (rubash#1250; GNU survives with rc=130). Non-interactive
             // shells keep SIG_DFL and die like GNU scripts do.
-            let _sigint_guard = ForegroundWaitSigintGuard::hold_if_interactive_untrapped(self);
+            let sigint_guard = ForegroundWaitSigintGuard::hold_if_interactive_untrapped(self);
             self.note_foreground_wait();
-            child.wait().map_err(ExecuteError::IoError)
+            let status = child.wait().map_err(ExecuteError::IoError)?;
+            // rubash#1639: the foreground job died by SIGINT in an
+            // interactive reader session with SIGINT untrapped — GNU
+            // jobs.c's waitchld tail (the job_control/IS_FOREGROUND/
+            // WTERMSIG==SIGINT block) does ADDINTERRUPT there, and
+            // the executing list throws to the top-level reader,
+            // discarding the rest of the line instead of continuing
+            // it with the 130 status. No shell-side receipt is
+            // required under job control: the job's own SIGINT death
+            // is the verdict. (Without job control the shell shares
+            // the child's process group, the same ^C is what the
+            // guard recorded, and the verdict is identical.) Mark the
+            // event; the list boundary converts it (the callers still
+            // record the 130 status from this ExitStatus first).
+            if sigint_guard.is_armed()
+                && crate::executor::wait_status::exit_status_signal(&status) == Some(libc::SIGINT)
+            {
+                self.fg_sigint_unwind = true;
+            }
+            Ok(status)
         }
     }
 
@@ -1742,14 +1761,22 @@ impl Executor {
 }
 
 #[cfg(unix)]
-/// Holds SIGINT at SIG_IGN across one foreground blocking wait when the
-/// shell is interactive and SIGINT has no trap installed (kernel
-/// disposition is SIG_DFL). GNU jobs.c:3086-3102 wait_for swaps in
-/// wait_sigint_handler for the wait so an interactive shell never dies
-/// mid-wait; rubash#1250 is that missing swap (Ctrl-C killed niu -i
-/// inside waitpid). Restores SIG_DFL on drop; no child is spawned while
-/// the guard lives, so nothing inherits the ignore. Trapped SIGINT keeps
-/// its handler (disposition != DFL) so trap recording is untouched, and
+/// Holds untrapped SIGINT at the recording handler across one
+/// foreground blocking wait when the shell is an interactive reader
+/// session (kernel disposition is SIG_DFL). GNU jobs.c:3086-3102
+/// wait_for swaps in wait_sigint_handler for the wait: the handler
+/// only RECORDS the delivery (trap.c trap_handler ->
+/// set_trap_state), so an interactive shell never dies mid-wait —
+/// including when it shares the child's process group (no job
+/// control) and its own copy of ^C arrives during waitpid
+/// (rubash#1250). This used to install SIG_IGN:
+/// the shell survived, but its own copy of the delivery vanished
+/// unrecorded, leaving the line-discard verdict nothing to consult.
+/// The hold is the same one the builtin-sleep guard uses
+/// (kill::hold_fg_sigint): arrivals queue in the kernel backend while
+/// FG_INT_HOLD keeps reconcile from flipping SIGINT back to Default
+/// mid-wait; Drop releases the hold. Trapped SIGINT keeps its handler
+/// (disposition != DFL) so trap recording is untouched, and
 /// entry-ignored SIGINT stays ignored.
 struct ForegroundWaitSigintGuard {
     armed: bool,
@@ -1761,31 +1788,29 @@ impl ForegroundWaitSigintGuard {
         if !foreground_sigint_needs_protection(executor) {
             return Self { armed: false };
         }
-        unsafe {
-            let mut ignore: libc::sigaction = std::mem::zeroed();
-            ignore.sa_sigaction = libc::SIG_IGN;
-            ignore.sa_flags = 0;
-            ignore.sa_mask = std::mem::zeroed();
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            {
-                ignore.sa_restorer = None;
-            }
-            if libc::sigaction(libc::SIGINT, &ignore, std::ptr::null_mut()) == 0 {
-                return Self { armed: true };
-            }
-        }
-        Self { armed: false }
+        crate::builtins::kill::hold_fg_sigint();
+        Self { armed: true }
+    }
+
+    pub(in crate::executor) fn is_armed(&self) -> bool {
+        self.armed
     }
 }
 
-/// Shared predicate for both foreground SIGINT guards (rubash#1250): the
-/// shell is interactive (same definition as the interactive-discard rule,
-/// so the two can never drift) and SIGINT sits at SIG_DFL — i.e. no trap
-/// installed (a handler means the trap path owns the delivery) and not
-/// entry-ignored.
+/// Shared predicate for both foreground SIGINT guards (rubash#1250):
+/// an interactive reader session and SIGINT sits at SIG_DFL — i.e. no
+/// trap installed (a handler means the trap path owns the delivery)
+/// and not entry-ignored. rubash#1639: the session test is
+/// interactive_reader_session, not the full expansion-discard rule —
+/// the discard rule's frame conditions (depth 0, no comsub body)
+/// govern where an expansion error is FATAL, while a foreground wait
+/// needs protection at any depth: in the flat model the subshell
+/// frame's wait is the process's foreground wait, and GNU protects
+/// the corresponding wait_for (the parent's, for the subshell job)
+/// identically.
 #[cfg(unix)]
 pub(in crate::executor) fn foreground_sigint_needs_protection(executor: &Executor) -> bool {
-    executor.expansion_error_is_interactive_discard() && sigint_disposition_is_default()
+    executor.interactive_reader_session() && sigint_disposition_is_default()
 }
 
 #[cfg(unix)]
@@ -1807,17 +1832,7 @@ impl Drop for ForegroundWaitSigintGuard {
         if !self.armed {
             return;
         }
-        unsafe {
-            let mut dfl: libc::sigaction = std::mem::zeroed();
-            dfl.sa_sigaction = libc::SIG_DFL;
-            dfl.sa_flags = 0;
-            dfl.sa_mask = std::mem::zeroed();
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            {
-                dfl.sa_restorer = None;
-            }
-            libc::sigaction(libc::SIGINT, &dfl, std::ptr::null_mut());
-        }
+        crate::builtins::kill::release_fg_sigint();
     }
 }
 
@@ -1874,7 +1889,20 @@ impl ForegroundBuiltinSigintGuard {
         let mut rest = Vec::new();
         let mut interrupted = false;
         for signal in pending {
-            if signal == libc::SIGINT && crate::builtins::kill::kernel_handler_installed(signal) {
+            // rubash#1640: only a KERNEL-caused SIGINT (the terminal
+            // driver's group delivery, ^C) kills the virtual child —
+            // that is the delivery GNU's real foreground child dies
+            // from. A kill(2) addressed to the shell alone leaves the
+            // real child running, so it is not an abort: put it back
+            // for observe_signals_while_blocked, which consumes it
+            // without ending the wait (the recorded interrupt is
+            // forgotten when the child completes normally, exactly
+            // like the trapped path's origin check in
+            // sleep_interruptibly).
+            if signal == libc::SIGINT
+                && crate::builtins::kill::kernel_handler_installed(signal)
+                && crate::builtins::kill::last_delivery_kernel_caused(signal)
+            {
                 interrupted = true;
             } else {
                 rest.push(signal);

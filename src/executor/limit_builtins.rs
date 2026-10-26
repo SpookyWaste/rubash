@@ -5,6 +5,16 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<i32, ExecuteError> {
+        // rubash#1654: inside a flat subshell layer (same process,
+        // depth > 0), a kill addressed to the shell's own pid must be
+        // judged by the pid's owner — the top-level layer — not by
+        // this layer's kernel dispositions. Arm the ancestor route for
+        // the whole dispatch; the builtin's delivery queues such
+        // signals for the depth-0 boundary (kill.rs ANCESTOR_SIGNALS).
+        #[cfg(unix)]
+        let _ancestor_route = (self.shell_state.subshell_depth.get() > 0
+            && self.shell_pid == std::process::id())
+        .then(crate::builtins::kill::arm_ancestor_route);
         if let Some(result) = self.intercept_fake_bashpid_kill(cmd) {
             return result;
         }
@@ -206,6 +216,33 @@ impl Executor {
                         // delivery below decides the counters.
                         Ok(pid) => (pid, false),
                         Err(_) => {
+                            if operand.parse::<i64>().is_ok() {
+                                // A signed numeric operand is still a
+                                // pid operand (kill.def:194-216): a
+                                // negative value names a process group
+                                // and takes a real kill(2) attempt, whose
+                                // failure reports `({pid}) - No such
+                                // process` and moves any_failed — it is
+                                // NOT a badpid. Delegate this operand to
+                                // the builtin (owner of group delivery)
+                                // and fold its verdict into the counters.
+                                // rubash#1631 (`kill -n 10 -15 $job`).
+                                let signal_args =
+                                    vec![format!("-{}", request.signal), operand.clone()];
+                                let mut signed_stderr = Vec::new();
+                                let signed_status = crate::builtins::kill::execute_with_io(
+                                    &signal_args,
+                                    &mut std::io::sink(),
+                                    &mut signed_stderr,
+                                )?;
+                                stderr.extend(signed_stderr);
+                                if signed_status != 0 {
+                                    any_failed = true;
+                                } else {
+                                    any_succeeded = true;
+                                }
+                                continue;
+                            }
                             // kill.def:205-216 sh_badpid — message only.
                             writeln!(
                                 stderr,
@@ -383,6 +420,18 @@ fn kill_request(words: &[String]) -> Option<KillRequest> {
     let mut index = 0;
     let mut signal = 15;
     let mut check_only = false;
+    // GNU builtins/kill.def option loop (kill_builtin): only the FIRST
+    // signal specification is consumed as an option — the bare -SIG
+    // branch is gated on `saw_signal == 0` (kill.def: "We only process
+    // the first one seen; other arguments may signify process groups
+    // (e.g., -num == process group num)"). A later -SIG word ends the
+    // scan and becomes an operand, judged by the operand loop (badpid
+    // diagnostic for -TERM, process-group delivery for -15). The -s/-n
+    // branches stay live after a bare spec (`kill -TERM -s USR1 pid`
+    // still delivers USR1). rubash#1631: this pre-parser used to assign
+    // every later -SIG over the earlier one, silently retargeting the
+    // tracked-job delivery.
+    let mut saw_signal = false;
     while let Some(word) = words.get(index) {
         if word == "--" {
             index += 1;
@@ -403,17 +452,23 @@ fn kill_request(words: &[String]) -> Option<KillRequest> {
             };
             signal = crate::builtins::kill::signal_number_for_spec(sigspec)?;
             check_only |= signal == 0;
+            saw_signal = true;
             index += 2;
             continue;
         }
         if word.starts_with('-') && word != "-" {
-            if word != "-0"
-                && crate::builtins::kill::translate_signal(word.trim_start_matches('-')).is_none()
-            {
+            if saw_signal {
+                break;
+            }
+            // GNU strips exactly the one leading dash (sigspec = word+1);
+            // trimming every dash would misread `--15`-style operands.
+            let spec = &word[1..];
+            if spec != "0" && crate::builtins::kill::translate_signal(spec).is_none() {
                 return None;
             }
-            signal = crate::builtins::kill::signal_number_for_spec(word.trim_start_matches('-'))?;
+            signal = crate::builtins::kill::signal_number_for_spec(spec)?;
             check_only |= signal == 0;
+            saw_signal = true;
             index += 1;
             continue;
         }

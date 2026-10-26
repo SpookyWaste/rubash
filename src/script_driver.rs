@@ -3320,6 +3320,11 @@ fn run_source_impl(
         // ExpansionFailure is GNU's DISCARD: the command list aborted but
         // the reader continues with the next complete command.
         Err(ExecuteError::ExpansionFailure(code)) => code,
+        // SigintUnwind is the same DISCARD shape with a fixed verdict
+        // (rubash#1639): GNU threw to the top-level reader on the
+        // foreground job's SIGINT death — no diagnostic, the reader
+        // continues, and $? is the 130 the wait recorded.
+        Err(ExecuteError::SigintUnwind) => 130,
         // A `return` that unwinds to this unit's top ends the unit with
         // its status as an ordinary value (builtins/evalfile.c
         // source_file returns it; no jump_to_top_level). It can only
