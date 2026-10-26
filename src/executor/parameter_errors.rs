@@ -1490,6 +1490,30 @@ impl Executor {
             && self.shell_state.subshell_depth.get() == 0
     }
 
+    /// The session half of the interactive-discard rule, WITHOUT the
+    /// frame conditions: this executor is serving a reader (an
+    /// interactive shell or a `bash -i` script — a `-c` unit is not a
+    /// reader session even under `-i`). Foreground-wait SIGINT
+    /// protection and the rubash#1639 line discard key on this alone:
+    /// GNU protects every wait_for of the session and throws from the
+    /// wait that owned the process's foreground job, and in the flat
+    /// model a subshell frame's wait IS that wait (the frame is the
+    /// job), so no depth/comsub condition applies there the way it
+    /// does to expansion-error fatality.
+    pub(in crate::executor) fn interactive_reader_session(&self) -> bool {
+        self.shell_state
+            .env_vars
+            .get("__RUBASH_INTERACTIVE")
+            .map(String::as_str)
+            == Some("1")
+            && self
+                .shell_state
+                .env_vars
+                .get("__RUBASH_IS_C")
+                .map(String::as_str)
+                != Some("1")
+    }
+
     /// `quote_aware` mirrors GNU word expansion (subst.c): quotes in a word
     /// delimit data, so `${` inside `'...'`, a $'...' string, a backtick
     /// body or a $(...) body is not an expansion start of THIS word
@@ -2003,7 +2027,9 @@ impl Executor {
                     } else {
                         self.parameter_error_value(name).is_some_and(|value| {
                             parameter_substring_has_negative_result(
-                                value.chars().count(),
+                                crate::executor::expand_braced_indices::parameter_char_length(
+                                    &value,
+                                ),
                                 offset,
                                 length,
                             )

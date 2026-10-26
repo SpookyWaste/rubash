@@ -1734,6 +1734,7 @@ impl Executor {
             // always exits its own frame, so a live parent cannot carry it).
             exec_replaced: false,
             subshell_signal_death: None,
+            fg_sigint_unwind: false,
             // rubash#1175: a fork copy shares the parent shell's process;
             // it must never execve that process away.
             owns_process_image: false,
@@ -1777,6 +1778,7 @@ impl Executor {
             last_builtin_write_failed: Cell::new(false),
             alias_introduced_words: Cell::new(0),
             redirect_target_memo: RefCell::new(HashMap::new()),
+            redirect_target_single_glob_match: RefCell::new(std::collections::HashSet::new()),
             assignment_expansion_memo: RefCell::new(HashMap::new()),
             fd_var_external_undo: Vec::new(),
             read_deadline: None,

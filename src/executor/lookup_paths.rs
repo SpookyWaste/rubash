@@ -2,6 +2,33 @@ use super::*;
 
 impl Executor {
     pub(in crate::executor) fn command_path(&self, name: &str, force_path: bool) -> Option<String> {
+        self.command_path_with_bridge(name, force_path, true)
+    }
+
+    /// Bridge-free command lookup, for execution decisions only.
+    /// The Windows suite bridge below answers display questions
+    /// (`type`, `command -v`) while PATH still holds its startup
+    /// value; it must never decide whether an emulation may run —
+    /// GNU findcmd.c:348 search_for_command resolves a slash-free
+    /// name only against the hash table and the PATH walk
+    /// (findcmd.c:623 find_user_command_in_path), and a display-only
+    /// stand-in is neither. rubash#1777: under an imported PATH the
+    /// bridge made `cat` look resolvable, so its emulation arms ran
+    /// while `head`/`wc` stood down and reported 127.
+    pub(in crate::executor) fn command_path_without_bridge(
+        &self,
+        name: &str,
+        force_path: bool,
+    ) -> Option<String> {
+        self.command_path_with_bridge(name, force_path, false)
+    }
+
+    fn command_path_with_bridge(
+        &self,
+        name: &str,
+        force_path: bool,
+        allow_bridge: bool,
+    ) -> Option<String> {
         if !force_path {
             if let Some(path) = crate::builtins::hash::hashed_path(&self.shell_state.env_vars, name)
             {
@@ -24,7 +51,7 @@ impl Executor {
         // found, so `PATH=/nonexistent; command -v ls` fails with rc 1 the
         // way GNU 5.3.0 does (WSL probe 2026-10-13).
         #[cfg(windows)]
-        if !crate::executor::path::path_is_user_owned(&self.shell_state.env_vars) {
+        if allow_bridge && !crate::executor::path::path_is_user_owned(&self.shell_state.env_vars) {
             if matches!(name, "mv") {
                 return Some("/usr/bin/mv".to_string());
             }
@@ -32,6 +59,8 @@ impl Executor {
                 return Some(format!("/bin/{name}"));
             }
         }
+        #[cfg(not(windows))]
+        let _ = allow_bridge;
         // GNU findcmd.c:266 path_value + builtins/type.def:390 describe_command:
         // an unset PATH makes find_user_command return NAME unchanged, which
         // describe_command then reports as "./name" when NAME is executable in
@@ -57,11 +86,12 @@ impl Executor {
     /// PATH=/nonexistent while GNU reports `command not found`, 127;
     /// the command's existence must not depend on the invocation
     /// shape). The resolution model is this module's own
-    /// [`Executor::command_path`]: hash first, then the GNU walk, with
-    /// the unset/empty-PATH "." rule.
+    /// [`Executor::command_path_without_bridge`]: hash first, then the
+    /// GNU walk, with the unset/empty-PATH "." rule — the Windows suite
+    /// bridge is a display stand-in, not a resolution (rubash#1777).
     pub(in crate::executor) fn emulated_external_stands_down(&self, name: &str) -> bool {
         crate::executor::path::path_is_unset(&self.shell_state.env_vars)
-            || self.command_path(name, false).is_none()
+            || self.command_path_without_bridge(name, false).is_none()
     }
 
     fn command_path_in_dot(&self, name: &str) -> Option<String> {

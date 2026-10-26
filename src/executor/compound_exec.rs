@@ -680,6 +680,26 @@ impl Executor {
         env_map.retain(|key, _| {
             !(key.starts_with("__RUBASH_TRAP") && key != "__RUBASH_TRAP_ORIG_IGN")
         });
+        // rubash#1630: dropping the table outright also dropped its
+        // VISIBILITY — GNU's forked child lists the inherited traps in
+        // reset form (`trap -p` inside `( ... ) &` prints the parent's
+        // USR1 and EXIT entries) while the dispositions stay reset, so
+        // nothing fires and the inherited EXIT trap in particular never
+        // runs in the child. The in-process subshell path gets exactly
+        // that shape from reset_for_subshell_child applied to the live
+        // table; run the same transform on a clone of the live table
+        // and forward the resulting __RUBASH_TRAP* keys, so the
+        // respawned child seeds the identical reset-but-listed table
+        // (including the save/restore idiom `eval "$(trap -p ...)"`).
+        // The retain above ran first, so only the live table's entries
+        // can land here — no stale OS-env copies.
+        let mut child_trap_table = self.shell_state.env_vars.clone();
+        crate::builtins::trap::reset_for_subshell_child(&mut child_trap_table);
+        for (key, value) in &child_trap_table {
+            if key.starts_with("__RUBASH_TRAP") {
+                env_map.insert(key.clone(), value.clone());
+            }
+        }
         // rubash#1035: GNU execute_cmd.c setup_async_signals ignores
         // SIGINT/SIGQUIT in the forked async child while job_control is off
         // (the `monitor` option is unset). A respawned `rubash -c` child
@@ -3374,10 +3394,29 @@ impl Executor {
                     child.arg(word);
                 }
             } else {
-                child.arg("-c").arg(command_words_source_text(
-                    &coproc_cmd.words,
-                    &coproc_cmd.word_metadata,
-                ));
+                // rubash#1653: the child re-parses this text, so a bare
+                // head word `time` would regain keyword status in the
+                // child even though the coproc parser never granted it
+                // (GNU parse.y:1125-1175: after `coproc`, `time` is a
+                // plain word — GNU forks the same parse tree, rubash
+                // respawns through `-c`). Quote the bare head word so
+                // the re-parse keeps it an ordinary command name: the
+                // child's lookup then matches GNU's forked child
+                // (function, builtin, PATH, else 127 `time: command
+                // not found`). A head word already quoted in source
+                // keeps its own raw spelling; only the bare `time`
+                // spelling needs the quote.
+                let mut metadata = coproc_cmd.word_metadata.clone();
+                if coproc_cmd.words.first().map(String::as_str) == Some("time")
+                    && metadata
+                        .first()
+                        .is_some_and(|meta| meta.value == "time" && meta.raw == "time")
+                {
+                    metadata[0].raw = "'time'".to_string();
+                }
+                child
+                    .arg("-c")
+                    .arg(command_words_source_text(&coproc_cmd.words, &metadata));
             }
             child
         } else {
@@ -3760,11 +3799,53 @@ impl Executor {
     }
 
     fn apply_coproc_redirects(
-        &self,
+        &mut self,
         cmd: &CommandNode,
         child: &mut Command,
     ) -> Result<(), ExecuteError> {
-        if let Some(redirect) = &cmd.redirect_in {
+        // rubash#1651: a memory-backed stdin body (here-string,
+        // heredoc) that wins fd 0 replaces the coproc pipe as the
+        // child's stdin. GNU redir.c do_redirections binds fd 0
+        // to the body before the child runs, so the coproc
+        // consumes it and exits; the old code left the child on
+        // the pipe and `coproc cat <<< hi` blocked forever. The
+        // body rides a pre-filled pipe (writer thread: a body
+        // larger than the pipe buffer must not block the spawn
+        // waiting for a reader that does not exist yet; EPIPE
+        // when the child exits early is ignored). Only
+        // HereDoc/HereString winners take this path: `< file`
+        // keeps the real-file path below, and `<&N` dups keep
+        // the pipe — streaming a dup through a string buffer
+        // would change blocking behavior. When the body wins,
+        // it outranks redirect_in (GNU left-to-right order: the
+        // last fd-0 redirect wins).
+        let mut body_stdin: Option<std::process::Stdio> = None;
+        if let Some(text) = self.coproc_stdin_body(cmd) {
+            use std::io::Write as _;
+            if let Ok((reader, mut writer)) = std::io::pipe() {
+                std::thread::spawn(move || {
+                    let _ = writer.write_all(text.as_bytes());
+                });
+                #[cfg(windows)]
+                {
+                    use std::os::windows::io::{FromRawHandle as _, IntoRawHandle as _};
+                    let handle = reader.into_raw_handle();
+                    body_stdin = Some(std::process::Stdio::from(unsafe {
+                        std::fs::File::from_raw_handle(handle)
+                    }));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::{FromRawFd as _, IntoRawFd as _};
+                    let fd = reader.into_raw_fd();
+                    body_stdin = Some(std::process::Stdio::from(unsafe {
+                        std::fs::File::from_raw_fd(fd)
+                    }));
+                }
+            }
+        }
+        if body_stdin.is_none() {
+            if let Some(redirect) = &cmd.redirect_in {
             if redirect.fd.unwrap_or(0) == 0 {
                 let target = self.expand_redirect_target(redirect);
                 if is_closed_redirect_target(&target) {
@@ -3772,6 +3853,7 @@ impl Executor {
                 } else if redirect_target_fd(&target).is_none() {
                     child.stdin(Stdio::from(self.open_input_redirect(&target)?));
                 }
+            }
             }
         }
 
@@ -3813,6 +3895,13 @@ impl Executor {
                     shell_path_to_windows(&target, &self.shell_state.env_vars),
                 ))?));
             }
+        }
+
+        // The body pipe replaces the coproc pipe set by the caller
+        // (the parent's write end stays registered as ${COPROC[1]},
+        // useless but present, like GNU's rebound pipe end).
+        if let Some(stdio) = body_stdin {
+            child.stdin(stdio);
         }
 
         Ok(())

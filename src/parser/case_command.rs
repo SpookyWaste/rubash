@@ -495,9 +495,13 @@ fn case_command_end_index(tokens: &[Token], start: usize) -> usize {
     let mut depth = 0usize;
     let mut index = start;
     while index < tokens.len() {
-        if is_keyword(tokens, index, "case") {
+        // rubash#1721: only structural `case'/`esac' count — a
+        // keyword-spelled argument word inside a clause body
+        // (`echo esac') is not the case's own keyword (GNU parse.y:
+        // 3168 CHECK_FOR_RESERVED_WORD).
+        if tokens[index].structural_keyword() && is_keyword(tokens, index, "case") {
             depth += 1;
-        } else if is_keyword(tokens, index, "esac") {
+        } else if tokens[index].structural_keyword() && is_keyword(tokens, index, "esac") {
             depth = depth.saturating_sub(1);
             if depth == 0 {
                 return index + 1;

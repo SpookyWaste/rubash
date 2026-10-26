@@ -398,6 +398,7 @@ impl Executor {
     pub(in crate::executor) fn execute_empty_words_command(
         &mut self,
         cmd: &CommandNode,
+        vanished_substitution_status: Option<i32>,
     ) -> Result<(), ExecuteError> {
         let _t = super::exec_profile::PhaseTimer::new(&super::exec_profile::P_EMPTY);
         if command_has_no_effect(cmd) {
@@ -534,6 +535,17 @@ impl Executor {
         let trace_assignments = self.xtrace_enabled() && cmd.arithmetic_command.is_none();
         let xtrace_prefix = trace_assignments.then(|| self.xtrace_prefix());
         let mut status = 0;
+        // rubash#1661: a null command whose words vanished into a
+        // command substitution keeps that substitution's status (GNU
+        // execute_cmd.c execute_null_command: the command's status is
+        // the last command substitution status from its expansion).
+        // The caller consumed the value from
+        // last_command_substitution_status; the assignment loop below
+        // overwrites it per assignment and the redirect arms overwrite
+        // it on failure, preserving GNU's ordering.
+        if let Some(substitution_status) = vanished_substitution_status {
+            status = substitution_status;
+        }
         // assignment_raws stays index-aligned with assignments when every
         // binding came through insert_assignment_with_raw (the normal
         // parse path); sentinel inserts without raw break alignment, so
@@ -841,7 +853,17 @@ impl Executor {
             // ast_exec loop's adjudication entirely. The non-errexit path
             // still returns Ok and lets the loop fire, so fire only on
             // this converting branch.
-            self.maybe_run_error_trap(cmd)?;
+            // rubash#1611/#1661: inside a timed dispatch the fire is
+            // deferred to the ast_exec time branch (the single
+            // adjudication for the completed timed command), and the
+            // conversion mark lets execute_time_ast_command treat this
+            // ExitCode as a completion. Without the mark, a timed
+            // assignment-only failure (`time x=$(false)`) took the
+            // genuine-unwind arm and exited 127 instead of GNU's 1.
+            if self.timed_dispatch_depth.get() == 0 {
+                self.maybe_run_error_trap(cmd)?;
+            }
+            self.errexit_status_converted.set(true);
             return Err(ExecuteError::ExitCode(self.exit_code));
         }
         Ok(())

@@ -1553,6 +1553,7 @@ fn variable_completion_candidates(
         [
             "BASHPID",
             "BASH_COMMAND",
+            "BASH_MONOSECONDS",
             "BASH_SUBSHELL",
             "EPOCHREALTIME",
             "EPOCHSECONDS",

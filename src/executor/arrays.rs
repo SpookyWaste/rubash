@@ -446,6 +446,17 @@ fn bytes_to_shell_text(
 }
 
 pub(super) fn field_split_values_with_ifs(value: &str, ifs: Option<&str>) -> Vec<String> {
+    // GNU word splitting (subst.c:12377 word_split) of an empty expansion
+    // result yields NO field, whatever IFS holds: the trailing-field
+    // emission below is driven by consumed delimiters, and an empty
+    // string contains none (rubash#1715: `IFS=:; v=''; for x in $v`
+    // must iterate zero times). The whitespace and empty-IFS branches
+    // already encode this; the non-whitespace and raw-byte-marker
+    // branches manufactured one empty field from the unconditional
+    // final push.
+    if value.is_empty() {
+        return Vec::new();
+    }
     let Some(ifs) = ifs else {
         return split_ifs_whitespace(value, " \t\n");
     };
@@ -526,10 +537,29 @@ pub(super) fn field_split_array_values_with_ifs(
     values: Vec<String>,
     ifs: Option<&str>,
 ) -> Vec<String> {
-    values
-        .into_iter()
-        .flat_map(|value| field_split_values_with_ifs(&value, ifs))
-        .collect()
+    // GNU hands the element list to the standard field splitter as ONE
+    // string joined with the first IFS character (the model
+    // string_list_dollar_at documents at subst.c:2957 and that
+    // field_split_positional_values_with_ifs already implements for
+    // $@): junction empties then fall out of the single-string rules.
+    // Splitting each element independently and concatenating miscounts
+    // exactly at the junctions (rubash#1714): a delimiter-only element
+    // `:` under IFS=: must contribute TWO empty fields (it is two
+    // adjacent separators in the joined string), an empty element
+    // between neighbors contributes one, and a leading empty element
+    // survives while a trailing one drops.
+    if ifs.is_some_and(|ifs| ifs.is_empty()) {
+        // Null IFS: no field splitting — one word per element, but an
+        // entirely empty element contributes no field at all (measured
+        // GNU 5.3.20: `IFS=''; arr=('' x); set -- ${arr[@]}` -> 1 word).
+        return values
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect();
+    }
+    let separator = ifs.and_then(|ifs| ifs.chars().next()).unwrap_or(' ');
+    let joined = values.join(&separator.to_string());
+    field_split_values_with_ifs(&joined, ifs)
 }
 
 pub(super) fn field_split_positional_values_with_ifs(
@@ -549,8 +579,13 @@ pub(super) fn field_split_positional_values_with_ifs(
     if ifs.is_some_and(|ifs| ifs.is_empty()) {
         // Posix interp 888 (IFS null): no field splitting — one word per
         // parameter (callers already special-case the plain `$*`/`${*}`
-        // spellings the same way).
-        return values;
+        // spellings the same way), but an entirely empty parameter
+        // contributes no word (rubash#1714; measured GNU 5.3.20:
+        // `IFS=''; set -- '' x ' y '; set -- $@` -> 2 words [x][ y ]).
+        return values
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect();
     }
     let separator = ifs.and_then(|ifs| ifs.chars().next()).unwrap_or(' ');
     let joined = values.join(&separator.to_string());

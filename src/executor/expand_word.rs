@@ -122,8 +122,9 @@ impl Executor {
         raw: &str,
         target: &str,
     ) -> bool {
+        let extglob = crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "extglob");
         if !target.chars().any(char::is_whitespace) {
-            return redirect_target_is_ambiguous(raw, target);
+            return redirect_target_is_ambiguous(raw, target, extglob);
         }
         let posix_nosplit = self.posix_mode_enabled()
             && !self
@@ -142,7 +143,17 @@ impl Executor {
                 return false;
             }
         }
-        redirect_target_is_ambiguous(raw, target)
+        // rubash#1769: one glob match is one field (redir.c:298 count),
+        // whatever whitespace its name contains — the textual gate below
+        // cannot tell it from a multi-field join, so the expansion's own
+        // field-count fact wins. Every other shape still falls through to
+        // the textual gate (an unquoted `$var` that word-splits stays
+        // ambiguous). The #1673 extglob introducer class (3rd arg) is
+        // preserved, not replaced.
+        if self.redirect_target_resolved_single_glob_match(redirect) {
+            return false;
+        }
+        redirect_target_is_ambiguous(raw, target, extglob)
     }
 
     pub(crate) fn expand_redirect_target(&self, redirect: &crate::parser::Redirect) -> String {
@@ -188,10 +199,7 @@ impl Executor {
             }
             return redirect.target.clone();
         }
-        let key = format!(
-            "{:?}\x1f{}\x1f{:?}\x1f{}",
-            redirect.kind, redirect.operator, redirect.fd, redirect.target
-        );
+        let key = Self::redirect_target_memo_key(redirect);
         if let Some(hit) = self.redirect_target_memo.borrow().get(&key) {
             return hit.clone();
         }
@@ -202,7 +210,7 @@ impl Executor {
         // the word expansion, then pathname expansion. Heredoc/herestring
         // operands do NOT (redir.c:396-397 heredoc_expand uses
         // expand_string_to_string — single string, no field list, no glob).
-        let expanded = self.expand_redirect_operand_fields(redirect, expanded);
+        let (expanded, single_glob_match) = self.expand_redirect_operand_fields(redirect, expanded);
         // The lexer's fully-quoted-word role marker (lexer/word.rs, the
         // STORAGE_WORD_PREFIX sentinel for words that are wholly quoted and
         // contain ${..}) is word-LEVEL role information — GNU's
@@ -225,8 +233,39 @@ impl Executor {
         };
         self.redirect_target_memo
             .borrow_mut()
-            .insert(key, expanded.clone());
+            .insert(key.clone(), expanded.clone());
+        if single_glob_match {
+            self.redirect_target_single_glob_match
+                .borrow_mut()
+                .insert(key);
+        }
         expanded
+    }
+
+    /// The memo key shared by `redirect_target_memo` and
+    /// `redirect_target_single_glob_match`: one entry per redirect node
+    /// per command execution span.
+    fn redirect_target_memo_key(redirect: &crate::parser::Redirect) -> String {
+        format!(
+            "{:?}\x1f{}\x1f{:?}\x1f{}",
+            redirect.kind, redirect.operator, redirect.fd, redirect.target
+        )
+    }
+
+    /// True when this redirect's expansion resolved through pathname
+    /// expansion to exactly one match (see
+    /// `expand_redirect_operand_fields`): one field by the
+    /// redir.c:298/subst.c:12602 count, whatever whitespace its name
+    /// contains. Consulted by the ambiguity gates; false when the target
+    /// was never expanded through that arm (procsub carrier, memo state
+    /// from another span) and the caller falls back to the textual gate.
+    pub(in crate::executor) fn redirect_target_resolved_single_glob_match(
+        &self,
+        redirect: &crate::parser::Redirect,
+    ) -> bool {
+        self.redirect_target_single_glob_match
+            .borrow()
+            .contains(&Self::redirect_target_memo_key(redirect))
     }
 
     /// GNU redir.c:298 redirection_expand → subst.c:12590
@@ -241,17 +280,27 @@ impl Executor {
     /// field-split `$var` operands already use — and the ambiguity gate
     /// (`redirect_target_is_ambiguous`) recognizes them through the raw
     /// word's unquoted expansion introducers.
+    ///
+    /// The returned bool is the field-count fact the gate cannot recover
+    /// from the joined String: true only when pathname expansion resolved
+    /// to exactly one match. GNU redir.c:298 redirection_expand returns
+    /// NULL exactly when the expanded word list has zero or more than one
+    /// field, and subst.c:12602 glob_expand_word_list makes one list entry
+    /// per match without word-splitting the matches — so one match is one
+    /// field even when its name contains whitespace (rubash#1769). Every
+    /// other arm returns false and leaves the gate's existing behavior
+    /// untouched (an unquoted `$var` that word-splits stays ambiguous).
     fn expand_redirect_operand_fields(
         &self,
         redirect: &crate::parser::Redirect,
         expanded: String,
-    ) -> String {
+    ) -> (String, bool) {
         use crate::parser::RedirectKind;
         if matches!(
             redirect.kind,
             RedirectKind::HereDoc | RedirectKind::HereString
         ) {
-            return expanded;
+            return (expanded, false);
         }
         let raw = redirect.target_metadata.raw.as_str();
         // Pathname expansion obeys quoting exactly like an argument word
@@ -284,11 +333,14 @@ impl Executor {
             // more than one alternative is already the ambiguous condition
             // (`> a{b,c}` -> `ab ac`), so join for the gate exactly like a
             // field-split expansion.
-            return branches
-                .iter()
-                .map(|branch| self.expand_word(branch))
-                .collect::<Vec<_>>()
-                .join(" ");
+            return (
+                branches
+                    .iter()
+                    .map(|branch| self.expand_word(branch))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                false,
+            );
         }
         // A single branch that the brace machinery rewrote (`> out{1..1}`
         // -> `out1`) replaces the operand for the rest of the pipeline;
@@ -309,7 +361,7 @@ impl Executor {
             // GNU subst.c:12683-12688 (expand_words_no_vars else-branch): a
             // word that does not glob is still DEQUOTED before it becomes
             // the literal filename.
-            return redirect_operand_literal(&expanded);
+            return (redirect_operand_literal(&expanded), false);
         }
         match glob::pathname_expand_word(
             &expanded,
@@ -320,13 +372,18 @@ impl Executor {
             // value globs to two files, or a literal `> amb*` with two
             // matches): joined for the ambiguity gate, GNU reports
             // AMBIGUOUS_REDIRECT and opens nothing.
-            glob::PathnameExpansion::Matches(matches) if matches.len() > 1 => matches.join(" "),
+            glob::PathnameExpansion::Matches(matches) if matches.len() > 1 => {
+                (matches.join(" "), false)
+            }
             // A single match is the resolved filename GNU opens
             // (`> amb1*` with one match opens amb1); an empty match list
             // (nullglob) is the zero-field ambiguous condition carried as
-            // the empty string the gate already reports.
+            // the empty string the gate already reports. Only this arm
+            // reports a field count of one: the match is one field even
+            // when its name contains whitespace (rubash#1769).
             glob::PathnameExpansion::Matches(matches) => {
-                matches.into_iter().next().unwrap_or_default()
+                let single = matches.len() == 1;
+                (matches.into_iter().next().unwrap_or_default(), single)
             }
             // NoMatch keeps the literal pattern (nullglob off, glob.c
             // returns the pattern itself) — DEQUOTED, because GNU replaces
@@ -339,7 +396,7 @@ impl Executor {
             // boundary — a `>"@(zz)q"` target opens `@(zz)q`, not a name
             // led by the CTLESC byte \x11 (rubash#424: Windows open()
             // failed ERROR_INVALID_NAME on the carrier byte).
-            glob::PathnameExpansion::NoMatch => redirect_operand_literal(&expanded),
+            glob::PathnameExpansion::NoMatch => (redirect_operand_literal(&expanded), false),
             // GNU subst.c:12663-12668 (fail_glob_expansion): report_error
             // `no match: WORD' (the dequoted word) and exp_jump_to_
             // top_level(DISCARD) — the redirection NEVER opens and the
@@ -361,7 +418,7 @@ impl Executor {
                 }
                 self.shell_state.redirect_failglob_error.set(true);
                 self.shell_state.redirect_failglob_seen.set(true);
-                pattern
+                (pattern, false)
             }
         }
     }

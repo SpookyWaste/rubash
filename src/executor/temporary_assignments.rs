@@ -342,12 +342,27 @@ impl Executor {
                     assignments_failed = true;
                     continue;
                 }
+                // rubash#1620: an APPEND compound word (`a+=(9) cmd`)
+                // prepends the old cell's scalar view to the literal
+                // list text (GNU variables.c assign_in_env via
+                // make_variable_value with ASS_APPEND: element 0 for an
+                // indexed array, empty for an assoc array, the value
+                // itself for a scalar) — the same view the #1556 array
+                // shadow branch below computes for plain appends. The
+                // non-append form keeps binding the list text alone.
+                let (_, append) = assignment_name_and_append(name);
+                let window_value = if append {
+                    let target = resolved_target.as_deref().unwrap_or(base_name).to_string();
+                    format!("{}{}", self.tempenv_scalar_view(&target), compound)
+                } else {
+                    compound.to_string()
+                };
                 self.shell_state
                     .env_vars
-                    .insert(base_name.to_string(), compound.to_string());
+                    .insert(base_name.to_string(), window_value.clone());
                 let _ = self.shell_state.variables.set(
                     base_name.to_string(),
-                    crate::shell::Variable::scalar(compound.to_string()),
+                    crate::shell::Variable::scalar(window_value),
                 );
                 // rubash#1525: the compound tempenv binds as a
                 // literal scalar tempvar, PIPESTATUS included.
@@ -635,7 +650,7 @@ impl Executor {
     /// variables.c make_variable_value with ASS_APPEND, rubash#1556):
     /// element 0 of an indexed array, empty for an assoc array,
     /// the value itself for a scalar.
-    fn tempenv_scalar_view(&self, target: &str) -> String {
+    pub(in crate::executor) fn tempenv_scalar_view(&self, target: &str) -> String {
         match self.shell_state.variables.get(target).map(|v| &v.value) {
             Some(crate::shell::ShellValue::IndexedArray(entries)) => {
                 entries.get(&0).cloned().unwrap_or_default()
@@ -1653,8 +1668,13 @@ impl Executor {
                     )
                 } else {
                     element_values_converted = true;
-                    let value = self.apply_case_assignment_attributes(base_name, value);
-                    append_assoc_scalar_value(current, &value)
+                    append_assoc_scalar_append_value(
+                        current,
+                        &value,
+                        is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name),
+                        &self.shell_state.env_vars,
+                        base_name,
+                    )
                 }
             } else if is_array_storage(current)
                 || is_marked_var(&self.shell_state.env_vars, ARRAY_VARS, base_name)

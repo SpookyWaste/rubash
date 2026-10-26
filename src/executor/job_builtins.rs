@@ -2609,13 +2609,9 @@ impl Executor {
         // a session history on demand so the builtin can read/list —
         // but only when no host provider is installed: an installed
         // provider IS the history list (the host owns interactive
-        // history), so an auto-created empty session must not shadow it.
-        if self.shell_state.session_history.is_none() && self.history_provider.is_none() {
-            let session = std::rc::Rc::new(std::cell::RefCell::new(
-                crate::history::SessionHistory::new(),
-            ));
-            self.set_session_history(Some(session));
-        }
+        // history), so an auto-created empty session must not shadow
+        // it (Executor::ensure_session_history owns the rule).
+        self.ensure_session_history();
         if let Some(session) = self.shell_state.session_history.clone() {
             // The shell's own session history (scripts that ran
             // "set -o history") takes precedence over the host provider.
@@ -2820,21 +2816,33 @@ impl Executor {
             } else {
                 provider.borrow_mut().entries()?
             };
+            let mut surplus = false;
             let status = crate::builtins::history::execute_with_history(
                 args,
                 &self.diagnostic_prefix(),
                 &entries,
                 &mut stdout,
                 &mut stderr,
+                &mut surplus,
             )?;
+            if surplus {
+                // rubash#1660: no_args DISCARD (see history_exec.rs).
+                self.raise_evalerror_abort();
+                self.evalerror_exit_toomany_pending.set(true);
+            }
             self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
             return Ok(status);
         }
-        let status = crate::builtins::history::execute_with_io(
+        let (status, surplus) = crate::builtins::history::execute_with_io(
             args,
             &self.diagnostic_prefix(),
             &mut stderr,
         )?;
+        if surplus {
+            // rubash#1660: no_args DISCARD (see history_exec.rs).
+            self.raise_evalerror_abort();
+            self.evalerror_exit_toomany_pending.set(true);
+        }
         self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
         Ok(status)
     }

@@ -22,6 +22,18 @@ impl Executor {
             crate::builtins::shift::ShiftAction::Complete(status) => {
                 self.exit_code = status;
             }
+            // rubash#1650: the no_args DISCARD channel, shared with
+            // `exit 1 2` (command_dispatch_primary.rs): set
+            // EX_BADUSAGE, then arm the reader-level discard — the
+            // list loop skips the rest of the failing logical line,
+            // a function body unwinds with status 2 and its caller
+            // continues, a subshell ends with 2, and under `-c` the
+            // whole string is abandoned with status 1.
+            crate::builtins::shift::ShiftAction::TooManyArguments => {
+                self.exit_code = crate::builtins::shift::EX_USAGE;
+                self.raise_evalerror_abort();
+                self.evalerror_exit_toomany_pending.set(true);
+            }
             crate::builtins::shift::ShiftAction::Shift(amount) => {
                 if amount > self.shell_state.positional_len() {
                     // GNU general.c:112 (posix_initialize): `set -o posix'
@@ -154,6 +166,18 @@ impl Executor {
         if cmd.word_kinds.len() == cmd.words.len() {
             timed.word_kinds = cmd.word_kinds[index..].to_vec();
         }
+        // Keep word_metadata index-aligned with the stripped words,
+        // as the parser fold and the pipeline-prefix strip both do:
+        // the restore below reads the recorded raw spellings through
+        // it, and any other metadata consumer expects the alignment.
+        if cmd.word_metadata.len() == cmd.words.len() {
+            timed.word_metadata = cmd.word_metadata[index..].to_vec();
+        }
+        // rubash#1661: nodes that reach this name-dispatch without a
+        // parse-time fold carry the same displaced classification the
+        // parser fold restores — the assignment words sat behind the
+        // `time` name word, so handle_token never classified them.
+        crate::parser::reclassify_leading_assignment_words(&mut timed);
         let started = time_command_started();
         // GNU execute_cmd.c: the time report (print_time_info) is part of
         // executing the timed command — it is printed even when the

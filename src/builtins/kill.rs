@@ -505,10 +505,22 @@ where
             continue;
         };
 
-        // Negative pid → Unix process group.  Windows has no such target,
-        // so silently skip delivery (signal 0 already handled above for
-        // existence probes of the current group).
+        // Negative pid → Unix process group (GNU kill.def:194-216
+        // kill_pid: a valid negative number is delivered through
+        // kill(2) as-is — the negative value IS the group addressing —
+        // and a failure reports `({pid}) - {strerror}` and moves
+        // any_failed, exactly like a positive pid). Windows has no such
+        // target, so the silent skip stays there (signal 0 probes of
+        // the current group are handled above). rubash#1631.
         if pid < 0 {
+            #[cfg(unix)]
+            match signal_process_group(pid, signal) {
+                Ok(()) => any_succeeded = true,
+                Err(message) => {
+                    writeln!(stderr, "{}kill: ({pid}) - {message}", diagnostic_prefix())?;
+                    any_failed = true;
+                }
+            }
             continue;
         }
 
@@ -519,6 +531,25 @@ where
         // existence probe, so the shell can answer it from its own group
         // context without attempting to terminate a process.
         if pid == 0 && signal == 0 {
+            any_succeeded = true;
+            continue;
+        }
+
+        // rubash#1654: a delivery addressed to the shell's own pid
+        // from inside a flat subshell layer (ancestor route armed) is
+        // judged by the top-level layer that OWNS the pid, not by the
+        // subshell layer's just-reprogrammed kernel disposition —
+        // queue it for the depth-0 boundary dispatch instead of
+        // raising it into the child's SIG_IGN / handler. Signal 0
+        // probes and non-adjudicable signals (SIGKILL, stop class)
+        // keep the raw path.
+        #[cfg(unix)]
+        if pid == std::process::id()
+            && signal != 0
+            && ancestor_route_active()
+            && boundary_adjudicable_signal(signal)
+        {
+            queue_ancestor_signal(signal);
             any_succeeded = true;
             continue;
         }
@@ -1095,6 +1126,74 @@ fn take_self_signals() -> Vec<i32> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::mem::take(&mut *queue)
+}
+
+/// rubash#1654: signals a flat subshell layer addressed to the shell's
+/// own pid (`kill -s TERM $$` inside `( ... )`). In GNU the subshell
+/// is a separate process and `$$` names the PARENT shell, whose own
+/// dispositions judge the delivery; here the layers share one process
+/// and one kernel disposition table, which the subshell body's
+/// `trap ''` / `trap '...'` may just have reprogrammed — a raw
+/// raise(2) is swallowed by the child's SIG_IGN, or queued under the
+/// child's handler and then dropped as stale once the parent boundary
+/// reconciles back. So while the ancestor route is armed (see below),
+/// the kill builtin queues such deliveries here instead, and the
+/// first depth-0 boundary poll dispatches them against the restored
+/// top-level table (trap_exec::run_pending_signal_traps): trapped ->
+/// run the action, ignored -> drop, untrapped -> the 128+sig death —
+/// exactly the verdicts the addressed process would have produced.
+static ANCESTOR_SIGNALS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn queue_ancestor_signal(signal: i32) {
+    ANCESTOR_SIGNALS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(signal);
+    #[cfg(unix)]
+    {
+        PENDING_ANY.store(true, std::sync::atomic::Ordering::Release);
+        // An in-process routed delivery is by construction not a
+        // kernel/group delivery (same record queue_self_signal makes).
+        kernel_signals::note_self_delivery(signal);
+    }
+}
+
+pub(crate) fn take_ancestor_signals() -> Vec<i32> {
+    let mut queue = ANCESTOR_SIGNALS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::mem::take(&mut *queue)
+}
+
+thread_local! {
+    /// Armed by Executor::execute_kill while the current executor is
+    /// a flat subshell layer sharing this process (rubash#1654): kill
+    /// deliveries addressed to the shell's own pid then route to
+    /// ANCESTOR_SIGNALS instead of raise(2). A Session is confined to
+    /// one thread and the builtin's delivery is synchronous, so a
+    /// thread-local flag is exact; the guard restores the prior value
+    /// so nested kill invocations cannot leak the routing.
+    static ANCESTOR_ROUTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn ancestor_route_active() -> bool {
+    ANCESTOR_ROUTE.with(|flag| flag.get())
+}
+
+/// RAII arm for the ancestor route (rubash#1654).
+pub(crate) struct AncestorRouteGuard {
+    previous: bool,
+}
+
+pub(crate) fn arm_ancestor_route() -> AncestorRouteGuard {
+    let previous = ANCESTOR_ROUTE.with(|flag| flag.replace(true));
+    AncestorRouteGuard { previous }
+}
+
+impl Drop for AncestorRouteGuard {
+    fn drop(&mut self) {
+        ANCESTOR_ROUTE.with(|flag| flag.set(self.previous));
+    }
 }
 
 // rubash#375/perf3: the per-command signal-poll's Windows-port catch_flag.
@@ -1754,6 +1853,22 @@ fn signal_process(pid: u32, signal: i32) -> Result<(), &'static str> {
     }
 }
 
+/// kill(2) with a signed pid: a negative value addresses a process
+/// group (GNU kill.def kill_pid passes the operand through verbatim).
+/// rubash#1631.
+#[cfg(unix)]
+fn signal_process_group(pid: i32, signal: i32) -> Result<(), &'static str> {
+    let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    if result == 0 {
+        return Ok(());
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Err("No such process"),
+        Some(libc::EPERM) => Err("Permission denied"),
+        _ => Err("Failed to signal process"),
+    }
+}
+
 #[cfg(not(any(unix, windows)))]
 fn signal_process(_pid: u32, signal: i32) -> Result<(), &'static str> {
     if signal == 0 {
@@ -2166,6 +2281,15 @@ mod kernel_signals {
             return true;
         }
         is_managed(sig) && HANDLER_SET.load(Ordering::Relaxed) & bit(sig) != 0
+    }
+
+    /// Whether the boundary dispatcher can adjudicate `sig` at all
+    /// (the managed set or the fatal set). The rubash#1654 ancestor
+    /// route queues only signals whose top-level verdict the
+    /// dispatcher owns; SIGKILL and the stop class are not adjudicable
+    /// and keep raw raise(2) semantics.
+    pub(super) fn adjudicable(sig: i32) -> bool {
+        is_managed(sig) || fatal_index(sig).is_some()
     }
 
     /// rubash#1475: the fatal set, SIGSEGV and SIGBUS. Both are caught
@@ -2662,8 +2786,7 @@ mod kernel_signals {
 /// the full managed set (see MANAGED_CORE).
 #[cfg(unix)]
 fn managed_trap_keys() -> &'static [(i32, String, String)] {
-    static KEYS: std::sync::OnceLock<Vec<(i32, String, String)>> =
-        std::sync::OnceLock::new();
+    static KEYS: std::sync::OnceLock<Vec<(i32, String, String)>> = std::sync::OnceLock::new();
     KEYS.get_or_init(|| {
         let mut keys: Vec<(i32, String, String)> = Vec::new();
         let mut push = |keys: &mut Vec<(i32, String, String)>, sig: i32, short: &str| {
@@ -2836,9 +2959,7 @@ pub fn reconcile_kernel_trap_dispositions(env_vars: &std::collections::HashMap<S
     // armed EXIT trap — GNU's terminating set names them (oracle:
     // EXIT trap + untrapped kill -ILL runs the EXIT trap, dies 132).
     let fatal_want_rerouted = |short: &str, key: &str| match env_vars.get(key) {
-        Some(action) if !action.is_empty() && !reset_contains(reset, short) => {
-            Disposition::Handler
-        }
+        Some(action) if !action.is_empty() && !reset_contains(reset, short) => Disposition::Handler,
         Some(_) if reset_contains(reset, short) => Disposition::Default,
         Some(_) => Disposition::Ignore,
         None if exit_armed => Disposition::Handler,
@@ -2930,6 +3051,13 @@ pub fn kernel_handler_installed(signal: i32) -> bool {
 #[cfg(unix)]
 pub fn last_delivery_kernel_caused(signal: i32) -> bool {
     kernel_signals::last_delivery_kernel_caused(signal)
+}
+
+/// Whether the boundary dispatcher can adjudicate `signal` (managed or
+/// fatal set) — see kernel_signals::adjudicable (rubash#1654).
+#[cfg(unix)]
+pub fn boundary_adjudicable_signal(signal: i32) -> bool {
+    kernel_signals::adjudicable(signal)
 }
 
 /// rubash#1250: hold untrapped SIGINT at the mailbox handler across a
@@ -3145,6 +3273,25 @@ pub const ASYNC_CHILD_ENV_KEY: &str = "__RUBASH_ASYNC_CHILD";
 /// Scrubs the key unconditionally afterwards so it never reaches
 /// `export -p` or grandchildren environments (kernel inheritance carries
 /// the disposition there, as fork does in GNU).
+///
+/// The async-child ignore is a setup_async_signals disposition, NOT a
+/// hard ignore: GNU's forked async child lists `trap -- '' SIGINT` yet
+/// still lets a later `trap` override it (trap.c's ASYNCSIG special-case
+/// in set_signal — the golden trap-signal-matrix fires its INT handler).
+/// The entry-disposition fold in seed_startup_traps must therefore tell
+/// this ignore apart from a foreign parent's inherited ignore, which IS
+/// hard (trap.c original_signals). This flag is the marker: it is set
+/// here, before the trap table seeds, and read only by that fold.
+#[cfg(unix)]
+static ASYNC_CHILD_ENTRY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True when this process started as an asynchronous (`&`) job child
+/// (entry SIGINT/SIGQUIT ignored by the spawn site, not by inheritance).
+#[cfg(unix)]
+pub(crate) fn async_child_entry() -> bool {
+    ASYNC_CHILD_ENTRY.load(std::sync::atomic::Ordering::Acquire)
+}
+
 #[cfg(unix)]
 pub fn apply_async_child_entry_ignores() {
     if std::env::var(ASYNC_CHILD_ENV_KEY).as_deref() != Ok("1") {
@@ -3152,6 +3299,7 @@ pub fn apply_async_child_entry_ignores() {
         return;
     }
     std::env::remove_var(ASYNC_CHILD_ENV_KEY);
+    ASYNC_CHILD_ENTRY.store(true, std::sync::atomic::Ordering::Release);
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
         libc::signal(libc::SIGQUIT, libc::SIG_IGN);
@@ -3683,7 +3831,17 @@ mod posix_sigspec_tests {
         }
         assert_eq!(translate_signal("sighup"), Some("1"));
         assert_eq!(translate_signal("SigHup"), Some("1"));
-        assert_eq!(translate_signal("sigusr1"), Some("10"));
+        // The SIGNALS table is cfg-gated per platform (USR1 is 10 on
+        // Linux/Android/Windows but 30 on macOS/FreeBSD); the test must
+        // follow the platform number, not hardcode the Linux one, and
+        // must not reach for libc: the crate is a unix-only dependency
+        // while this test module also compiles on Windows (the goldens
+        // job runs cargo test --lib there).
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        let usr1 = "30";
+        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+        let usr1 = "10";
+        assert_eq!(translate_signal("sigusr1"), Some(usr1));
     }
 
     /// rubash#1386: the EXIT pseudo-signal takes no SIG prefix in GNU
@@ -3710,6 +3868,10 @@ mod posix_sigspec_tests {
         }
         assert_eq!(signal_number_from_spec("sighup"), Some(1));
         assert_eq!(signal_number_from_spec("SigHup"), Some(1));
+        // Same platform-number note as mixed_case_prefixed_names_translate.
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        assert_eq!(signal_number_from_spec("sigusr1"), Some(30));
+        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
         assert_eq!(signal_number_from_spec("sigusr1"), Some(10));
     }
 

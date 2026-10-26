@@ -71,6 +71,18 @@ impl Executor {
         let _env_journal_guard = push_env_journal(&self.env_write_journal);
         let result = self.execute_ast_inner(&ast.commands);
         EXECUTION_LOCK_DEPTH.with(|depth| depth.set(0));
+        // rubash#1639: a marked SIGINT discard whose foreground command
+        // was the LAST of this unit has no next command boundary to
+        // convert it — flush it here so the mark can never leak into
+        // the next input unit (whose first line must run normally,
+        // seeing only the recorded $?=130).
+        let result = match result {
+            Ok(()) if self.fg_sigint_unwind => {
+                self.fg_sigint_unwind = false;
+                Err(ExecuteError::SigintUnwind)
+            }
+            other => other,
+        };
         // rubash#423: GNU has no per-run cwd undo. `cd` runs chdir(2) in the
         // shell process itself (builtins/cd.def cd_builtin -> chdir), and the
         // process cwd IS the session state every later command inherits —
@@ -428,6 +440,39 @@ impl Executor {
         }
 
         while index < commands.len() {
+            // rubash#1639: a foreground wait marked a SIGINT line
+            // discard (fg_sigint_unwind): GNU wait_for throws to the
+            // top-level reader, so the NEXT command of this list — at
+            // any frame depth — never dispatches. Inside a flat `( )`
+            // region the region first closes as a signal death
+            // (fast-forward + restore, the handle_exit_code discipline)
+            // because the region's saved parent state is this frame's
+            // to restore; the throw then unwinds this frame too.
+            if self.fg_sigint_unwind {
+                self.fg_sigint_unwind = false;
+                if subshell_state.is_some() {
+                    while index + 1 < commands.len() && !commands[index + 1].subshell_end {
+                        index += 1;
+                    }
+                    if index + 1 < commands.len() {
+                        index += 1;
+                    }
+                    if let Some(saved_state) = subshell_state.take() {
+                        self.restore_flat_subshell(saved_state, subshell_cwd.take());
+                        if let Some(saved) = subshell_fd_table.take() {
+                            self.fd_table = saved;
+                        }
+                        if let Some(saved) = subshell_timed_stdin.take() {
+                            self.timed_stdin = saved;
+                        }
+                        if let Some(saved) = saved_fork_collapse.take() {
+                            self.subshell_fork_collapse.set(saved);
+                        }
+                    }
+                    self.exit_code = 130;
+                }
+                return Err(ExecuteError::SigintUnwind);
+            }
             let command = &commands[index];
             // rubash#439: the expansion-failure mark belongs to ONE command.
             // Reset before each iteration so a previous command's expansion
