@@ -676,7 +676,12 @@ fn parameter_substring_bytes(value: &str, offset: isize, length: Option<isize>) 
 fn locale_byte_span(value: &str) -> Vec<u8> {
     let sentinel = char::from_u32(crate::executor::substitution_metadata::RAW_BYTE_MARKER_ESCAPE)
         .expect("raw-byte sentinel is a valid char");
-    if value.contains(sentinel) {
+    // rubash#1635: decode under the same two-trigger condition as
+    // parameter_char_length — a U+E400 literal-escape pair is one data
+    // character, so substring offsets/lengths must walk the decoded
+    // view for it too, not only for raw-byte pairs.
+    let literal_escape = crate::executor::markers::LITERAL_CHAR_ESCAPE;
+    if value.contains(sentinel) || value.contains(literal_escape) {
         crate::executor::substitution_metadata::decode_raw_byte_markers(value.as_bytes())
     } else {
         value.as_bytes().to_vec()
