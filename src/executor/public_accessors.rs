@@ -647,6 +647,16 @@ impl Executor {
             .env_vars
             .insert(name.to_string(), value.clone());
         if is_valid_process_env(name, &value) {
+            // G-03: a host-directed write is this lineage's mirror write
+            // and must be journaled exactly like remove_env's — set_env
+            // is called between runs, when no journal is on the stack,
+            // so without the push the write escaped the journal and
+            // leaked past Drop into every later Executor in the process
+            // (the __RUBASH_IS_C / __RUBASH_INTERACTIVE protocol markers
+            // are the observed case: a sibling session's markers became
+            // a later session's invocation context at Executor::new's
+            // process-env import).
+            let _journal = push_env_journal(&self.env_write_journal);
             set_process_env(name, &value);
         }
         // Keep the shell-variable view in sync with the environment mirror.
