@@ -2252,7 +2252,11 @@ fn push_unclosed_paren_error(state: &mut ParseState, tokens: &[Token], start: us
 fn innermost_unclosed_compound(region: &[Token]) -> Option<(String, usize)> {
     let mut stack: Vec<(&'static str, usize)> = Vec::new();
     for token in region {
-        if token.kind != TokenKind::Keyword {
+        // rubash#1721: structural keywords only (see
+        // Token::structural_keyword) — an argument-position keyword
+        // word (`command -vkb if' in a case clause) is not an open
+        // compound and must not be named as the unclosed one.
+        if !token.structural_keyword() {
             continue;
         }
         let value = token.value.trim_end();
@@ -2453,7 +2457,10 @@ pub(super) fn unclosed_keyword_eof_node(
 pub(super) fn first_mismatched_closer(region: &[Token], opener: &'static str) -> Option<usize> {
     let mut stack: Vec<&'static str> = vec![opener];
     for (region_index, token) in region.iter().enumerate() {
-        if token.kind != TokenKind::Keyword {
+        // rubash#1721: structural keywords only (see
+        // Token::structural_keyword) — argument-position keyword words
+        // neither open frames nor count as mismatched closers.
+        if !token.structural_keyword() {
             continue;
         }
         let value = token.value.trim_end();

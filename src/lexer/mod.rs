@@ -799,7 +799,12 @@ impl GroupScanFeeder {
 
     /// Fold one token into the keyword-stack / last-significant summary,
     /// exactly the loop `stdin_source_needs_more_posix` runs over the fresh
-    /// token list.
+    /// token list. Only STRUCTURAL keywords fold (Token::structural_keyword):
+    /// a keyword-spelled word in argument position (`echo if', the `if' in
+    /// `command -vkb if && set -o posix' inside a case clause) is a plain
+    /// word to GNU's reader (parse.y:3168 CHECK_FOR_RESERVED_WORD), so it
+    /// must neither push a phantom frame nor make the clause's `;;' read
+    /// as stray against that frame (rubash#1721, modernish bin/modernish).
     fn fold_token(&mut self, token: &Token) {
         // `=~` RHS fragments are word data (token.rs field doc), never
         // grammar tokens — a `)` inside `[[ x =~ (a|b) ]]` is pattern text.
@@ -810,7 +815,7 @@ impl GroupScanFeeder {
             if !matches!(self.keyword_stack.last(), Some(&"esac") | Some(&")")) {
                 self.stray_close = true;
             }
-        } else if token.kind == TokenKind::Keyword && !token.regexp_rhs_fragment {
+        } else if token.structural_keyword() && !token.regexp_rhs_fragment {
             match token.value.as_str() {
                 "case" => self.keyword_stack.push("esac"),
                 "if" => self.keyword_stack.push("fi"),
