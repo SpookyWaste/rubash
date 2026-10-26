@@ -572,8 +572,20 @@ impl Executor {
             if let Ok(materialized) =
                 self.materialize_assignment_process_substitutions_from_raw(raw)
             {
+                // rubash#1690: the materialized text is re-derived from the
+                // raw RHS, which never carried the cooked value's markers.
+                // Dropping COMPOUND_ASSIGNMENT_MARKER here made the inner
+                // expansion treat a compound RHS as a plain scalar, so
+                // `a=(<(echo one) <(echo two))` stored ONE element whose
+                // text was the whole parenthesized string. GNU
+                // arrayfunc.c:557 expand_compound_array_assignment splits
+                // the body into element words first and expands each one,
+                // so compoundness is a property of the assignment, not of
+                // the expansion route the value happened to take.
                 let materialized = if value.starts_with(tilde_expand::QUOTED_ASSIGNMENT_VALUE) {
                     format!("{}{materialized}", tilde_expand::QUOTED_ASSIGNMENT_VALUE)
+                } else if value.starts_with(COMPOUND_ASSIGNMENT_MARKER) {
+                    format!("{COMPOUND_ASSIGNMENT_MARKER}{materialized}")
                 } else {
                     materialized
                 };
