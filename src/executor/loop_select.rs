@@ -269,6 +269,9 @@ impl Executor {
                 &for_command.variable,
                 &value,
             );
+            // rubash#1692: the loop-variable bind is bind_variable —
+            // sv_locale fires on it like any other bind.
+            self.note_locale_assignment(&for_command.variable);
 
             // GNU execute_for_command (execute_cmd.c:3201+) runs the body by
             // POINTER — the COMMAND list make_cmd.c allocated once at parse

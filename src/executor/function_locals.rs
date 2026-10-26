@@ -393,6 +393,10 @@ impl Executor {
             if name == "PATH" {
                 crate::builtins::hash::flush_command_hash_table(&mut self.shell_state.env_vars);
             }
+            // rubash#1692: pop_var_context reinstalling a saved
+            // binding re-runs sv_locale in GNU — a restored invalid
+            // locale value re-warns as the frame unwinds.
+            self.note_locale_assignment(&name);
         }
         for (name, variable) in typed_scope {
             self.shell_state.variables.remove(&name);

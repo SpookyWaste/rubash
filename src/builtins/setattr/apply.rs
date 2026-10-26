@@ -152,6 +152,15 @@ where
             // cross via the explicit child env; mirror to the process env
             // only when exported-or-special, like plain assignments (#916).
             sync_shell_assignment_process_env(env_vars, name, &value);
+            // rubash#1692: an export VALUE bind is bind_variable —
+            // sv_locale fires (variables.c:6272). A name-only export
+            // merely marks att_exported in GNU (no bind, no warning),
+            // so gate on has_assign like the sv_path flush below.
+            if has_assign {
+                if let Some(warning) = crate::locale::locale_assignment_warning(name, env_vars) {
+                    writeln!(stderr, "{}warning: {}", diagnostic_prefix(), warning)?;
+                }
+            }
             // GNU variables.c:5819/5919 sv_path -> phash_flush
             // (rubash#1551): an export VALUE bind is a bind. A name-only
             // `export PATH` merely marks att_exported in GNU (no bind,
@@ -321,6 +330,14 @@ where
     // attribute but its storage value never enters the child env. Mirrored
     // through the same gate as every other write (#916).
     sync_shell_assignment_process_env(env_vars, name, &value);
+    // rubash#1692: a readonly VALUE bind is bind_variable — sv_locale
+    // fires (variables.c:6272); name-only marks att_readonly only
+    // (same has_assign gate as the sv_path flush below).
+    if has_assign {
+        if let Some(warning) = crate::locale::locale_assignment_warning(name, env_vars) {
+            writeln!(stderr, "{}warning: {}", diagnostic_prefix(), warning)?;
+        }
+    }
     // GNU variables.c:5819/5919 sv_path -> phash_flush (rubash#1551):
     // a readonly VALUE bind is a bind; a name-only `readonly PATH`
     // only sets the attribute in GNU and must not flush (same

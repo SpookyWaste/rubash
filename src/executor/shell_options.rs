@@ -234,6 +234,13 @@ impl Executor {
                     .map_err(|_| {
                         io::Error::new(io::ErrorKind::Other, "failed to materialize input")
                     })?;
+                // rubash#1691: this fresh carrier backs the returned
+                // File only — park the path so the per-command procsub
+                // finish removes it once the consumer is done.
+                self.shell_state
+                    .procsub_adhoc_carriers
+                    .borrow_mut()
+                    .push(path.clone());
                 return File::open(&path).map_err(|e| crate::posix_errors::path_error(target, e));
             }
         }
@@ -280,6 +287,12 @@ impl Executor {
                     .map_err(|_| {
                         io::Error::new(io::ErrorKind::Other, "failed to materialize fd input")
                     })?;
+                // rubash#1691: same ad-hoc carrier bookkeeping as
+                // open_input_redirect's consume branch.
+                self.shell_state
+                    .procsub_adhoc_carriers
+                    .borrow_mut()
+                    .push(path.clone());
                 File::open(&path)
             }
             Some(FdReadEndpoint::InheritedProcessStdin) => {
