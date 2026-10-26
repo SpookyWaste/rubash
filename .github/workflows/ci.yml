@@ -161,13 +161,34 @@ jobs:
       - name: Check Linux target
         run: cargo check --target x86_64-unknown-linux-gnu
 
+      # The darwin checks cross-compile from a Linux host: cc-rs feeds
+      # clang-style flags (-arch, -mmacosx-version-min) to whatever
+      # `cc` resolves to, and on this runner that is gcc, which rejects
+      # them (signal-hook's build script is the first casualty). Pin
+      # the darwin-target C toolchain to clang explicitly. Both the
+      # dashed and underscored variable spellings are set because
+      # cc-rs accepts either.
       - name: Check macOS target
+        env:
+          CC_aarch64-apple-darwin: clang
+          CXX_aarch64-apple-darwin: clang++
+          AR_aarch64-apple-darwin: llvm-ar
+          CC_aarch64_apple_darwin: clang
+          CXX_aarch64_apple_darwin: clang++
+          AR_aarch64_apple_darwin: llvm-ar
         run: cargo check --target aarch64-apple-darwin
 
       - name: Check tests on Linux target
         run: cargo check --tests --target x86_64-unknown-linux-gnu
 
       - name: Check tests on macOS target
+        env:
+          CC_aarch64-apple-darwin: clang
+          CXX_aarch64-apple-darwin: clang++
+          AR_aarch64-apple-darwin: llvm-ar
+          CC_aarch64_apple_darwin: clang
+          CXX_aarch64_apple_darwin: clang++
+          AR_aarch64_apple_darwin: llvm-ar
         run: cargo check --tests --target aarch64-apple-darwin
 
       # Android (bionic): check-only, no linking — the runner has no NDK.
