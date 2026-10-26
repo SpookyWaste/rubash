@@ -3776,11 +3776,53 @@ impl Executor {
     }
 
     fn apply_coproc_redirects(
-        &self,
+        &mut self,
         cmd: &CommandNode,
         child: &mut Command,
     ) -> Result<(), ExecuteError> {
-        if let Some(redirect) = &cmd.redirect_in {
+        // rubash#1651: a memory-backed stdin body (here-string,
+        // heredoc) that wins fd 0 replaces the coproc pipe as the
+        // child's stdin. GNU redir.c do_redirections binds fd 0
+        // to the body before the child runs, so the coproc
+        // consumes it and exits; the old code left the child on
+        // the pipe and `coproc cat <<< hi` blocked forever. The
+        // body rides a pre-filled pipe (writer thread: a body
+        // larger than the pipe buffer must not block the spawn
+        // waiting for a reader that does not exist yet; EPIPE
+        // when the child exits early is ignored). Only
+        // HereDoc/HereString winners take this path: `< file`
+        // keeps the real-file path below, and `<&N` dups keep
+        // the pipe — streaming a dup through a string buffer
+        // would change blocking behavior. When the body wins,
+        // it outranks redirect_in (GNU left-to-right order: the
+        // last fd-0 redirect wins).
+        let mut body_stdin: Option<std::process::Stdio> = None;
+        if let Some(text) = self.coproc_stdin_body(cmd) {
+            use std::io::Write as _;
+            if let Ok((reader, mut writer)) = std::io::pipe() {
+                std::thread::spawn(move || {
+                    let _ = writer.write_all(text.as_bytes());
+                });
+                #[cfg(windows)]
+                {
+                    use std::os::windows::io::{FromRawHandle as _, IntoRawHandle as _};
+                    let handle = reader.into_raw_handle();
+                    body_stdin = Some(std::process::Stdio::from(unsafe {
+                        std::fs::File::from_raw_handle(handle)
+                    }));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::{FromRawFd as _, IntoRawFd as _};
+                    let fd = reader.into_raw_fd();
+                    body_stdin = Some(std::process::Stdio::from(unsafe {
+                        std::fs::File::from_raw_fd(fd)
+                    }));
+                }
+            }
+        }
+        if body_stdin.is_none() {
+            if let Some(redirect) = &cmd.redirect_in {
             if redirect.fd.unwrap_or(0) == 0 {
                 let target = self.expand_redirect_target(redirect);
                 if is_closed_redirect_target(&target) {
@@ -3788,6 +3830,7 @@ impl Executor {
                 } else if redirect_target_fd(&target).is_none() {
                     child.stdin(Stdio::from(self.open_input_redirect(&target)?));
                 }
+            }
             }
         }
 
@@ -3831,6 +3874,13 @@ impl Executor {
                     &self.shell_state.env_vars,
                 ))?));
             }
+        }
+
+        // The body pipe replaces the coproc pipe set by the caller
+        // (the parent's write end stays registered as ${COPROC[1]},
+        // useless but present, like GNU's rebound pipe end).
+        if let Some(stdio) = body_stdin {
+            child.stdin(stdio);
         }
 
         Ok(())

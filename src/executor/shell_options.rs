@@ -1158,6 +1158,28 @@ impl Executor {
         Some(input[offset..].to_string())
     }
 
+    /// rubash#1651: the winning fd-0 stdin body for a coproc child,
+    /// if the winning redirect is memory-backed (here-string or
+    /// heredoc). Same ordering as stdin_string_for_command_mut
+    /// (GNU redir.c do_redirections: the last fd-0 input redirect
+    /// wins); file and dup winners return None so their existing
+    /// paths stay untouched. The mut variant matters: its
+    /// here-string expansion strips quotes segment-wise
+    /// (expand_here_string_mut), while the read-only fallback
+    /// leaves them (`coproc cat <<< "hello"` fed `"hello"`
+    /// with quotes). For a well-formed body the mut variant
+    /// returns from the body branches before its FUNCTION_STDIN
+    /// drain tail, so the drain never fires here.
+    pub(crate) fn coproc_stdin_body(&mut self, cmd: &CommandNode) -> Option<String> {
+        match fd0_stdin_redirect_winner(cmd) {
+            Some(crate::parser::RedirectKind::HereDoc)
+            | Some(crate::parser::RedirectKind::HereString) => {
+                self.stdin_string_for_command_mut(cmd)
+            }
+            _ => None,
+        }
+    }
+
     pub(in crate::executor) fn stdin_string_for_command_mut(
         &mut self,
         cmd: &CommandNode,
