@@ -35,6 +35,28 @@ fn job_line(stdout: &str, id: u32) -> String {
 
 /// The issue seed: one fast builtin between kill -STOP and jobs —
 /// GNU shows both jobs Running with the ORIGINAL marks ([1]- [2]+).
+///
+/// De-flake adjudication (tests-only; the product's 5ms term is
+/// deliberate semantics and is NOT changed here): a deferred mark
+/// publishes once it is one reader command old AND at least 5ms of
+/// wall time have passed since the signal was sent (see
+/// `JobTable::apply_deferred_state_marks`). A single run of this
+/// script therefore cannot tell "published because the mark aged
+/// while the shell process was descheduled inside the kill -> jobs
+/// window" (legitimate — at load ~11 that window exceeds 5ms in
+/// roughly 1/8 of runs) from "published because a count rule fired
+/// early" (the #1607 bug). The bug, however, is wall-clock
+/// INDEPENDENT: the old `seq + 1 < now` counting rule published at
+/// the second reader command after the mark on EVERY run, as would
+/// any regression that drops the aging term. So this test samples
+/// fresh processes: a run showing the fully published shape
+/// ([1]+ Stopped / [2]- Running — exactly what the mirror test
+/// below expects after a real wait point) is an "aged" sample and
+/// is retried; the first un-published sample passes; if all 25
+/// samples age, the test fails (probability <= (1/8)^25 at the
+/// worst measured load for a correct product). Any third shape
+/// fails immediately — it is neither the pinned behavior nor
+/// legitimate aging.
 #[test]
 fn stopped_state_not_published_after_one_fast_builtin() {
     let script = "\
@@ -46,16 +68,39 @@ echo intervening-builtin
 jobs
 kill -9 %1 %2 2>/dev/null; wait 2>/dev/null
 ";
-    let (stdout, stderr) = rubash(script);
-    let one = job_line(&stdout, 1);
-    let two = job_line(&stdout, 2);
-    assert!(
-        one.starts_with("[1]-") && one.contains("Running"),
-        "job 1 published too early: {one:?} (stderr={stderr:?})"
-    );
-    assert!(
-        two.starts_with("[2]+") && two.contains("Running"),
-        "job 2 mark disturbed: {two:?} (stderr={stderr:?})"
+    const MAX_ATTEMPTS: usize = 25;
+    let mut last_aged: Option<(String, String)> = None;
+    for _ in 0..MAX_ATTEMPTS {
+        let (stdout, stderr) = rubash(script);
+        let one = job_line(&stdout, 1);
+        let two = job_line(&stdout, 2);
+        if one.starts_with("[1]-")
+            && one.contains("Running")
+            && two.starts_with("[2]+")
+            && two.contains("Running")
+        {
+            // Un-published sample: the pinned #1607 behavior.
+            return;
+        }
+        if one.starts_with("[1]+")
+            && one.contains("Stopped")
+            && two.starts_with("[2]-")
+            && two.contains("Running")
+        {
+            // Aged sample: the 5ms term legitimately fired under
+            // scheduler preemption. Retry with a fresh process.
+            last_aged = Some((one, two));
+            continue;
+        }
+        panic!(
+            "unexpected jobs shape after one fast builtin: {one:?} / {two:?} (stderr={stderr:?})"
+        );
+    }
+    let (one, two) = last_aged.expect("at least one attempt ran");
+    panic!(
+        "stop published after one fast builtin in all {MAX_ATTEMPTS} samples \
+         (last: {one:?} / {two:?}) — unless this machine is pathologically \
+         loaded, this is the #1607 early-publication regression"
     );
 }
 
