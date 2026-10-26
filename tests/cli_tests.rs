@@ -410,6 +410,47 @@ fn issue1624_coproc_vars_unset_after_eof_and_reap() {
 }
 
 #[test]
+fn issue1645_jobs_omits_implicit_name_for_simple_coproc() {
+    // GNU print_cmd.c: the implicit COPROC name renders only for
+    // non-simple bodies; a simple-command coproc prints its words
+    // verbatim (`coproc MYC sleep 5` is the simple command MYC sleep 5).
+    let output = rubash_command()
+        .arg("-c")
+        .arg(
+            "coproc read -t 30; jobs; kill $COPROC_PID 2>/dev/null; wait 2>/dev/null; \
+             coproc command read -t 30; jobs; kill $COPROC_PID 2>/dev/null; wait 2>/dev/null; \
+             coproc { read -t 30; }; jobs; kill $COPROC_PID 2>/dev/null; wait 2>/dev/null; \
+             coproc MYG { read -t 30; }; jobs; kill $MYG_PID 2>/dev/null; wait 2>/dev/null; \
+             true",
+        )
+        .output()
+        .expect("run rubash");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("coproc read -t 30 &"),
+        "unnamed simple jobs line missing verbatim words: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("coproc COPROC read"),
+        "implicit COPROC name leaked into simple coproc jobs line: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("coproc command read -t 30 &"),
+        "word-led simple coproc jobs line wrong: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("coproc COPROC { read -t 30; } &"),
+        "unnamed group jobs line lost implicit name: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("coproc MYG { read -t 30; } &"),
+        "named group jobs line wrong: {stdout:?}"
+    );
+}
+
+#[test]
 fn issue1632_coproc_redirected_stdout_read_end_blocks_until_exit() {
     // GNU: with the coproc child's stdout redirected to a file, the
     // child still holds a writer on the coproc read pipe for its whole

@@ -882,17 +882,22 @@ fn case_command_source_text(case_command: &CaseCommand) -> String {
 
 fn coproc_command_source_text(coproc_command: &crate::parser::CoprocCommand) -> String {
     let mut text = String::from("coproc");
-    // GNU always renders the coprocess name in command displays (jobs,
-    // BASH_COMMAND): an unnamed coproc runs under the default name COPROC
-    // (execute_cmd.c coproc_setup; print_cmd.c prints the name verbatim).
-    text.push(' ');
-    text.push_str(coproc_command.name.as_deref().unwrap_or("COPROC"));
     text.push(' ');
     if let Some(body) = &coproc_command.body {
+        // GNU print_cmd.c:357-361 prints the coproc name for every
+        // NON-simple body; an unnamed non-simple coproc is stored with
+        // the implicit name "COPROC" (parse.y:1127 make_coproc_command).
+        text.push_str(coproc_command.name.as_deref().unwrap_or("COPROC"));
+        text.push(' ');
         text.push_str("{ ");
         text.push_str(&bash_command_sequence_text(body));
         text.push_str("; }");
     } else {
+        // A simple-command coproc has no name slot at all (parse.y:1125
+        // the WORD before a simple command is its argv[0], rubash#1153):
+        // `coproc sleep 5` prints bare and `coproc MYC sleep 5` prints
+        // the words verbatim — inserting the default COPROC name here
+        // produced `coproc COPROC sleep 5` in `jobs` (rubash#1645).
         text.push_str(&command_words_source_text(
             &coproc_command.words,
             &coproc_command.word_metadata,
