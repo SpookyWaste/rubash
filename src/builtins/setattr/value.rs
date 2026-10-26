@@ -73,7 +73,7 @@ pub(super) fn array_attribute_assignment_value(
     // missing target it is a scalar literal.
     let integer = env_vars.is_marked(INTEGER_VARS, name);
     let literal = if integer {
-        eval_arith_value(compound).to_string()
+        eval_integer_operand(compound, env_vars).to_string()
     } else {
         compound.to_string()
     };
@@ -90,6 +90,9 @@ pub(super) fn array_attribute_assignment_value(
         let current = env_vars.get(name).cloned().unwrap_or_default();
         let mut entries = parse_assoc_words(&current);
         match entries.iter_mut().find(|(key, _)| key == "0") {
+            Some(entry) if append && integer => {
+                entry.1 = integer_appended_value(&entry.1, compound, env_vars)
+            }
             Some(entry) if append => entry.1.push_str(&literal),
             Some(entry) => entry.1 = literal,
             None => entries.push(("0".to_string(), literal)),
@@ -99,7 +102,10 @@ pub(super) fn array_attribute_assignment_value(
     if array_target {
         let current = env_vars.get(name).cloned().unwrap_or_default();
         let mut entries = indexed_array_entries(&current);
-        let stored = if append {
+        let stored = if append && integer {
+            let prior = entries.get(&0).cloned().unwrap_or_default();
+            integer_appended_value(&prior, compound, env_vars)
+        } else if append {
             let prior = entries.get(&0).cloned().unwrap_or_default();
             format!("{prior}{literal}")
         } else {
@@ -114,7 +120,7 @@ pub(super) fn array_attribute_assignment_value(
     let mut current = env_vars.get(name).cloned().unwrap_or_default();
     (
         if integer {
-            (eval_arith_value(&current) + eval_arith_value(&literal)).to_string()
+            integer_appended_value(&current, compound, env_vars)
         } else {
             current.push_str(&literal);
             current
@@ -217,11 +223,28 @@ pub(crate) fn valid_identifier(name: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-pub(super) fn eval_arith_value(value: &str) -> i128 {
-    value
-        .split('+')
-        .map(|part| part.trim().parse::<i128>().unwrap_or(0))
-        .sum()
+/// GNU variables.c:2905 make_variable_value, integer branch: binding an
+/// integer variable stores the *evaluated* expression, and an ASS_APPEND
+/// bind stores `evalexp(old value) + evalexp(new value)` — arithmetic
+/// addition through the real evaluator, never text concatenation
+/// (rubash#1710). This replaces the residual split('+') evaluator this
+/// file used to carry: it could not see `2*3`, parentheses, variable
+/// references, or octal literals, so an integer append onto an array's
+/// element 0 concatenated the operand text (`10` + `5` stored `105`).
+fn eval_integer_operand(text: &str, env_vars: &crate::shell::var_table::VarTable) -> i128 {
+    crate::executor::arithmetic::eval_conditional_arith_value(text, env_vars).unwrap_or(0)
+}
+
+/// The element-0 / scalar text stored by an integer `name+=operand`
+/// bind: the prior text ("" for an unset element, evaluating to 0) and
+/// the operand are both evaluated, then added — make_variable_value's
+/// ASS_APPEND integer rule above.
+fn integer_appended_value(
+    prior: &str,
+    operand: &str,
+    env_vars: &crate::shell::var_table::VarTable,
+) -> String {
+    (eval_integer_operand(prior, env_vars) + eval_integer_operand(operand, env_vars)).to_string()
 }
 
 pub(super) fn quote_export_value(value: &str) -> String {
