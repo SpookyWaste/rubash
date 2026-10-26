@@ -568,6 +568,15 @@ pub struct Executor {
     /// while it blocks, jobs.c:3064 — an observation point).
     foreground_wait_count: Cell<u64>,
     coproc_stderr_forwarders: HashMap<u32, std::thread::JoinHandle<Result<(), std::io::Error>>>,
+    /// rubash#1632: when a coproc command's own redirections move the
+    /// child's stdout off the coproc pipe (a file, `>&2`, `>&-`), GNU's
+    /// child still holds a writer on the read pipe for its whole life
+    /// (its inherited fd from the coproc pipe pair), so the parent's
+    /// reads block until the coproc exits. The parent mirrors that by
+    /// retaining a duplicate of the pipe writer here, keyed by coproc
+    /// pid and dropped when the coproc is retired (reaped) or its
+    /// endpoints are closed.
+    coproc_retained_stdout_writers: HashMap<u32, std::fs::File>,
     /// Assignment-RHS output process substitutions awaiting their
     /// finish, in materialization order (GNU forks left-to-right
     /// and the bodies' observable effects order the same way,
