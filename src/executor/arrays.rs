@@ -445,6 +445,17 @@ fn bytes_to_shell_text(
 }
 
 pub(super) fn field_split_values_with_ifs(value: &str, ifs: Option<&str>) -> Vec<String> {
+    // GNU word splitting (subst.c:12377 word_split) of an empty expansion
+    // result yields NO field, whatever IFS holds: the trailing-field
+    // emission below is driven by consumed delimiters, and an empty
+    // string contains none (rubash#1715: `IFS=:; v=''; for x in $v`
+    // must iterate zero times). The whitespace and empty-IFS branches
+    // already encode this; the non-whitespace and raw-byte-marker
+    // branches manufactured one empty field from the unconditional
+    // final push.
+    if value.is_empty() {
+        return Vec::new();
+    }
     let Some(ifs) = ifs else {
         return split_ifs_whitespace(value, " \t\n");
     };
