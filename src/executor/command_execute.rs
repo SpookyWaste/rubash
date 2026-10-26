@@ -350,13 +350,21 @@ impl Executor {
                 // command carrying a failed substitution's status is a
                 // failed simple command, so `set -e; trap 'echo T' ERR;
                 // $(false)` prints T and exits 1. The assignment/
-                // redirect forms fire at execute_empty_words_command's
-                // tail (rubash#1171); this bare arm converts here, so it
-                // fires here. maybe_run_error_trap's own gates keep the
-                // exempt shapes (inverted, and-or, suppressed) silent,
-                // and without -e nothing converts here at all, so the
-                // trap cannot fire twice.
-                self.maybe_run_error_trap(cmd)?;
+                // redirect forms convert at execute_empty_words_command's
+                // tail (rubash#1171); this bare arm converts here.
+                // maybe_run_error_trap's own gates keep the exempt
+                // shapes (inverted, and-or, suppressed) silent.
+                // rubash#1611: inside a timed dispatch the fire is
+                // deferred to the ast_exec time branch, which performs
+                // the single trap adjudication for the completed timed
+                // command — an unguarded fire here double-fired
+                // `time $(false)` (ERRFIRED x2, GNU x1). The conversion
+                // mark below is what lets execute_time_ast_command
+                // treat this ExitCode as a completion, exactly like
+                // the dispatch-level conversion sites.
+                if self.timed_dispatch_depth.get() == 0 {
+                    self.maybe_run_error_trap(cmd)?;
+                }
                 // rubash#1611: conversion of a completed command's
                 // status — mark for execute_time_ast_command.
                 self.errexit_status_converted.set(true);

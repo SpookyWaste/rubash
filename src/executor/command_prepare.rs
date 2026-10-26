@@ -849,7 +849,17 @@ impl Executor {
             // ast_exec loop's adjudication entirely. The non-errexit path
             // still returns Ok and lets the loop fire, so fire only on
             // this converting branch.
-            self.maybe_run_error_trap(cmd)?;
+            // rubash#1611/#1661: inside a timed dispatch the fire is
+            // deferred to the ast_exec time branch (the single
+            // adjudication for the completed timed command), and the
+            // conversion mark lets execute_time_ast_command treat this
+            // ExitCode as a completion. Without the mark, a timed
+            // assignment-only failure (`time x=$(false)`) took the
+            // genuine-unwind arm and exited 127 instead of GNU's 1.
+            if self.timed_dispatch_depth.get() == 0 {
+                self.maybe_run_error_trap(cmd)?;
+            }
+            self.errexit_status_converted.set(true);
             return Err(ExecuteError::ExitCode(self.exit_code));
         }
         Ok(())

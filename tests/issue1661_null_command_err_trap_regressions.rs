@@ -13,6 +13,14 @@
 //! status at 0, clobbering the substitution status for
 //! `$(false) >/dev/null`.
 //!
+//! Consolidation follow-up (same issue): both conversion sites
+//! initially fired without the rubash#1611 timed-dispatch deferral,
+//! so under `time` the bare form fired twice and the assignment form
+//! converted unmarked (exit 127 via the genuine-unwind arm). Both
+//! sites now follow the #1611 mechanism — depth-guarded fire plus
+//! the errexit_status_converted mark — leaving the ast_exec time
+//! branch as the single adjudication site for timed commands.
+//!
 //! Expectations verified against GNU bash 5.3.20 (self-compiled
 //! oracle), script-file mode authoritative.
 
@@ -97,5 +105,43 @@ fn issue1661_assignment_only_form_still_fires_err_trap() {
     let (stdout, _, code) =
         rubash_file("set -e\ntrap 'echo ERRFIRED' ERR\nx=$(false)\necho done\n");
     assert_eq!(stdout, "ERRFIRED\n");
+    assert_eq!(code, Some(1));
+}
+
+#[test]
+fn issue1661_timed_bare_null_command_fires_err_trap_exactly_once() {
+    // The consolidation stop: the bare arm fired unguarded, and the
+    // ast_exec time branch fired again for the same command, so
+    // `time $(false)` printed ERRFIRED twice (GNU: once). The time
+    // report must still print and the exit status stays 1.
+    let (stdout, stderr, code) =
+        rubash_file("set -e\ntrap 'echo ERRFIRED' ERR\ntime $(false)\necho done\n");
+    assert_eq!(stdout, "ERRFIRED\n");
+    assert!(stderr.contains("real"), "time report missing: {stderr}");
+    assert_eq!(code, Some(1));
+}
+
+#[test]
+fn issue1661_timed_assignment_null_command_fires_once_and_exits_1() {
+    // The assignment-only tail converted without the rubash#1611
+    // conversion mark, so the timed frame mistook the conversion
+    // for a genuine unwind and the script exited 127. GNU: the
+    // trap fires exactly once, the report prints, exit 1.
+    let (stdout, stderr, code) =
+        rubash_file("set -e\ntrap 'echo ERRFIRED' ERR\ntime x=$(false)\necho done\n");
+    assert_eq!(stdout, "ERRFIRED\n");
+    assert!(stderr.contains("real"), "time report missing: {stderr}");
+    assert_eq!(code, Some(1));
+}
+
+#[test]
+fn issue1661_timed_plain_failure_fires_err_trap_exactly_once() {
+    // Control: an ordinary failing command under `time` — the
+    // dispatch-level conversion sites already defer to the time
+    // branch; the null-command forms above must match this count.
+    let (stdout, stderr, code) =
+        rubash_file("set -e\ntrap 'echo ERRFIRED' ERR\ntime false\necho done\n");
+    assert_eq!(stdout, "ERRFIRED\n");
+    assert!(stderr.contains("real"), "time report missing: {stderr}");
     assert_eq!(code, Some(1));
 }
