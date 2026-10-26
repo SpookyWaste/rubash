@@ -291,10 +291,7 @@ fn test_coproc_time_simple_command_ends_at_pipeline_bar() {
     ] {
         let tokens = tokenize(input);
         let ast = parse(&tokens);
-        let pipeline = ast.commands[0]
-            .pipeline_command
-            .as_ref()
-            .expect(input);
+        let pipeline = ast.commands[0].pipeline_command.as_ref().expect(input);
         let coproc = pipeline.stages[0].coproc_command.as_ref().expect(input);
         assert_eq!(coproc.name, None, "{input}");
         assert_eq!(coproc.body_kind, CoprocBodyKind::SimpleCommand, "{input}");
@@ -315,9 +312,7 @@ fn test_coproc_time_words_collect_like_a_simple_command() {
     assert_eq!(coproc.body_kind, CoprocBodyKind::SimpleCommand);
     assert_eq!(coproc.words, ["MYC", "time", "-p", "echo", "hi"]);
 
-    let ast = parse(&tokenize(
-        "coproc MYC time -p for x in a; do echo $x; done",
-    ));
+    let ast = parse(&tokenize("coproc MYC time -p for x in a; do echo $x; done"));
     assert_eq!(
         ast.commands[0]
             .get_assignment("__RUBASH_PARSE_ERROR__")

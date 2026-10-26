@@ -35,9 +35,7 @@ pub(super) fn parse_coproc_command(tokens: &[Token], start: usize) -> Option<(Co
             // it, so it is excluded from name consumption even when
             // a compound body follows (`coproc ! { ...; }` is GNU's
             // syntax error, not a coproc named `!`).
-            if !lookahead.value.starts_with('-')
-                && next_is_compound
-                && !is_keyword(tokens, i, "!")
+            if !lookahead.value.starts_with('-') && next_is_compound && !is_keyword(tokens, i, "!")
             {
                 name = Some((lookahead.value.clone(), lookahead.raw.clone()));
                 i += 1; // consume the name

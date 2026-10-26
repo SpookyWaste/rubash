@@ -217,8 +217,7 @@ fn pin_coproc_writer_in_child(child: &mut Command, writer: std::fs::File) {
                 // not clear CLOEXEC, so clear it explicitly (the
                 // dev_fd_operands pin does the same).
                 let flags = libc::fcntl(source, libc::F_GETFD);
-                if flags < 0 || libc::fcntl(source, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
-                {
+                if flags < 0 || libc::fcntl(source, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
             } else if libc::dup2(source, 10) < 0 {
