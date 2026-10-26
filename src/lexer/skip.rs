@@ -678,6 +678,7 @@ impl<'a> Lexer<'a> {
                 // GNU function_def is FUNCTION WORD with no newline between;
                 // a line break drops any pending `function' chain.
                 scan.function_chain = 0;
+                scan.coproc_chain = 0;
             } else if c.is_whitespace() {
                 if !scan.word_start {
                     scan.prev_accepts_close =
@@ -692,6 +693,22 @@ impl<'a> Lexer<'a> {
                         scan.function_chain = 2;
                     } else {
                         scan.function_chain = 0;
+                        // NOTE: no coproc_chain reset here — the coproc
+                        // block below adjudicates its own chain for this
+                        // same completed word, and zeroing it first made
+                        // the NAME word read as a reset instead of the
+                        // stage-1 -> stage-2 advance (rubash#1625).
+                    }
+                    // The `coproc NAME' chain advances the same way
+                    // (rubash#1625): `coproc' arms stage 1, the NAME
+                    // word arms stage 2, any other completed word (or a
+                    // quoted one) resets it.
+                    if scan.close_word == "coproc" && scan.word_plain {
+                        scan.coproc_chain = 1;
+                    } else if scan.coproc_chain == 1 && scan.word_plain {
+                        scan.coproc_chain = 2;
+                    } else {
+                        scan.coproc_chain = 0;
                     }
                 }
                 scan.word_start = true;
@@ -707,6 +724,7 @@ impl<'a> Lexer<'a> {
                     // the definition chain; stage 1 keeps waiting for it.
                     if scan.function_chain == 2 {
                         scan.function_chain = 0;
+                        scan.coproc_chain = 0;
                     }
                 } else {
                     match c {
@@ -716,6 +734,7 @@ impl<'a> Lexer<'a> {
                             scan.word_plain = true;
                             scan.close_word.clear();
                             scan.function_chain = 0;
+                            scan.coproc_chain = 0;
                         }
                         // GNU parse.y:2378 alist `{"!", BANG}` +
                         // reserved_word_acceptable (parse.y:5913 BANG): a
@@ -738,6 +757,7 @@ impl<'a> Lexer<'a> {
                             scan.word_plain = true;
                             scan.close_word.clear();
                             scan.function_chain = 0;
+                            scan.coproc_chain = 0;
                         }
                         // Quotes, substitutions, backslash and the rest of
                         // the word's own characters keep the word in
@@ -801,7 +821,10 @@ impl<'a> Lexer<'a> {
                             // body's `{' is read at command position, after a
                             // WORD — reserved_word_acceptable does not gate it
                             // (rubash#465).
-                            || scan.function_chain == 2)
+                            || scan.function_chain == 2
+                            // parse.y:1125-1175 coproc body, the
+                            // `coproc_chain` analogue (rubash#1625).
+                            || scan.coproc_chain == 2)
                         && self
                             .peek()
                             .is_none_or(|next| "()<>;&| \t\n\r".contains(next));
@@ -812,6 +835,7 @@ impl<'a> Lexer<'a> {
                         scan.word_start = true;
                         scan.word_plain = true;
                         scan.function_chain = 0;
+                        scan.coproc_chain = 0;
                     } else {
                         scan.word_start = false;
                         scan.word_plain = false;
@@ -1070,6 +1094,19 @@ struct SkipBraceScan {
     /// `{ function i { :; } }' closed one `}' early and the enclosing
     /// definition's close was misattributed (rubash#465, mirkop.sh).
     function_chain: u8,
+    /// `coproc NAME' chain, the coproc analogue of `function_chain`:
+    /// 0 = idle, 1 = the plain word `coproc' completed, 2 = the NAME
+    /// word completed after it. GNU's grammar reads the coproc body's
+    /// `{' as a shell_command at command position (parse.y:1125-1175
+    /// coproc: COPROC WORD shell_command) — again not gated by
+    /// reserved_word_acceptable, which is false after the NAME word.
+    /// Without this chain the body's `{' is invisible to the depth
+    /// scan while its `}' (after `;') still counts as a closer, so an
+    /// enclosing group's fold ends one `}' early and the group's tail
+    /// is left as stray tokens (`{ coproc FC2 { cat; }; echo ok; }'
+    /// reported `syntax error near unexpected token `}'' —
+    /// rubash#1625).
+    coproc_chain: u8,
 }
 
 impl SkipBraceScan {
@@ -1093,6 +1130,7 @@ impl SkipBraceScan {
             word_plain: true,
             close_word: String::new(),
             function_chain: 0,
+            coproc_chain: 0,
         }
     }
 
@@ -1114,6 +1152,7 @@ impl SkipBraceScan {
             word_plain: resume.word_plain,
             close_word: resume.close_word,
             function_chain: resume.function_chain,
+            coproc_chain: resume.coproc_chain,
         }
     }
 
@@ -1136,6 +1175,7 @@ impl SkipBraceScan {
             word_plain: self.word_plain,
             close_word: self.close_word,
             function_chain: self.function_chain,
+            coproc_chain: self.coproc_chain,
         }
     }
 }

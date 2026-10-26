@@ -586,6 +586,96 @@ fn issue1651_coproc_heredoc_feeds_child_stdin() {
 }
 
 #[test]
+fn issue1625_named_coproc_brace_body_inside_group() {
+    // GNU: a named coproc with a brace body inside a brace group is
+    // ordinary syntax (parse.y coproc production takes a compound
+    // command) — the body braces must not terminate the outer group.
+    let output = rubash_command()
+        .arg("-c")
+        .arg(
+            "{ coproc FC2 { cat; }; \
+             echo hello >&${FC2[1]}; \
+             read -t 2 -u ${FC2[0]} l; echo \"grouped: $l\"; \
+             exec {FC2[1]}>&-; wait $FC2_PID 2>/dev/null; }",
+        )
+        .output()
+        .expect("run rubash");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "grouped: hello\n");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
+fn issue1625_named_coproc_brace_body_inside_function() {
+    let output = rubash_command()
+        .arg("-c")
+        .arg(
+            "f() { coproc FC3 { cat; }; \
+             echo hello >&${FC3[1]}; \
+             read -t 2 -u ${FC3[0]} l; echo \"func: $l\"; }; \
+             f; exec {FC3[1]}>&- 2>/dev/null; wait $FC3_PID 2>/dev/null",
+        )
+        .output()
+        .expect("run rubash");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "func: hello\n");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
+fn issue1625_named_coproc_brace_body_preceded_by_command_in_group() {
+    let output = rubash_command()
+        .arg("-c")
+        .arg(
+            "{ x=1; coproc FC4 { cat; }; \
+             echo hello >&${FC4[1]}; \
+             read -t 2 -u ${FC4[0]} l; echo \"preceded: $l x=$x\"; \
+             exec {FC4[1]}>&-; wait $FC4_PID 2>/dev/null; }",
+        )
+        .output()
+        .expect("run rubash");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "preceded: hello x=1\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
+fn issue1625_named_coproc_brace_body_in_then_clause_inside_group() {
+    let output = rubash_command()
+        .arg("-c")
+        .arg(
+            "{ if true; then coproc FC5 { cat; }; fi; \
+             echo hello >&${FC5[1]}; \
+             read -t 2 -u ${FC5[0]} l; echo \"then: $l\"; \
+             exec {FC5[1]}>&-; wait $FC5_PID 2>/dev/null; }",
+        )
+        .output()
+        .expect("run rubash");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "then: hello\n");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
 fn typed_cell_stays_consistent_across_builtin_writes() {
     // Typed-cell reads must agree with the mirror after every kind of
     // write: plain/compound/append element writes, declare/typeset/local,

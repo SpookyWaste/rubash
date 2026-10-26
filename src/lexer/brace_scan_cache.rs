@@ -86,6 +86,10 @@ pub(crate) struct BraceScanResume {
     /// `SkipBraceScan::function_chain`): 0 idle, 1 `function' seen, 2 its
     /// NAME seen — a following `{' opens a nested group (rubash#465).
     pub(crate) function_chain: u8,
+    /// `coproc NAME' chain of the same tracker (see
+    /// `SkipBraceScan::coproc_chain`): 0 idle, 1 `coproc' seen, 2 its
+    /// NAME seen — a following `{' opens a nested group (rubash#1625).
+    pub(crate) coproc_chain: u8,
 }
 
 /// Outcome of `skip_brace` worth remembering for the `{` at some offset.
