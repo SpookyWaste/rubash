@@ -2820,21 +2820,33 @@ impl Executor {
             } else {
                 provider.borrow_mut().entries()?
             };
+            let mut surplus = false;
             let status = crate::builtins::history::execute_with_history(
                 args,
                 &self.diagnostic_prefix(),
                 &entries,
                 &mut stdout,
                 &mut stderr,
+                &mut surplus,
             )?;
+            if surplus {
+                // rubash#1660: no_args DISCARD (see history_exec.rs).
+                self.raise_evalerror_abort();
+                self.evalerror_exit_toomany_pending.set(true);
+            }
             self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
             return Ok(status);
         }
-        let status = crate::builtins::history::execute_with_io(
+        let (status, surplus) = crate::builtins::history::execute_with_io(
             args,
             &self.diagnostic_prefix(),
             &mut stderr,
         )?;
+        if surplus {
+            // rubash#1660: no_args DISCARD (see history_exec.rs).
+            self.raise_evalerror_abort();
+            self.evalerror_exit_toomany_pending.set(true);
+        }
         self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
         Ok(status)
     }
