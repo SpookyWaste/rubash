@@ -687,6 +687,12 @@ fn globstar_expand(
         nocaseglob,
         dotglob,
         globskipdots,
+        // glob.c glob_filename: the symlink skip in the walk applies
+        // only when the directory part consists solely of `**` segments
+        // (empty prefix here). Any literal prefix (`./`, `sub/`, `/`)
+        // makes symlinked directories ordinary for the remaining
+        // pattern (rubash#1672).
+        !prefix.is_empty(),
         env_vars,
     );
     // A `./` prefix is part of every result GNU prints (`./**/` yields
@@ -799,6 +805,7 @@ fn expand_multi_globstar(
         nocaseglob,
         dotglob,
         globskipdots,
+        absolute,
         env_vars,
     );
     crate::locale::sort_collated(&mut matches);
@@ -868,6 +875,7 @@ fn collect_multi_globstar_paths(
     nocaseglob: bool,
     dotglob: bool,
     globskipdots: bool,
+    absolute: bool,
     env_vars: &std::collections::HashMap<String, String>,
 ) {
     if index == segments.len() {
@@ -892,6 +900,7 @@ fn collect_multi_globstar_paths(
             nocaseglob,
             dotglob,
             globskipdots,
+            absolute,
             env_vars,
         );
         let entries = match shell_directory_entries(logical, env_vars) {
@@ -915,16 +924,44 @@ fn collect_multi_globstar_paths(
                 .map(|meta| meta.file_type().is_symlink())
                 .unwrap_or(false);
             if is_symlink {
-                // glob.c: `**` never descends through a symlinked directory,
-                // but the link itself is still emitted as a match
-                // (globstar3.sub: `c` for `**`, `c/` for `**/`).
-                if !dirs_only || is_dir {
-                    matches.push(if dirs_only {
-                        format!("{child_logical}/")
-                    } else {
-                        child_logical.clone()
-                    });
+                // glob.c glob_filename (the all_starstar symlink special
+                // case): what a symlinked directory enumerated by `**`
+                // contributes depends on the rest of the pattern.
+                if index + 1 == segments.len() {
+                    // `**` is the final segment: the link itself is a
+                    // match (globstar3.sub: `c` for `**`, `c/` for `**/`).
+                    if !dirs_only || is_dir {
+                        matches.push(if dirs_only {
+                            format!("{child_logical}/")
+                        } else {
+                            child_logical.clone()
+                        });
+                    }
+                } else if absolute || segments[..index].iter().any(|s| *s != "**") {
+                    // The directory part is not all-`**` (a literal or
+                    // absolute prefix precedes this `**`): the remaining
+                    // segments are applied inside the linked directory.
+                    // The recursive call consumes the next segment, so
+                    // the `**` enumeration itself still never descends
+                    // into the link (rubash#1672, multi-segment forms).
+                    collect_multi_globstar_paths(
+                        segments,
+                        index + 1,
+                        &child_logical,
+                        &child_physical,
+                        dirs_only,
+                        matches,
+                        nocaseglob,
+                        dotglob,
+                        globskipdots,
+                        absolute,
+                        env_vars,
+                    );
                 }
+                // All-`**` prefix with segments remaining: the link
+                // contributes nothing — it is skipped, never emitted as
+                // a bare final match (rubash#1671: `**/deep/*` used to
+                // append every cwd symlink name, dangling included).
                 continue;
             }
             if index + 1 < segments.len() && !is_dir {
@@ -940,6 +977,7 @@ fn collect_multi_globstar_paths(
                 nocaseglob,
                 dotglob,
                 globskipdots,
+                absolute,
                 env_vars,
             );
         }
@@ -987,6 +1025,7 @@ fn collect_multi_globstar_paths(
             nocaseglob,
             dotglob,
             globskipdots,
+            absolute,
             env_vars,
         );
     }
@@ -1029,6 +1068,7 @@ fn collect_multi_globstar(
                         nocaseglob,
                         dotglob,
                         globskipdots,
+                        false,
                         env_vars,
                     );
                 }
@@ -1116,6 +1156,7 @@ fn collect_globstar_matches(
     nocaseglob: bool,
     dotglob: bool,
     globskipdots: bool,
+    follow_symlink_suffix: bool,
     env_vars: &std::collections::HashMap<String, String>,
 ) {
     let entries = match shell_directory_entries(logical_dir, env_vars) {
@@ -1190,8 +1231,59 @@ fn collect_globstar_matches(
                 nocaseglob,
                 dotglob,
                 globskipdots,
+                follow_symlink_suffix,
                 env_vars,
             );
+        }
+        // glob.c glob_filename (the all_starstar symlink special case):
+        // the recursion skip above is GNU's rule only when the pattern's
+        // directory part consists solely of `**` segments. With a literal
+        // prefix (`./**/*.txt`, `sub/**/*.txt`, an absolute prefix —
+        // follow_symlink_suffix), a symlinked directory enumerated by
+        // the walk is treated as an ordinary directory for the REMAINING
+        // pattern: the suffix is applied to its entries, one level, with
+        // no recursion into it (so `sub/**/g.txt` still never reaches
+        // `sub/linkd/deep/g.txt`). A suffix-free remainder (bare
+        // `PREFIX/**`, pure `PREFIX/**/`) is the enumeration itself and
+        // applies nothing (rubash#1672).
+        if follow_symlink_suffix
+            && !suffix.is_empty()
+            && is_dir
+            && is_symlink
+            && name != "."
+            && name != ".."
+        {
+            if let Ok(sub_entries) = shell_directory_entries(&logical_path, env_vars) {
+                for sub in &sub_entries {
+                    let sub_name = &sub.name;
+                    if sub_name == "." || sub_name == ".." {
+                        continue;
+                    }
+                    if sub_name.starts_with('.') && !include_dotfiles {
+                        continue;
+                    }
+                    let sub_is_dir = sub.path.is_dir();
+                    let sub_matched = if dirs_only {
+                        if nocaseglob {
+                            sub_is_dir && case_pattern_matches_nocase(suffix, sub_name)
+                        } else {
+                            sub_is_dir && super::case_pattern_matches(suffix, sub_name)
+                        }
+                    } else if nocaseglob {
+                        case_pattern_matches_nocase(suffix, sub_name)
+                    } else {
+                        super::case_pattern_matches(suffix, sub_name)
+                    };
+                    if sub_matched {
+                        let sub_logical = join_path_segment(&logical_path, sub_name);
+                        matches.push(if dirs_only {
+                            format!("{}/", sub_logical)
+                        } else {
+                            sub_logical
+                        });
+                    }
+                }
+            }
         }
     }
 }
