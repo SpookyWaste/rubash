@@ -1127,7 +1127,91 @@ impl Executor {
             && self.virtual_fd_stdin_remaining(0).is_none()
             && self.function_stdin_remaining().is_some();
         let Some(redirect) = &call_cmd.redirect_in else {
+            // rubash#1703: when fd 0 is a live File endpoint (a compound
+            // command's `< file` binding), a call without its own stdin
+            // redirection inherits that descriptor unchanged — GNU
+            // execute_function (execute_cmd.c:5181, body run at :5395)
+            // executes the body in-process on the caller's descriptors,
+            // and only a call's own redirections rebind fd 0, via
+            // do_redirections RX_UNDOABLE (execute_cmd.c:854), undone on
+            // return. Snapshotting the endpoint through
+            // stdin_string_for_command read_to_end's the shared-offset
+            // dup to EOF, and the staged text is then shadowed by the
+            // fd-table endpoint for every body reader — so the bytes are
+            // consumed AND discarded, and a `while read …; do f; done
+            // < file` loop ends after the line on which f was first
+            // called. Stage no text: the body reads the shared cursor
+            // through the fd table.
+            // The "call carries a stdin body of its own" judgment is
+            // made over the same stores stdin_string_for_command_mut
+            // consults — the fd-0 winner over `redirects`, with the
+            // legacy fields and the parallel `heredoc_redirects` store
+            // as fallback (the shape apply_external_stdin_redirect
+            // already uses) — so this guard and the consumer below can
+            // never disagree about whether the call brought a body.
+            // The two decisions that use it are the early return here
+            // (no body: stage nothing) and the fd-0 binding further
+            // down (body present: bind it, do not just stage it).
+            let call_has_own_stdin_body =
+                match crate::executor::shell_options::fd0_stdin_redirect_winner(call_cmd) {
+                    Some(kind) => matches!(
+                        kind,
+                        crate::parser::RedirectKind::HereDoc
+                            | crate::parser::RedirectKind::HereString
+                    ),
+                    None => {
+                        call_cmd.heredoc.is_some()
+                            || call_cmd.here_string.is_some()
+                            || call_cmd
+                                .heredoc_redirects
+                                .iter()
+                                .any(|redirect| redirect.fd.is_none() || redirect.fd == Some(0))
+                    }
+                };
+            if !call_has_own_stdin_body
+                && matches!(
+                    self.fd_table.read_endpoint(0),
+                    Some(FdReadEndpoint::File(_))
+                )
+            {
+                return Ok((None, false, None));
+            }
             if let Some(input) = self.stdin_string_for_command_mut(call_cmd) {
+                // A call's own heredoc/here-string body is normally
+                // staged as FUNCTION_STDIN text, but a live fd-0
+                // endpoint shadows the mirror for every body reader:
+                // read_input_for_command_inner serves a non-null File
+                // endpoint first because its cursor is the persistent
+                // one, and a Text/ProcessSubstitution endpoint (an
+                // enclosing call's bound body, a loop's staged input)
+                // is served before the mirror as well — so the body
+                // would read the caller's stream instead of its
+                // heredoc. GNU do_redirections (redir.c:854,
+                // RX_UNDOABLE, applied by execute_function) rebinds
+                // fd 0 itself for the body's duration — do the same:
+                // park the body on fd 0 as a text endpoint and let the
+                // caller's binding restore reinstate the caller's
+                // endpoint, shared cursor untouched, when the body
+                // returns. The null device is exempt: the read path
+                // falls through it to the mirror, so text staging
+                // already works there.
+                let fd0_endpoint_shadows_mirror = match self.fd_table.read_endpoint(0) {
+                    Some(FdReadEndpoint::File(ref file)) => {
+                        !crate::executor::is_null_device(&file.path.to_string_lossy())
+                    }
+                    Some(
+                        FdReadEndpoint::Text(_)
+                        | FdReadEndpoint::ProcessSubstitution(_)
+                        | FdReadEndpoint::CoprocStdout { .. },
+                    ) => true,
+                    _ => false,
+                };
+                if call_has_own_stdin_body && fd0_endpoint_shadows_mirror {
+                    let saved = self.fd_table.entries.get(&0).cloned();
+                    self.fd_table
+                        .open_input(0, FdReadEndpoint::text(input), false);
+                    return Ok((None, false, Some(FunctionCallStdinBinding { entry: saved })));
+                }
                 return Ok((Some(input), carves_parent_stdin, None));
             }
             // A shell script read through `< file` still has the unread
