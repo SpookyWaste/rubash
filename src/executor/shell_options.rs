@@ -251,6 +251,20 @@ impl Executor {
             Some(FdReadEndpoint::File(file_fd)) => crate::fd::duplicate_handle(file_fd.handle)
                 .map(crate::fd::handle_to_file)
                 .map_err(|e| crate::posix_errors::path_error(&file_fd.path.to_string_lossy(), e)),
+            // rubash#1659: a coproc pipe read end is handle-backed
+            // exactly like a file (its FileFd carries the pipe
+            // handle); every sibling reader (read_all_bytes,
+            // take_buffered_input_line, inherited_async_stdin)
+            // already serves it, but this helper dropped it to
+            // Bad file descriptor — so mapfile's `<&${COPROC[0]}`
+            // string channel failed and fell through to reading
+            // inherited process stdin (a hang on a held-open
+            // pipe, or 0 lines on /dev/null).
+            Some(FdReadEndpoint::CoprocStdout { fd: file_fd, .. }) => {
+                crate::fd::duplicate_handle(file_fd.handle)
+                    .map(crate::fd::handle_to_file)
+                    .map_err(|e| crate::posix_errors::path_error(&file_fd.path.to_string_lossy(), e))
+            }
             Some(FdReadEndpoint::Text(_)) | Some(FdReadEndpoint::ProcessSubstitution(_)) => {
                 let bytes = self
                     .virtual_fd_stdin_remaining_bytes(fd)
