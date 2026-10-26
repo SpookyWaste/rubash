@@ -4372,7 +4372,11 @@ impl Executor {
         // authority for the readonly/special classes: report it here,
         // exactly once, and kill the element the same way.
         if let Some((name, message)) = self.parameter_assignment_error(command) {
-            let class = if message == "readonly variable" { 2 } else { 1 };
+            let class = if matches!(message, "readonly variable" | "bad array subscript") {
+                2
+            } else {
+                1
+            };
             let line = format!("{}{}: {}\n", self.error_prefix(), name, message);
             self.write_diagnostic_fd2(line.as_bytes());
             return Ok(Some((

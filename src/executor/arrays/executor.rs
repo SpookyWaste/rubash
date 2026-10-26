@@ -794,12 +794,18 @@ impl Executor {
         &self,
         array_name: &str,
         offset: isize,
-        length: Option<usize>,
+        length: Option<isize>,
     ) -> Option<Vec<String>> {
         let storage = self.parameter_array_storage(array_name)?;
         let resolved = self
             .resolved_variable_name(array_name)
             .unwrap_or_else(|| array_name.to_string());
+        // The signed length reaches this function unchanged (rubash#1600):
+        // the scalar branch below consumes it directly, while the array
+        // branches keep treating a negative length as "no length" — for a
+        // real array that case is the verify_substring_values error, which
+        // the parameter error scan reports before expansion runs.
+        let unsigned_length = length.and_then(|length| usize::try_from(length).ok());
         if !is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, &resolved) {
             // GNU subst.c:9064 get_var_and_type resolves / on
             // a scalar to VT_VARIABLE, so parameter_brace_substring
@@ -811,12 +817,10 @@ impl Executor {
             let is_array = self.parameter_is_array_variable(&resolved);
             if !is_array {
                 return Some(vec![crate::executor::parameter_substring(
-                    &storage,
-                    offset,
-                    length.map(|length| length as isize),
+                    &storage, offset, length,
                 )]);
             }
-            return Some(array_parameter_slice(&storage, offset, length));
+            return Some(array_parameter_slice(&storage, offset, unsigned_length));
         }
         let values = assoc_hash_ordered_values(
             &storage,
@@ -836,7 +840,7 @@ impl Executor {
             values
                 .into_iter()
                 .skip(skip)
-                .take(length.unwrap_or(usize::MAX))
+                .take(unsigned_length.unwrap_or(usize::MAX))
                 .collect(),
         )
     }
@@ -900,11 +904,7 @@ impl Executor {
                     .strip_suffix("[@]")
                     .or_else(|| name.strip_suffix("[*]"))
                 {
-                    return self.array_subscript_range_values(
-                        array_name,
-                        offset,
-                        length.and_then(|length| usize::try_from(length).ok()),
-                    );
+                    return self.array_subscript_range_values(array_name, offset, length);
                 }
             }
         }
@@ -933,11 +933,7 @@ impl Executor {
                             length.and_then(|length| usize::try_from(length).ok()),
                         ));
                     }
-                    return self.array_subscript_range_values(
-                        array_name,
-                        offset,
-                        length.and_then(|length| usize::try_from(length).ok()),
-                    );
+                    return self.array_subscript_range_values(array_name, offset, length);
                 }
             }
             if let Some(values) = self.indirect_array_reference_word_values(word, true) {

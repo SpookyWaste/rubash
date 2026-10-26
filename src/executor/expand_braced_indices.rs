@@ -831,11 +831,7 @@ impl Executor {
             .or_else(|| var_name.strip_suffix("[*]"))
         {
             return self
-                .array_subscript_range_values(
-                    array_name,
-                    offset,
-                    length.and_then(|length| usize::try_from(length).ok()),
-                )
+                .array_subscript_range_values(array_name, offset, length)
                 .map(|values| {
                     let values = values
                         .into_iter()
