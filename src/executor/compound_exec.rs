@@ -3620,12 +3620,20 @@ impl Executor {
                     .and_then(|path| std::fs::File::open(path).ok()),
                 _ => None,
             };
-            if let Some(file) = heredoc_stdin {
-                child.stdin(Stdio::from(file));
+            // rubash#1651 (mixed fd-0 redirects): when a heredoc /
+            // here-string body wins fd 0, the pipe read end is dropped
+            // here, but the body file itself is bound only AFTER
+            // apply_coproc_redirects has run below — GNU applies the
+            // command's redirects left to right, so an fd-0 file
+            // redirect the body outranks must not clobber it just
+            // because the redirect pass runs later in this function.
+            let deferred_heredoc_stdin = if heredoc_stdin.is_some() {
                 drop(stdin_reader);
+                heredoc_stdin
             } else {
                 child.stdin(stdin_reader);
-            }
+                None
+            };
             // The child's stdout starts as the coproc pipe writer; the
             // command's own redirections may move it (GNU applies them
             // after the pipe wiring, in the child). Two duplicates of
@@ -3696,6 +3704,12 @@ impl Executor {
                 }
             };
 
+            // rubash#1651: bind the winning heredoc / here-string
+            // body last, on top of whatever apply_coproc_redirects
+            // left on fd 0 (see deferred_heredoc_stdin above).
+            if let Some(file) = deferred_heredoc_stdin {
+                child.stdin(Stdio::from(file));
+            }
             suppress_orphan_console(&mut child);
             // rubash#1632: on Unix the displaced-stdout writer goes
             // into the child (fd 10), not the parent's map — EOF must
