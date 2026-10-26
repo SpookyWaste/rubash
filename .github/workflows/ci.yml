@@ -145,7 +145,7 @@ jobs:
           if-no-files-found: error
 
   cross-target-check:
-    name: Cross-target check (linux/darwin/android)
+    name: Cross-target check (linux/android)
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -156,40 +156,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu, aarch64-apple-darwin, aarch64-linux-android, armv7-linux-androideabi
+          targets: x86_64-unknown-linux-gnu, aarch64-linux-android, armv7-linux-androideabi
 
       - name: Check Linux target
         run: cargo check --target x86_64-unknown-linux-gnu
 
-      # The darwin checks cross-compile from a Linux host: cc-rs feeds
-      # clang-style flags (-arch, -mmacosx-version-min) to whatever
-      # `cc` resolves to, and on this runner that is gcc, which rejects
-      # them (signal-hook's build script is the first casualty). Pin
-      # the darwin-target C toolchain to clang explicitly. Both the
-      # dashed and underscored variable spellings are set because
-      # cc-rs accepts either.
-      - name: Check macOS target
-        env:
-          CC_aarch64-apple-darwin: clang
-          CXX_aarch64-apple-darwin: clang++
-          AR_aarch64-apple-darwin: llvm-ar
-          CC_aarch64_apple_darwin: clang
-          CXX_aarch64_apple_darwin: clang++
-          AR_aarch64_apple_darwin: llvm-ar
-        run: cargo check --target aarch64-apple-darwin
-
       - name: Check tests on Linux target
         run: cargo check --tests --target x86_64-unknown-linux-gnu
-
-      - name: Check tests on macOS target
-        env:
-          CC_aarch64-apple-darwin: clang
-          CXX_aarch64-apple-darwin: clang++
-          AR_aarch64-apple-darwin: llvm-ar
-          CC_aarch64_apple_darwin: clang
-          CXX_aarch64_apple_darwin: clang++
-          AR_aarch64_apple_darwin: llvm-ar
-        run: cargo check --tests --target aarch64-apple-darwin
 
       # Android (bionic): check-only, no linking — the runner has no NDK.
       # Both targets are Tier 2, so rustup's rust-std is enough for cargo
@@ -199,6 +172,37 @@ jobs:
 
       - name: Check Android armv7 target
         run: cargo check --target armv7-linux-androideabi
+
+  # The darwin checks used to run in the ubuntu job above. That only
+  # worked while no build script compiled C for the darwin target:
+  # since cc entered Cargo.lock (333cbd66), signal-hook's build script
+  # compiles extract.c via cc-rs, and a Linux host cannot service that
+  # — `cc` is gcc and rejects the clang-style -arch flags, and clang
+  # pointed at a darwin target has no macOS SDK headers to compile
+  # against (it falls back to the host glibc headers and fails in
+  # bits/wordsize.h). A darwin target check needs a darwin host, so
+  # the two darwin steps live here now, where `cc` is clang with the
+  # SDK by construction. Check-only, same as before: this proves the
+  # tree compiles FOR darwin; execution stays with the macOS test jobs.
+  darwin-target-check:
+    name: Cross-target check (darwin)
+    runs-on: macos-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Check macOS target
+        run: cargo check --target aarch64-apple-darwin
+
+      - name: Check tests on macOS target
+        run: cargo check --tests --target aarch64-apple-darwin
 
   shell-functionality:
     name: Shell functionality tests
