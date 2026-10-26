@@ -43,7 +43,7 @@ fn issue1285_printf_percent_a_accepted_glibc_form() {
 fn issue1285_printf_percent_capital_a_accepted_glibc_form() {
     let (stdout, stderr, status) = run("printf '%A\\n' 3.14; echo \"rc=$?\"");
     assert_eq!(
-        stdout, "0XC.8F5C28F5C28F5CP-2\nrc=0\n",
+        stdout, "0XC.8F5C28F5C28F5C3P-2\nrc=0\n",
         "stderr: {stderr:?}"
     );
     assert_eq!(status, Some(0), "stderr: {stderr:?}");
