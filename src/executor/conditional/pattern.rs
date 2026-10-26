@@ -423,6 +423,17 @@ pub(in crate::executor) fn flatten_pattern_to_byte_chars(pattern: &str) -> Vec<c
                 }
                 _ => output.push(ch),
             }
+        } else if ch == crate::executor::markers::LITERAL_CHAR_ESCAPE {
+            // rubash#1635: a literal-char escape pair is ONE data
+            // character (its payload), exactly as a raw-byte pair is
+            // one byte-char above — staging the halves as two units
+            // made `?` unable to match the character, so ${v#?} on a
+            // lone escaped char removed nothing. Greedy pairing,
+            // mirroring shell_text_to_raw_bytes.
+            match chars.next() {
+                Some(payload) => output.push(payload),
+                None => output.push(ch),
+            }
         } else if ch == crate::executor::markers::CTLESC {
             // CTLESC quotes the next pattern char (parse.y:5694-5706
             // got_escaped_character). When the quoted unit is a raw-byte
@@ -570,6 +581,13 @@ pub(in crate::executor) fn flatten_word_to_byte_chars(word: &str) -> Vec<char> {
                     );
                 }
                 _ => output.push(ch),
+            }
+        } else if ch == crate::executor::markers::LITERAL_CHAR_ESCAPE {
+            // rubash#1635: word twin of the pattern-side pair collapse
+            // (one data character per literal-escape pair).
+            match chars.next() {
+                Some(payload) => output.push(payload),
+                None => output.push(ch),
             }
         } else if ch == crate::executor::markers::CTLESC {
             match try_consume_ctlesc_quoted_pair(&mut chars) {

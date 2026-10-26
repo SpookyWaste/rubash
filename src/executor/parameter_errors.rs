@@ -2003,7 +2003,9 @@ impl Executor {
                     } else {
                         self.parameter_error_value(name).is_some_and(|value| {
                             parameter_substring_has_negative_result(
-                                value.chars().count(),
+                                crate::executor::expand_braced_indices::parameter_char_length(
+                                    &value,
+                                ),
                                 offset,
                                 length,
                             )
