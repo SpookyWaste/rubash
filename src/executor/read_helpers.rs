@@ -45,7 +45,49 @@ fn rusage_counters() -> RusageCounters {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn rusage_counters() -> RusageCounters {
+    // Windows has no getrusage. The SELF half of GNU's SELF+CHILDREN
+    // sum maps to GetProcessTimes on the current process — which is
+    // also where rubash's no-fork subshell and builtin work lands, so
+    // it is the half that moves for in-process timed commands (a pure
+    // builtin loop under `time` used to report user 0m0.000s here).
+    // The CHILDREN half has no accumulation point yet: a waited
+    // child's times would have to be sampled from its process handle
+    // before the executor closes it, so external commands still
+    // contribute zero on this platform.
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    fn ticks(ft: FILETIME) -> std::time::Duration {
+        // FILETIME counts 100-nanosecond intervals since 1601.
+        let raw = ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64;
+        std::time::Duration::from_nanos(raw.saturating_mul(100))
+    }
+
+    let mut creation: FILETIME = unsafe { std::mem::zeroed() };
+    let mut exit: FILETIME = unsafe { std::mem::zeroed() };
+    let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+    let mut user: FILETIME = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if ok == 0 {
+        return RusageCounters::default();
+    }
+    RusageCounters {
+        user: ticks(user),
+        sys: ticks(kernel),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn rusage_counters() -> RusageCounters {
     RusageCounters::default()
 }

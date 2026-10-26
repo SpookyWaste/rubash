@@ -54,7 +54,10 @@ fn fd_is_anonymous_pipe(fd: std::os::unix::io::RawFd) -> bool {
     if unsafe { libc::fstat(fd, &mut stat) } != 0 {
         return false;
     }
-    (stat.st_mode & libc::S_IFMT) == libc::S_IFIFO
+    // Widened through u32 like the sibling checks in src/fd/unix.rs:
+    // bionic (Android) types the S_IF* constants as u16 while st_mode
+    // is u32, so the raw comparison does not compile there.
+    (u32::from(stat.st_mode) & u32::from(libc::S_IFMT)) == u32::from(libc::S_IFIFO)
 }
 
 impl Executor {
