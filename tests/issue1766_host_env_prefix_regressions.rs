@@ -52,6 +52,11 @@ fn run_host_captures(script: &str) -> Vec<HashMap<String, String>> {
     let ast = parse(&tokens);
     let result = executor.execute_ast(&ast);
     assert!(result.is_ok(), "script failed: {script:?} -> {result:?}");
+    // The executor owns the handler closure, which owns the second Arc
+    // clone of the sink; try_unwrap can only succeed once the executor
+    // (and with it the closure) is dropped. Without this drop every test
+    // in this file panics in try_unwrap before any assertion runs.
+    drop(executor);
     Arc::try_unwrap(captured)
         .ok()
         .unwrap()
