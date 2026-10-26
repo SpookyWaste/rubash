@@ -509,6 +509,12 @@ pub struct Executor {
     fd_table: FdTable,
     exit_code: i32,
     parse_error_occurred: bool,
+    /// rubash#1662: set by the boundary signal dispatch when it aborts a
+    /// unit for an untrapped signal in an interactive shell. GNU
+    /// classifies that unwind as DISCARD (the reader prompts again with
+    /// $? = 128+sig), not as a jump_to_top_level exit; run_source_impl
+    /// consumes the mark instead of recording an exit jump.
+    signal_discard_pending: bool,
     /// GNU exit.def:52 (sourced_logout): ~/.bash_logout runs at most once
     /// per shell process (bash_logout, exit.def:156-166).
     bash_logout_sourced: bool,
