@@ -99,7 +99,6 @@ fn issue1626_exec_fd_listed_in_child_fd_table() {
 }
 
 #[test]
-#[ignore = "adjacent gap: pipeline member spawns build their own child commands and do not pass through the direct spawn path's ambient pin — GNU lists the fd in pipeline children too"]
 fn issue1626_exec_fd_listed_in_pipeline_child_known_gap() {
     let dir = tempdir("listing-pipe");
     let run = rubash_c(
@@ -111,6 +110,33 @@ fn issue1626_exec_fd_listed_in_pipeline_child_known_gap() {
         "pipeline child fd listing lacks 9: {}",
         run.stdout
     );
+}
+
+#[test]
+fn issue1688_exec_fd_listed_in_second_pipeline_stage() {
+    // rubash#1688: every pipeline member inherits, not just the first.
+    let dir = tempdir("listing-pipe2");
+    let run = rubash_c(
+        "exec 9>/dev/null; echo x | /usr/bin/bash -c 'ls /proc/$$/fd' | sort -n | tr '\\n' ' '; echo",
+        &dir,
+    );
+    assert!(
+        run.stdout.split_whitespace().any(|fd| fd == "9"),
+        "second-stage fd listing lacks 9: {}",
+        run.stdout
+    );
+}
+
+#[test]
+fn issue1688_pipeline_member_writes_through_ambient_fd() {
+    // rubash#1688: a write through the ambient descriptor from inside a
+    // pipeline member lands in the bound file (GNU fork inheritance).
+    let dir = tempdir("pipewrite");
+    let run = rubash_c(
+        "exec 8>pw.txt; /usr/bin/bash -c 'echo via_pipe >&8' | cat; echo \"pw=[$(cat pw.txt)]\"",
+        &dir,
+    );
+    assert_eq!(run.stdout, "pw=[via_pipe]\n", "stderr: {}", run.stderr);
 }
 
 #[test]
