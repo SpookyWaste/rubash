@@ -370,7 +370,13 @@ pub fn find_user_command(name: &str, env_vars: &HashMap<String, String>) -> Opti
     // mid-session without a PATH change must stay findable, which keeps
     // GNU's re-scan semantics for positives (`hash -r` /
     // builtins/hash.def:150 phash_flush and any fingerprint change still
-    // drop the memo).
+    // drop the memo). GNU also never remembers a failed search
+    // (findcmd.c:623-697 find_user_command_in_path re-walks $PATH for
+    // every unhashed lookup), so a memoized miss is served only after the
+    // rubash#392 probe grid re-stats every candidate spelling under every
+    // PATH dir — a self-healing memo: a probe hit drops the entry and the
+    // real walk below resolves the file that appeared mid-session
+    // (rubash#1723).
     if !crate::builtins::set::shell_option_enabled(env_vars, "hashall")
         || env_vars.get("__RUBASH_TEMP_PATH").map(String::as_str) == Some("1")
     {
@@ -382,10 +388,32 @@ pub fn find_user_command(name: &str, env_vars: &HashMap<String, String>) -> Opti
             if cache.fingerprint != fingerprint {
                 cache.reset(fingerprint.clone());
             } else if cache.results.get(name) == Some(&None) {
-                return None;
+                // rubash#1723: a memoized miss is a staleness suspect, not
+                // an answer — GNU never remembers a failed search
+                // (findcmd.c:348-380 re-stats even hashed entries;
+                // findcmd.c:623-697 re-walks $PATH per unhashed lookup).
+                // The probe grid re-stats every candidate spelling under
+                // every PATH dir; a hit means the file appeared
+                // mid-session, so drop the memo and take the real walk.
+                if memoized_miss_still_absent(&mut cache, name, env_vars, &fingerprint) {
+                    return None;
+                }
+                cache.results.remove(name);
             }
         }
-        return find_user_command_uncached(name, env_vars, &fingerprint);
+        let result = find_user_command_uncached(name, env_vars, &fingerprint);
+        if result.is_none() && !has_path_separator(name) {
+            let mut cache = command_lookup_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if cache.fingerprint == fingerprint {
+                if cache.results.len() >= 4096 {
+                    cache.results.clear();
+                }
+                cache.results.insert(name.to_string(), None);
+            }
+        }
+        return result;
     }
 
     let fingerprint = command_lookup_fingerprint(env_vars);
@@ -628,6 +656,36 @@ fn listed_candidates(name: &str, extensions: &[String]) -> Vec<ListedCandidate> 
     probes
 }
 
+/// The per-fingerprint PATH-scan scaffold (rubash#159): the split and
+/// translated PATH directories plus the parsed PATHEXT order, built on the
+/// first use after a fingerprint change and remembered for its life.
+/// `cache` must be the locked lookup cache; a fingerprint mismatch resets
+/// it first, same as the walk's own entry check.
+#[cfg(not(unix))]
+fn path_scan_scaffold(
+    cache: &mut CommandLookupCache,
+    env_vars: &HashMap<String, String>,
+    fingerprint: &str,
+) -> (Arc<Vec<PathBuf>>, Arc<Vec<String>>) {
+    if cache.fingerprint != fingerprint {
+        cache.reset(fingerprint.to_string());
+    }
+    if cache.path_dirs.is_none() {
+        let dirs = split_shell_path(env_vars.get("PATH").map(String::as_str).unwrap_or_default())
+            .into_iter()
+            .map(|dir| shell_path_to_windows(&dir, env_vars))
+            .collect::<Vec<_>>();
+        cache.path_dirs = Some(Arc::new(dirs));
+    }
+    if cache.path_extensions.is_none() {
+        cache.path_extensions = Some(Arc::new(executable_extensions(env_vars)));
+    }
+    (
+        Arc::clone(cache.path_dirs.as_ref().unwrap()),
+        Arc::clone(cache.path_extensions.as_ref().unwrap()),
+    )
+}
+
 /// Merged Windows PATH scan (rubash#159). Mirrors the walk shape of GNU
 /// findcmd.c:623 find_user_command_in_path (first match wins, PATH order
 /// preserved, per-directory extension order from executable_candidate),
@@ -645,21 +703,7 @@ fn find_in_path_via_listings(
     let mut cache = command_lookup_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if cache.fingerprint != fingerprint {
-        cache.reset(fingerprint.to_string());
-    }
-    if cache.path_dirs.is_none() {
-        let dirs = split_shell_path(env_vars.get("PATH").map(String::as_str).unwrap_or_default())
-            .into_iter()
-            .map(|dir| shell_path_to_windows(&dir, env_vars))
-            .collect::<Vec<_>>();
-        cache.path_dirs = Some(Arc::new(dirs));
-    }
-    if cache.path_extensions.is_none() {
-        cache.path_extensions = Some(Arc::new(executable_extensions(env_vars)));
-    }
-    let dirs = Arc::clone(cache.path_dirs.as_ref().unwrap());
-    let extensions = Arc::clone(cache.path_extensions.as_ref().unwrap());
+    let (dirs, extensions) = path_scan_scaffold(&mut cache, env_vars, fingerprint);
     // Candidate spellings are per-NAME, not per-directory (GNU passes the
     // same NAME through the whole walk); derive them once so a miss costs
     // one contains() per PATH entry per PATHEXT candidate and no
@@ -716,7 +760,7 @@ fn find_in_path_via_listings(
         // unhashed lookup, so the negative answer always comes from the
         // filesystem, never from a cache. Hits return from the listing
         // scan above and never pay the probe grid.
-        if attempt == 0 && confirm_listing_miss(&mut cache, &dirs, &candidates) {
+        if attempt == 0 && confirm_listing_miss(&mut cache, &dirs, &candidates).moved {
             continue;
         }
         break;
@@ -763,6 +807,21 @@ fn strip_prefix_ascii_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
+/// What the rubash#392 probe grid learned about a would-be miss.
+#[cfg(not(unix))]
+struct MissProbe {
+    /// At least one candidate spelling stat'ed present under a consulted
+    /// PATH dir — the filesystem holds a file the listings claim absent.
+    /// Unlike `moved`, this stays true on every later probe of the same
+    /// name while the file exists, so it is the staleness oracle for a
+    /// memoized miss (rubash#1723).
+    hit: bool,
+    /// At least one probed dir's re-read listing differed from the cached
+    /// listing (and the fresh one was swapped in) — the listing scan's
+    /// signal to re-walk exactly once.
+    moved: bool,
+}
+
 /// Ground-truth confirmation for a would-be miss (rubash#392): stat each
 /// candidate spelling under every consulted directory — the same probes
 /// GNU's find_in_path_element -> file_status walk performs — and re-read
@@ -776,8 +835,7 @@ fn strip_prefix_ascii_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
 /// listing moves). When a
 /// listing actually moved, the dispatcher-probe outcomes ride the same
 /// directories — a `wpm` install that adds a link can also flip a
-/// `winuxcmd help NAME` answer — so they are cleared with it. Returns true
-/// when anything changed so the caller re-walks exactly once. Cost: PATH
+/// `winuxcmd help NAME` answer — so they are cleared with it. Cost: PATH
 /// entries x PATHEXT candidates stats, miss path only; hits never reach
 /// this.
 #[cfg(not(unix))]
@@ -785,13 +843,17 @@ fn confirm_listing_miss(
     cache: &mut CommandLookupCache,
     dirs: &[PathBuf],
     candidates: &[ListedCandidate],
-) -> bool {
-    let mut changed = false;
+) -> MissProbe {
+    let mut probe = MissProbe {
+        hit: false,
+        moved: false,
+    };
     for dir in dirs {
         if candidates
             .iter()
             .any(|candidate| dir.join(&candidate.file).is_file())
         {
+            probe.hit = true;
             let fresh = read_dir_listing(dir);
             // `fold` is derived from `exact` but its per-key winner follows
             // enumeration order, so compare both — a case-distinct rename
@@ -802,15 +864,54 @@ fn confirm_listing_miss(
                 None => true,
             };
             if moved {
-                changed = true;
+                probe.moved = true;
                 cache.listings.insert(dir.clone(), Arc::new(fresh));
             }
         }
     }
-    if changed {
+    if probe.moved {
         cache.probes.clear();
     }
-    changed
+    probe
+}
+
+/// The memoized-miss gate (rubash#1723): GNU keeps no negative command
+/// cache — findcmd.c:348-380 search_for_command re-stats even positively
+/// hashed entries on every lookup, and findcmd.c:623-697
+/// find_user_command_in_path re-walks $PATH for every unhashed name — so
+/// a remembered miss may be served only after the filesystem re-confirms
+/// the absence. Runs the rubash#392 probe grid (every candidate spelling
+/// stat'ed under every PATH dir); a hit means the command appeared
+/// mid-session (the `wpm` unlink+create window) and the memo is stale.
+/// Bounded cost per repeated miss: one stat grid, no directory re-reads
+/// unless a probe lands.
+#[cfg(not(unix))]
+fn memoized_miss_still_absent(
+    cache: &mut CommandLookupCache,
+    name: &str,
+    env_vars: &HashMap<String, String>,
+    fingerprint: &str,
+) -> bool {
+    let (dirs, extensions) = path_scan_scaffold(cache, env_vars, fingerprint);
+    let candidates = listed_candidates(name, &extensions);
+    !confirm_listing_miss(cache, &dirs, &candidates).hit
+}
+
+/// Unix arm of the memoized-miss gate: there is no listing cache to
+/// revalidate, so the probe is GNU's own per-element existence check —
+/// `dir.join(name)` stat'ed under every PATH element, the same walk
+/// findcmd.c:623-697 performs (the real lookup then applies the
+/// executable/directory tiers on a hit).
+#[cfg(unix)]
+fn memoized_miss_still_absent(
+    _cache: &mut CommandLookupCache,
+    name: &str,
+    env_vars: &HashMap<String, String>,
+    _fingerprint: &str,
+) -> bool {
+    !split_shell_path(env_vars.get("PATH").map(String::as_str).unwrap_or_default())
+        .iter()
+        .any(|dir| shell_path_to_windows(dir, env_vars).join(name).is_file())
 }
 
 #[cfg_attr(unix, allow(unused_variables))]
@@ -6356,12 +6457,13 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_nohash_mode_memoizes_hits_but_not_misses() {
+    fn windows_nohash_mode_memoizes_misses_with_probe_gate() {
         // GNU findcmd.c:348-427 search_for_command with hashing disabled
         // (`set +h`): no phash_search / phash_insert, every lookup
         // re-walks PATH. rubash#159 memoized that walk per fingerprint;
-        // rubash#392 keeps the walk cache but stops memoizing MISSES, so
-        // GNU's re-scan semantics hold for a command that appears
+        // rubash#392 keeps the walk cache and rubash#1723 memoizes misses
+        // again but gates every memoized-miss serve on the candidate probe
+        // grid, so GNU's re-scan semantics hold for a command that appears
         // mid-session -- in a later directory or in the same one.
         let dir0 = std::env::temp_dir().join("rubash-nohash-memo-0");
         let dir1 = std::env::temp_dir().join("rubash-nohash-memo-1");
@@ -6430,6 +6532,67 @@ mod tests {
 
         let _ = fs::remove_dir_all(dir0);
         let _ = fs::remove_dir_all(dir1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_memoized_miss_self_heals_via_probe_grid() {
+        // rubash#1723: GNU never remembers a failed search — a memoized
+        // miss (the `set +h` / tempenv-PATH bypass) is served only after
+        // the rubash#392 probe grid re-stats every candidate spelling
+        // under every PATH dir, so a command that appears inside an
+        // already-listed directory (the `wpm` unlink+create window) is
+        // found on the next lookup WITHOUT `hash -r` or a PATH change —
+        // findcmd.c:348-380 re-stats hashed entries and findcmd.c:623-697
+        // re-walks $PATH for every unhashed lookup.
+        let dir = std::env::temp_dir().join("rubash-memoized-miss-gate");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut env_vars = HashMap::new();
+        env_vars.insert("PATH".to_string(), dir.to_string_lossy().to_string());
+        env_vars.insert("__RUBASH_SETOPT_hashall".to_string(), "0".to_string());
+
+        clear_command_lookup_cache();
+        assert_eq!(find_user_command("gate_tool", &env_vars), None);
+        // The miss is memoized (rubash#159)...
+        assert_eq!(
+            command_lookup_cache()
+                .lock()
+                .unwrap()
+                .results
+                .get("gate_tool"),
+            Some(&None)
+        );
+        // ...and a still-absent repeat stays absent WITHOUT growing the
+        // listings: the bounded probe grid (stat walk) ran, not the full
+        // directory re-scan (rubash#159 miss-cost contract).
+        let listings_before = command_lookup_cache().lock().unwrap().listings.len();
+        assert_eq!(find_user_command("gate_tool", &env_vars), None);
+        assert_eq!(find_user_command("gate_tool", &env_vars), None);
+        assert_eq!(
+            command_lookup_cache().lock().unwrap().listings.len(),
+            listings_before
+        );
+
+        // The wpm window: create inside the already-listed directory; the
+        // next lookup drops the stale memo and resolves the file.
+        fs::write(dir.join("gate_tool.exe"), b"").unwrap();
+        assert_eq!(
+            find_user_command("gate_tool", &env_vars),
+            Some(dir.join("gate_tool.exe"))
+        );
+        assert_eq!(
+            command_lookup_cache()
+                .lock()
+                .unwrap()
+                .results
+                .get("gate_tool"),
+            None
+        );
+
+        let _ = fs::remove_dir_all(dir);
+        clear_command_lookup_cache();
     }
 
     fn windows_shell_path(path: &Path) -> String {
