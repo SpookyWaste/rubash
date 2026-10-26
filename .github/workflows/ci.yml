@@ -164,9 +164,36 @@ jobs:
       - name: Check tests on Linux target
         run: cargo check --tests --target x86_64-unknown-linux-gnu
 
-      # Android (bionic): check-only, no linking — the runner has no NDK.
-      # Both targets are Tier 2, so rustup's rust-std is enough for cargo
-      # check. Mirrors the musl/OpenHarmony gate (unixwin/niubash#210).
+      # Android (bionic): check-only, no linking. Both targets are
+      # Tier 2, so rustup's rust-std is enough for the Rust side — but
+      # since cc entered Cargo.lock (333cbd66), signal-hook's build
+      # script also compiles C for the android targets, and cc-rs
+      # looks for the NDK compilers (aarch64-linux-android-clang and
+      # friends), which are not on PATH. Point cc-rs at the NDK that
+      # ships with the runner image. The NDK only ships API-suffixed
+      # compiler names, so resolve them by glob; fail loudly if the
+      # image ever stops shipping an NDK instead of silently losing
+      # the android checks.
+      - name: Point cc-rs at the NDK compilers
+        run: |
+          ndk_bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          cc_aarch64=$(ls "$ndk_bin"/aarch64-linux-android*-clang | sort -V | tail -n 1)
+          cc_armv7=$(ls "$ndk_bin"/armv7a-linux-androideabi*-clang | sort -V | tail -n 1)
+          {
+            echo "CC_aarch64-linux-android=$cc_aarch64"
+            echo "CXX_aarch64-linux-android=${cc_aarch64}++"
+            echo "AR_aarch64-linux-android=$ndk_bin/llvm-ar"
+            echo "CC_aarch64_linux_android=$cc_aarch64"
+            echo "CXX_aarch64_linux_android=${cc_aarch64}++"
+            echo "AR_aarch64_linux_android=$ndk_bin/llvm-ar"
+            echo "CC_armv7-linux-androideabi=$cc_armv7"
+            echo "CXX_armv7-linux-androideabi=${cc_armv7}++"
+            echo "AR_armv7-linux-androideabi=$ndk_bin/llvm-ar"
+            echo "CC_armv7_linux_androideabi=$cc_armv7"
+            echo "CXX_armv7_linux_androideabi=${cc_armv7}++"
+            echo "AR_armv7_linux_androideabi=$ndk_bin/llvm-ar"
+          } >> "$GITHUB_ENV"
+
       - name: Check Android aarch64 target
         run: cargo check --target aarch64-linux-android
 
