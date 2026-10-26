@@ -13,19 +13,24 @@ pub enum ProcessState {
     Completed,
 }
 
-/// A job-state transition the shell has SENT (via its own `kill`) but not
-/// yet LEARNED through a notification point (rubash#1494). GNU's kill_pid
-/// is pure signal delivery; the shell learns of the stop/continue only in
-/// waitchld, whose report lands at reader notification points — observably
-/// one top-level command later than the kill: `kill -STOP %1` on one line
-/// and `jobs` on the next still shows the pre-signal state and the old
-/// current/previous marks, an intervening command lets the new state (and
-/// the stopped job's promotion to current) appear, and `kill -STOP %1;
-/// jobs` on ONE line never sees it. Rubash has no waitchld/WUNTRACED
-/// poller for its own kill, so the kill path records the transition here
-/// stamped with the reader command sequence, and the per-command refresh
-/// applies it once a full intervening command boundary has passed —
-/// the same lag GNU's SIGCHLD processing exhibits in scripts.
+/// A job-state transition the shell has SENT (via its own `kill`) but
+/// not yet LEARNED (rubash#1494/#1607/#1612). GNU's kill_pid is pure
+/// signal delivery; the shell learns of the stop/continue only in
+/// waitchld (jobs.c), which runs asynchronously from the SIGCHLD
+/// handler and at notification points (parse.y read_command's
+/// notify_and_cleanup, wait_for's blocking wait). There is no
+/// per-command counter in GNU: the observable lag is signal-delivery
+/// latency. In scripts a fast builtin-only sequence therefore still
+/// shows the pre-signal state (and the old current/previous marks)
+/// at the next command, while any real observation opportunity —
+/// the shell blocking on a foreground process, job control active
+/// on a terminal, or simply several milliseconds of wall time —
+/// publishes the transition, including the stopped job's promotion
+/// to current. Rubash has no waitchld/WUNTRACED poller for its own
+/// kill, so the kill path records the transition here stamped with
+/// the reader command sequence and the send instant, and the
+/// per-command refresh applies it once one of those observation
+/// events occurs (see apply_deferred_state_marks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeferredJobState {
     Stopped(Option<i32>),
@@ -121,10 +126,17 @@ pub struct JobTable {
     /// Monotonic count of top-level (reader) commands started; the
     /// executor bumps it once per command at depth 1 (rubash#1494).
     pub reader_command_seq: u64,
-    /// Stop/continue transitions sent by the shell's own `kill`, stamped
-    /// with `reader_command_seq`, awaiting their notification lag
-    /// (rubash#1494, see [`DeferredJobState`]).
-    pub deferred_state_marks: Vec<(u32, DeferredJobState, u64)>,
+    /// Stop/continue transitions sent by the shell's own `kill`,
+    /// stamped with `reader_command_seq` and the send instant,
+    /// awaiting an observation event (rubash#1494, see
+    /// [`DeferredJobState`]).
+    pub deferred_state_marks: Vec<(u32, DeferredJobState, u64, std::time::Instant)>,
+    /// Pids the shell's own `kill` sent a terminating signal to
+    /// during the current reader command, stamped with
+    /// `reader_command_seq` (rubash#1604): an incidental reap of one
+    /// of these must not publish its death notice before a `wait`
+    /// has had its chance to reap the job itself.
+    pub fresh_fatal_marks: Vec<(u32, u64)>,
 }
 
 impl JobTable {
@@ -447,6 +459,18 @@ impl JobTable {
     /// (rubash#1494's notification-lag clock).
     pub fn note_reader_command(&mut self) {
         self.reader_command_seq += 1;
+        // rubash#1604: fatal-signal marks guard the reader command
+        // that sent them AND the one that follows it. The incidental
+        // reap that must not publish lands at the FOLLOWING command's
+        // pre-execution refresh (ast_exec runs the boundary sweep
+        // before a command executes, not after the previous one), and
+        // that following command is typically the `wait` itself —
+        // its redirects are not installed yet at sweep time, so
+        // applying the completion there prints the notice to raw
+        // stderr, past the wait's `2>/dev/null`. After the second
+        // advance an incidental reap publishes normally again.
+        self.fresh_fatal_marks
+            .retain(|(_, seq)| *seq + 1 >= self.reader_command_seq);
     }
 
     /// Queue a stop/continue transition sent by the shell's own `kill`
@@ -455,22 +479,70 @@ impl JobTable {
         // A newer signal to the same pid supersedes an unapplied older
         // one (STOP then CONT inside the lag window nets to Running).
         self.deferred_state_marks
-            .retain(|(marked_pid, _, _)| *marked_pid != pid);
-        self.deferred_state_marks
-            .push((pid, state, self.reader_command_seq));
+            .retain(|(marked_pid, _, _, _)| *marked_pid != pid);
+        self.deferred_state_marks.push((
+            pid,
+            state,
+            self.reader_command_seq,
+            std::time::Instant::now(),
+        ));
     }
 
-    /// Apply every deferred mark at least one full reader command old
-    /// (rubash#1494): a mark recorded during command S becomes visible
-    /// at command S+2's refresh — the immediately following command
-    /// (S+1) still observes the pre-signal state, exactly as GNU's
-    /// waitchld lag presents it.
-    pub fn apply_deferred_state_marks(&mut self) {
+    /// Record that the shell's own `kill` delivered a terminating
+    /// signal to `pid` during the current reader command
+    /// (rubash#1604).
+    pub fn note_fatal_signal(&mut self, pid: u32) {
+        if !self
+            .fresh_fatal_marks
+            .iter()
+            .any(|(marked, _)| *marked == pid)
+        {
+            self.fresh_fatal_marks.push((pid, self.reader_command_seq));
+        }
+    }
+
+    /// True (once) when `pid` was fatally signalled by the shell's
+    /// own `kill` during the current or the immediately preceding
+    /// reader command (see note_reader_command for why the window
+    /// spans the boundary); the mark is consumed so a later reap of
+    /// a recycled pid cannot match it.
+    pub fn take_fresh_fatal(&mut self, pid: u32) -> bool {
+        let now = self.reader_command_seq;
+        if let Some(position) = self
+            .fresh_fatal_marks
+            .iter()
+            .position(|(marked, seq)| *marked == pid && *seq + 1 >= now)
+        {
+            self.fresh_fatal_marks.remove(position);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Publish deferred marks at an observation event
+    /// (rubash#1607/#1612). The caller passes `observe_event` when
+    /// this refresh is itself a GNU notification point for state:
+    /// a wait/fg observed refresh, the shell having blocked on a
+    /// foreground process since the last refresh, or job control
+    /// active on a terminal (under a pty GNU's cadence publishes on
+    /// the very next command). Without such an event a mark
+    /// publishes only once it is at least one reader command old
+    /// AND several milliseconds of wall time have passed since the
+    /// signal was sent — the SIGCHLD-delivery latency GNU exhibits
+    /// across a busy stretch of builtins (a ~50ms builtin loop
+    /// publishes; a microsecond `echo` between kill and `jobs`
+    /// does not). The old `seq + 1 < now` counting rule published
+    /// one command too early for that microsecond case (#1607) and
+    /// never published at all where the reader's cadence differs
+    /// (#1612).
+    pub fn apply_deferred_state_marks(&mut self, observe_event: bool) {
+        const AGED: std::time::Duration = std::time::Duration::from_millis(5);
         let now = self.reader_command_seq;
         let mut pending = std::mem::take(&mut self.deferred_state_marks);
         let mut ready = Vec::new();
-        pending.retain(|(pid, state, seq)| {
-            if *seq + 1 < now {
+        pending.retain(|(pid, state, seq, sent)| {
+            if observe_event || (*seq < now && sent.elapsed() >= AGED) {
                 ready.push((*pid, *state));
                 false
             } else {
