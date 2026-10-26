@@ -297,6 +297,32 @@ fn forward_coproc_stderr(
     }
 }
 
+/// rubash#1611: true when a timed command's inner is itself a time
+/// frame through a "pure" chain — directly (`time time ...`) or
+/// through sole-command subshells (`time (time ...)`, recursively).
+/// GNU
+/// prints exactly ONE report for a pure chain — the innermost
+/// frame's — for completions and unwinds alike (verified against GNU
+/// bash 5.3.20: `time time false`, `time time exit 3`,
+/// `time (time false)`, `time ((time false))` all print one report;
+/// a brace group, a function call, or a subshell with further
+/// commands breaks the chain and every frame prints). The outer
+/// frames therefore delegate: they still adjudicate status, traps,
+/// and errexit, but emit no report of their own.
+fn time_inner_is_pure_time_chain(inner: &CommandNode) -> bool {
+    if inner.time_command.is_some() {
+        return true;
+    }
+    // A pipeline inner never delegates: the pipeline frame owns the
+    // single report (a stage's own time report is hoisted into it,
+    // rubash#1263) — GNU `time time false | cat` prints one report,
+    // from the outer frame, and `time (time false) | cat` prints two.
+    if let Some(subshell) = &inner.subshell_command {
+        return subshell.body.len() == 1 && time_inner_is_pure_time_chain(&subshell.body[0]);
+    }
+    inner.words.first().map(String::as_str) == Some("time")
+}
+
 impl Executor {
     /// Allocate a coproc pipe fd the way GNU exposes it: the parent keeps
     /// `rpipe[0]` and `wpipe[1]` from `sh_openpipe`, which moves the pipe
@@ -653,6 +679,26 @@ impl Executor {
         env_map.retain(|key, _| {
             !(key.starts_with("__RUBASH_TRAP") && key != "__RUBASH_TRAP_ORIG_IGN")
         });
+        // rubash#1630: dropping the table outright also dropped its
+        // VISIBILITY — GNU's forked child lists the inherited traps in
+        // reset form (`trap -p` inside `( ... ) &` prints the parent's
+        // USR1 and EXIT entries) while the dispositions stay reset, so
+        // nothing fires and the inherited EXIT trap in particular never
+        // runs in the child. The in-process subshell path gets exactly
+        // that shape from reset_for_subshell_child applied to the live
+        // table; run the same transform on a clone of the live table
+        // and forward the resulting __RUBASH_TRAP* keys, so the
+        // respawned child seeds the identical reset-but-listed table
+        // (including the save/restore idiom `eval "$(trap -p ...)"`).
+        // The retain above ran first, so only the live table's entries
+        // can land here — no stale OS-env copies.
+        let mut child_trap_table = self.shell_state.env_vars.clone();
+        crate::builtins::trap::reset_for_subshell_child(&mut child_trap_table);
+        for (key, value) in &child_trap_table {
+            if key.starts_with("__RUBASH_TRAP") {
+                env_map.insert(key.clone(), value.clone());
+            }
+        }
         // rubash#1035: GNU execute_cmd.c setup_async_signals ignores
         // SIGINT/SIGQUIT in the forked async child while job_control is off
         // (the `monitor` option is unset). A respawned `rubash -c` child
@@ -1713,6 +1759,10 @@ impl Executor {
         &mut self,
         time_command: &TimeCommand,
     ) -> Result<(), ExecuteError> {
+        // rubash#1611: the errexit-conversion mark is scoped to THIS
+        // timed command's inner dispatch — clear any stale value before
+        // the inner runs (the mark is taken right after it below).
+        self.errexit_status_converted.set(false);
         // rubash#1218: in posix mode a dash word right after `time`
         // means `time` was never a keyword (GNU parse.y), so the
         // reconstructed command (`time`, the prefix words, then the
@@ -1751,6 +1801,10 @@ impl Executor {
         // reports 0.000s — both at notice time, never at spawn).
         // Snapshot the child set so the spawn below can be identified
         // and its report deferred to the completion funnel.
+        // rubash#1611: a pure time chain delegates its report to the
+        // innermost frame (see time_inner_is_pure_time_chain) — this
+        // frame adjudicates status/traps/errexit but prints nothing.
+        let delegated_report = time_inner_is_pure_time_chain(&time_command.command);
         let timed_coproc_shape = time_command.command.coproc_command.is_some()
             || time_command.command.words.first().map(String::as_str) == Some("coproc");
         let children_before: std::collections::HashSet<u32> = if timed_coproc_shape {
@@ -1759,6 +1813,27 @@ impl Executor {
             std::collections::HashSet::new()
         };
         let started = time_command_started();
+        // rubash#1611: for the span of the inner dispatch below, the
+        // dispatch-level errexit conversion sites convert WITHOUT
+        // firing the ERR trap — the timed command completes here and
+        // the ast_exec time branch performs the single trap
+        // adjudication for it (the rubash#1277 design). The depth is
+        // raised/lowered around the single dispatch statement; the
+        // statement contains no `?` (the DEBUG-trap arm captures its
+        // result instead of propagating), so the lowering cannot be
+        // bypassed.
+        self.timed_dispatch_depth
+            .set(self.timed_dispatch_depth.get() + 1);
+        // rubash#1611: clear the conversion mark immediately before the
+        // inner dispatch (the DEBUG-trap call in the simple-command arm
+        // below runs its own commands first; their conversions must not
+        // be mistaken for the inner command's).
+        self.errexit_status_converted.set(false);
+        // Snapshot the parse-error latch: a parse-diagnostic ExitCode(2)
+        // out of the inner dispatch means the timed command never
+        // executed (GNU reports no timing for it), unlike a genuine
+        // runtime unwind.
+        let parse_error_before_inner = self.parse_error_occurred;
         let inner_result = if let Some(coproc_cmd) = &time_command.command.coproc_command {
             self.execute_coproc_command(&time_command.command, coproc_cmd)
         } else if time_command.command.words.is_empty()
@@ -1797,12 +1872,37 @@ impl Executor {
                 || inner.and_or_list.is_some()
                 || inner.function_command.is_some()
                 || inner.time_command.is_some();
-            if !inner_defers_debug && self.debug_trap_in_scope() {
+            // rubash#1611: the trap result is captured, not `?`-
+            // propagated, so the dispatch statement below the timed-
+            // dispatch depth raise contains no early exit and the
+            // depth lowering after it always runs. An erroring trap
+            // still abandons the timed command with that error, as
+            // the `?` did.
+            let trap_result = if !inner_defers_debug && self.debug_trap_in_scope() {
                 let inner_text = bash_command_source_text(inner);
-                let _ = self.run_debug_trap(&inner_text)?;
+                self.run_debug_trap(&inner_text).map(|_| ())
+            } else {
+                Ok(())
+            };
+            match trap_result {
+                Ok(()) => {
+                    // rubash#1611: the DEBUG trap above is the time
+                    // wrapper's own pre-step, not part of the inner
+                    // command — a conversion inside the trap action
+                    // must not be read as the inner command's
+                    // conversion mark.
+                    self.errexit_status_converted.set(false);
+                    self.execute_command(&time_command.command)
+                }
+                Err(error) => Err(error),
             }
-            self.execute_command(&time_command.command)
         };
+        self.timed_dispatch_depth
+            .set(self.timed_dispatch_depth.get() - 1);
+        // rubash#1611: take the errexit-conversion mark left by the
+        // inner dispatch (cleared at entry above).
+        let errexit_converted = self.errexit_status_converted.replace(false);
+        let parse_error_during_inner = self.parse_error_occurred && !parse_error_before_inner;
         match inner_result {
             Ok(()) => {}
             // GNU execute_cmd.c execute_time_command reports the timed
@@ -1815,6 +1915,50 @@ impl Executor {
             // rubash#1240).
             Err(ExecuteError::ExpansionFailure(code)) => {
                 self.exit_code = code;
+            }
+            Err(ExecuteError::ExitCode(code)) if errexit_converted => {
+                // rubash#1611: the ExitCode is the dispatch-level
+                // errexit conversion of a COMPLETED inner command
+                // (execute_materialized_command's tail and its siblings
+                // in execute_command), not a jump out of the timed
+                // command. GNU's execute_time_command completes and
+                // prints its report; the errexit jump belongs to ITS
+                // caller (the ast_exec time branch re-adjudicates after
+                // flushing the queued report). A genuine unwind (exit
+                // builtin, FORCE_EOF) leaves the mark clear and takes
+                // the print-and-propagate arm below.
+                self.exit_code = code;
+            }
+            Err(ExecuteError::ExitCode(code)) if !parse_error_during_inner => {
+                // rubash#1611: a genuine runtime unwind whose target is
+                // NOT inside this frame — the exit builtin (and exit
+                // reached through eval, a brace group, or a function).
+                // GNU's execute_time_command still prints its report
+                // before the jump takes effect (verified against GNU
+                // bash 5.3.20: `time exit 3`, `time { exit 3; }`,
+                // `time eval "exit 3"` all print, rc preserved). The
+                // report cannot ride the defer queue — the caller's
+                // unwind arm discards it — so print it now, then let
+                // the unwind proceed. A parse-diagnostic ExitCode is
+                // excluded above: the timed command never executed, and
+                // GNU prints no report for it.
+                self.exit_code = code;
+                if !delegated_report {
+                    self.print_time_shell(time_command.posix_format, started);
+                }
+                return Err(ExecuteError::ExitCode(code));
+            }
+            Err(error @ (ExecuteError::Break(_) | ExecuteError::Continue(_))) => {
+                // rubash#1611: break/continue unwind to the enclosing
+                // loop, outside this frame — GNU's execute_time_command
+                // prints its report first (`time break` in a loop
+                // prints, verified against GNU bash 5.3.20). Print now
+                // (the caller's unwind arms discard the defer queue),
+                // then propagate.
+                if !delegated_report {
+                    self.print_time_shell(time_command.posix_format, started);
+                }
+                return Err(error);
             }
             Err(error) => return Err(error),
         }
@@ -1831,7 +1975,11 @@ impl Executor {
         } else {
             None
         };
-        if let Some(pid) = running_timed_coproc {
+        if delegated_report {
+            // rubash#1611: pure time chain — the innermost frame owns
+            // the report; this frame emits none (no queue entry either,
+            // or the caller's flush would print it anyway).
+        } else if let Some(pid) = running_timed_coproc {
             self.pending_timed_coproc_reports
                 .push((pid, started, time_command.posix_format));
         } else if self.defer_list_time_report {
@@ -3244,10 +3392,29 @@ impl Executor {
                     child.arg(word);
                 }
             } else {
-                child.arg("-c").arg(command_words_source_text(
-                    &coproc_cmd.words,
-                    &coproc_cmd.word_metadata,
-                ));
+                // rubash#1653: the child re-parses this text, so a bare
+                // head word `time` would regain keyword status in the
+                // child even though the coproc parser never granted it
+                // (GNU parse.y:1125-1175: after `coproc`, `time` is a
+                // plain word — GNU forks the same parse tree, rubash
+                // respawns through `-c`). Quote the bare head word so
+                // the re-parse keeps it an ordinary command name: the
+                // child's lookup then matches GNU's forked child
+                // (function, builtin, PATH, else 127 `time: command
+                // not found`). A head word already quoted in source
+                // keeps its own raw spelling; only the bare `time`
+                // spelling needs the quote.
+                let mut metadata = coproc_cmd.word_metadata.clone();
+                if coproc_cmd.words.first().map(String::as_str) == Some("time")
+                    && metadata
+                        .first()
+                        .is_some_and(|meta| meta.value == "time" && meta.raw == "time")
+                {
+                    metadata[0].raw = "'time'".to_string();
+                }
+                child
+                    .arg("-c")
+                    .arg(command_words_source_text(&coproc_cmd.words, &metadata));
             }
             child
         } else {
@@ -3629,11 +3796,53 @@ impl Executor {
     }
 
     fn apply_coproc_redirects(
-        &self,
+        &mut self,
         cmd: &CommandNode,
         child: &mut Command,
     ) -> Result<(), ExecuteError> {
-        if let Some(redirect) = &cmd.redirect_in {
+        // rubash#1651: a memory-backed stdin body (here-string,
+        // heredoc) that wins fd 0 replaces the coproc pipe as the
+        // child's stdin. GNU redir.c do_redirections binds fd 0
+        // to the body before the child runs, so the coproc
+        // consumes it and exits; the old code left the child on
+        // the pipe and `coproc cat <<< hi` blocked forever. The
+        // body rides a pre-filled pipe (writer thread: a body
+        // larger than the pipe buffer must not block the spawn
+        // waiting for a reader that does not exist yet; EPIPE
+        // when the child exits early is ignored). Only
+        // HereDoc/HereString winners take this path: `< file`
+        // keeps the real-file path below, and `<&N` dups keep
+        // the pipe — streaming a dup through a string buffer
+        // would change blocking behavior. When the body wins,
+        // it outranks redirect_in (GNU left-to-right order: the
+        // last fd-0 redirect wins).
+        let mut body_stdin: Option<std::process::Stdio> = None;
+        if let Some(text) = self.coproc_stdin_body(cmd) {
+            use std::io::Write as _;
+            if let Ok((reader, mut writer)) = std::io::pipe() {
+                std::thread::spawn(move || {
+                    let _ = writer.write_all(text.as_bytes());
+                });
+                #[cfg(windows)]
+                {
+                    use std::os::windows::io::{FromRawHandle as _, IntoRawHandle as _};
+                    let handle = reader.into_raw_handle();
+                    body_stdin = Some(std::process::Stdio::from(unsafe {
+                        std::fs::File::from_raw_handle(handle)
+                    }));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::{FromRawFd as _, IntoRawFd as _};
+                    let fd = reader.into_raw_fd();
+                    body_stdin = Some(std::process::Stdio::from(unsafe {
+                        std::fs::File::from_raw_fd(fd)
+                    }));
+                }
+            }
+        }
+        if body_stdin.is_none() {
+            if let Some(redirect) = &cmd.redirect_in {
             if redirect.fd.unwrap_or(0) == 0 {
                 let target = self.expand_redirect_target(redirect);
                 if is_closed_redirect_target(&target) {
@@ -3641,6 +3850,7 @@ impl Executor {
                 } else if redirect_target_fd(&target).is_none() {
                     child.stdin(Stdio::from(self.open_input_redirect(&target)?));
                 }
+            }
             }
         }
 
@@ -3684,6 +3894,13 @@ impl Executor {
                     &self.shell_state.env_vars,
                 ))?));
             }
+        }
+
+        // The body pipe replaces the coproc pipe set by the caller
+        // (the parent's write end stays registered as ${COPROC[1]},
+        // useless but present, like GNU's rebound pipe end).
+        if let Some(stdio) = body_stdin {
+            child.stdin(stdio);
         }
 
         Ok(())

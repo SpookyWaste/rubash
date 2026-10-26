@@ -351,6 +351,22 @@ fn push_ansi_c_codepoint(output: &mut String, value: u32) {
     if value >= 0x8000_0000 {
         return;
     }
+    // Values above the Unicode maximum (U+10FFFF) are not codepoints at
+    // all (rubash#1606, residual of #1465): there is no scalar for rubash's
+    // text layer to carry, and the raw-byte marker path below would emit
+    // the historic 4/5/6-byte form (e.g. F4 90 80 80 for U+110000) that no
+    // UTF-8 decoder accepts. GNU reaches this band only through glibc
+    // wctomb inside u32cconv (lib/sh/unicode.c:239); in the C locale —
+    // GNU's default when no locale is selected, the environment the
+    // regression pins run in — wctomb fails and the u32tocesc fallback
+    // (unicode.c:141, uppercase hex) keeps the escape literal. Keep it
+    // literal in every locale mode: the band has no valid representation
+    // to convert to. (Surrogates below the band keep the existing
+    // raw-byte path, matching GNU in a UTF-8 locale.)
+    if value > 0x10_FFFF {
+        output.push_str(&format!("\\U{value:08X}"));
+        return;
+    }
     // GNU strtrans.c:161-181 decodes $'\uNNNN'/'\UNNNNNNNN' through the same
     // u32cconv as printf (lib/sh/unicode.c:239): wctomb on a 4-byte-wchar_t
     // UTF-8 platform encodes every value <= 0x7fffffff, including surrogates

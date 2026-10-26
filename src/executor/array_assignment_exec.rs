@@ -401,6 +401,11 @@ impl Executor {
                     stored.to_uppercase()
                 } else if attrs.lowercase {
                     stored.to_lowercase()
+                } else if is_marked_var(&self.shell_state.env_vars, CAPCASE_VARS, name) {
+                    // rubash#1619: capcase has no typed-cell bit (it lives
+                    // only in the marker list), so the #1400 chain missed
+                    // it — `declare -cA h; h[k]=abc` stored abc, not Abc.
+                    super::variable_state::capitalize_value(&stored)
                 } else {
                     stored
                 };
@@ -519,6 +524,9 @@ impl Executor {
                 value.to_uppercase()
             } else if attrs.lowercase {
                 value.to_lowercase()
+            } else if is_marked_var(&self.shell_state.env_vars, CAPCASE_VARS, name) {
+                // rubash#1619: capcase on the canonical assoc path too.
+                super::variable_state::capitalize_value(&value)
             } else {
                 value
             };
@@ -779,7 +787,15 @@ impl Executor {
                     .unwrap_or_default()
             };
             if attrs.integer {
-                (eval_arith_value(&current_element) + eval_arith_value(value)).to_string()
+                // GNU make_array_variable_value (arrayfunc.c:166) ->
+                // make_variable_value (variables.c:2905): an integer
+                // element append runs BOTH sides through the full evalexp
+                // (expr.c), exactly like the assoc branch below — the old
+                // split('+') evaluator stored 0 for `a[0]+='2*3'`
+                // (rubash#1617).
+                (self.eval_integer_assignment_value(&current_element)
+                    + self.eval_integer_assignment_value(value))
+                .to_string()
             } else {
                 append_scalar_value(&current_element, value)
             }
@@ -787,7 +803,7 @@ impl Executor {
             value.to_string()
         };
         let element = if attrs.integer {
-            eval_arith_value(&element).to_string()
+            self.eval_integer_assignment_value(&element).to_string()
         } else {
             element
         };
@@ -798,6 +814,11 @@ impl Executor {
             element.to_uppercase()
         } else if attrs.lowercase {
             element.to_lowercase()
+        } else if is_marked_var(&self.shell_state.env_vars, CAPCASE_VARS, name) {
+            // rubash#1619: `declare -c a; a[0]=hello` stores Hello — the
+            // capcase attribute lives only in the marker list (no typed
+            // bit), so the attrs chain above cannot see it.
+            super::variable_state::capitalize_value(&element)
         } else {
             element
         };

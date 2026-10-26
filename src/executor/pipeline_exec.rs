@@ -4372,7 +4372,11 @@ impl Executor {
         // authority for the readonly/special classes: report it here,
         // exactly once, and kill the element the same way.
         if let Some((name, message)) = self.parameter_assignment_error(command) {
-            let class = if message == "readonly variable" { 2 } else { 1 };
+            let class = if matches!(message, "readonly variable" | "bad array subscript") {
+                2
+            } else {
+                1
+            };
             let line = format!("{}{}: {}\n", self.error_prefix(), name, message);
             self.write_diagnostic_fd2(line.as_bytes());
             return Ok(Some((
@@ -5715,6 +5719,10 @@ fn time_pipeline_prefix(command: &CommandNode) -> Option<TimePipelinePrefix> {
     if command.word_metadata.len() == command.words.len() {
         stripped.word_metadata = command.word_metadata[index..].to_vec();
     }
+    // rubash#1661: same displaced classification as the parser fold —
+    // restore the stage's leading assignment words (see
+    // parser::reclassify_leading_assignment_words).
+    crate::parser::reclassify_leading_assignment_words(&mut stripped);
     Some(TimePipelinePrefix {
         command: stripped,
         inverted,

@@ -8,9 +8,8 @@ pub(crate) mod path;
 pub(crate) mod types;
 pub(crate) mod wait_status;
 use arithmetic::{
-    arithmetic_division_by_zero_token, arithmetic_unbound_variable, eval_arith_value,
-    eval_conditional_arith_value, eval_conditional_arith_value_categorized,
-    eval_conditional_arith_value_categorized_with_writes,
+    arithmetic_division_by_zero_token, arithmetic_unbound_variable, eval_conditional_arith_value,
+    eval_conditional_arith_value_categorized, eval_conditional_arith_value_categorized_with_writes,
     eval_conditional_arith_value_categorized_with_writes_and_state,
     eval_conditional_arith_value_with_writes,
 };
@@ -320,7 +319,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use self::path::{
     adopt_orphan_console, apply_required_windows_child_environment,
-    external_command_for_named_program, find_shell, find_user_command, shell_path_to_process,
+    external_command_for_named_program, find_shell, find_user_command, find_user_command_without_hash,
+    shell_path_to_process,
     shell_path_to_windows, standard_path, suppress_orphan_console,
 };
 
@@ -450,6 +450,21 @@ pub enum ExecuteError {
     /// `execute_builtin_pipeline_stage`, `execute_function_pipeline_stage`)
     /// convert it to that status; it never escapes a pipeline element.
     BrokenPipe,
+    /// rubash#1639: an untrapped SIGINT killed the foreground job of an
+    /// interactive reader session — GNU jobs.c waitchld's
+    /// job-control/foreground/SIGINT block does ADDINTERRUPT and the
+    /// executing list throws to the top-level reader
+    /// (throw_to_top_level), discarding the rest of the current
+    /// command line in every frame with $? recorded as 130. (For the
+    /// in-process virtual child — the builtin sleep — the killing
+    /// delivery is the shell's own kernel-caused SIGINT receipt.)
+    /// The wait
+    /// sites only MARK the event (Executor::fg_sigint_unwind); the list
+    /// executor converts it to this error at the next command boundary
+    /// so frames cannot absorb it as a plain 130 status. Frames must
+    /// propagate it untouched (like LastpipeExit); drivers treat it as
+    /// the end of the current input unit with exit_code already 130.
+    SigintUnwind,
 }
 
 impl std::fmt::Display for ExecuteError {
@@ -471,6 +486,7 @@ impl std::fmt::Display for ExecuteError {
             }
             ExecuteError::LastpipeExit(code) => write!(f, "exit code: {}", code),
             ExecuteError::BrokenPipe => write!(f, "broken pipe"),
+            ExecuteError::SigintUnwind => write!(f, "interrupt: discarding current command line"),
         }
     }
 }
@@ -735,6 +751,16 @@ pub struct Executor {
     /// layer's EXIT trap (a signal-killed GNU process runs none) and
     /// queues the parent-side death notice.
     subshell_signal_death: Option<(usize, i32)>,
+    /// rubash#1639: a foreground wait adjudicated an untrapped SIGINT
+    /// job death for an interactive reader session (the wait sites in
+    /// trap_exec/external_inner set this; exit_code already holds
+    /// 130). The list executor converts it to
+    /// ExecuteError::SigintUnwind at the next command boundary,
+    /// discarding the rest of the current command line in every frame
+    /// (GNU wait_for's throw_to_top_level). Transient per-command
+    /// state: set only by a wait, consumed by the boundary that
+    /// immediately follows it.
+    fg_sigint_unwind: bool,
     /// rubash#1175: true only on the executor that IS this OS process's
     /// shell (constructed by Executor::new for a real process root).
     /// Fork-copy clones (command_substitution_executor) construct with
@@ -1262,6 +1288,28 @@ pub struct Executor {
     /// command status (builtins source5.sub: `. missing` under `set -o
     /// posix` exits the shell even without `set -e`).
     pub(crate) exit_jump_pending: Cell<bool>,
+    /// Set by the dispatch-level errexit conversion sites when an
+    /// Ok-completed command's failing status is converted into
+    /// ExecuteError::ExitCode purely for errexit/POSIX-exit adjudication
+    /// (execute_materialized_command's tail and its siblings in
+    /// execute_command). GNU adjudicates errexit in execute_command's
+    /// CALLER, so such a conversion is not a jump out of the command;
+    /// execute_time_ast_command takes this mark to tell a converted
+    /// status from a genuine unwind (exit builtin, FORCE_EOF), whose
+    /// timing report GNU drops (rubash#1611). Cleared at every
+    /// execute_time_ast_command entry and taken right after its inner
+    /// dispatch, so a stale mark can never be consumed.
+    pub(crate) errexit_status_converted: Cell<bool>,
+    /// Depth of enclosing execute_time_ast_command inner dispatches.
+    /// While > 0, the dispatch-level errexit conversion sites convert
+    /// WITHOUT firing the ERR trap: the timed command completes through
+    /// execute_time_ast_command and the ast_exec time branch performs
+    /// the single trap adjudication for it (the rubash#1277 design —
+    /// the same treatment function and pipeline inners already get).
+    /// Outside a timed dispatch the sites fire the trap themselves, as
+    /// the plain list loop never adjudicates an Err completion
+    /// (rubash#1611).
+    pub(crate) timed_dispatch_depth: Cell<u32>,
     /// GNU execute_cmd.c:4887-4888 sets `special_builtin_failed = 1` when a
     /// POSIX special builtin returns an error status (> EX_SHERRBASE = 256).
     /// After the command (execute_cmd.c:1004-1017), if `posixly_correct &&
@@ -1297,6 +1345,22 @@ pub struct Executor {
     /// entry; keyed by node address, valid only within that command's
     /// execution span.
     redirect_target_memo: RefCell<HashMap<String, String>>,
+    /// The field-count fact the ambiguity gate cannot recover from the
+    /// carrier String: keys (same key as redirect_target_memo) whose
+    /// expansion resolved through pathname expansion to EXACTLY ONE
+    /// match. GNU subst.c:12645-12676 (glob_expand_word_list) returns
+    /// one field per match, and glob matches are never word-split, so a
+    /// single match is one field even when its name contains whitespace
+    /// (rubash#1769: `> only*.txt` with one file `only one.txt` opens
+    /// it, it is not AMBIGUOUS_REDIRECT). The carrier String joins
+    /// multi-field results with ' ', which the textual gate cannot
+    /// distinguish from one space-containing field — this set carries
+    /// the count the gate needs. Cleared at each execute_command entry
+    /// like redirect_target_memo; only the single-match arm sets it,
+    /// every other arm (multi-match join, no-match literal, brace
+    /// branches, failglob pattern) leaves the gate's existing behavior
+    /// untouched, so an unquoted `$var` that word-splits stays ambiguous.
+    redirect_target_single_glob_match: RefCell<HashSet<String>>,
     /// GNU subst.c:3565 do_assignment_internal expands an assignment RHS
     /// exactly once and subst.c:3576 hands the COMPUTED value to
     /// xtrace_print_assignment — the trace never re-runs the expansion.

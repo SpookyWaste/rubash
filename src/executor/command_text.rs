@@ -296,18 +296,35 @@ fn command_word_needs_process_line_env(word: &str) -> bool {
 
 pub(in crate::executor) fn bash_command_text(cmd: &CommandNode) -> String {
     let mut parts = Vec::new();
-    for (name, value) in &cmd.assignments {
-        // Assignment values may carry the lexer's private quoted-RHS marker.
-        // BASH_COMMAND exposes shell source, never that expansion sentinel.
-        let value = value
-            .strip_prefix(crate::executor::markers::IFS_GLUE)
-            .unwrap_or(value);
+    let raws_aligned = cmd.assignment_raws.len() == cmd.assignments.len();
+    for (index, (name, value)) in cmd.assignments.iter().enumerate() {
+        // GNU print_cmd.c print_simple_command prints each assignment
+        // word's TEXT as lexed (rubash#202, ast_print.rs): the raw RHS
+        // carries the source quotes, so `x="$(a) ($(b | cat))"` re-parses
+        // as one assignment. The cooked value drops those quotes, which
+        // corrupted respawned background children (rubash#1664: the
+        // payload became `x=$(a) ($(b cat))`, a syntax error). Prefer
+        // the raw RHS when the parser recorded it; fall back to the
+        // cooked value (with the lexer's private quoted-RHS marker
+        // stripped, so BASH_COMMAND never exposes that sentinel).
+        let raw = raws_aligned
+            .then(|| cmd.assignment_raws.get(index))
+            .flatten()
+            .filter(|raw| !raw.is_empty());
+        let text = match raw {
+            Some(raw) => format!("{name}={raw}"),
+            None => {
+                let value = value
+                    .strip_prefix(crate::executor::markers::IFS_GLUE)
+                    .unwrap_or(value);
+                format!("{name}={value}")
+            }
+        };
         // GNU parse.y:4451/4632 (parse_comsub -> print_comsub) replaces every
         // `$()` body with the canonical print_cmd.c serialization at parse
         // time, so the enclosing command's BASH_COMMAND carries that form:
         // `v=$(echo    a   b)` exposes `v=$(echo a b)` and multi-clause
         // bodies expose the re-indented canonical text (rubash#274).
-        let text = format!("{name}={value}");
         parts.push(super::print_comsub::canonicalize_comsub_spans(&text));
     }
     let words = command_words_source_text_for_command(cmd);
@@ -882,11 +899,18 @@ fn case_command_source_text(case_command: &CaseCommand) -> String {
 
 fn coproc_command_source_text(coproc_command: &crate::parser::CoprocCommand) -> String {
     let mut text = String::from("coproc");
-    // GNU always renders the coprocess name in command displays (jobs,
-    // BASH_COMMAND): an unnamed coproc runs under the default name COPROC
-    // (execute_cmd.c coproc_setup; print_cmd.c prints the name verbatim).
-    text.push(' ');
-    text.push_str(coproc_command.name.as_deref().unwrap_or("COPROC"));
+    // GNU print_cmd.c `cm_coproc` (5.3.20) prints the name ONLY when
+    // the body is not a simple command: `coproc sleep 5` for a
+    // simple body (named or not — there is no `COPROC WORD
+    // simple_command` production, so a simple body never carries a
+    // real name), but `coproc COPROC { sleep 5; }` / `coproc C1
+    // { sleep 5; }` for compound bodies. The old comment here
+    // claimed GNU always prints the name; that matches bash 5.2's
+    // print code, not 5.3.20's (rubash#1645).
+    if coproc_command.body_kind != crate::parser::CoprocBodyKind::SimpleCommand {
+        text.push(' ');
+        text.push_str(coproc_command.name.as_deref().unwrap_or("COPROC"));
+    }
     text.push(' ');
     if let Some(body) = &coproc_command.body {
         text.push_str("{ ");

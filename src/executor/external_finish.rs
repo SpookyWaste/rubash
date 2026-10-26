@@ -2,6 +2,18 @@ use super::*;
 use crate::executor::ast_exec::is_closed_output_io_error;
 use crate::executor::markers::DATA_DOLLAR_STR;
 
+/// GNU cat.c: `cat 1>&-` runs with fd 1 closed in the child
+/// (redir.c r_close_this), so the first write fails EBADF and cat
+/// reports it against standard output. The parser mirrors the close
+/// into `redirect_out` with the literal `&-` target; opening that as a
+/// filename would create a bogus file named `&-` (rubash#1594).
+pub(in crate::executor) fn cat_closed_stdout_error() -> ExecuteError {
+    ExecuteError::IoError(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "cat: standard output: Bad file descriptor",
+    ))
+}
+
 impl Executor {
     pub(in crate::executor) fn write_cat_output(
         &mut self,
@@ -35,6 +47,9 @@ impl Executor {
         }
         if let Some(redirect) = &cmd.redirect_out {
             let target = self.expand_redirect_target(redirect);
+            if crate::executor::execution_misc::is_closed_redirect_target(&target) {
+                return Err(cat_closed_stdout_error());
+            }
             // /dev/std*, /dev/fd/N: resolve as a dup of the aliased fd's
             // current binding (implicit std fds write their default stream)
             // instead of reopening the alias as a literal Windows path
@@ -79,6 +94,9 @@ impl Executor {
             (None, Some(append)) => (self.expand_redirect_target(append), true, true),
             (None, None) => return Ok(None),
         };
+        if crate::executor::execution_misc::is_closed_redirect_target(&target) {
+            return Err(cat_closed_stdout_error());
+        }
         // fd aliases (`/dev/stdout`, `/dev/fd/N`) resolve through the fd table,
         // not a reopened path — leave those to the per-chunk path.
         if crate::executor::execution_misc::redirect_target_fd(&target).is_some() {
@@ -367,6 +385,26 @@ impl Executor {
             // startup (rubash#1275).
             for name in imported_funcs.keys() {
                 mark_env_name(&mut self.shell_state.env_vars, EXPORTED_FUNCTIONS, name);
+            }
+            // GNU variables.c:397-446: a successfully imported function
+            // becomes a shell function, NOT a variable — strip the
+            // BASH_FUNC_* entries from the child's env map exactly as
+            // Executor::new does at process startup, or they linger as
+            // bogus variables (niubash#102 class). A failed import keeps
+            // its raw entry (GNU bind_invalid_envvar).
+            let imported_fn_env_names: Vec<String> = self
+                .shell_state
+                .env_vars
+                .values_map()
+                .keys()
+                .filter(|env_name| {
+                    imported_function_name(env_name)
+                        .is_some_and(|name| imported_funcs.contains_key(name))
+                })
+                .cloned()
+                .collect();
+            for env_name in imported_fn_env_names {
+                self.shell_state.env_vars.remove(&env_name);
             }
             self.shell_state.functions = imported_funcs;
             self.shell_state.function_definition_redirects = HashMap::new();
@@ -786,6 +824,11 @@ impl Executor {
             // niubash#345: a broken pipe escaping an in-process child script
             // is the child's SIGPIPE-shaped status (141).
             ExecuteError::BrokenPipe => Ok(141),
+            // rubash#1639: a SIGINT line discard inside the child script
+            // ends the child's current unit with the recorded 130 — the
+            // child-process analogue of the reader discard (the parent's
+            // list only ever sees the child's 130 status).
+            ExecuteError::SigintUnwind => Ok(130),
             // Loop control can never escape a child process.
             ExecuteError::Break(_) | ExecuteError::Continue(_) => Ok(1),
             ExecuteError::CommandNotFound(name) => {
@@ -848,6 +891,29 @@ impl Executor {
                     .entry(name.to_string())
                     .or_insert_with(|| value.clone());
             }
+        }
+        // GNU variables.c make_env_array_from_var_list: exported
+        // functions cross the boundary as BASH_FUNC_<name>%% entries,
+        // exactly as the real spawn path materializes them
+        // (apply_exported_functions_to_child). The fresh-shell import
+        // in execute_direct_shell_script (like Executor::new at process
+        // startup) reads them back into the function table; without
+        // them an in-process script child imported NO functions at all
+        // (rubash#1610).
+        for name in marked_env_names(&self.shell_state.env_vars, EXPORTED_FUNCTIONS) {
+            let Some(body) = self.shell_state.functions.get(&name) else {
+                continue;
+            };
+            let def_redirects = self
+                .shell_state
+                .function_def_infos
+                .get(&name)
+                .map(|info| info.def_redirects.as_slice())
+                .unwrap_or(&[]);
+            child.insert(
+                exported_function_env_name(&name),
+                exported_function_env_value(&body.commands, def_redirects),
+            );
         }
         child.insert(EXPORTED_VARS.to_string(), exported.join(DATA_DOLLAR_STR));
         child

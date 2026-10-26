@@ -403,6 +403,18 @@ impl Executor {
     /// `$(( ${ number; } ))` is 123, not 0). The payload escapes the embedded
     /// walker leaves behind are decoded before evaluation.
     pub(crate) fn expand_arithmetic_expression_mut(&mut self, expression: &str) -> String {
+        // rubash#1588: a `${name:=word}` fragment inside arithmetic text
+        // binds in GNU (the text is expanded like a double-quoted word
+        // before evaluation), but the embedded expansion below runs on
+        // &self paths that drop the bind. The word-level pre-scan skips
+        // `$((...))` spans as command-substitution frames, so this entry
+        // — the one &mut pass arithmetic text goes through — applies
+        // the binds first. Re-application on a later evaluation of the
+        // same text is inert: the apply arms re-test the operator and
+        // find the variable already set.
+        if expression.contains("${") {
+            self.apply_parameter_assignment_expansions_in_word(expression);
+        }
         let routed = self.route_current_shell_substitutions(expression);
         let expanded = self.expand_arithmetic_special_parameters(&routed);
         crate::executor::execution_misc::restore_command_substitution_output(
@@ -745,6 +757,7 @@ impl Executor {
             Some(&self.shell_state.random_state),
             dynamic_values.as_ref(),
             true,
+            Some(&self.shell_state.variables),
         );
         // Failure path: every consumer of arithmetic_last_eval_input
         // (arithmetic_aliases, embedded_mutations, parameter_core error
@@ -943,6 +956,7 @@ impl Executor {
             Some(&self.shell_state.random_state),
             Some(&dynamic_values),
             true,
+            Some(&self.shell_state.variables),
         );
         self.shell_state
             .arithmetic_last_error_category
@@ -1183,6 +1197,7 @@ impl Executor {
             Some(&self.shell_state.random_state),
             Some(&dynamic_values),
             true,
+            Some(&self.shell_state.variables),
         );
         self.shell_state
             .arithmetic_last_error_category
@@ -1698,13 +1713,6 @@ pub(in crate::executor) fn requote_arith_span_token_text(text: &str) -> String {
     output
 }
 
-pub(super) fn eval_arith_value(value: &str) -> i128 {
-    value
-        .split('+')
-        .map(|part| part.trim().parse::<i128>().unwrap_or(0))
-        .sum()
-}
-
 fn empty_quoted_operand_has_operator(expression: &str) -> bool {
     let chars = expression.chars().collect::<Vec<_>>();
     let mut outside = String::new();
@@ -1754,7 +1762,8 @@ pub(crate) fn arithmetic_expansion_is_fatal(expression: &str) -> bool {
 
 pub(crate) fn arithmetic_error_category(expression: &str) -> Option<ArithmeticErrorCategory> {
     let mut env_vars = crate::shell::var_table::VarTable::default();
-    let (_, category) = eval_mutable_arith_result(expression, &mut env_vars, None, None, false);
+    let (_, category) =
+        eval_mutable_arith_result(expression, &mut env_vars, None, None, false, None);
     category
 }
 
@@ -1785,6 +1794,7 @@ pub(in crate::executor) fn trailing_input_token(
         resolving: Vec::new(),
         random_state: None,
         dynamic_values: None,
+        cells: None,
         error_category: None,
         no_expand: false,
         error: None,
@@ -1838,6 +1848,7 @@ fn indexed_noexpand_error_token(resolved: &str) -> String {
         resolving: Vec::new(),
         random_state: None,
         dynamic_values: None,
+        cells: None,
         error_category: None,
         no_expand: true,
         error: None,
@@ -1911,6 +1922,7 @@ pub(crate) fn eval_conditional_arith_value_with_writes(
     env_vars: &crate::shell::var_table::VarTable,
     random_state: Option<&RandomGen>,
     dynamic_values: Option<&super::dynamic_arrays::ArithDynamicContext>,
+    cells: Option<&crate::shell::VariableStore>,
 ) -> (Option<i128>, Vec<(String, String)>) {
     let (result, writes, _category) =
         eval_conditional_arith_value_categorized_with_writes_and_state(
@@ -1918,6 +1930,7 @@ pub(crate) fn eval_conditional_arith_value_with_writes(
             env_vars,
             random_state,
             dynamic_values,
+            cells,
         );
     (result, writes)
 }
@@ -1931,14 +1944,20 @@ pub(crate) fn eval_conditional_arith_value_categorized_with_writes_and_state(
     env_vars: &crate::shell::var_table::VarTable,
     random_state: Option<&RandomGen>,
     dynamic_values: Option<&super::dynamic_arrays::ArithDynamicContext>,
+    cells: Option<&crate::shell::VariableStore>,
 ) -> (
     Option<i128>,
     Vec<(String, String)>,
     Option<ArithmeticErrorCategory>,
 ) {
     let mut cloned = env_vars.clone();
-    let (result, category) =
-        eval_mutable_arith_value_with_random(value, &mut cloned, random_state, dynamic_values);
+    let (result, category) = eval_mutable_arith_value_with_random(
+        value,
+        &mut cloned,
+        random_state,
+        dynamic_values,
+        cells,
+    );
     let writes = cloned
         .iter()
         .filter(|(name, _)| name.as_str() != "__RUBASH_ARITH_SUBSCRIPT_EXPR")
@@ -1958,7 +1977,7 @@ pub(crate) fn eval_conditional_arith_value_categorized(
     env_vars: &crate::shell::var_table::VarTable,
 ) -> (Option<i128>, Option<ArithmeticErrorCategory>) {
     let mut env_vars = env_vars.clone();
-    eval_mutable_arith_result(value, &mut env_vars, None, None, false)
+    eval_mutable_arith_result(value, &mut env_vars, None, None, false, None)
 }
 
 /// `eval_conditional_arith_value_categorized` plus the write-capture of
@@ -1975,7 +1994,7 @@ pub(crate) fn eval_conditional_arith_value_categorized_with_writes(
     Option<ArithmeticErrorCategory>,
 ) {
     let mut cloned = env_vars.clone();
-    let (result, category) = eval_mutable_arith_result(value, &mut cloned, None, None, false);
+    let (result, category) = eval_mutable_arith_result(value, &mut cloned, None, None, false, None);
     let writes = cloned
         .iter()
         .filter(|(name, _)| name.as_str() != "__RUBASH_ARITH_SUBSCRIPT_EXPR")
@@ -2067,6 +2086,7 @@ pub(super) fn arithmetic_unbound_variable(
                     | "SECONDS"
                     | "EPOCHSECONDS"
                     | "EPOCHREALTIME"
+                    | "BASH_MONOSECONDS"
                     | "LINENO"
                     | "BASHPID"
                     | "BASH_SUBSHELL"
@@ -2406,11 +2426,19 @@ pub(crate) fn decode_arithmetic_assoc_key(text: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// A single quote in `expression` that is not part of an associative-array
-/// subscript. GNU rejects `(( '1' ))` — a quoted operand is not a number — but
-/// accepts a quoted assoc subscript (`(( A['a b']++ ))`), which is a string
-/// key, so those quotes must not trigger the operand error.
-fn has_bare_single_quote(expression: &str, env_vars: &crate::shell::var_table::VarTable) -> bool {
+/// A single quote in `expression` that is not part of an array subscript.
+/// GNU rejects `(( '1' ))` — a quoted operand is not a number — but a quote
+/// inside ANY `name[...]` bracket span belongs to the subscript's own
+/// evalexp frame, never to this level: for an associative array it delimits
+/// a string key (`(( A['a b']++ ))`, accepted), and for an indexed array
+/// the subscript text is evaluated by array_expand_index in its own frame
+/// (arrayfunc.c:1356-1391), whose evalerror names the subscript text
+/// (`(( a['k'] ))` -> `'k': arithmetic syntax error: operand expected
+/// (error token is \"'k'\")`, rubash#1603). Treating an indexed subscript's
+/// quotes as bare used to short-circuit the whole evaluation here, and the
+/// caller's text heuristics then framed the diagnostic on the OUTER
+/// expression (`((: a['k'] : ... (error token is \"'k'] \")`).
+fn has_bare_single_quote(expression: &str, _env_vars: &crate::shell::var_table::VarTable) -> bool {
     let bytes = expression.as_bytes();
     let mut index = 0usize;
     while index < bytes.len() {
@@ -2418,17 +2446,13 @@ fn has_bare_single_quote(expression: &str, env_vars: &crate::shell::var_table::V
             return true;
         }
         if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
-            let start = index;
             index += 1;
             while index < bytes.len()
                 && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
             {
                 index += 1;
             }
-            if index < bytes.len()
-                && bytes[index] == b'['
-                && is_marked_var(env_vars, ASSOC_VARS, &expression[start..index])
-            {
+            if index < bytes.len() && bytes[index] == b'[' {
                 let end = assoc_subscript_end(bytes, index);
                 // An unterminated subscript (missing `]` or unclosed quote)
                 // consumes the rest of the operand — its quotes are part of
@@ -2979,7 +3003,7 @@ fn eval_mutable_arith_value(
     value: &str,
     env_vars: &mut crate::shell::var_table::VarTable,
 ) -> Option<i128> {
-    eval_mutable_arith_value_with_random(value, env_vars, None, None).0
+    eval_mutable_arith_value_with_random(value, env_vars, None, None, None).0
 }
 
 pub(super) fn eval_mutable_arith_value_with_random(
@@ -2987,8 +3011,16 @@ pub(super) fn eval_mutable_arith_value_with_random(
     env_vars: &mut crate::shell::var_table::VarTable,
     random_state: Option<&RandomGen>,
     dynamic_values: Option<&super::dynamic_arrays::ArithDynamicContext>,
+    cells: Option<&crate::shell::VariableStore>,
 ) -> (Option<i128>, Option<ArithmeticErrorCategory>) {
-    eval_mutable_arith_value_with_random_flags(value, env_vars, random_state, dynamic_values, false)
+    eval_mutable_arith_value_with_random_flags(
+        value,
+        env_vars,
+        random_state,
+        dynamic_values,
+        false,
+        cells,
+    )
 }
 
 pub(super) fn eval_mutable_arith_value_with_random_flags(
@@ -2997,6 +3029,7 @@ pub(super) fn eval_mutable_arith_value_with_random_flags(
     random_state: Option<&RandomGen>,
     dynamic_values: Option<&super::dynamic_arrays::ArithDynamicContext>,
     no_expand: bool,
+    cells: Option<&crate::shell::VariableStore>,
 ) -> (Option<i128>, Option<ArithmeticErrorCategory>) {
     // GNU Bash's subexpr() treats an empty arithmetic expression as zero.
     // This matters for expansion and variable contexts, where an empty
@@ -3006,7 +3039,14 @@ pub(super) fn eval_mutable_arith_value_with_random_flags(
     // eval_mutable_arith_result performs both, so this wrapper only passes
     // the flags through (the former duplicate normalize was one of the
     // ~10 full-string scans per `(( ))` evaluation; rubash#156).
-    eval_mutable_arith_result(value, env_vars, random_state, dynamic_values, no_expand)
+    eval_mutable_arith_result(
+        value,
+        env_vars,
+        random_state,
+        dynamic_values,
+        no_expand,
+        cells,
+    )
 }
 
 fn eval_mutable_arith_result(
@@ -3015,6 +3055,7 @@ fn eval_mutable_arith_result(
     random_state: Option<&RandomGen>,
     dynamic_values: Option<&super::dynamic_arrays::ArithDynamicContext>,
     no_expand: bool,
+    cells: Option<&crate::shell::VariableStore>,
 ) -> (Option<i128>, Option<ArithmeticErrorCategory>) {
     // Fresh evaluation: a stale record/diagnostic from an earlier
     // expression must not label this one (early-return paths below never
@@ -3059,6 +3100,7 @@ fn eval_mutable_arith_result(
         resolving: Vec::new(),
         random_state,
         dynamic_values,
+        cells,
         error_category: None,
         no_expand,
         error: None,
@@ -3910,12 +3952,13 @@ impl ArithParseCache {
 /// volatile read into a cached shape, so admission rejects them outright
 /// and execution double-checks. Covers the fast-ticket context names plus
 /// the RNG/derived-clock spellings and the noassign bash arrays.
-const ARITH_PARSE_CACHE_DYNAMIC_NAMES: [&str; 19] = [
+const ARITH_PARSE_CACHE_DYNAMIC_NAMES: [&str; 20] = [
     "RANDOM",
     "SRANDOM",
     "SECONDS",
     "EPOCHSECONDS",
     "EPOCHREALTIME",
+    "BASH_MONOSECONDS",
     "LINENO",
     "BASHPID",
     "BASH_SUBSHELL",

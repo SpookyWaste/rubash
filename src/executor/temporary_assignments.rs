@@ -342,12 +342,27 @@ impl Executor {
                     assignments_failed = true;
                     continue;
                 }
+                // rubash#1620: an APPEND compound word (`a+=(9) cmd`)
+                // prepends the old cell's scalar view to the literal
+                // list text (GNU variables.c assign_in_env via
+                // make_variable_value with ASS_APPEND: element 0 for an
+                // indexed array, empty for an assoc array, the value
+                // itself for a scalar) — the same view the #1556 array
+                // shadow branch below computes for plain appends. The
+                // non-append form keeps binding the list text alone.
+                let (_, append) = assignment_name_and_append(name);
+                let window_value = if append {
+                    let target = resolved_target.as_deref().unwrap_or(base_name).to_string();
+                    format!("{}{}", self.tempenv_scalar_view(&target), compound)
+                } else {
+                    compound.to_string()
+                };
                 self.shell_state
                     .env_vars
-                    .insert(base_name.to_string(), compound.to_string());
+                    .insert(base_name.to_string(), window_value.clone());
                 let _ = self.shell_state.variables.set(
                     base_name.to_string(),
-                    crate::shell::Variable::scalar(compound.to_string()),
+                    crate::shell::Variable::scalar(window_value),
                 );
                 // rubash#1525: the compound tempenv binds as a
                 // literal scalar tempvar, PIPESTATUS included.
@@ -635,7 +650,7 @@ impl Executor {
     /// variables.c make_variable_value with ASS_APPEND, rubash#1556):
     /// element 0 of an indexed array, empty for an assoc array,
     /// the value itself for a scalar.
-    fn tempenv_scalar_view(&self, target: &str) -> String {
+    pub(in crate::executor) fn tempenv_scalar_view(&self, target: &str) -> String {
         match self.shell_state.variables.get(target).map(|v| &v.value) {
             Some(crate::shell::ShellValue::IndexedArray(entries)) => {
                 entries.get(&0).cloned().unwrap_or_default()
@@ -1573,12 +1588,19 @@ impl Executor {
                         is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name);
                     let stored = if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base_name)
                     {
-                        append_assoc_value(&current, &partial, integer, &self.shell_state.env_vars)
+                        append_assoc_value(
+                            &current,
+                            &partial,
+                            integer,
+                            &self.shell_state.env_vars,
+                            base_name,
+                        )
                     } else {
                         match append_array_value(
                             &current,
                             None,
                             &partial,
+                            base_name,
                             integer,
                             self.shell_state.env_vars.get("IFS").map(String::as_str),
                             &self.shell_state.env_vars,
@@ -1611,25 +1633,49 @@ impl Executor {
         // partial element writes still land (see the tail), then the
         // assignment fails like the plain `a[-2]=q` path does.
         let mut bad_subscript: Option<String> = None;
+        // rubash#1618: set when the value chain produced an array storage
+        // render whose element values were already case-converted by the
+        // producing walker (append_array_value / append_assoc_value). The
+        // shared case pass below converts a SCALAR value text; running it
+        // over a storage render instead would case-fold assoc keys (the
+        // appended value was then unreachable under its written key), so
+        // those renders skip it.
+        let mut element_values_converted = false;
         let value = if append {
+            // Borrowed, not cloned: the old code cloned the whole mirror
+            // here on EVERY append, but the clone is read only by the
+            // render fallback below — the in-place append path (the
+            // fill-loop shape, where the mirror grows to Θ(n) bytes)
+            // never reads it, so the clone was a Θ(mirror) memcpy per
+            // append for nothing. The arms below consume the borrow
+            // through &str parameters only; the fallback re-fetches.
             let current = self
                 .shell_state
                 .env_vars
                 .get(base_name)
-                .cloned()
+                .map(String::as_str)
                 .unwrap_or_default();
             if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base_name) {
                 if value.starts_with('(') && value.ends_with(')') {
+                    element_values_converted = true;
                     append_assoc_value(
-                        &current,
+                        current,
                         &value,
                         is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name),
                         &self.shell_state.env_vars,
+                        base_name,
                     )
                 } else {
-                    append_assoc_scalar_value(&current, &value)
+                    element_values_converted = true;
+                    append_assoc_scalar_append_value(
+                        current,
+                        &value,
+                        is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name),
+                        &self.shell_state.env_vars,
+                        base_name,
+                    )
                 }
-            } else if is_array_storage(&current)
+            } else if is_array_storage(current)
                 || is_marked_var(&self.shell_state.env_vars, ARRAY_VARS, base_name)
                 || (value.starts_with('(') && value.ends_with(')'))
             {
@@ -1654,14 +1700,16 @@ impl Executor {
                 // variable used to fall through to append_scalar_value and
                 // store the serialized `("word")` literal as a scalar).
                 match append_array_value(
-                    &current,
+                    current,
                     self.shell_state.variables.indexed_array_cell(base_name),
                     &value,
+                    base_name,
                     is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name),
                     self.shell_state.env_vars.get("IFS").map(String::as_str),
                     &self.shell_state.env_vars,
                 ) {
                     Ok(outcome) => {
+                        element_values_converted = true;
                         // rubash#631: the scan stopped on an out-of-range
                         // negative subscript; the renders below still carry
                         // every element written before it.
@@ -1686,6 +1734,25 @@ impl Executor {
                             mirror_written_in_place = true;
                             String::new()
                         } else {
+                            // Render fallback: re-fetch the mirror text
+                            // (the pre-append borrow ended before the
+                            // in-place attempt). When the attempt was
+                            // refused nothing was written, so this is the
+                            // pre-append text exactly as before; when
+                            // the mirror was extended but the cell
+                            // refused, this is the extended text, whose
+                            // parse folds to the same entries as the
+                            // pre-append text plus the outcome (the
+                            // segment writer appends exactly the
+                            // outcome's segments), so the render — and
+                            // the cell re-sync in the tail — lands on
+                            // the same state either way.
+                            let current = self
+                                .shell_state
+                                .env_vars
+                                .get(base_name)
+                                .cloned()
+                                .unwrap_or_default();
                             render_indexed_outcome(&current, outcome)
                         }
                     }
@@ -1697,6 +1764,10 @@ impl Executor {
                 // GNU variables.c:2922-2935: `x+=v` on an integer variable
                 // evaluates the current value first — its evalerror is just
                 // as fatal as the rhs one, and neither bind happens.
+                // (Materialize the small scalar text: the checked eval
+                // takes &mut self, so the borrowed mirror cannot be held
+                // across it. This arm is scalar-only by construction.)
+                let current = current.to_string();
                 let Some(current) = self.eval_integer_assignment_checked(&current) else {
                     return false;
                 };
@@ -1705,7 +1776,7 @@ impl Executor {
                 };
                 (current + value).to_string()
             } else {
-                append_scalar_value(&current, &value)
+                append_scalar_value(current, &value)
             }
         } else if compound_assignment
             && value.starts_with('(')
@@ -1723,6 +1794,7 @@ impl Executor {
                 &value,
                 is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name),
                 &self.shell_state.env_vars,
+                base_name,
             );
             // Partial store before the error report — keep the structured
             // cell in lockstep from the same render.
@@ -1758,6 +1830,7 @@ impl Executor {
             if !bare_elements.is_empty() {
                 self.exit_code = 1;
             }
+            element_values_converted = true;
             stored
         } else if compound_assignment
             && value.starts_with('(')
@@ -1779,11 +1852,13 @@ impl Executor {
                 "()",
                 None,
                 &value,
+                base_name,
                 is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name),
                 self.shell_state.env_vars.get("IFS").map(String::as_str),
                 &self.shell_state.env_vars,
             ) {
                 Ok(outcome) => {
+                    element_values_converted = true;
                     bad_subscript = outcome.bad_subscript.clone();
                     render_indexed_outcome("()", outcome)
                 }
@@ -1802,7 +1877,11 @@ impl Executor {
         } else {
             value
         };
-        let value = self.apply_case_assignment_attributes(base_name, value);
+        let value = if element_values_converted {
+            value
+        } else {
+            self.apply_case_assignment_attributes(base_name, value)
+        };
         let protocol_scalar = self.pending_scalar_assignment;
         self.pending_scalar_assignment = false;
         if value.starts_with(STORAGE_WORD_PREFIX)

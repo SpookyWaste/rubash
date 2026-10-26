@@ -199,6 +199,12 @@ impl Executor {
     /// execute_command prints. Shared so a command-substitution body that
     /// parsed to an error node can report GNU's `syntax error near ...`
     /// lines without executing the broken ast.
+    ///
+    /// Every line goes through write_diagnostic_fd2, never raw eprintln:
+    /// GNU parser_error (error.c) writes to fd 2 AS CURRENTLY BOUND, so a
+    /// parse error inside an eval/source body honors the caller's
+    /// redirections (`eval '...' 2>&1` routes the diagnostic to stdout;
+    /// rubash#1609, the #167 family).
     pub(in crate::executor) fn report_command_parse_error(&self, cmd: &crate::parser::CommandNode) {
         // The compound-EOF shape (parse.y yyerror EOF path, printed by the
         // execute_command arm for top-level nodes): a node carrying the
@@ -223,8 +229,11 @@ impl Executor {
             } else {
                 self.parser_error_prefix_for_line(eof_line)
             };
-            eprintln!(
-                "{prefix}syntax error: unexpected end of file from `{compound_name}' command on line {_open_line}"
+            self.write_diagnostic_fd2(
+                format!(
+                    "{prefix}syntax error: unexpected end of file from `{compound_name}' command on line {_open_line}\n"
+                )
+                .as_bytes(),
             );
             return;
         }
@@ -252,7 +261,7 @@ impl Executor {
             None => self.parser_error_prefix(),
         };
         if message.starts_with("syntax error:") || message.starts_with("arithmetic syntax error:") {
-            eprintln!("{prefix}{message}");
+            self.write_diagnostic_fd2(format!("{prefix}{message}\n").as_bytes());
             // GNU error.c:324-327 (parser_error): with
             // exit_immediately_on_error set, the first diagnostic line is
             // followed by an immediate exit_shell(2) — the second line of
@@ -264,12 +273,14 @@ impl Executor {
             // parse.y:6865: the offending-line echo is non-interactive only.
             if self.offending_line_echo_enabled() {
                 if let Some(source) = cmd.get_assignment("__RUBASH_PARSE_SOURCE__") {
-                    eprintln!("{prefix}syntax error: `{source}'");
+                    self.write_diagnostic_fd2(
+                        format!("{prefix}syntax error: `{source}'\n").as_bytes(),
+                    );
                 }
             }
         } else {
             let message = super::command_execute::bash_style_unexpected_token_message(message);
-            eprintln!("{prefix}syntax error near {message}");
+            self.write_diagnostic_fd2(format!("{prefix}syntax error near {message}\n").as_bytes());
             if self.errexit_active_at_diagnostic() {
                 return;
             }
@@ -281,7 +292,7 @@ impl Executor {
             // parse.y:6865: the echo is non-interactive only.
             if self.offending_line_echo_enabled() {
                 if let Some(source) = cmd.get_assignment("__RUBASH_PARSE_SOURCE__") {
-                    eprintln!("{prefix}`{source}'");
+                    self.write_diagnostic_fd2(format!("{prefix}`{source}'\n").as_bytes());
                 }
             }
         }
@@ -302,11 +313,13 @@ impl Executor {
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or_else(|| cmd.line.unwrap_or(1));
             let prefix = self.parser_error_prefix_for_line(line);
-            eprintln!("{prefix}syntax error near unexpected token `{token}'");
+            self.write_diagnostic_fd2(
+                format!("{prefix}syntax error near unexpected token `{token}'\n").as_bytes(),
+            );
             // parse.y:6865: the offending-line echo is non-interactive only.
             if self.offending_line_echo_enabled() {
                 if let Some(source) = cmd.get_assignment("__RUBASH_PARSE_SOURCE__") {
-                    eprintln!("{prefix}`{source}'");
+                    self.write_diagnostic_fd2(format!("{prefix}`{source}'\n").as_bytes());
                 }
             }
             return;
@@ -752,6 +765,26 @@ impl Executor {
         &self,
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::history::SessionHistory>>> {
         self.shell_state.session_history.clone()
+    }
+
+    /// Returns the session history list, creating and installing an
+    /// empty one on demand when the shell has none. This is the history
+    /// builtin's creation rule (builtins/history.def): the list exists
+    /// for history's consumers even in shells that never installed one
+    /// (the non-interactive stdin driver), but an installed host
+    /// provider IS the history list, so an auto-created empty session
+    /// must not shadow it — with a provider and no session this
+    /// returns None (rubash#1668).
+    pub fn ensure_session_history(
+        &mut self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::history::SessionHistory>>> {
+        if self.shell_state.session_history.is_none() && !self.has_history_provider() {
+            let session = std::rc::Rc::new(std::cell::RefCell::new(
+                crate::history::SessionHistory::new(),
+            ));
+            self.set_session_history(Some(session));
+        }
+        self.get_session_history()
     }
 
     /// Run `body` with user trap delivery (DEBUG/RETURN/ERR) suspended.
@@ -2303,9 +2336,12 @@ impl Executor {
             .heredoc_end_line
             .unwrap_or_else(|| gather_line + body_lines);
         let delimiter = cmd.heredoc_delimiter.as_deref().unwrap_or("");
-        eprintln!(
-            "{}warning: here-document at line {gather_line} delimited by end-of-file (wanted `{delimiter}')",
-            self.error_prefix_for_line(warning_line)
+        self.write_diagnostic_fd2(
+            format!(
+                "{}warning: here-document at line {gather_line} delimited by end-of-file (wanted `{delimiter}')\n",
+                self.error_prefix_for_line(warning_line)
+            )
+            .as_bytes(),
         );
     }
 
@@ -2329,9 +2365,12 @@ impl Executor {
             .heredoc_end_line
             .unwrap_or_else(|| gather_line + body_lines + 1);
         let delimiter = cmd.heredoc_delimiter.as_deref().unwrap_or("");
-        eprintln!(
-            "{}warning: here-document at line {gather_line} delimited by end-of-file (wanted `{delimiter}')",
-            self.error_prefix_for_line(delimiter_line)
+        self.write_diagnostic_fd2(
+            format!(
+                "{}warning: here-document at line {gather_line} delimited by end-of-file (wanted `{delimiter}')\n",
+                self.error_prefix_for_line(delimiter_line)
+            )
+            .as_bytes(),
         );
     }
 
@@ -2377,15 +2416,21 @@ impl Executor {
                 line_no += 1;
             }
             for (delim, at_line) in pending {
-                eprintln!(
-                    "{}warning: here-document at line {at_line} delimited by end-of-file (wanted `{delim}')",
-                    self.error_prefix_for_line(last_line)
+                self.write_diagnostic_fd2(
+                    format!(
+                        "{}warning: here-document at line {at_line} delimited by end-of-file (wanted `{delim}')\n",
+                        self.error_prefix_for_line(last_line)
+                    )
+                    .as_bytes(),
                 );
             }
         }
-        eprintln!(
-            "{}unexpected EOF while looking for matching `)'",
-            self.parser_error_prefix_for_line(last_line + 1)
+        self.write_diagnostic_fd2(
+            format!(
+                "{}unexpected EOF while looking for matching `)'\n",
+                self.parser_error_prefix_for_line(last_line + 1)
+            )
+            .as_bytes(),
         );
     }
 
@@ -2401,9 +2446,12 @@ impl Executor {
             .heredoc_end_line
             .unwrap_or_else(|| cmd.heredoc_gather_line.or(cmd.line).unwrap_or(1) + body_lines);
         let syntax_line = warning_line + 1;
-        eprintln!(
-            "{}syntax error: unexpected end of file from `(' command on line {start_line}",
-            self.parser_error_prefix_for_line(syntax_line)
+        self.write_diagnostic_fd2(
+            format!(
+                "{}syntax error: unexpected end of file from `(' command on line {start_line}\n",
+                self.parser_error_prefix_for_line(syntax_line)
+            )
+            .as_bytes(),
         );
     }
 }

@@ -40,6 +40,7 @@ impl Executor {
         // command execution; drop the previous command's target memo so a
         // re-executed node (loop body, function body) expands fresh.
         self.redirect_target_memo.borrow_mut().clear();
+        self.redirect_target_single_glob_match.borrow_mut().clear();
         self.assignment_expansion_memo.borrow_mut().clear();
         // Commit any deferred arithmetic writes queued by `&self` redirect
         // target expansion during the previous command (GNU redirection_expand
@@ -120,16 +121,23 @@ impl Executor {
                 // the rubash#720 fork-collapse this frame performs no
                 // wait-side adjudication at all (execute_cmd.c:662-663
                 // skips wait_for) — the failure is observed one frame up.
-                if !self.subshell_fork_collapse.get() {
+                // rubash#1611: the timed-dispatch depth gate is the
+                // same single-adjudication rule as in
+                // execute_materialized_command's tail.
+                if !self.subshell_fork_collapse.get() && self.timed_dispatch_depth.get() == 0 {
                     self.maybe_run_error_trap(cmd)?;
                 }
+                // rubash#1611: conversion of a completed subshell's
+                // status, not a jump out of it — mark for
+                // execute_time_ast_command's report adjudication.
+                self.errexit_status_converted.set(true);
                 return Err(ExecuteError::ExitCode(self.exit_code));
             }
             return result;
         }
 
         if cmd.words.is_empty() {
-            let result = self.execute_empty_words_command(cmd);
+            let result = self.execute_empty_words_command(cmd, None);
             // GNU execute_cmd.c:4625-4640: with WORDS==0 the null command
             // path binds `$_` to the null string (4638 bind_lastarg((char
             // *)NULL)) after the command (including its assignment
@@ -306,7 +314,19 @@ impl Executor {
                 || cmd.heredoc.is_some()
                 || cmd.here_string.is_some()
             {
-                return self.execute_empty_words_command(cmd);
+                // rubash#1661: the vanished words' substitution status
+                // is this null command's status seed (consumed here,
+                // where the bare arm below reads the same channel). The
+                // channel is only attributable when this command's own
+                // words carried a substitution — otherwise it may hold
+                // a previous command's leftover, and the seed stays
+                // None (the pre-#1661 behavior for those shapes).
+                let vanished_status = if original_words_had_command_substitution {
+                    self.last_command_substitution_status.take()
+                } else {
+                    None
+                };
+                return self.execute_empty_words_command(cmd, vanished_status);
             }
             if let Some(status) = self.last_command_substitution_status.get() {
                 self.exit_code = status;
@@ -325,6 +345,30 @@ impl Executor {
             // command binds `$_` to the null string.
             self.bind_underscore("");
             if self.errexit_enabled() && self.errexit_is_active() && self.exit_code != 0 {
+                // rubash#1661: GNU adjudicates the ERR trap for a failed
+                // simple command before the ERREXIT jump (execute_cmd.c
+                // run_error_trap ahead of the errexit exit) — a null
+                // command carrying a failed substitution's status is a
+                // failed simple command, so `set -e; trap 'echo T' ERR;
+                // $(false)` prints T and exits 1. The assignment/
+                // redirect forms convert at execute_empty_words_command's
+                // tail (rubash#1171); this bare arm converts here.
+                // maybe_run_error_trap's own gates keep the exempt
+                // shapes (inverted, and-or, suppressed) silent.
+                // rubash#1611: inside a timed dispatch the fire is
+                // deferred to the ast_exec time branch, which performs
+                // the single trap adjudication for the completed timed
+                // command — an unguarded fire here double-fired
+                // `time $(false)` (ERRFIRED x2, GNU x1). The conversion
+                // mark below is what lets execute_time_ast_command
+                // treat this ExitCode as a completion, exactly like
+                // the dispatch-level conversion sites.
+                if self.timed_dispatch_depth.get() == 0 {
+                    self.maybe_run_error_trap(cmd)?;
+                }
+                // rubash#1611: conversion of a completed command's
+                // status — mark for execute_time_ast_command.
+                self.errexit_status_converted.set(true);
                 return Err(ExecuteError::ExitCode(self.exit_code));
             }
             return Ok(());
@@ -351,7 +395,17 @@ impl Executor {
         // become assignment-only and must still apply the assignment and its
         // redirections.
         if cmd.words.is_empty() {
-            return self.execute_empty_words_command(&cmd);
+            // rubash#1661: same attributable-seed rule as the
+            // expansion-time vanished-words arm above — this site is
+            // reached by commands that started as `name=$(...)` and
+            // became assignment-only, whose substitution status word
+            // expansion left in the channel.
+            let vanished_status = if original_words_had_command_substitution {
+                self.last_command_substitution_status.take()
+            } else {
+                None
+            };
+            return self.execute_empty_words_command(&cmd, vanished_status);
         }
 
         // GNU redir.c do_redirections → redir_varassign (redir.c:1133-1166):
@@ -425,7 +479,16 @@ impl Executor {
                     // command is a failed command — GNU fires the ERR
                     // trap before the ERREXIT jump; the Ok path below
                     // lets the ast_exec loop fire instead.
-                    self.maybe_run_error_trap(&cmd)?;
+                    // rubash#1611: inside a timed dispatch the ERR trap
+                    // is adjudicated once by the ast_exec time branch
+                    // (rubash#1277) — firing here too would double it.
+                    if self.timed_dispatch_depth.get() == 0 {
+                        self.maybe_run_error_trap(&cmd)?;
+                    }
+                    // rubash#1611: the command completed (with a
+                    // redirection failure status) — mark the conversion
+                    // for execute_time_ast_command.
+                    self.errexit_status_converted.set(true);
                     return Err(ExecuteError::ExitCode(1));
                 }
                 Ok(())
@@ -721,14 +784,20 @@ impl Executor {
                     .next()
                     .and_then(|value| value.parse::<usize>().ok())
                     .unwrap_or(1);
-                eprintln!(
-                    "{}warning: here-document at line {at_line} delimited by end-of-file (wanted `{delimiter}')",
-                    self.error_prefix_for_line(warn_line)
+                self.write_diagnostic_fd2(
+                    format!(
+                        "{}warning: here-document at line {at_line} delimited by end-of-file (wanted `{delimiter}')\n",
+                        self.error_prefix_for_line(warn_line)
+                    )
+                    .as_bytes(),
                 );
             }
-            eprintln!(
-                "{}syntax error near unexpected token `{token}'",
-                self.parser_error_prefix_for_line(line)
+            self.write_diagnostic_fd2(
+                format!(
+                    "{}syntax error near unexpected token `{token}'\n",
+                    self.parser_error_prefix_for_line(line)
+                )
+                .as_bytes(),
             );
             // GNU error.c:324-327: with exit_immediately_on_error live, the
             // offending-line echo (parse.y:6814 print_offending_line) never
@@ -744,7 +813,10 @@ impl Executor {
             // parse.y:6865: no offending-line echo in an interactive shell.
             if self.offending_line_echo_enabled() {
                 if let Some(source) = cmd.get_assignment("__RUBASH_PARSE_SOURCE__") {
-                    eprintln!("{}`{}'", self.parser_error_prefix_for_line(line), source);
+                    self.write_diagnostic_fd2(
+                        format!("{}`{}'\n", self.parser_error_prefix_for_line(line), source)
+                            .as_bytes(),
+                    );
                 }
             }
             self.exit_code = 2;
@@ -757,9 +829,12 @@ impl Executor {
             // file" at the end-of-input line, with no token echo.
             self.mark_parse_error();
             let eof_line = cmd.line.map(|line| line + 1).unwrap_or(1);
-            eprintln!(
-                "{}syntax error: unexpected end of file",
-                self.parser_error_prefix_for_line(eof_line)
+            self.write_diagnostic_fd2(
+                format!(
+                    "{}syntax error: unexpected end of file\n",
+                    self.parser_error_prefix_for_line(eof_line)
+                )
+                .as_bytes(),
             );
             // Single-line parser_error: GNU error.c:324-327 still
             // exit_shell(2)s right after it under live errexit — record
@@ -853,9 +928,12 @@ impl Executor {
                     // Report only the fatal, at the offending line.
                     if let Some(line) = crate::lexer::heredoc_overflow_line() {
                         self.mark_parse_error();
-                        eprintln!(
-                            "{}maximum here-document count exceeded",
-                            self.parser_error_prefix_for_line(line)
+                        self.write_diagnostic_fd2(
+                            format!(
+                                "{}maximum here-document count exceeded\n",
+                                self.parser_error_prefix_for_line(line)
+                            )
+                            .as_bytes(),
                         );
                         self.exit_code = 2;
                         return Err(ExecuteError::ExitCode(2));
@@ -883,9 +961,12 @@ impl Executor {
                 .any(|metadata| metadata.raw.contains('(') && unterminated_extglob(&metadata.raw))
         {
             self.mark_parse_error();
-            eprintln!(
-                "{}syntax error near unexpected token `('",
-                self.parser_error_prefix()
+            self.write_diagnostic_fd2(
+                format!(
+                    "{}syntax error near unexpected token `('\n",
+                    self.parser_error_prefix()
+                )
+                .as_bytes(),
             );
             self.exit_code = 2;
             return Err(ExecuteError::ExitCode(2));
@@ -903,9 +984,12 @@ impl Executor {
             && cmd.case_command.is_none()
         {
             self.mark_parse_error();
-            eprintln!(
-                "{}syntax error near unexpected token `('",
-                self.parser_error_prefix()
+            self.write_diagnostic_fd2(
+                format!(
+                    "{}syntax error near unexpected token `('\n",
+                    self.parser_error_prefix()
+                )
+                .as_bytes(),
             );
             self.exit_code = 2;
             return Err(ExecuteError::ExitCode(2));

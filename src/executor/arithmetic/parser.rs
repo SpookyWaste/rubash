@@ -83,11 +83,65 @@ impl ArithEvalError {
     pub(crate) fn render(&self) -> String {
         format!(
             "{}: {} (error token is \"{}\")",
-            self.display(),
+            de_carrier_arith_text(self.display()),
             self.msg,
-            self.token()
+            de_carrier_arith_text(self.token())
         )
     }
+}
+
+/// Undo the subscript carrier encoding for diagnostic display
+/// (rubash#1602). The parser's input is not source text: the
+/// pre-evaluation passes rewrite every subscript as
+/// `name[<SUBSCRIPT_CARRIER><hex of the expanded subscript text>]`
+/// (mod.rs `expand_arithmetic_assoc_subscripts` /
+/// `expand_arith_indexed_subscripts`), which the parser needs to tell an
+/// expanded subscript apart from a literal `a[]`. GNU's evalerror echoes
+/// the frame's expression as written (expr.c:1526-1535), so a record
+/// rendered verbatim leaks the raw 0x1e carrier byte and the hex payload
+/// (`a[<0x1e>30]` for `a[0]`). Decode each complete
+/// `[<carrier><hex>]` span back to `[<subscript text>]`; a span cut by
+/// the display truncation decodes its whole hex pairs and keeps the
+/// dangling remainder out. Text without the carrier is returned as-is.
+fn de_carrier_arith_text(text: &str) -> std::borrow::Cow<'_, str> {
+    let carrier = super::ARITH_ASSOC_KEY_MARKER;
+    if !text.contains(carrier) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let bytes = text.as_bytes();
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        // A carrier span opens with `[` immediately followed by the
+        // carrier char.
+        if bytes[index] == b'[' && text[index + 1..].starts_with(carrier) {
+            let hex_start = index + 1 + carrier.len_utf8();
+            let mut hex_end = hex_start;
+            while hex_end < bytes.len() && bytes[hex_end].is_ascii_hexdigit() {
+                hex_end += 1;
+            }
+            let closed = hex_end < bytes.len() && bytes[hex_end] == b']';
+            let hex = &text[hex_start..hex_end];
+            if !hex.is_empty() && hex.len() % 2 == 0 {
+                let inner = format!("{carrier}{hex}");
+                if let Some(decoded) = super::decode_arithmetic_assoc_key(&inner) {
+                    output.push('[');
+                    output.push_str(&decoded);
+                    if closed {
+                        output.push(']');
+                        index = hex_end + 1;
+                    } else {
+                        index = hex_end;
+                    }
+                    continue;
+                }
+            }
+        }
+        let next = text[index..].chars().next().unwrap_or_default();
+        output.push(next);
+        index += next.len_utf8();
+    }
+    std::borrow::Cow::Owned(output)
 }
 
 pub(super) struct ConditionalArithParser<'a> {
@@ -106,6 +160,17 @@ pub(super) struct ConditionalArithParser<'a> {
     /// getters resolve at find_variable time), and neither does this
     /// port: a name resolves only when an operand actually spells it.
     pub(super) dynamic_values: Option<&'a super::super::dynamic_arrays::ArithDynamicContext>,
+    /// Read-only view of the structured variable store, supplied only
+    /// when `env_vars` is the Executor's live table (or a plain clone of
+    /// it taken at evaluation start): element reads may then answer
+    /// from the typed cells under the same dirty-bit discipline the
+    /// braced paths use (rubash#616/#1510), instead of re-hashing and
+    /// re-scanning the serialized mirror on every read — the mirror leg
+    /// is Θ(mirror bytes) per read, which made `$((a[i]))` the one
+    /// remaining shape-level gap (11x at N=8000 while braced reads sit
+    /// at the ~3x floor). Parser-only contexts (no Executor) pass None
+    /// and keep the mirror leg byte-for-byte.
+    pub(super) cells: Option<&'a crate::shell::VariableStore>,
     pub(super) error_category: Option<super::ArithmeticErrorCategory>,
     pub(super) no_expand: bool,
     /// The first recorded evalerror — GNU longjmps on the first failure, so

@@ -1,6 +1,39 @@
 use super::*;
 use crate::executor::markers::DATA_DOLLAR;
 
+/// GNU sh_modcase CASE_CAPITALIZE (lib/sh/casemod.c, driven from
+/// make_variable_value at variables.c:2975): the first character is
+/// uppercased and the REST of the string is lowercased — the att_capcase
+/// conversion applied on every bind (casemod.tests:99-103).
+pub(in crate::executor) fn capitalize_value(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+        None => value.to_string(),
+    }
+}
+
+/// The case-attribute conversion GNU bind_variable_value applies to a
+/// value being stored (variables.c:2970-2986): at most one of
+/// att_uppercase / att_lowercase / att_capitalize can be in effect, in
+/// that precedence. Shared by the scalar assignment funnel and the
+/// per-element array write paths (rubash#1618/#1619).
+pub(in crate::executor) fn apply_case_attributes(
+    env_vars: &crate::shell::var_table::VarTable,
+    name: &str,
+    value: String,
+) -> String {
+    if is_marked_var(env_vars, UPPERCASE_VARS, name) {
+        value.to_uppercase()
+    } else if is_marked_var(env_vars, LOWERCASE_VARS, name) {
+        value.to_lowercase()
+    } else if is_marked_var(env_vars, CAPCASE_VARS, name) {
+        capitalize_value(&value)
+    } else {
+        value
+    }
+}
+
 impl Executor {
     /// shopt `expand_aliases` state — `pub` for the bin-side grouped-driver
     /// admission (rubash#414). GNU's non-interactive shell derives the
@@ -64,23 +97,7 @@ impl Executor {
         name: &str,
         value: String,
     ) -> String {
-        if is_marked_var(&self.shell_state.env_vars, UPPERCASE_VARS, name) {
-            value.to_uppercase()
-        } else if is_marked_var(&self.shell_state.env_vars, LOWERCASE_VARS, name) {
-            value.to_lowercase()
-        } else if is_marked_var(&self.shell_state.env_vars, CAPCASE_VARS, name) {
-            // GNU capitalize: first character uppercased, rest lowercased
-            // (variables.c capcase assignment, casemod.tests:99-103).
-            let mut chars = value.chars();
-            match chars.next() {
-                Some(first) => {
-                    first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
-                }
-                None => value,
-            }
-        } else {
-            value
-        }
+        apply_case_attributes(&self.shell_state.env_vars, name, value)
     }
 
     pub(in crate::executor) fn nameref_target_name(&self, name: &str) -> Option<String> {

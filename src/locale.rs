@@ -161,17 +161,22 @@ pub fn locale_name() -> String {
 /// Whether multibyte (UTF-8) character semantics are in effect, i.e. whether
 /// the locale named by the environment is actually active.
 ///
-/// An unset locale keeps rubash's default UTF-8 model. `C`/`POSIX` and any
-/// named single-byte locale (ru_RU.CP1251, en_US.ISO-8859-1, ...) select
-/// byte semantics. A UTF-8-named locale selects UTF-8 only when the C library
-/// can activate it; otherwise GNU bash - and rubash - fall back to the C
-/// locale, which is what makes `${#var}` count bytes on a machine that does
-/// not have `en_US.UTF-8` compiled in (intl1.sub: 31/30 for a 15-character
-/// Cyrillic word, not 16/15).
+/// GNU bash resolves the locale at startup with setlocale(LC_ALL, "")
+/// (locale.c set_default_locale, called from shell.c), so with NO locale
+/// variable set — or every one of them empty — the C locale is in effect
+/// and character semantics are byte semantics (rubash#1622; this branch
+/// used to keep a default UTF-8 model, a leftover of the locale port
+/// that #1464's explicit-locale fixes never reached). `C`/`POSIX` and
+/// any named single-byte locale (ru_RU.CP1251, en_US.ISO-8859-1, ...)
+/// likewise select byte semantics. A UTF-8-named locale selects UTF-8
+/// only when the C library can activate it; otherwise GNU bash - and
+/// rubash - fall back to the C locale, which is what makes `${#var}`
+/// count bytes on a machine that does not have `en_US.UTF-8` compiled
+/// in (intl1.sub: 31/30 for a 15-character Cyrillic word, not 16/15).
 pub fn is_utf8() -> bool {
     let name = locale_name();
     if name.is_empty() {
-        return true;
+        return false;
     }
     let lower = name.to_lowercase();
     if lower == "c" || lower == "posix" {
@@ -193,6 +198,179 @@ pub fn is_multi_byte() -> bool {
 pub fn is_utf8_locale_name(name: &str) -> bool {
     let lower = name.to_lowercase();
     lower.contains("utf-8") || lower.contains("utf8")
+}
+
+/// Non-ASCII decimal-digit (general category Nd) codepoint ranges.
+/// glibc's C.UTF-8 `alpha` class admits Nd characters beyond ASCII
+/// (measured against the oracle: Arabic-Indic, Devanagari, Thai and
+/// fullwidth digits are all `alpha`), while its `digit`/`xdigit`
+/// classes stay ASCII-only, and Rust's `char` predicates cannot
+/// express the set (`is_numeric`/`is_alphanumeric` also admit No/Nl
+/// characters like '²', which glibc keeps out of `alnum`). Generated
+/// from the Unicode data tables; this is the single source both the
+/// pattern matcher (predicate form, [`utf8_posix_class_matches`]) and
+/// the `=~` class translator (regex-text form,
+/// [`non_ascii_nd_class_items`]) draw from (rubash#1621).
+const NON_ASCII_ND_RANGES: &[(u32, u32)] = &[
+    (0x0660, 0x0669),
+    (0x06F0, 0x06F9),
+    (0x07C0, 0x07C9),
+    (0x0966, 0x096F),
+    (0x09E6, 0x09EF),
+    (0x0A66, 0x0A6F),
+    (0x0AE6, 0x0AEF),
+    (0x0B66, 0x0B6F),
+    (0x0BE6, 0x0BEF),
+    (0x0C66, 0x0C6F),
+    (0x0CE6, 0x0CEF),
+    (0x0D66, 0x0D6F),
+    (0x0DE6, 0x0DEF),
+    (0x0E50, 0x0E59),
+    (0x0ED0, 0x0ED9),
+    (0x0F20, 0x0F29),
+    (0x1040, 0x1049),
+    (0x1090, 0x1099),
+    (0x17E0, 0x17E9),
+    (0x1810, 0x1819),
+    (0x1946, 0x194F),
+    (0x19D0, 0x19D9),
+    (0x1A80, 0x1A89),
+    (0x1A90, 0x1A99),
+    (0x1B50, 0x1B59),
+    (0x1BB0, 0x1BB9),
+    (0x1C40, 0x1C49),
+    (0x1C50, 0x1C59),
+    (0xA620, 0xA629),
+    (0xA8D0, 0xA8D9),
+    (0xA900, 0xA909),
+    (0xA9D0, 0xA9D9),
+    (0xA9F0, 0xA9F9),
+    (0xAA50, 0xAA59),
+    (0xABF0, 0xABF9),
+    (0xFF10, 0xFF19),
+    (0x104A0, 0x104A9),
+    (0x10D30, 0x10D39),
+    (0x11066, 0x1106F),
+    (0x110F0, 0x110F9),
+    (0x11136, 0x1113F),
+    (0x111D0, 0x111D9),
+    (0x112F0, 0x112F9),
+    (0x11450, 0x11459),
+    (0x114D0, 0x114D9),
+    (0x11650, 0x11659),
+    (0x116C0, 0x116C9),
+    (0x11730, 0x11739),
+    (0x118E0, 0x118E9),
+    (0x11950, 0x11959),
+    (0x11C50, 0x11C59),
+    (0x11D50, 0x11D59),
+    (0x11DA0, 0x11DA9),
+    (0x11F50, 0x11F59),
+    (0x16A60, 0x16A69),
+    (0x16AC0, 0x16AC9),
+    (0x16B50, 0x16B59),
+    (0x1D7CE, 0x1D7FF),
+    (0x1E140, 0x1E149),
+    (0x1E2F0, 0x1E2F9),
+    (0x1E4F0, 0x1E4F9),
+    (0x1E950, 0x1E959),
+    (0x1FBF0, 0x1FBF9),
+];
+
+/// Whether `ch` is a decimal digit (category Nd) outside ASCII.
+pub(crate) fn is_non_ascii_nd(ch: char) -> bool {
+    let cp = ch as u32;
+    NON_ASCII_ND_RANGES
+        .binary_search_by(|&(lo, hi)| {
+            if cp < lo {
+                std::cmp::Ordering::Greater
+            } else if cp > hi {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
+/// [`NON_ASCII_ND_RANGES`] rendered as regex character-class items,
+/// for the `=~` bracket-class translator in executor::conditional.
+pub(crate) fn non_ascii_nd_class_items() -> &'static str {
+    static ITEMS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ITEMS.get_or_init(|| {
+        let mut out = String::new();
+        for &(lo, hi) in NON_ASCII_ND_RANGES {
+            if lo == hi {
+                out.push_str(&format!("\\u{{{lo:x}}}"));
+            } else {
+                out.push_str(&format!("\\u{{{lo:x}}}-\\u{{{hi:x}}}"));
+            }
+        }
+        out
+    })
+}
+
+/// glibc C.UTF-8 `space` membership: the Unicode White_Space set MINUS
+/// U+00A0 and U+202F, which glibc keeps in `print`/`graph`/`punct`
+/// only (measured against the oracle, rubash#1621).
+pub(crate) fn is_glibc_space(ch: char) -> bool {
+    matches!(
+        ch,
+        '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{205f}' | '\u{3000}'
+    )
+}
+
+/// glibc C.UTF-8 `blank` membership: tab, space, and the space-class
+/// members in category Zs (U+2028/U+2029 are `space` but not `blank`).
+pub(crate) fn is_glibc_blank(ch: char) -> bool {
+    matches!(
+        ch,
+        '\t' | ' ' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{205f}' | '\u{3000}'
+    )
+}
+
+/// glibc C.UTF-8 `cntrl` membership: category Cc plus U+2028/U+2029,
+/// which glibc counts as control (and therefore not `print`); other
+/// format characters (Cf, e.g. U+00AD, U+200B) are `print` there.
+pub(crate) fn is_glibc_cntrl(ch: char) -> bool {
+    ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}')
+}
+
+/// POSIX character-class membership under a UTF-8 locale, following
+/// glibc's C.UTF-8 tables — GNU resolves classes through
+/// wctype/iswctype (lib/glob/smatch.c for the pattern matcher, the
+/// regcomp tables for `=~`). Measured divergences from the naive
+/// Unicode reading, all pinned by oracle probes (rubash#1621):
+/// `digit`/`xdigit` are ASCII-only; `alpha` adds non-ASCII Nd;
+/// `alnum` is `alpha` plus every Nd; `word` is `alnum` plus '_';
+/// `print` is the complement of the cntrl table above, so unassigned
+/// codepoints count as print — the one place the tables cannot be
+/// reproduced exactly from Rust predicates.
+pub(crate) fn utf8_posix_class_matches(class: &str, ch: char) -> bool {
+    fn is_alpha(ch: char) -> bool {
+        ch.is_alphabetic() || is_non_ascii_nd(ch)
+    }
+    fn is_alnum(ch: char) -> bool {
+        is_alpha(ch) || ch.is_ascii_digit()
+    }
+    match class {
+        "alpha" => is_alpha(ch),
+        "alnum" => is_alnum(ch),
+        "upper" => ch.is_uppercase(),
+        "lower" => ch.is_lowercase(),
+        "digit" => ch.is_ascii_digit(),
+        "xdigit" => ch.is_ascii_hexdigit(),
+        "ascii" => ch.is_ascii(),
+        "cntrl" => is_glibc_cntrl(ch),
+        "print" => !is_glibc_cntrl(ch),
+        "graph" => !is_glibc_cntrl(ch) && !is_glibc_blank(ch),
+        "punct" => !is_glibc_cntrl(ch) && !is_glibc_blank(ch) && !is_alnum(ch),
+        "space" => is_glibc_space(ch),
+        "blank" => is_glibc_blank(ch),
+        "word" => is_alnum(ch) || ch == '_',
+        _ => false,
+    }
 }
 
 // Cached outcome of the locale activation probe, keyed by the locale name so

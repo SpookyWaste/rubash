@@ -396,7 +396,19 @@ impl Executor {
                 .map(String::as_str)
                 != Some("1")
         {
-            self.maybe_run_error_trap(cmd)?;
+            // rubash#1611: inside a timed dispatch the ERR trap is
+            // adjudicated once, by the ast_exec time branch, when the
+            // timed command completes (rubash#1277) — firing here too
+            // would double it.
+            if self.timed_dispatch_depth.get() == 0 {
+                self.maybe_run_error_trap(cmd)?;
+            }
+            // rubash#1611: this is a conversion of a COMPLETED command's
+            // status, not a jump out of it — mark it so an enclosing
+            // execute_time_ast_command can still print its report (GNU
+            // adjudicates this exit in execute_time_command's caller,
+            // after print_time_info).
+            self.errexit_status_converted.set(true);
             Err(ExecuteError::ExitCode(self.exit_code))
         } else if matches!(result, Err(ExecuteError::Return(_)))
             && (self.shell_state.function_depth > 0 || self.source_nest_depth > 0)
@@ -417,7 +429,20 @@ impl Executor {
             // through to the function (or source) boundary untouched.
             result
         } else if self.errexit_enabled() && self.errexit_is_active() && self.exit_code != 0 {
-            self.maybe_run_error_trap(cmd)?;
+            // rubash#1611: inside a timed dispatch the ERR trap is
+            // adjudicated once, by the ast_exec time branch, when the
+            // timed command completes (rubash#1277) — firing here too
+            // would double it.
+            if self.timed_dispatch_depth.get() == 0 {
+                self.maybe_run_error_trap(cmd)?;
+            }
+            // rubash#1611: mark ONLY the conversion of an Ok completion —
+            // an Err already in flight (the exit builtin's own unwind)
+            // stays unmarked: it takes the print-and-propagate arm in
+            // execute_time_ast_command instead of the completion flow.
+            if result.is_ok() {
+                self.errexit_status_converted.set(true);
+            }
             Err(ExecuteError::ExitCode(self.exit_code))
         } else {
             result

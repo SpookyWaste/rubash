@@ -535,11 +535,11 @@ impl Executor {
             return self.shell_state.positional_window().len().to_string();
         }
         if is_special_parameter_name(var_name) || var_name.parse::<usize>().is_ok() {
-            return self
-                .expand_parameter_named_value(var_name)
-                .chars()
-                .count()
-                .to_string();
+            // rubash#1635: measure in data units like every other leg
+            // of this function — the transport text counts a carrier
+            // escape pair (U+E400 + payload, raw-byte pair) as two
+            // chars for what is one data character.
+            return parameter_char_length(&self.expand_parameter_named_value(var_name)).to_string();
         }
         if let Some((array_name, index)) = parse_array_integer_subscript(var_name) {
             // GNU subst.c:7488 array_length_reference: an absent or
@@ -669,6 +669,11 @@ impl Executor {
                     &overlaid,
                     Some(&self.shell_state.random_state),
                     Some(&dynamic_values),
+                    if matches!(&overlaid, std::borrow::Cow::Borrowed(_)) {
+                        Some(&self.shell_state.variables)
+                    } else {
+                        None
+                    },
                 );
                 if !writes.is_empty() {
                     PENDING_SUBSCRIPT_WRITES.with(|w| {
@@ -826,11 +831,7 @@ impl Executor {
             .or_else(|| var_name.strip_suffix("[*]"))
         {
             return self
-                .array_subscript_range_values(
-                    array_name,
-                    offset,
-                    length.and_then(|length| usize::try_from(length).ok()),
-                )
+                .array_subscript_range_values(array_name, offset, length)
                 .map(|values| {
                     let values = values
                         .into_iter()
@@ -899,7 +900,7 @@ impl Executor {
 /// (substitution_metadata), so the value must be decoded to its byte view
 /// before counting (intl.tests: a=$'\303\251' is 1, not the 4 chars of two
 /// marker pairs).
-fn parameter_char_length(value: &str) -> usize {
+pub(in crate::executor) fn parameter_char_length(value: &str) -> usize {
     let sentinel = char::from_u32(crate::executor::substitution_metadata::RAW_BYTE_MARKER_ESCAPE)
         .expect("raw-byte sentinel is a valid char");
     // decode_raw_byte_markers also restores the E400 literal-char escape

@@ -308,8 +308,80 @@ pub(super) fn parse_case_command(
         let pattern_close_delimiter_metadata = build_keyword_metadata(&tokens[i]);
         i += 1;
 
+        // GNU parse.y:1227-1236 pattern_list: after the pattern's
+        // closing `)' the grammar admits only a compound_list or a
+        // newline_list (the bodyless alternative); compound_list
+        // (parse.y:1262) is `newline_list list0', and no list can begin
+        // with `)'. A second `)' — `x))', `(x))', `x|y))' — is a
+        // syntax error at that token (rubash#1641; verified vs GNU
+        // 5.3.20: `syntax error near unexpected token `)'', rc 2, and
+        // the clause never executes). Report it through the same
+        // pattern-position error channel as the extglob `(' above, and
+        // consume only through this case's `esac` so commands after
+        // the case stay separate units.
+        let mut body_head = i;
+        while body_head < tokens.len()
+            && tokens[body_head].kind == TokenKind::Semicolon
+            && tokens[body_head].line_break
+        {
+            body_head += 1;
+        }
+        if is_keyword(tokens, body_head, ")") {
+            let mut command = CommandNode::new();
+            command.line = tokens.get(start).map(|token| token.position);
+            command.logical_line = tokens.get(start).map(|token| token.logical_line);
+            command.insert_assignment(
+                "__RUBASH_PARSE_ERROR_NEAR__".to_string(),
+                format!(
+                    "){}{}",
+                    crate::executor::markers::PARSE_ERROR_FIELD_SEP,
+                    tokens[body_head].position
+                ),
+            );
+            command.insert_assignment(
+                "__RUBASH_PARSE_SOURCE__".to_string(),
+                pattern_error_line_text(tokens, body_head),
+            );
+            return Some(finish_compound_command(
+                command,
+                tokens,
+                case_command_end_index(tokens, start),
+            ));
+        }
+
         let body_start = i;
-        i = case_body_end(tokens, i);
+        let (body_end, stray_close) = case_body_end(tokens, i);
+        if let Some(stray) = stray_close {
+            // The body scan ran into the next clause's pattern close
+            // with no valid terminator in between (rubash#1656): GNU
+            // parse.y:1237-1256 case_clause_sequence admits only
+            // SEMI_SEMI/SEMI_AND/SEMI_SEMI_AND or ESAC after a clause's
+            // compound_list, so this is a syntax error at that `)',
+            // reported via the same channel as rubash#1641 above.
+            // Verified against GNU bash 5.3.20 (rc 2) for both spelled
+            // seeds `a) echo A;\;& b) ...' and `a) echo A;\;\& b) ...'.
+            let mut command = CommandNode::new();
+            command.line = tokens.get(start).map(|token| token.position);
+            command.logical_line = tokens.get(start).map(|token| token.logical_line);
+            command.insert_assignment(
+                "__RUBASH_PARSE_ERROR_NEAR__".to_string(),
+                format!(
+                    "){}{}",
+                    crate::executor::markers::PARSE_ERROR_FIELD_SEP,
+                    tokens[stray].position
+                ),
+            );
+            command.insert_assignment(
+                "__RUBASH_PARSE_SOURCE__".to_string(),
+                pattern_error_line_text(tokens, stray),
+            );
+            return Some(finish_compound_command(
+                command,
+                tokens,
+                case_command_end_index(tokens, start),
+            ));
+        }
+        i = body_end;
         let body = super::parse_loop::parse_body_with_diagnostics(
             &tokens[body_start..i],
             source,
@@ -423,9 +495,13 @@ fn case_command_end_index(tokens: &[Token], start: usize) -> usize {
     let mut depth = 0usize;
     let mut index = start;
     while index < tokens.len() {
-        if is_keyword(tokens, index, "case") {
+        // rubash#1721: only structural `case'/`esac' count — a
+        // keyword-spelled argument word inside a clause body
+        // (`echo esac') is not the case's own keyword (GNU parse.y:
+        // 3168 CHECK_FOR_RESERVED_WORD).
+        if tokens[index].structural_keyword() && is_keyword(tokens, index, "case") {
             depth += 1;
-        } else if is_keyword(tokens, index, "esac") {
+        } else if tokens[index].structural_keyword() && is_keyword(tokens, index, "esac") {
             depth = depth.saturating_sub(1);
             if depth == 0 {
                 return index + 1;
@@ -623,8 +699,20 @@ pub(super) fn collect_extglob_pattern_from_bang(tokens: &[Token], i: &mut usize)
     pattern
 }
 
-pub(super) fn case_body_end(tokens: &[Token], mut index: usize) -> usize {
+/// End of a clause body: the index where the body token span stops,
+/// plus the index of a stray pattern-close `)` met on the way, if any
+/// (rubash#1656). A body is a compound_list (parse.y:1262); at its top
+/// level an unquoted `)` owns no construct — subshell/function parens
+/// balance in `paren_depth`, nested compounds ride the boundary
+/// stack, pattern regions ride the stack's case sentinels — so a `)`
+/// that arrives with both empty can only be the NEXT clause's pattern
+/// close, reached because the current clause's terminator is missing
+/// or invalid (`a) echo A;\;& b) ...`: `\;&` is a word plus `&`, not
+/// SEMI_AND). GNU parse.y:1237-1256 case_clause_sequence admits only
+/// a terminator or ESAC there and reports a syntax error at that `)`.
+pub(super) fn case_body_end(tokens: &[Token], mut index: usize) -> (usize, Option<usize>) {
     let mut stack = Vec::new();
+    let mut paren_depth = 0usize;
     while index < tokens.len() {
         if stack.is_empty()
             && (is_case_terminator(tokens, index)
@@ -648,11 +736,22 @@ pub(super) fn case_body_end(tokens: &[Token], mut index: usize) -> usize {
             break;
         }
 
+        if tokens[index].kind == TokenKind::Keyword && is_unquoted_operator(&tokens[index], ")") {
+            if paren_depth == 0 && stack.is_empty() {
+                return (index, Some(index));
+            }
+            paren_depth = paren_depth.saturating_sub(1);
+        } else if tokens[index].kind == TokenKind::Keyword
+            && is_unquoted_operator(&tokens[index], "(")
+        {
+            paren_depth += 1;
+        }
+
         update_compound_boundary_stack(tokens, index, &mut stack);
         index += 1;
     }
 
-    index
+    (index, None)
 }
 
 pub(super) fn is_case_terminator(tokens: &[Token], index: usize) -> bool {

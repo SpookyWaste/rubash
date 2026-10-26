@@ -244,13 +244,22 @@ fn delimiter_metadata(delimiter: &str) -> Box<WordMetadata> {
 /// output. Source-verbatim captures never carry carriers; a captured
 /// carrier byte would otherwise flow both into the evaluator (a spurious
 /// lexical failure) and into the rendered diagnostic.
+///
+/// A char is an in-band carrier only when it is a genuine single-char
+/// transport codepoint: the marker zone (U+E000..=U+E401,
+/// `markers::is_marker_zone_char`) or a C0/C1 control char. Matching
+/// against every `MARKERS` row's `code` instead is wrong (rubash#1727):
+/// `MarkerInfo.code` is documented as the FIRST code point of the marker,
+/// and the multi-char string markers (`QUOTED_HEREDOC_MARKER` =
+/// "__RUBASH_HD1__", `COMPOUND_ASSIGNMENT_MARKER` = "__RUBASH_CA1__")
+/// register `'_'` (0x5F) — so the old predicate stripped every underscore
+/// from the section text and `_x` / `x_y` resolved as the unset names
+/// `x` / `xy`. Audited over all registry rows: every single-char carrier's
+/// code lies in the marker zone or the control range, and no printable
+/// ASCII char is ever an in-band carrier.
 fn arith_for_section_text(raw: &str) -> String {
     let trimmed = raw.trim_start();
-    let is_carrier = |c: char| {
-        crate::executor::markers::MARKERS
-            .iter()
-            .any(|m| m.code == c as u32)
-    };
+    let is_carrier = |c: char| crate::executor::markers::is_marker_zone_char(c) || c.is_control();
     if !trimmed.chars().any(is_carrier) {
         return trimmed.to_string();
     }
