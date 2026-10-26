@@ -33,7 +33,15 @@ pub(super) fn parse_coproc_command(tokens: &[Token], start: usize) -> Option<(Co
             // and the fds bind as COPROC). A builtin-name allowlist
             // here stole the first word of the simple command as a
             // name (rubash#1153).
-            if !lookahead.value.starts_with('-') && next_is_compound {
+            // rubash#1652: `!` is never a coproc NAME — when it sits
+            // at the operand position the bang check below must see
+            // it, so it is excluded from name consumption even when
+            // a compound body follows (`coproc ! { ...; }` is GNU's
+            // syntax error, not a coproc named `!`).
+            if !lookahead.value.starts_with('-')
+                && next_is_compound
+                && !is_keyword(tokens, i, "!")
+            {
                 name = Some((lookahead.value.clone(), lookahead.raw.clone()));
                 i += 1; // consume the name
             }
