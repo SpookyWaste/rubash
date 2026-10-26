@@ -4623,17 +4623,25 @@ pub fn run_stdin_script(executor: &mut Executor) -> i32 {
             continue;
         }
 
-        // bashhist.c:869 bash_add_history: in interactive mode, each
-        // complete command is recorded to the session history.
-        if let Some(session) = executor.get_session_history() {
-            let trimmed = pending.trim_end();
-            if !trimmed.is_empty() {
-                let control = executor.get_env("HISTCONTROL").unwrap_or_default();
-                let ignore = executor.get_env("HISTIGNORE").unwrap_or_default();
-                let histsize = SessionHistory::size_limit(executor.get_env("HISTSIZE"));
-                session
-                    .borrow_mut()
-                    .record(trimmed, &control, &ignore, histsize);
+        // bashhist.c maybe_add_history gates recording on
+        // remember_on_history — the `history' set option, which defaults
+        // OFF for a non-interactive shell. This driver is the
+        // non-interactive stdin path, so input lines enter the history
+        // list only after `set -o history' (or `-o history' at startup)
+        // turns the option on (rubash#1629).
+        let remember_on_history =
+            executor.get_env("__RUBASH_SETOPT_history").as_deref() == Some("1");
+        if remember_on_history {
+            if let Some(session) = executor.get_session_history() {
+                let trimmed = pending.trim_end();
+                if !trimmed.is_empty() {
+                    let control = executor.get_env("HISTCONTROL").unwrap_or_default();
+                    let ignore = executor.get_env("HISTIGNORE").unwrap_or_default();
+                    let histsize = SessionHistory::size_limit(executor.get_env("HISTSIZE"));
+                    session
+                        .borrow_mut()
+                        .record(trimmed, &control, &ignore, histsize);
+                }
             }
         }
 
