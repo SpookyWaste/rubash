@@ -478,6 +478,17 @@ where
                 // gated names (locale family) must reach the process-env
                 // mirror on a declare bind too.
                 sync_shell_assignment_process_env(variables, var_name, value);
+                // rubash#1692: a declare bind is bind_variable — GNU's
+                // sv_locale watcher fires on it (variables.c:6272).
+                if let Some(warning) = crate::locale::locale_assignment_warning(var_name, variables)
+                {
+                    writeln!(
+                        stderr,
+                        "{}warning: {}",
+                        diagnostic_prefix(variables),
+                        warning
+                    )?;
+                }
                 unmark_typed(variables, DECLARED_UNSET_VARS, var_name);
                 continue;
             }
@@ -735,6 +746,16 @@ where
         // once. The sync is gated (#916), so ordinary names pay only
         // the name check.
         sync_shell_assignment_process_env(variables, var_name, &value);
+        // rubash#1692: same sv_locale bind hook as the nameref path
+        // above (variables.c:6272).
+        if let Some(warning) = crate::locale::locale_assignment_warning(var_name, variables) {
+            writeln!(
+                stderr,
+                "{}warning: {}",
+                diagnostic_prefix(variables),
+                warning
+            )?;
+        }
         unmark_typed(variables, DECLARED_UNSET_VARS, var_name);
         if compound_operand && !assoc && !variables.is_marked(ASSOC_VARS, var_name) {
             mark_typed(variables, ARRAY_VARS, var_name);

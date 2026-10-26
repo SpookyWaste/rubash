@@ -203,6 +203,52 @@ pub(crate) fn unset_process_env(name: &str) {
     }
 }
 
+impl Executor {
+    /// rubash#1692: register one just-committed locale-family bind so
+    /// GNU's sv_locale consequence runs (variables.c:6272 sv_locale ->
+    /// locale.c:185 set_locale_var): the real setlocale attempt and,
+    /// on failure, the `{prefix}warning: setlocale: ...` diagnostic.
+    /// Callers invoke this AFTER the value lands in the variable store
+    /// (sv_locale reads the stored binding). While a simple command's
+    /// tempenv binds are deferred (its class is not known yet — see
+    /// `defer_locale_assignment_warnings`), the bind is only recorded;
+    /// the dispatch then flushes or drops the record.
+    pub(in crate::executor) fn note_locale_assignment(&mut self, name: &str) {
+        if !crate::locale::is_locale_family_name(name) {
+            return;
+        }
+        if self.defer_locale_assignment_warnings.get() {
+            self.deferred_locale_assignment_binds.push(name.to_string());
+            return;
+        }
+        self.emit_locale_assignment_warning(name);
+    }
+
+    fn emit_locale_assignment_warning(&mut self, name: &str) {
+        if let Some(warning) =
+            crate::locale::locale_assignment_warning(name, &self.shell_state.env_vars)
+        {
+            let line = format!("{}warning: {}\n", self.diagnostic_prefix(), warning);
+            let _ = self.write_default_stderr(line.as_bytes());
+        }
+    }
+
+    /// The deferred tempenv binds belong to a command that DOES bind
+    /// them (builtin/function): run GNU's attempts now, before the
+    /// command body executes.
+    pub(in crate::executor) fn flush_deferred_locale_assignment_binds(&mut self) {
+        for name in std::mem::take(&mut self.deferred_locale_assignment_binds) {
+            self.emit_locale_assignment_warning(&name);
+        }
+    }
+
+    /// The deferred tempenv binds belong to a disk command: GNU never
+    /// bound them in the shell, so no attempt ever ran.
+    pub(in crate::executor) fn drop_deferred_locale_assignment_binds(&mut self) {
+        self.deferred_locale_assignment_binds.clear();
+    }
+}
+
 pub(crate) fn sync_shell_assignment_process_env(
     _env_vars: &crate::shell::var_table::VarTable,
     name: &str,

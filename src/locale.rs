@@ -431,16 +431,174 @@ pub fn locale_request_active() -> bool {
     !is_utf8_locale_name(&name) || utf8_locale_active(&name)
 }
 
-/// Emit setlocale warning if locale is requested but not available.
+/// The locale variable family GNU binds to sv_locale (variables.c:5800
+/// special_vars table -> variables.c:6272 sv_locale).
+pub fn is_locale_family_name(name: &str) -> bool {
+    matches!(
+        name,
+        "LANG" | "LC_ALL" | "LC_COLLATE" | "LC_CTYPE" | "LC_MESSAGES" | "LC_NUMERIC" | "LC_TIME"
+    )
+}
+
+/// POSIX category precedence (locale.c:343 get_locale_var): LC_ALL wins,
+/// then the category's own variable, then LANG, then "" (the
+/// environment-default locale).
+fn get_locale_var(var: &str, env_vars: &std::collections::HashMap<String, String>) -> String {
+    let nonempty = |name: &str| {
+        env_vars
+            .get(name)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    nonempty("LC_ALL")
+        .or_else(|| nonempty(var))
+        .or_else(|| nonempty("LANG"))
+        .unwrap_or("")
+        .to_string()
+}
+
+#[cfg(unix)]
+fn category_constant(var: &str) -> Option<libc::c_int> {
+    Some(match var {
+        "LC_ALL" => libc::LC_ALL,
+        "LC_COLLATE" => libc::LC_COLLATE,
+        "LC_CTYPE" => libc::LC_CTYPE,
+        "LC_MESSAGES" => libc::LC_MESSAGES,
+        "LC_NUMERIC" => libc::LC_NUMERIC,
+        "LC_TIME" => libc::LC_TIME,
+        _ => return None,
+    })
+}
+
+/// One real setlocale attempt, mirroring GNU locale.c set_locale_var:
+/// errno is cleared first (locale.c:191), and on failure the caller
+/// reports `strerror(errno)` only when the call left errno set — glibc
+/// sets ENOENT on the first failed lookup of a (category, name) pair
+/// and leaves errno clear on repeat lookups it has already cached, so
+/// the `: No such file or directory` suffix appears exactly on the
+/// first failing bind of each name, as in GNU.
+#[cfg(unix)]
+fn attempt_setlocale(category: libc::c_int, name: &str) -> Result<(), Option<String>> {
+    let Ok(c_name) = std::ffi::CString::new(name) else {
+        return Err(None);
+    };
+    unsafe {
+        *libc::__errno_location() = 0;
+        let result = libc::setlocale(category, c_name.as_ptr());
+        if !result.is_null() {
+            return Ok(());
+        }
+        let errno = *libc::__errno_location();
+        if errno == 0 {
+            Err(None)
+        } else {
+            let message = std::ffi::CStr::from_ptr(libc::strerror(errno));
+            Err(Some(message.to_string_lossy().into_owned()))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn attempt_setlocale(_category: std::ffi::c_int, _name: &str) -> Result<(), Option<String>> {
+    // The Windows CRT has no compiled locale archive to reject a name
+    // (see utf8_locale_active); GNU's warning has no failing call to
+    // mirror there. (std::ffi::c_int keeps the signature identical to
+    // the unix form; no caller reaches this on non-unix.)
+    Ok(())
+}
+
+/// locale.c reset_locale_vars: composite re-apply when LC_ALL is
+/// empty — setlocale(LC_ALL, lang) then each category from its
+/// precedence value. Never warns (the function has no diagnostic).
+#[cfg(unix)]
+fn reset_locale_vars_mirror(env_vars: &std::collections::HashMap<String, String>) {
+    let lang = env_vars.get("LANG").cloned().unwrap_or_default();
+    // locale.c reset_locale_vars returns at once when the composite
+    // apply fails; the per-category applies never run.
+    if attempt_setlocale(libc::LC_ALL, &lang).is_err() {
+        return;
+    }
+    for category in [
+        "LC_CTYPE",
+        "LC_COLLATE",
+        "LC_MESSAGES",
+        "LC_NUMERIC",
+        "LC_TIME",
+    ] {
+        if let Some(constant) = category_constant(category) {
+            let _ = attempt_setlocale(constant, &get_locale_var(category, env_vars));
+        }
+    }
+}
+
+/// Mirror one locale-family bind the way GNU sv_locale does
+/// (variables.c:6272 -> locale.c:185 set_locale_var / locale.c:313
+/// set_lang), performing the same real setlocale call GNU performs
+/// and returning the warning text (without the caller's diagnostic
+/// prefix) when GNU would print one:
 ///
-/// GNU bash warns when setlocale() fails (variables.c:1476-1488), e.g.
-/// "bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8)".
-/// Emission is intentionally suppressed: the diagnostic prefix is
-/// this_command_name, which does not normalize across the two shells, so the
-/// warning would be diff noise in every suite that reassigns LC_ALL. The
-/// semantic consequence - single-byte fallback - is applied by is_utf8().
-pub fn check_setlocale_warning() {
-    let _ = locale_request_active();
+/// * `LC_ALL` non-empty: one setlocale(LC_ALL, value) attempt; failure
+///   warns `setlocale: LC_ALL: cannot change locale (<value>)`.
+/// * `LC_ALL` empty/unset: the silent reset path (no warning even
+///   when a category value is bad).
+/// * A category (LC_COLLATE/LC_CTYPE/LC_MESSAGES/LC_NUMERIC/LC_TIME):
+///   attempted only while LC_ALL is empty, with the precedence value
+///   from get_locale_var — so `LANG=bad` followed by `LC_CTYPE=` warns
+///   about LC_CTYPE with LANG's value, exactly as locale.c:301 does.
+/// * `LANG`: never warns (set_lang is silent); still runs the reset
+///   so the process locale follows, like GNU.
+///
+/// `env_vars` must already hold the just-committed values (sv_locale
+/// reads the stored binding via get_string_value).
+pub fn locale_assignment_warning(
+    var: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    if !is_locale_family_name(var) {
+        return None;
+    }
+    // The Windows CRT has no compiled locale archive to reject a name,
+    // so GNU's failing-setlocale warning has no counterpart there.
+    #[cfg(not(unix))]
+    {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        let lc_all = env_vars.get("LC_ALL").cloned().unwrap_or_default();
+        if var == "LC_ALL" {
+            if lc_all.is_empty() {
+                reset_locale_vars_mirror(env_vars);
+                return None;
+            }
+            return match attempt_setlocale(libc::LC_ALL, &lc_all) {
+                Ok(()) => None,
+                Err(suffix) => Some(format!(
+                    "setlocale: LC_ALL: cannot change locale ({lc_all}){}",
+                    suffix.map(|text| format!(": {text}")).unwrap_or_default()
+                )),
+            };
+        }
+        if var == "LANG" {
+            if lc_all.is_empty() {
+                reset_locale_vars_mirror(env_vars);
+            }
+            return None;
+        }
+        // A category variable.
+        if !lc_all.is_empty() {
+            return None;
+        }
+        let applied = get_locale_var(var, env_vars);
+        let constant = category_constant(var)?;
+        match attempt_setlocale(constant, &applied) {
+            Ok(()) => None,
+            Err(suffix) => Some(format!(
+                "setlocale: {var}: cannot change locale ({applied}){}",
+                suffix.map(|text| format!(": {text}")).unwrap_or_default()
+            )),
+        }
+    }
 }
 
 /// Sync the locale-category variables into the PROCESS environment so the
@@ -470,10 +628,30 @@ pub fn sync_process_locale(env_vars: &std::collections::HashMap<String, String>)
     }
 }
 
-/// Initialize locale state. Kept as a no-op hook for parity with GNU bash's
-/// startup setlocale() pass; rubash re-derives the locale on demand.
+/// Initialize locale state at shell startup, mirroring GNU shell.c's
+/// startup sequence: set_default_locale (locale.c:85) applies
+/// setlocale(LC_ALL, "") — the environment composite, silently — then
+/// set_default_lang (locale.c set_default_lang) runs
+/// set_locale_var("LC_ALL", <env value>), which is the one startup
+/// bind that can warn (`<shell_name>: warning: setlocale: LC_ALL:
+/// cannot change locale (<value>)`, no line number, and never the
+/// strerror suffix: the priming composite attempt already consumed
+/// the first-failure errno for the name), and set_lang applies LANG
+/// silently. Invalid LANG or LC_* values in the startup environment
+/// warn about nothing (rubash#1692).
 pub fn init_locale() {
-    let _ = locale_request_active();
+    #[cfg(unix)]
+    {
+        let _ = attempt_setlocale(libc::LC_ALL, "");
+        let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+        if let Some(warning) = locale_assignment_warning("LC_ALL", &env) {
+            let shell_name = std::env::args()
+                .next()
+                .unwrap_or_else(|| "rubash".to_string());
+            eprintln!("{shell_name}: warning: {warning}");
+        }
+        let _ = locale_assignment_warning("LANG", &env);
+    }
 }
 
 /// Decode rubash's internal transport text into user-visible text.
