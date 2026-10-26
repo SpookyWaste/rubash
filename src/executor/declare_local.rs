@@ -1543,6 +1543,17 @@ impl Executor {
                     // Same eval-boundary class as execute_declare (rubash#637).
                     self.evalerror_subscript_pending.set(true);
                     self.raise_evalerror_abort();
+                    // The assign path installed the PARTIAL store in the
+                    // mirror (GNU arrayfunc.c:913-932 binds the elements
+                    // before the bad subscript into the one array object),
+                    // so re-sync the typed cell from that mirror before the
+                    // command-boundary verifier runs — the same step
+                    // execute_declare's abort path performs (rubash#1719).
+                    crate::builtins::declare::sync_typed_assignments(
+                        &args,
+                        &self.shell_state.env_vars,
+                        &mut self.shell_state.variables,
+                    );
                     (1, 1)
                 } else {
                     (status, builtin_status)
@@ -1581,6 +1592,29 @@ impl Executor {
                         }
                     }
                 }
+            }
+            if builtin_status == 0 {
+                // rubash#1719: the scalar-shadow pass above skips array and
+                // assoc operands outright, and nothing else in execute_local
+                // re-synced their typed cells — the builtin wrote the new
+                // binding into the mirror only, so a cell installed by an
+                // intervening plain assignment (or append / element write)
+                // stayed stale and shadowed the new binding (debug builds
+                // panicked in verify_typed_cells; the oh-my-bash module
+                // loader re-declares `local -a locations=()` per module in
+                // its while loop, after a case-branch plain assignment had
+                // created the cell). GNU has ONE variable object per name:
+                // declare.def:261 declare_internal binds through
+                // variables.c:2579 make_local_variable and variables.c:3225
+                // bind_variable, and every read consults that same object.
+                // The typed/mirror split is ours, so a mirror write must
+                // sync or drop the cell (the storage.rs contract) — perform
+                // the same post-bind sync execute_declare performs.
+                crate::builtins::declare::sync_typed_assignments(
+                    &args,
+                    &self.shell_state.env_vars,
+                    &mut self.shell_state.variables,
+                );
             }
             // rubash#1471: restore the outer locals begin unshadowed —
             // the scope slots now hold the NEW global values (so a later
