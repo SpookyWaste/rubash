@@ -22,6 +22,15 @@
 //! first_mismatched_closer, case_command_end_index) consumes only
 //! structural keywords (Token::structural_keyword).
 //!
+//! Second layer of the same state-machine family: the scanner's
+//! case-operand slot (record_token's is_case_operand) did not count
+//! a Keyword token as the case word, so with a keyword-spelled
+//! subject (`case if in`) the wait for the separator `in` never
+//! armed, the first clause never entered pattern state, and its
+//! pattern `)` was reported as a stray close. The operand slot now
+//! accepts Keyword tokens, as the parser's collect_case_word and
+//! GNU's grammar (a WORD follows `case`) both do.
+//!
 //! Expectations are the GNU bash 5.3.20 oracle's for the same files.
 
 use std::fs;
@@ -211,6 +220,26 @@ fi
 ";
     let (stdout, stderr, code) = scratch.rubash_file_parse_only(script);
     assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    assert_eq!(code, Some(0));
+}
+
+/// The subject spelled `in` itself: the first `in` is the case word,
+/// the second is the separator (GNU-verified). This pins the scanner
+/// state machine's operand slot — a keyword-spelled subject must arm
+/// the wait for the separator, or the first clause never enters
+/// pattern state.
+#[test]
+fn issue1721_keyword_subject_spelled_in() {
+    let scratch = Scratch::new("insubj");
+    let script = "\
+set -o posix
+case in in
+( in )	echo in-subj ;;
+esac
+";
+    let (stdout, stderr, code) = scratch.rubash_file(script);
+    assert_eq!(stdout, "in-subj\n");
     assert_eq!(stderr, "");
     assert_eq!(code, Some(0));
 }

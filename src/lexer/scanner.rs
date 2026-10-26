@@ -334,6 +334,14 @@ impl<'a> Lexer<'a> {
         }
         let keyword_is = |v: &str| token.kind == TokenKind::Keyword && token.value == v;
         let word_is = |v: &str| token.kind == TokenKind::Word && token.value == v;
+        // rubash#1721: a keyword-spelled case word (`case if in',
+        // `case in in', `case esac in') IS the operand — GNU's grammar
+        // takes a WORD there and recognizes no reserved word in that
+        // slot, and the parser's collect_case_word likewise accepts a
+        // Keyword token as the subject. Excluding Keyword here left
+        // case_expect_in unarmed, the `in' unrecognized, and the first
+        // clause's PST_CASEPAT state (case_pattern / case_pattern_close
+        // / the reserved_position CASEPAT branch) lost with it.
         let is_case_operand = matches!(
             token.kind,
             TokenKind::Word
@@ -341,6 +349,7 @@ impl<'a> Lexer<'a> {
                 | TokenKind::CommandSubst
                 | TokenKind::Assignment
                 | TokenKind::BraceExpand
+                | TokenKind::Keyword
         ) && !word_is(";;")
             && !word_is(";&")
             && !word_is(";;&");
