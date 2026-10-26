@@ -64,7 +64,9 @@ impl Executor {
     /// The simple-command execution lookup. Under a `command -p`
     /// re-dispatch (standard_path_scope set) the lookup walks the
     /// standard path — by substituting PATH in a throwaway copy of the
-    /// env map, never in the shell's own variables (rubash#1047).
+    /// env map, never in the shell's own variables (rubash#1047) —
+    /// and skips the hash table entirely (rubash#1648; GNU
+    /// findcmd.c:364: CMDSRCH_STDPATH never consults hashed_filenames).
     pub(in crate::executor) fn find_scoped_user_command(
         &self,
         name: &str,
@@ -73,7 +75,7 @@ impl Executor {
             Some(standard) => {
                 let mut env_vars = self.shell_state.env_vars.clone();
                 env_vars.insert("PATH".to_string(), standard.clone());
-                find_user_command(name, &env_vars)
+                find_user_command_without_hash(name, &env_vars)
             }
             None => find_user_command(name, &self.shell_state.env_vars),
         }
@@ -640,11 +642,21 @@ impl Executor {
             let display = super::execution_misc::shell_display_path(
                 &program.to_string_lossy().replace('\\', "/"),
             );
-            crate::builtins::hash::record_command_resolution(
-                &mut self.shell_state.env_vars,
-                &cmd.words[0],
-                &display,
-            );
+            if self.standard_path_scope.is_some() {
+                // rubash#1648: a `command -p` resolution inserts
+                // unconditionally (see record_standard_path_resolution).
+                crate::builtins::hash::record_standard_path_resolution(
+                    &mut self.shell_state.env_vars,
+                    &cmd.words[0],
+                    &display,
+                );
+            } else {
+                crate::builtins::hash::record_command_resolution(
+                    &mut self.shell_state.env_vars,
+                    &cmd.words[0],
+                    &display,
+                );
+            }
         }
 
         // GNU execute_cmd.c:6139-6233 (shell_execve): the OS-level exec is

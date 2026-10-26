@@ -456,6 +456,23 @@ pub fn find_user_command(name: &str, env_vars: &HashMap<String, String>) -> Opti
     result
 }
 
+/// GNU findcmd.c:364 + execute_cmd.c:5804-5808: under `command -p`
+/// (CMDSRCH_STDPATH) search_for_command skips the hashed_filenames
+/// consult entirely and walks the standard path instead (bash 5.2
+/// CHANGES: "`command -p' no longer looks in the hash table for the
+/// specified command"). The hash *insert* still happens (execute_cmd.c
+/// passes CMDSRCH_HASH alongside STDPATH) — that write lives in
+/// execute_external_inner and is untouched here; only the consult is
+/// skipped. This is the same PATH walk find_user_command performs,
+/// minus the hashed-mirror consult.
+pub(crate) fn find_user_command_without_hash(
+    name: &str,
+    env_vars: &HashMap<String, String>,
+) -> Option<PathBuf> {
+    let fingerprint = command_lookup_fingerprint(env_vars);
+    find_user_command_uncached(name, env_vars, &fingerprint)
+}
+
 /// GNU findcmd.c:373 `file_status(hashed_file)` checks FS_EXISTS|FS_EXECABLE.
 /// On Windows executability is extension-driven, so a plain existence+file
 /// check is the closest equivalent; the full PATHEXT probe would be too
