@@ -458,7 +458,7 @@ impl Executor {
                         index += 1;
                     }
                     if let Some(saved_state) = subshell_state.take() {
-                        self.restore_flat_subshell(saved_state, subshell_cwd.take());
+                        self.restore_flat_subshell(saved_state);
                         if let Some(saved) = subshell_fd_table.take() {
                             self.fd_table = saved;
                         }

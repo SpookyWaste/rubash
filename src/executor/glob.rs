@@ -1317,7 +1317,7 @@ fn collect_globstar_matches(
             && name != "."
             && name != ".."
         {
-            if let Ok(sub_entries) = shell_directory_entries(&logical_path, env_vars) {
+            if let Ok(sub_entries) = shell_directory_entries_in(&physical_path) {
                 for sub in &sub_entries {
                     let sub_name = &sub.name;
                     if sub_name == "." || sub_name == ".." {
