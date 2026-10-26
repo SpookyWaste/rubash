@@ -403,6 +403,18 @@ impl Executor {
     /// `$(( ${ number; } ))` is 123, not 0). The payload escapes the embedded
     /// walker leaves behind are decoded before evaluation.
     pub(crate) fn expand_arithmetic_expression_mut(&mut self, expression: &str) -> String {
+        // rubash#1588: a `${name:=word}` fragment inside arithmetic text
+        // binds in GNU (the text is expanded like a double-quoted word
+        // before evaluation), but the embedded expansion below runs on
+        // &self paths that drop the bind. The word-level pre-scan skips
+        // `$((...))` spans as command-substitution frames, so this entry
+        // — the one &mut pass arithmetic text goes through — applies
+        // the binds first. Re-application on a later evaluation of the
+        // same text is inert: the apply arms re-test the operator and
+        // find the variable already set.
+        if expression.contains("${") {
+            self.apply_parameter_assignment_expansions_in_word(expression);
+        }
         let routed = self.route_current_shell_substitutions(expression);
         let expanded = self.expand_arithmetic_special_parameters(&routed);
         crate::executor::execution_misc::restore_command_substitution_output(
@@ -1701,13 +1713,6 @@ pub(in crate::executor) fn requote_arith_span_token_text(text: &str) -> String {
     output
 }
 
-pub(super) fn eval_arith_value(value: &str) -> i128 {
-    value
-        .split('+')
-        .map(|part| part.trim().parse::<i128>().unwrap_or(0))
-        .sum()
-}
-
 fn empty_quoted_operand_has_operator(expression: &str) -> bool {
     let chars = expression.chars().collect::<Vec<_>>();
     let mut outside = String::new();
@@ -2420,11 +2425,19 @@ pub(crate) fn decode_arithmetic_assoc_key(text: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// A single quote in `expression` that is not part of an associative-array
-/// subscript. GNU rejects `(( '1' ))` — a quoted operand is not a number — but
-/// accepts a quoted assoc subscript (`(( A['a b']++ ))`), which is a string
-/// key, so those quotes must not trigger the operand error.
-fn has_bare_single_quote(expression: &str, env_vars: &crate::shell::var_table::VarTable) -> bool {
+/// A single quote in `expression` that is not part of an array subscript.
+/// GNU rejects `(( '1' ))` — a quoted operand is not a number — but a quote
+/// inside ANY `name[...]` bracket span belongs to the subscript's own
+/// evalexp frame, never to this level: for an associative array it delimits
+/// a string key (`(( A['a b']++ ))`, accepted), and for an indexed array
+/// the subscript text is evaluated by array_expand_index in its own frame
+/// (arrayfunc.c:1356-1391), whose evalerror names the subscript text
+/// (`(( a['k'] ))` -> `'k': arithmetic syntax error: operand expected
+/// (error token is \"'k'\")`, rubash#1603). Treating an indexed subscript's
+/// quotes as bare used to short-circuit the whole evaluation here, and the
+/// caller's text heuristics then framed the diagnostic on the OUTER
+/// expression (`((: a['k'] : ... (error token is \"'k'] \")`).
+fn has_bare_single_quote(expression: &str, _env_vars: &crate::shell::var_table::VarTable) -> bool {
     let bytes = expression.as_bytes();
     let mut index = 0usize;
     while index < bytes.len() {
@@ -2432,17 +2445,13 @@ fn has_bare_single_quote(expression: &str, env_vars: &crate::shell::var_table::V
             return true;
         }
         if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
-            let start = index;
             index += 1;
             while index < bytes.len()
                 && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
             {
                 index += 1;
             }
-            if index < bytes.len()
-                && bytes[index] == b'['
-                && is_marked_var(env_vars, ASSOC_VARS, &expression[start..index])
-            {
+            if index < bytes.len() && bytes[index] == b'[' {
                 let end = assoc_subscript_end(bytes, index);
                 // An unterminated subscript (missing `]` or unclosed quote)
                 // consumes the rest of the operand — its quotes are part of

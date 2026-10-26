@@ -610,7 +610,10 @@ impl Executor {
     /// expands there: the definition was read in the eval string's stream,
     /// earlier than the caller's token). The generation drops when the
     /// string's execution returns, on every path.
-    fn execute_eval_source(
+    // pub(in crate::executor): the mapfile -C callback path
+    // (mapfile_helpers.rs) runs its command string through this same
+    // parse_and_execute unit (rubash#1586).
+    pub(in crate::executor) fn execute_eval_source(
         &mut self,
         source: &str,
         caller_line: usize,
@@ -3124,7 +3127,11 @@ impl Executor {
                         if let Some(name) = redirect.fd_var.as_deref() {
                             self.close_dynamic_fd(name)?;
                         } else {
-                            self.close_persistent_output_fd(fd)?;
+                            // GNU redir.c r_close_this: close(redirector)
+                            // closes the descriptor wholesale — both
+                            // directions die, whichever spelling (`>&-` or
+                            // `<&-`) named it (rubash#1590).
+                            self.close_persistent_fd(fd)?;
                             self.shell_state
                                 .env_vars
                                 .insert(fd_closed_key(fd), "1".to_string());
@@ -3144,7 +3151,9 @@ impl Executor {
                         self.flush_persistent_output_process_substitution(fd)?;
                         self.copy_exec_output_fd_resolving_ambient(fd, source_fd, &ambient);
                         if move_source {
-                            self.close_persistent_output_fd(source_fd)?;
+                            // GNU redir.c dup/move case: a move closes the
+                            // source descriptor wholesale (close(redir_fd)).
+                            self.close_persistent_fd(source_fd)?;
                         }
                         continue;
                     }
@@ -3200,7 +3209,7 @@ impl Executor {
                 crate::parser::RedirectKind::DuplicateOutput => {
                     let fd = redirect.fd.unwrap_or(1);
                     if is_closed_redirect_target(&target) {
-                        self.close_persistent_output_fd(fd)?;
+                        self.close_persistent_fd(fd)?;
                         self.shell_state
                             .env_vars
                             .insert(fd_closed_key(fd), "1".to_string());
@@ -3215,7 +3224,7 @@ impl Executor {
                         self.flush_persistent_output_process_substitution(fd)?;
                         self.copy_exec_output_fd_resolving_ambient(fd, source_fd, &ambient);
                         if move_source {
-                            self.close_persistent_output_fd(source_fd)?;
+                            self.close_persistent_fd(source_fd)?;
                         }
                         continue;
                     }
@@ -3241,7 +3250,7 @@ impl Executor {
                 }
                 crate::parser::RedirectKind::CloseOutput => {
                     let fd = redirect.fd.unwrap_or(1);
-                    self.close_persistent_output_fd(fd)?;
+                    self.close_persistent_fd(fd)?;
                     self.shell_state
                         .env_vars
                         .insert(fd_closed_key(fd), "1".to_string());
@@ -3249,7 +3258,7 @@ impl Executor {
                 crate::parser::RedirectKind::Input | crate::parser::RedirectKind::ReadWrite => {
                     let fd = redirect.fd.unwrap_or(0);
                     if is_closed_redirect_target(&target) {
-                        self.close_persistent_input_fd(fd);
+                        self.close_persistent_fd(fd)?;
                         self.shell_state
                             .env_vars
                             .insert(fd_closed_key(fd), "1".to_string());
@@ -3262,7 +3271,7 @@ impl Executor {
                         }
                         self.copy_persistent_input_fd(fd, source_fd);
                         if move_source {
-                            self.close_persistent_input_fd(source_fd);
+                            self.close_persistent_fd(source_fd)?;
                         }
                         continue;
                     }
@@ -3333,7 +3342,7 @@ impl Executor {
                 }
                 crate::parser::RedirectKind::CloseInput => {
                     let fd = redirect.fd.unwrap_or(0);
-                    self.close_persistent_input_fd(fd);
+                    self.close_persistent_fd(fd)?;
                     self.shell_state
                         .env_vars
                         .insert(fd_closed_key(fd), "1".to_string());
@@ -3516,7 +3525,7 @@ impl Executor {
                 break;
             }
             if is_closed_redirect_target(target) {
-                let _ = self.close_persistent_output_fd(target_fd);
+                let _ = self.close_persistent_fd(target_fd);
                 self.shell_state
                     .env_vars
                     .insert(fd_closed_key(target_fd), "1".to_string());
@@ -4407,7 +4416,11 @@ impl Executor {
             }
             crate::parser::RedirectKind::DuplicateInput => {
                 if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
-                    if !self.fd_table.is_open_for_read(source_fd) {
+                    // GNU redir.c do_redirection_internal dup/move case:
+                    // the descriptor is copied wholesale — the </> letter
+                    // never gates on the source's direction, only on it
+                    // being open at all (rubash#1591).
+                    if !self.fd_table.is_open(source_fd) {
                         return Ok(true);
                     }
                     let Some(fd) = self.allocate_dynamic_fd() else {
@@ -4427,7 +4440,7 @@ impl Executor {
                         )));
                     }
                     if move_source {
-                        self.close_persistent_input_fd(source_fd);
+                        self.close_persistent_fd(source_fd)?;
                     }
                     close_after_success(self, fd)?;
                     return Ok(true);
@@ -4435,7 +4448,7 @@ impl Executor {
             }
             crate::parser::RedirectKind::DuplicateOutput => {
                 if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
-                    if !self.fd_table.is_open_for_write(source_fd) {
+                    if !self.fd_table.is_open(source_fd) {
                         return Ok(true);
                     }
                     let Some(fd) = self.allocate_dynamic_fd() else {
@@ -4453,7 +4466,7 @@ impl Executor {
                         )));
                     }
                     if move_source {
-                        self.close_persistent_output_fd(source_fd)?;
+                        self.close_persistent_fd(source_fd)?;
                     }
                     close_after_success(self, fd)?;
                     return Ok(true);

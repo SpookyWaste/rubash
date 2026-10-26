@@ -38,6 +38,131 @@ pub(in crate::executor) fn recycle_synthetic_fragment_word(word: String) {
     SYNTHETIC_FRAGMENT_WORD.with(|pool| pool.borrow_mut().push(word));
 }
 
+/// The EAGER secondary texts of a `${...}` body (rubash#1588): the
+/// spans GNU expands while computing the fragment's own value, before
+/// and regardless of the operator outcome — the leading name's
+/// subscript, a substring's offset and length texts, and the pattern
+/// (and replacement) texts of the trim / patsub / case-modification
+/// operators. An operator's WORD (`:-`, `=`, `:?`, ...) is NOT eager:
+/// it expands only when the operator selects it (rubash#1564), so it
+/// is deliberately absent here. Extraction mirrors the value side's
+/// own parsers (split_top_level_colon, parse_parameter_replacement,
+/// parse_parameter_case_mod) so the apply view cannot drift from the
+/// value view.
+fn secondary_assignment_texts(inner: &str) -> Vec<&str> {
+    let mut texts = Vec::new();
+    // The leading name ends at the earliest top-level operator: every
+    // operator split is tried and the shortest left-hand side wins
+    // (string_extract, subst.c:9805, stops at the first operator
+    // character outside a subscript).
+    fn shorter<'a>(current: &'a str, candidate: &'a str) -> &'a str {
+        if candidate.len() < current.len() {
+            candidate
+        } else {
+            current
+        }
+    }
+    let mut name = inner;
+    for op in [":-", ":+", ":=", ":?", "##", "%%"] {
+        if let Some((lhs, _)) =
+            super::expand_braced_ops::split_once_outside_subscript_str(inner, op)
+        {
+            name = shorter(name, lhs);
+        }
+    }
+    for op in ['-', '+', '=', '?', '#', '%'] {
+        if let Some((lhs, _)) = super::expand_braced_ops::split_once_outside_subscript(inner, op) {
+            name = shorter(name, lhs);
+        }
+    }
+    if let Some((lhs, _, _, _)) = super::parameter_ops::parse_parameter_replacement(inner) {
+        name = shorter(name, lhs);
+    }
+    if let Some((lhs, _, _)) = super::parameter_case::parse_parameter_case_mod(inner) {
+        name = shorter(name, lhs);
+    }
+    let (colon_name, colon_rest, has_colon) = super::parameter_core::split_top_level_colon(inner);
+    if has_colon {
+        name = shorter(name, colon_name.trim_end());
+    }
+    // Subscript of the leading name (a `#` length prefix or `!`
+    // indirect prefix may precede the name proper).
+    for candidate in [
+        name,
+        name.strip_prefix('#').unwrap_or(name),
+        name.strip_prefix('!').unwrap_or(name),
+    ] {
+        if let Some((_, subscript)) = parse_array_subscript(candidate) {
+            texts.push(subscript);
+            break;
+        }
+    }
+    let rest = &inner[name.len()..];
+    if rest.starts_with('/') {
+        // Patsub: pattern and replacement are both eager.
+        if let Some((_, pattern, replacement, _)) =
+            super::parameter_ops::parse_parameter_replacement(inner)
+        {
+            texts.push(pattern);
+            texts.push(replacement);
+        }
+    } else if rest.starts_with(['^', ',', '~']) {
+        if let Some((_, _, pattern)) = super::parameter_case::parse_parameter_case_mod(inner) {
+            texts.push(pattern);
+        }
+    } else if rest.starts_with("##") || rest.starts_with("%%") {
+        texts.push(&rest[2..]);
+    } else if rest.starts_with(['#', '%']) {
+        texts.push(&rest[1..]);
+    } else if has_colon
+        && !matches!(colon_rest.chars().next(), Some('=' | '+' | '?'))
+        && !colon_rest.starts_with('-')
+        && !colon_name.trim_end().is_empty()
+        && !colon_name
+            .trim_end()
+            .chars()
+            .any(|c| matches!(c, '/' | '%' | '^' | ',' | '~'))
+        && crate::executor::parameter_ops::is_parameter_error_name(colon_name.trim_end())
+    {
+        // Substring: offset and length texts are arithmetic-expanded
+        // eagerly (same admission as parse_parameter_substring).
+        let (offset, length, has_length) = super::parameter_core::split_top_level_colon(colon_rest);
+        texts.push(offset);
+        if has_length {
+            texts.push(length);
+        }
+    }
+    texts
+}
+
+/// The assignment targets bound through a body's eager secondary
+/// texts (rubash#1588) — the #1169 freeze must cover these too, since
+/// the pre-scan now applies them before the word's real pass.
+fn secondary_assignment_targets(inner: &str) -> Vec<String> {
+    fn collect(text: &str, out: &mut Vec<String>) {
+        let mut rest = text;
+        while let Some(start) = rest.find("${") {
+            let after = &rest[start + 2..];
+            let Some(end) = matching_parameter_brace(after) else {
+                break;
+            };
+            let nested = &after[..end];
+            if let Some(target) = parameter_assignment_target(nested) {
+                out.push(target);
+            }
+            for text in secondary_assignment_texts(nested) {
+                collect(text, out);
+            }
+            rest = &after[end + 1..];
+        }
+    }
+    let mut targets = Vec::new();
+    for text in secondary_assignment_texts(inner) {
+        collect(text, &mut targets);
+    }
+    targets
+}
+
 /// The variable a `${...}` body assigns through a top-level `:=` or `=`
 /// operator (base name, subscript stripped), when it is a plain shell
 /// name — the target whose later assignment can leak into earlier
@@ -1307,10 +1432,18 @@ impl Executor {
                 // earlier pure fragment that reads the target at its
                 // current (pre-assignment) value, keyed by its site; the
                 // real pass consults the frozen map first.
-                if let Some(target) = parameter_assignment_target(inner) {
+                // rubash#1588: targets bound through the fragment's
+                // eager secondary texts (subscript / substring / pattern
+                // spans) are applied by this same pre-scan, so the
+                // freeze covers them exactly like a top-level target.
+                let freeze_targets: Vec<String> = parameter_assignment_target(inner)
+                    .into_iter()
+                    .chain(secondary_assignment_targets(inner))
+                    .collect();
+                for target in &freeze_targets {
                     for (prev_inner, prev_index) in &earlier_fragments {
                         if !fragment_is_pure(prev_inner)
-                            || !fragment_references_var(prev_inner, &target)
+                            || !fragment_references_var(prev_inner, target)
                         {
                             continue;
                         }
@@ -1338,6 +1471,11 @@ impl Executor {
                 frag_index += 1;
                 guard
             });
+            // rubash#1588: the fragment's eager secondary texts
+            // (subscript, substring offset/length, pattern spans)
+            // evaluate before its own operator — apply any
+            // `${name:=word}` nested in them first.
+            self.apply_secondary_assignment_expansions(inner, in_double);
             self.apply_parameter_assignment_expansion_with_context(inner, in_double);
             if !inherit_site {
                 earlier_fragments.push((inner.to_string(), this_frag));
@@ -1358,6 +1496,72 @@ impl Executor {
         if !self.parameter_assignment_failure.replace(true) {
             self.parameter_assignment_failure_prev_status
                 .set(Some(prev_status));
+        }
+    }
+
+    /// rubash#1597: a triggered `=`/`:=` bind through the all-elements
+    /// spelling (`name[@]` / `name[*]`) on a non-associative base has
+    /// no element to bind — GNU parameter_brace_expand's `case '='`
+    /// (subst.c:10346) routes the still-subscripted name to
+    /// parameter_brace_expand_rhs (subst.c:8096) and the bind fails
+    /// with `name[@]: bad array subscript`, EX_BADUSAGE. An associative
+    /// base is the one legal case (the literal "@" / "*" text is a
+    /// key); apply_array_element_parameter_assignment has already
+    /// claimed it by the time this runs. Contexts the textual pre-scan
+    /// (parameter_assignment_error_in_word) covers never reach the
+    /// apply path — the command is discarded first — so reporting here
+    /// cannot double-print.
+    fn reject_bad_array_subscript_assignment(&mut self, name: &str, prev_status: i32) -> bool {
+        let Some(base) = name
+            .strip_suffix("[@]")
+            .or_else(|| name.strip_suffix("[*]"))
+        else {
+            return false;
+        };
+        let resolved_base = self
+            .nameref_target_name(base)
+            .unwrap_or_else(|| base.to_string());
+        if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, &resolved_base) {
+            return false;
+        }
+        eprintln!("{}{}: bad array subscript", self.error_prefix(), name);
+        self.latch_parameter_assignment_failure(prev_status);
+        true
+    }
+
+    /// rubash#1588: apply the `${name:=word}` / `${name=word}` binds
+    /// nested in a fragment's EAGER secondary texts (see
+    /// secondary_assignment_texts). GNU parameter_brace_expand
+    /// (subst.c:9777) evaluates the operand — subscript, substring
+    /// arithmetic, pattern texts — through the regular expansion
+    /// machinery, so a nested assignment operator binds exactly as if
+    /// it stood alone; rubash's value paths read those texts through
+    /// &self expanders (expand_subscript_string,
+    /// eval_parameter_substring_offset, the pattern expanders), which
+    /// produced the right VALUE but silently dropped the bind. The
+    /// pre-scan is the one &mut pass over the word, so it applies the
+    /// nested binds here, in textual order, before the fragment's own
+    /// operator. Operator WORDS are not descended into (rubash#1564).
+    fn apply_secondary_assignment_expansions(&mut self, inner: &str, double_quoted: bool) {
+        for text in secondary_assignment_texts(inner) {
+            self.apply_assignment_expansions_in_text(text, double_quoted);
+        }
+    }
+
+    /// Apply every top-level `${...}` fragment found in an eager
+    /// secondary text, recursively (a fragment's own secondary texts
+    /// before its own operator, matching evaluation order).
+    fn apply_assignment_expansions_in_text(&mut self, text: &str, double_quoted: bool) {
+        let mut rest = text;
+        while let Some(start) = rest.find("${") {
+            let after = &rest[start + 2..];
+            let Some(end) = matching_parameter_brace(after) else {
+                break;
+            };
+            let nested = &after[..end];
+            self.apply_secondary_assignment_expansions(nested, double_quoted);
+            self.apply_parameter_assignment_expansion_with_context(nested, double_quoted);
+            rest = &after[end + 1..];
         }
     }
 
@@ -1438,6 +1642,9 @@ impl Executor {
             if self.apply_array_element_parameter_assignment(name, bound.clone()) {
                 return;
             }
+            if self.reject_bad_array_subscript_assignment(name, prev_status) {
+                return;
+            }
             if self.apply_indirect_parameter_assignment(name, bound.clone()) {
                 return;
             }
@@ -1469,6 +1676,9 @@ impl Executor {
             // rubash#1542: same pre-bind `$?` snapshot as the `:=` arm.
             let prev_status = self.exit_code;
             if self.apply_array_element_parameter_assignment(name, bound.clone()) {
+                return;
+            }
+            if self.reject_bad_array_subscript_assignment(name, prev_status) {
                 return;
             }
             if self.apply_indirect_parameter_assignment(name, bound.clone()) {

@@ -8,9 +8,8 @@ pub(crate) mod path;
 pub(crate) mod types;
 pub(crate) mod wait_status;
 use arithmetic::{
-    arithmetic_division_by_zero_token, arithmetic_unbound_variable, eval_arith_value,
-    eval_conditional_arith_value, eval_conditional_arith_value_categorized,
-    eval_conditional_arith_value_categorized_with_writes,
+    arithmetic_division_by_zero_token, arithmetic_unbound_variable, eval_conditional_arith_value,
+    eval_conditional_arith_value_categorized, eval_conditional_arith_value_categorized_with_writes,
     eval_conditional_arith_value_categorized_with_writes_and_state,
     eval_conditional_arith_value_with_writes,
 };
@@ -1262,6 +1261,28 @@ pub struct Executor {
     /// command status (builtins source5.sub: `. missing` under `set -o
     /// posix` exits the shell even without `set -e`).
     pub(crate) exit_jump_pending: Cell<bool>,
+    /// Set by the dispatch-level errexit conversion sites when an
+    /// Ok-completed command's failing status is converted into
+    /// ExecuteError::ExitCode purely for errexit/POSIX-exit adjudication
+    /// (execute_materialized_command's tail and its siblings in
+    /// execute_command). GNU adjudicates errexit in execute_command's
+    /// CALLER, so such a conversion is not a jump out of the command;
+    /// execute_time_ast_command takes this mark to tell a converted
+    /// status from a genuine unwind (exit builtin, FORCE_EOF), whose
+    /// timing report GNU drops (rubash#1611). Cleared at every
+    /// execute_time_ast_command entry and taken right after its inner
+    /// dispatch, so a stale mark can never be consumed.
+    pub(crate) errexit_status_converted: Cell<bool>,
+    /// Depth of enclosing execute_time_ast_command inner dispatches.
+    /// While > 0, the dispatch-level errexit conversion sites convert
+    /// WITHOUT firing the ERR trap: the timed command completes through
+    /// execute_time_ast_command and the ast_exec time branch performs
+    /// the single trap adjudication for it (the rubash#1277 design —
+    /// the same treatment function and pipeline inners already get).
+    /// Outside a timed dispatch the sites fire the trap themselves, as
+    /// the plain list loop never adjudicates an Err completion
+    /// (rubash#1611).
+    pub(crate) timed_dispatch_depth: Cell<u32>,
     /// GNU execute_cmd.c:4887-4888 sets `special_builtin_failed = 1` when a
     /// POSIX special builtin returns an error status (> EX_SHERRBASE = 256).
     /// After the command (execute_cmd.c:1004-1017), if `posixly_correct &&

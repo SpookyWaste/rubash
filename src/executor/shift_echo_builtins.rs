@@ -162,7 +162,15 @@ impl Executor {
         // block in GNU). Capture the execution result, print the report,
         // and only then propagate an errexit/exit unwind.
         let result = self.execute_command(&timed);
-        self.print_time_shell(scan.posix_format, started);
+        // rubash#1611: a pure time chain prints exactly one report —
+        // the innermost frame's (GNU `time time false` prints one).
+        // When the stripped command is itself a `time` command it
+        // re-enters this function through the name dispatch and
+        // prints there, so this frame delegates and prints nothing.
+        let delegated = timed.words.first().map(String::as_str) == Some("time");
+        if !delegated {
+            self.print_time_shell(scan.posix_format, started);
+        }
         if result.is_ok() && inverted {
             self.exit_code = invert_exit_status(self.exit_code);
         }

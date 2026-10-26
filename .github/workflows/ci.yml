@@ -145,7 +145,7 @@ jobs:
           if-no-files-found: error
 
   cross-target-check:
-    name: Cross-target check (linux/darwin/android)
+    name: Cross-target check (linux/android)
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -156,28 +156,80 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu, aarch64-apple-darwin, aarch64-linux-android, armv7-linux-androideabi
+          targets: x86_64-unknown-linux-gnu, aarch64-linux-android, armv7-linux-androideabi
 
       - name: Check Linux target
         run: cargo check --target x86_64-unknown-linux-gnu
 
-      - name: Check macOS target
-        run: cargo check --target aarch64-apple-darwin
-
       - name: Check tests on Linux target
         run: cargo check --tests --target x86_64-unknown-linux-gnu
 
-      - name: Check tests on macOS target
-        run: cargo check --tests --target aarch64-apple-darwin
+      # Android (bionic): check-only, no linking. Both targets are
+      # Tier 2, so rustup's rust-std is enough for the Rust side — but
+      # since cc entered Cargo.lock (333cbd66), signal-hook's build
+      # script also compiles C for the android targets, and cc-rs
+      # looks for the NDK compilers (aarch64-linux-android-clang and
+      # friends), which are not on PATH. Point cc-rs at the NDK that
+      # ships with the runner image. The NDK only ships API-suffixed
+      # compiler names, so resolve them by glob; fail loudly if the
+      # image ever stops shipping an NDK instead of silently losing
+      # the android checks.
+      - name: Point cc-rs at the NDK compilers
+        run: |
+          ndk_bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          cc_aarch64=$(ls "$ndk_bin"/aarch64-linux-android*-clang | sort -V | tail -n 1)
+          cc_armv7=$(ls "$ndk_bin"/armv7a-linux-androideabi*-clang | sort -V | tail -n 1)
+          {
+            echo "CC_aarch64-linux-android=$cc_aarch64"
+            echo "CXX_aarch64-linux-android=${cc_aarch64}++"
+            echo "AR_aarch64-linux-android=$ndk_bin/llvm-ar"
+            echo "CC_aarch64_linux_android=$cc_aarch64"
+            echo "CXX_aarch64_linux_android=${cc_aarch64}++"
+            echo "AR_aarch64_linux_android=$ndk_bin/llvm-ar"
+            echo "CC_armv7-linux-androideabi=$cc_armv7"
+            echo "CXX_armv7-linux-androideabi=${cc_armv7}++"
+            echo "AR_armv7-linux-androideabi=$ndk_bin/llvm-ar"
+            echo "CC_armv7_linux_androideabi=$cc_armv7"
+            echo "CXX_armv7_linux_androideabi=${cc_armv7}++"
+            echo "AR_armv7_linux_androideabi=$ndk_bin/llvm-ar"
+          } >> "$GITHUB_ENV"
 
-      # Android (bionic): check-only, no linking — the runner has no NDK.
-      # Both targets are Tier 2, so rustup's rust-std is enough for cargo
-      # check. Mirrors the musl/OpenHarmony gate (unixwin/niubash#210).
       - name: Check Android aarch64 target
         run: cargo check --target aarch64-linux-android
 
       - name: Check Android armv7 target
         run: cargo check --target armv7-linux-androideabi
+
+  # The darwin checks used to run in the ubuntu job above. That only
+  # worked while no build script compiled C for the darwin target:
+  # since cc entered Cargo.lock (333cbd66), signal-hook's build script
+  # compiles extract.c via cc-rs, and a Linux host cannot service that
+  # — `cc` is gcc and rejects the clang-style -arch flags, and clang
+  # pointed at a darwin target has no macOS SDK headers to compile
+  # against (it falls back to the host glibc headers and fails in
+  # bits/wordsize.h). A darwin target check needs a darwin host, so
+  # the two darwin steps live here now, where `cc` is clang with the
+  # SDK by construction. Check-only, same as before: this proves the
+  # tree compiles FOR darwin; execution stays with the macOS test jobs.
+  darwin-target-check:
+    name: Cross-target check (darwin)
+    runs-on: macos-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Check macOS target
+        run: cargo check --target aarch64-apple-darwin
+
+      - name: Check tests on macOS target
+        run: cargo check --tests --target aarch64-apple-darwin
 
   shell-functionality:
     name: Shell functionality tests

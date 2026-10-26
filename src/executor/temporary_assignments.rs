@@ -1573,12 +1573,19 @@ impl Executor {
                         is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name);
                     let stored = if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base_name)
                     {
-                        append_assoc_value(&current, &partial, integer, &self.shell_state.env_vars)
+                        append_assoc_value(
+                            &current,
+                            &partial,
+                            integer,
+                            &self.shell_state.env_vars,
+                            base_name,
+                        )
                     } else {
                         match append_array_value(
                             &current,
                             None,
                             &partial,
+                            base_name,
                             integer,
                             self.shell_state.env_vars.get("IFS").map(String::as_str),
                             &self.shell_state.env_vars,
@@ -1611,6 +1618,14 @@ impl Executor {
         // partial element writes still land (see the tail), then the
         // assignment fails like the plain `a[-2]=q` path does.
         let mut bad_subscript: Option<String> = None;
+        // rubash#1618: set when the value chain produced an array storage
+        // render whose element values were already case-converted by the
+        // producing walker (append_array_value / append_assoc_value). The
+        // shared case pass below converts a SCALAR value text; running it
+        // over a storage render instead would case-fold assoc keys (the
+        // appended value was then unreachable under its written key), so
+        // those renders skip it.
+        let mut element_values_converted = false;
         let value = if append {
             // Borrowed, not cloned: the old code cloned the whole mirror
             // here on EVERY append, but the clone is read only by the
@@ -1627,13 +1642,17 @@ impl Executor {
                 .unwrap_or_default();
             if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base_name) {
                 if value.starts_with('(') && value.ends_with(')') {
+                    element_values_converted = true;
                     append_assoc_value(
                         current,
                         &value,
                         is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name),
                         &self.shell_state.env_vars,
+                        base_name,
                     )
                 } else {
+                    element_values_converted = true;
+                    let value = self.apply_case_assignment_attributes(base_name, value);
                     append_assoc_scalar_value(current, &value)
                 }
             } else if is_array_storage(current)
@@ -1664,11 +1683,13 @@ impl Executor {
                     current,
                     self.shell_state.variables.indexed_array_cell(base_name),
                     &value,
+                    base_name,
                     is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name),
                     self.shell_state.env_vars.get("IFS").map(String::as_str),
                     &self.shell_state.env_vars,
                 ) {
                     Ok(outcome) => {
+                        element_values_converted = true;
                         // rubash#631: the scan stopped on an out-of-range
                         // negative subscript; the renders below still carry
                         // every element written before it.
@@ -1753,6 +1774,7 @@ impl Executor {
                 &value,
                 is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name),
                 &self.shell_state.env_vars,
+                base_name,
             );
             // Partial store before the error report — keep the structured
             // cell in lockstep from the same render.
@@ -1788,6 +1810,7 @@ impl Executor {
             if !bare_elements.is_empty() {
                 self.exit_code = 1;
             }
+            element_values_converted = true;
             stored
         } else if compound_assignment
             && value.starts_with('(')
@@ -1809,11 +1832,13 @@ impl Executor {
                 "()",
                 None,
                 &value,
+                base_name,
                 is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name),
                 self.shell_state.env_vars.get("IFS").map(String::as_str),
                 &self.shell_state.env_vars,
             ) {
                 Ok(outcome) => {
+                    element_values_converted = true;
                     bad_subscript = outcome.bad_subscript.clone();
                     render_indexed_outcome("()", outcome)
                 }
@@ -1832,7 +1857,11 @@ impl Executor {
         } else {
             value
         };
-        let value = self.apply_case_assignment_attributes(base_name, value);
+        let value = if element_values_converted {
+            value
+        } else {
+            self.apply_case_assignment_attributes(base_name, value)
+        };
         let protocol_scalar = self.pending_scalar_assignment;
         self.pending_scalar_assignment = false;
         if value.starts_with(STORAGE_WORD_PREFIX)

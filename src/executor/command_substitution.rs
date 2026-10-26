@@ -1774,6 +1774,8 @@ impl Executor {
             compound_redirect_failed: Cell::new(false),
             noclobber_prepared_targets: std::cell::RefCell::new(std::collections::HashSet::new()),
             exit_jump_pending: Cell::new(false),
+            errexit_status_converted: Cell::new(false),
+            timed_dispatch_depth: Cell::new(0),
             special_builtin_failed: Cell::new(false),
             last_builtin_write_failed: Cell::new(false),
             alias_introduced_words: Cell::new(0),

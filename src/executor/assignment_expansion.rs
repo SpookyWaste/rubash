@@ -2380,11 +2380,20 @@ impl Executor {
                     {
                         if let Some(storage) = self.parameter_array_storage(array_name) {
                             changed = true;
-                            let sliced = array_parameter_slice(
-                                &storage,
-                                offset,
-                                length.and_then(|length| usize::try_from(length).ok()),
-                            );
+                            // A scalar base under [@]/[*] is VT_VARIABLE:
+                            // slice the string itself, signed length
+                            // included (subst.c:9083; rubash#1600). Real
+                            // arrays keep the element-slice path.
+                            let sliced = if self.parameter_is_array_variable(array_name) {
+                                array_parameter_slice(
+                                    &storage,
+                                    offset,
+                                    length.and_then(|length| usize::try_from(length).ok()),
+                                )
+                            } else {
+                                self.array_subscript_range_values(array_name, offset, length)
+                                    .unwrap_or_default()
+                            };
                             if starred {
                                 // GNU array_subrange + string_list_pos_params:
                                 // a quoted `arr[*]:off` joins the slice into
@@ -3259,11 +3268,18 @@ impl Executor {
                 .or_else(|| var_name.strip_suffix("[*]"))
             {
                 let storage = self.parameter_array_storage(array_name)?;
-                let sliced = array_parameter_slice(
-                    &storage,
-                    offset,
-                    length.and_then(|length| usize::try_from(length).ok()),
-                );
+                // Scalar base under [@]/[*]: VT_VARIABLE string slice
+                // with the signed length (subst.c:9083; rubash#1600).
+                let sliced = if self.parameter_is_array_variable(array_name) {
+                    array_parameter_slice(
+                        &storage,
+                        offset,
+                        length.and_then(|length| usize::try_from(length).ok()),
+                    )
+                } else {
+                    self.array_subscript_range_values(array_name, offset, length)
+                        .unwrap_or_default()
+                };
                 return Some(if starred {
                     vec![format!(
                         "{ARRAY_FIELD_SPLIT_MARKER}{}",

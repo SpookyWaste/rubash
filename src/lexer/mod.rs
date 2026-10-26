@@ -195,6 +195,21 @@ pub fn tokenize(input: &str) -> Vec<Token> {
     tokenize_with_options(input, TokenizeOptions::default())
 }
 
+/// Whether a fresh tokenize pass over `input` ends inside a `[[ ... ]]`
+/// conditional (PST_CONDCMD still armed — the COND_END `]]` was never
+/// read, including the rubash#1553 shape where a `]]` glued to a `=~`
+/// RHS group is word text). The fresh-scan mirror of the group
+/// completeness test (`stdin_source_needs_more_posix`) asks this of the
+/// scanner's own state machine rather than re-deriving it from the
+/// token list, so the feeder and fresh-scan answers cannot drift
+/// (rubash#1573).
+pub(crate) fn source_ends_in_cond_command(input: &str, posix: bool) -> bool {
+    let mut parse_state = LexerParseState::default();
+    let mut brace_cache = BraceScanCache::default();
+    let _ = tokenize_plain(input, posix, &mut parse_state, &mut brace_cache);
+    LexerParseState::cond_command_open(&parse_state)
+}
+
 pub fn tokenize_with_options(input: &str, options: TokenizeOptions) -> Vec<Token> {
     tokenize_with_initial_posix_and_origin(input, options.initial_posix, options.input_origin)
 }
@@ -696,6 +711,18 @@ impl GroupScanFeeder {
     pub(crate) fn token_level_needs_more(&self) -> bool {
         if self.stray_close {
             return false;
+        }
+        // rubash#1573: a `[[` whose COND_END has not been read holds the
+        // group open — the conditional is one command in GNU's reader
+        // (parse.y:3654 PST_CONDCMD), so a newline inside it is a token
+        // separator, not a command boundary. The scanner's own state
+        // machine is the authority (it already implements the #1524/#1553
+        // rule that a `]]' absorbed into a still-open `=~' RHS word is
+        // word text, never COND_END): without this arm the stdin group
+        // was submitted after the `[[` line and reported the EOF shape
+        // instead of reading on into the conditional's next line.
+        if LexerParseState::cond_command_open(&self.lexer_parse_state) {
+            return true;
         }
         // rubash#463: an open word-attached procsub body holds the logical
         // line open (the keyword stack cannot see it — the body's tokens are

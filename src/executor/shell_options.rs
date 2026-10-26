@@ -284,7 +284,10 @@ impl Executor {
     /// body reads FUNCTION_STDIN — pipe content in GNU terms
     /// (execute_cmd.c execute_pipeline binds the pipe to fd 0) — never the
     /// terminal, whatever the process stdin happens to be.
-    fn stdin_source_is_terminal(&self) -> bool {
+    // pub(in crate::executor): the jobs refresh (job_builtins.rs)
+    // also consults it — job control live on a terminal is one of
+    // GNU's state-publication events (rubash#1612).
+    pub(in crate::executor) fn stdin_source_is_terminal(&self) -> bool {
         if self.shell_state.env_vars.contains_key(FUNCTION_STDIN) {
             return false;
         }
@@ -1529,6 +1532,25 @@ impl Executor {
         };
         input.push('\n');
         Some(input)
+    }
+
+    /// rubash#1642: the stdin text `source /dev/stdin` must read for a
+    /// command — GNU source.def opens /dev/stdin, a dup of fd 0, so the
+    /// bytes are whatever fd 0 is bound to for this command (its own
+    /// `< file` / `<<<` / `<<EOF` redirections, an enclosing scope's fd-0
+    /// binding, or the pipeline stage buffer), resolved by the same
+    /// ladder every other stdin consumer uses. None when no channel
+    /// binds stdin (plain inherited process stdin).
+    pub(crate) fn command_stdin_text(&self, cmd: &CommandNode) -> Option<String> {
+        self.stdin_string_for_command(cmd)
+    }
+
+    /// rubash#1642: whether the command carries its own fd-0 input
+    /// redirection. When it does but resolves to no text (missing file,
+    /// closed fd), `source /dev/stdin` must source nothing rather than
+    /// fall through to a process stdin GNU never consults for it.
+    pub(crate) fn command_has_fd0_input_redirect(&self, cmd: &CommandNode) -> bool {
+        fd0_stdin_redirect_winner(cmd).is_some()
     }
 }
 

@@ -18,20 +18,14 @@ where
     W: Write,
 {
     let args: Vec<&str> = args.into_iter().collect();
-    // comsub-eof5 third heredoc: `echo "$(\ncat <<\)\nhi\n))"` – GNU outputs
-    // `hi` (without `)`), but the current lexer produces `hi)` because the
-    // `cat <<\)` with body `hi` and delimiter `)` plus `)` + `"` (comsub
-    // close + quote) is inside a double-quoted `$(` and the `hi`/`))"` are
-    // already consumed into the outer `logical_line` before the heredoc body
-    // collector runs, so the body is synthesized as `hi)` instead of `hi`.
-    // This narrow fix trims the spurious `)` for the `hi` payload used in
-    // comsub-eof5.sub (the only place where `hi)` appears as a single arg
-    // from that heredoc). It is intentionally narrow to the `hi` literal
-    // used in the suite.
-    if args.len() == 1 && args[0] == "hi)" {
-        writer.write_all(b"hi\n")?;
-        return Ok(());
-    }
+    // History (rubash#1585): a literal special case here rewrote a sole
+    // `hi)` argument to `hi`, compensating for a heredoc-body synthesis
+    // defect in the comsub-eof5 shape (`echo "$(\ncat <<\)\nhi\n))"`).
+    // That defect is gone — the substitution itself now yields `hi` on
+    // every route (direct echo, printf, assignment) — and the special
+    // case had become a divergence of its own: GNU echo prints its
+    // arguments verbatim (builtins/echo.def), so `echo 'hi)'` must print
+    // `hi)`. No literal rewrites live in the builtin.
     let mut display_newline = true;
     let mut interpret_escapes = crate::builtins::shopt::xpg_echo_enabled();
     let mut index = 0;
