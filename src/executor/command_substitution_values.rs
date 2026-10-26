@@ -1981,6 +1981,31 @@ where
                     for value in &mut values {
                         *value = protect_ifs_field_chars(value, ifs);
                     }
+                } else if !ifs.is_some_and(|ifs| ifs.is_empty()) {
+                    // GNU string_list_dollar_at (subst.c:2957): an UNQUOTED
+                    // $@/${arr[@]} does not splice one word per element —
+                    // the elements join with the first IFS character (a
+                    // space when IFS is unset) into the word's single
+                    // expansion string, and word_split runs over the whole
+                    // string, so junction empties count exactly like a
+                    // scalar split (rubash#1714: a delimiter-only element
+                    // contributes two empty fields, an empty element one).
+                    // Splicing per element and splitting each produced
+                    // word separately loses precisely those junction
+                    // fields (`x${arr[@]}y`, `for x in ${arr[@]}`). A null
+                    // IFS keeps the per-element splice below: no joining
+                    // and no splitting happen there.
+                    let separator = match ifs {
+                        Some(ifs) => ifs
+                            .chars()
+                            .next()
+                            .map(|ch| ch.to_string())
+                            .unwrap_or_default(),
+                        None => " ".to_string(),
+                    };
+                    current.push_str(&values.join(&separator));
+                    current_present = true;
+                    continue;
                 }
 
                 current.push_str(&values[0]);

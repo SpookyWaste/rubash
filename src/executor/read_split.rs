@@ -118,7 +118,15 @@ pub(in crate::executor) fn split_read_field_ranges(
     let n = units.len();
     let line_len = line.len();
     if ifs.is_empty() {
-        return vec![(0, line_len)];
+        // Empty IFS: the whole line is one field — except an empty
+        // line, which has no field at all (GNU subst.c:3119
+        // list_string returns NULL for an empty string, so
+        // `IFS='' read -a A` on an empty line assigns an empty array).
+        return if line.is_empty() {
+            Vec::new()
+        } else {
+            vec![(0, line_len)]
+        };
     }
 
     let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -240,6 +248,61 @@ pub(in crate::executor) fn read_array_field_values(line: &str, ifs: &str) -> Vec
         .collect()
 }
 
+/// First-field extraction for the last (or only) `read` variable,
+/// mirroring GNU subst.c:3268 get_word_from_string: scan to the first
+/// unescaped IFS character (an escape pair is data when backslashes
+/// are interpreted), then consume the delimiter sequence — one
+/// delimiter, following IFS whitespace, and, when the first delimiter
+/// was IFS whitespace, one adjacent non-whitespace delimiter plus its
+/// following IFS whitespace. Returns the field text when that
+/// consumption exhausts the line (including the no-delimiter case,
+/// where the field is the whole line), or None when input remains
+/// and the caller must apply the remainder rule instead.
+fn read_last_var_first_field(
+    lead: &str,
+    ifs_chars: &[char],
+    interpret_backslashes: bool,
+) -> Option<String> {
+    let units = logical_units(lead);
+    let n = units.len();
+    let mut i = 0usize;
+    while i < n {
+        let ch = units[i].2;
+        if interpret_backslashes && ch == '\\' && i + 1 < n {
+            i += 2;
+            continue;
+        }
+        if ifs_chars.contains(&ch) {
+            break;
+        }
+        i += 1;
+    }
+    let field_end = i;
+    if i >= n {
+        return Some(lead.to_string());
+    }
+    let first_sep_ws = ifs_whitespace_logical(units[i].2, ifs_chars);
+    i += 1;
+    while i < n && ifs_whitespace_logical(units[i].2, ifs_chars) {
+        i += 1;
+    }
+    if first_sep_ws
+        && i < n
+        && ifs_chars.contains(&units[i].2)
+        && !ifs_whitespace_logical(units[i].2, ifs_chars)
+    {
+        i += 1;
+        while i < n && ifs_whitespace_logical(units[i].2, ifs_chars) {
+            i += 1;
+        }
+    }
+    if i >= n {
+        Some(lead[..logical_prefix_len(lead, &units, field_end)].to_string())
+    } else {
+        None
+    }
+}
+
 pub(in crate::executor) fn read_scalar_fields(
     line: &str,
     names_len: usize,
@@ -281,8 +344,25 @@ fn read_scalar_fields_internal(
             .get(lead_start)
             .map(|unit| unit.0)
             .unwrap_or(line.len())..];
-        // A single name takes the whole line: GNU read.def binds it through
-        // the last-variable branch (b) whose strip_trailing_ifs_whitespace
+        // GNU read.def:1113-1126 (last-variable branch): extract the
+        // first field with get_word_from_string (subst.c:3268). If that
+        // extraction exhausts the line, the variable binds the FIELD
+        // ITSELF, not the remainder — so a lone trailing delimiter is
+        // dropped (`IFS=a read x` on `ba` -> `b`, rubash#1716) and an
+        // escaped trailing IFS whitespace survives as field data
+        // (`a\ ` -> `a `). Only when more input remains does the
+        // remainder rule below apply.
+        if let Some(field) = read_last_var_first_field(lead, &ifs_chars, interpret_backslashes) {
+            let value = if interpret_backslashes {
+                unescape_read_backslashes(&field)
+            } else {
+                field
+            };
+            return vec![value];
+        }
+        // More input remains after the first field: the name takes the
+        // whole remainder. GNU read.def binds it through the
+        // last-variable branch whose strip_trailing_ifs_whitespace
         // walk is escape-blind at the line level, so a trailing escaped
         // space is dropped along with plain IFS whitespace (read.tests
         // line 19: ` x  y\ \` -> x = `x  y`).

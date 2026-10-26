@@ -1150,12 +1150,17 @@ pub(in crate::executor) fn split_read_array_words(line: &str, ifs: Option<&str>)
         // GNU read.def assigns -a words through the same field-splitting
         // rules as scalar names: interior empty fields bounded by
         // non-whitespace IFS delimiters are kept (`IFS=: read -a A` on
-        // `:::` yields three empty elements).
-        Some(ifs) if !ifs.is_empty() => split_read_field_ranges(line, ifs, false)
+        // `:::` yields three empty elements). A set-but-empty IFS is not
+        // the default: read.def:969 hands the line to list_string
+        // (subst.c:3119) with the ambient IFS, and an empty IFS disables
+        // splitting entirely — the whole line is one field, which
+        // split_read_field_ranges already encodes for "" (rubash#1713).
+        // Only an UNSET IFS takes the default whitespace split.
+        Some(ifs) => split_read_field_ranges(line, ifs, false)
             .into_iter()
             .map(|(start, end)| line[start..end].to_string())
             .collect(),
-        _ => line.split_whitespace().map(str::to_string).collect(),
+        None => line.split_whitespace().map(str::to_string).collect(),
     }
 }
 
@@ -1170,10 +1175,11 @@ pub(in crate::executor) fn split_read_array_words_with_backslashes(
         // characters stay inside the element and the backslash is dropped.
         // The raw slice here kept the backslash (rubash#397); the scalar
         // field_value helper performs the same escape-aware split + unescape.
-        Some(ifs) if !ifs.is_empty() => {
-            crate::executor::read_split::read_array_field_values(line, ifs)
-        }
-        _ => split_escaped_words_on_whitespace(line),
+        // A set-but-empty IFS disables splitting (one field, escapes still
+        // processed) exactly as in the raw path above (rubash#1713); only
+        // an unset IFS falls back to whitespace splitting.
+        Some(ifs) => crate::executor::read_split::read_array_field_values(line, ifs),
+        None => split_escaped_words_on_whitespace(line),
     }
 }
 
