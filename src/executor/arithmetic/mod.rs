@@ -2086,6 +2086,7 @@ pub(super) fn arithmetic_unbound_variable(
                     | "SECONDS"
                     | "EPOCHSECONDS"
                     | "EPOCHREALTIME"
+                    | "BASH_MONOSECONDS"
                     | "LINENO"
                     | "BASHPID"
                     | "BASH_SUBSHELL"
@@ -3951,12 +3952,13 @@ impl ArithParseCache {
 /// volatile read into a cached shape, so admission rejects them outright
 /// and execution double-checks. Covers the fast-ticket context names plus
 /// the RNG/derived-clock spellings and the noassign bash arrays.
-const ARITH_PARSE_CACHE_DYNAMIC_NAMES: [&str; 19] = [
+const ARITH_PARSE_CACHE_DYNAMIC_NAMES: [&str; 20] = [
     "RANDOM",
     "SRANDOM",
     "SECONDS",
     "EPOCHSECONDS",
     "EPOCHREALTIME",
+    "BASH_MONOSECONDS",
     "LINENO",
     "BASHPID",
     "BASH_SUBSHELL",

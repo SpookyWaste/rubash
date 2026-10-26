@@ -856,6 +856,20 @@ pub(in crate::executor) fn current_epoch_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+/// GNU variables.c get_monoseconds (bash 5.3, BASH_MONOSECONDS):
+/// CLOCK_MONOTONIC seconds, falling back to gettimeofday (i.e.
+/// EPOCHSECONDS) where no monotonic clock is available.
+pub(in crate::executor) fn current_monotonic_seconds() -> i64 {
+    #[cfg(unix)]
+    {
+        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
+            return ts.tv_sec as i64;
+        }
+    }
+    current_epoch_seconds()
+}
+
 pub(in crate::executor) fn current_epoch_micros() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
