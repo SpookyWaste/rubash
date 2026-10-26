@@ -2250,6 +2250,7 @@ impl Executor {
                 process.stdout(Stdio::piped());
                 process.stderr(Stdio::piped());
             }
+            process.current_dir(&self.shell_state.cwd);
             suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
                 ExecuteError::IoError(io::Error::new(
@@ -2866,6 +2867,7 @@ impl Executor {
             // niubash#141: keep the failed stage's resolved program in the
             // diagnostic — a bare `line 1: Unknown error` hid which stage's
             // CreateProcess failed (and with which binary).
+            process.current_dir(&self.shell_state.cwd);
             suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
                 ExecuteError::IoError(io::Error::new(
@@ -3111,6 +3113,7 @@ impl Executor {
             process.stdout(stdio_from_transferred_handle(
                 write.take().expect("producer writer already transferred"),
             ));
+            process.current_dir(&self.shell_state.cwd);
             suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
                 ExecuteError::IoError(io::Error::new(
@@ -3588,6 +3591,7 @@ impl Executor {
                 }
             }
 
+            process.current_dir(&self.shell_state.cwd);
             suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
                 ExecuteError::IoError(io::Error::new(
@@ -3811,7 +3815,11 @@ impl Executor {
                     out.push(expanded.replace(crate::executor::markers::CTLESC, ""));
                     continue;
                 }
-                match glob::pathname_expand_word(&expanded, &self.shell_state.env_vars) {
+                match glob::pathname_expand_word(
+                    &expanded,
+                    &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
+                ) {
                     glob::PathnameExpansion::Matches(matches) => out.extend(matches),
                     glob::PathnameExpansion::NoMatch => {
                         out.push(expanded.replace(crate::executor::markers::CTLESC, ""))
@@ -4411,7 +4419,7 @@ impl Executor {
                 continue;
             }
             if let glob::PathnameExpansion::Fail(pattern) =
-                glob::pathname_expand_word(word, &self.shell_state.env_vars)
+                glob::pathname_expand_word(word, &self.shell_state.env_vars, &self.shell_state.cwd)
             {
                 if !self.evalerror_failglob_pending.replace(true) {
                     self.report_failglob(&pattern);
@@ -4688,7 +4696,11 @@ impl Executor {
                         file_operands.push(value.replace(crate::executor::markers::CTLESC, ""));
                         continue;
                     }
-                    match glob::pathname_expand_word(&value, &self.shell_state.env_vars) {
+                    match glob::pathname_expand_word(
+                        &value,
+                        &self.shell_state.env_vars,
+                        &self.shell_state.cwd,
+                    ) {
                         glob::PathnameExpansion::Matches(matches) => file_operands.extend(matches),
                         glob::PathnameExpansion::NoMatch | glob::PathnameExpansion::Fail(_) => {
                             file_operands.push(value.replace(crate::executor::markers::CTLESC, ""))

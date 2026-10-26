@@ -525,6 +525,9 @@ pub struct WhitelistedSpawn {
     pub env: Vec<(String, String)>,
     pub std_handles: [HANDLE; 3],
     pub extra_handles: Vec<HANDLE>,
+    /// G-02: the child's working directory (the spawning session's cwd).
+    /// None keeps the process cwd (host-level spawns with no session).
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug)]
@@ -563,6 +566,9 @@ pub fn spawn_whitelisted(spec: &WhitelistedSpawn) -> std::io::Result<SpawnedChil
     use std::process::{Command, Stdio};
     let mut cmd = Command::new(&spec.program);
     cmd.args(&spec.args);
+    if let Some(cwd) = &spec.cwd {
+        cmd.current_dir(cwd);
+    }
     // The spec's env IS the child environment (the caller composes it from
     // std::env::vars() plus the shell's exported state, then strips what a
     // subshell must not inherit — e.g. the __RUBASH_TRAP* keys, POSIX
@@ -689,6 +695,7 @@ mod tests {
             env: Vec::new(),
             std_handles: [0, 1, 2],
             extra_handles: vec![extra],
+            cwd: None,
         })
         .unwrap();
         let status = child.wait().unwrap();

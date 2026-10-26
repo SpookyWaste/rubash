@@ -88,7 +88,13 @@ impl<'a> SourceInvocation<'a> {
             return None;
         }
 
+        // G-02: the current-directory fallback anchors at the session cwd.
         let source_path = shell_path_to_windows(self.filename, executor.env_vars());
+        let source_path = if source_path.is_absolute() {
+            source_path
+        } else {
+            executor.session_cwd().join(source_path)
+        };
         source_path.exists().then_some(source_path)
     }
 }
@@ -118,11 +124,15 @@ fn source_path_search(path: &str, filename: &str, executor: &Executor) -> Option
     // file (builtins.tests TIMEOUT).
     //
     // Empty components mean the current directory (GNU findcmd.c behavior).
+    // G-02: empty and relative components anchor at the session cwd.
     for entry in shell_path_entries(path) {
         let candidate = if entry.is_empty() || entry == "." {
-            PathBuf::from(filename)
+            executor.session_cwd().join(filename)
         } else {
             let mut base = shell_path_to_windows(&entry, executor.env_vars());
+            if !base.is_absolute() {
+                base = executor.session_cwd().join(base);
+            }
             base.push(filename);
             base
         };

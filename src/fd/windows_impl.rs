@@ -1298,6 +1298,10 @@ pub struct WhitelistedSpawn {
     pub std_handles: [HANDLE; 3],
     /// Extra handles the child inherits at the same numeric values.
     pub extra_handles: Vec<HANDLE>,
+    /// G-02: the child's working directory (the spawning session's cwd),
+    /// passed as CreateProcessW's lpCurrentDirectory. None keeps the
+    /// process cwd (host-level spawns with no session).
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 fn push_quoted_arg(cmdline: &mut Vec<u16>, arg: &str) {
@@ -1445,6 +1449,7 @@ pub fn spawn_whitelisted(spec: &WhitelistedSpawn) -> std::io::Result<SpawnedChil
     si.si.hStdError = spec.std_handles[2];
     si.attr = attr_buf as _;
 
+    let cwd_w = spec.cwd.as_ref().map(|cwd| to_wide(&cwd.to_string_lossy()));
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let orphan_flags = crate::executor::path::orphan_console_creation_flags();
     let ok = unsafe {
@@ -1456,7 +1461,7 @@ pub fn spawn_whitelisted(spec: &WhitelistedSpawn) -> std::io::Result<SpawnedChil
             1,
             EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | orphan_flags,
             env_block.as_ptr() as _,
-            std::ptr::null(),
+            cwd_w.as_ref().map_or(std::ptr::null(), |cwd| cwd.as_ptr()),
             &si.si,
             &mut pi,
         )

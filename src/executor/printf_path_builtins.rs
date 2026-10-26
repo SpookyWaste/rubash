@@ -352,6 +352,7 @@ impl Executor {
                     target.strip_prefix('&').unwrap_or(target),
                     append_mode,
                     &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
                 )?;
                 stdout_file = Some(file);
             }
@@ -376,7 +377,12 @@ impl Executor {
             } else if redirect_target_fd(&target).is_some() {
                 stderr_dup = Some(target);
             } else {
-                let file = open_cd_redirect_file(&target, append_mode, &self.shell_state.env_vars)?;
+                let file = open_cd_redirect_file(
+                    &target,
+                    append_mode,
+                    &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
+                )?;
                 stderr_file = Some(file);
             }
         } else if err_and_out_peer {
@@ -403,6 +409,7 @@ impl Executor {
             let status = crate::builtins::cd::execute_with_io(
                 cmd.words[1..].iter().map(String::as_str),
                 &mut self.shell_state.env_vars,
+                &mut self.shell_state.cwd,
                 &mut stdout_sink,
                 &mut stderr_sink,
             )?;
@@ -572,11 +579,19 @@ fn open_cd_redirect_file(
     target: &str,
     append: bool,
     env_vars: &std::collections::HashMap<String, String>,
+    cwd: &std::path::Path,
 ) -> std::io::Result<File> {
-    if append {
-        open_redirect_append(&shell_path_to_windows(target, env_vars))
+    // G-02: relative targets anchor at the session cwd.
+    let path = shell_path_to_windows(target, env_vars);
+    let path = if path.is_absolute() {
+        path
     } else {
-        File::create(shell_path_to_windows(target, env_vars))
+        cwd.join(path)
+    };
+    if append {
+        open_redirect_append(&path)
+    } else {
+        File::create(path)
     }
 }
 

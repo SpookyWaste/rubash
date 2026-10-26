@@ -918,13 +918,14 @@ impl Executor {
         let _guard = EXECUTION_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let original_dir = env::current_dir().ok();
+        // G-02: the pre-call cwd restore now targets the session cwd field
+        // (formerly the process cwd). The $PWD variable is deliberately
+        // NOT restored, preserving the pre-G-02 observable shape.
+        let original_cwd = self.shell_state.cwd.clone();
         EXECUTION_LOCK_DEPTH.with(|depth| depth.set(1));
         let result = self.call_function_inner(name, args, temporary_env);
         EXECUTION_LOCK_DEPTH.with(|depth| depth.set(0));
-        if let Some(original_dir) = original_dir {
-            let _ = env::set_current_dir(original_dir);
-        }
+        self.shell_state.cwd = original_cwd;
         result
     }
 
@@ -1043,13 +1044,14 @@ impl Executor {
     /// state is the pre-entry ShellState clone — restore it wholesale so
     /// every semantic field (aliases, functions, scopes, positional params,
     /// env-carried traps, job bookkeeping) returns to the parent value.
-    /// Process env and cwd are shared in-place resources, so they resync
+    /// The process env is a shared in-place resource, so it resyncs
     /// separately: restore_shell_env must run before the swap because it
-    /// diffs the child's env_vars against the saved map.
+    /// diffs the child's env_vars against the saved map. The cwd needs no
+    /// separate resync since G-02: it is a ShellState field and rides the
+    /// wholesale swap.
     pub(in crate::executor) fn restore_flat_subshell(
         &mut self,
         saved_state: crate::shell::ShellState,
-        saved_cwd: Option<PathBuf>,
     ) {
         // Every caller is a fork boundary (flat `( )` regions and
         // command-substitution children): the region's descriptor copies
@@ -1059,9 +1061,6 @@ impl Executor {
         self.flush_region_owned_output_process_substitutions(&saved_state.env_vars);
         self.restore_shell_env(saved_state.env_vars.clone());
         self.shell_state = saved_state;
-        if let Some(dir) = saved_cwd {
-            let _ = env::set_current_dir(dir);
-        }
     }
 
     pub fn aliases_snapshot(&self) -> HashMap<String, String> {
@@ -1099,6 +1098,13 @@ impl Executor {
             }
         }
         snapshot
+    }
+
+    /// G-02: the session's current working directory (physical form).
+    /// cd/pushd/popd move this field only; the process cwd is never a
+    /// session-semantics source.
+    pub fn session_cwd(&self) -> &std::path::Path {
+        &self.shell_state.cwd
     }
 
     pub fn env_vars(&self) -> &HashMap<String, String> {

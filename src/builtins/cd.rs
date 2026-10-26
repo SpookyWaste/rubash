@@ -68,15 +68,23 @@ struct Target {
 }
 
 /// Execute `cd` with arguments after the command name.
+///
+/// Standalone entry (no session): the move lands in a throwaway cwd
+/// slot seeded from the process cwd. Session callers must use
+/// [`execute_with_io`] with the ShellState cwd slot so the move
+/// persists in the session (G-02: the process cwd is not session
+/// state).
 pub fn execute(
     args: &[String],
     env_vars: &mut crate::shell::var_table::VarTable,
 ) -> io::Result<i32> {
     let mut stdout = crate::executor::WriteFileStdout;
     let mut stderr = crate::executor::WriteFileStderr;
+    let mut cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     execute_with_io(
         args.iter().map(String::as_str),
         env_vars,
+        &mut cwd,
         &mut stdout,
         &mut stderr,
     )
@@ -85,6 +93,7 @@ pub fn execute(
 pub(crate) fn execute_with_io<'a, I, W, E>(
     args: I,
     env_vars: &mut crate::shell::var_table::VarTable,
+    cwd: &mut PathBuf,
     stdout: &mut W,
     stderr: &mut E,
 ) -> io::Result<i32>
@@ -116,21 +125,26 @@ where
         return Ok(EX_USAGE);
     }
 
-    let Some(target) = resolve_target(args.get(first_operand).copied(), env_vars, stderr)? else {
+    let Some(target) = resolve_target(args.get(first_operand).copied(), env_vars, cwd, stderr)?
+    else {
         return Ok(EXECUTION_FAILURE);
     };
 
-    let target = match resolve_cdpath(&target, env_vars) {
+    let target = match resolve_cdpath(&target, env_vars, cwd) {
         Some(found) => found,
         None => target,
     };
-    let target = match resolve_cdable_vars(&target, env_vars) {
+    let target = match resolve_cdable_vars(&target, env_vars, cwd) {
         Some(found) => found,
         None => target,
     };
 
-    let old_pwd = current_logical_pwd(env_vars);
+    let old_pwd = current_logical_pwd(env_vars, cwd);
     if let Some(logical_dir) = logical_posix_test_dir(&target, env_vars) {
+        // G-02: the bridge rewrites the logical state only — the session
+        // cwd field stays where it was, exactly as the process cwd used
+        // to stay put on this branch (the bridged names have no physical
+        // directory to move to).
         // TODO(builtins/cd.def): This is a Windows-host bridge for the GNU
         // Bash upstream tests that use POSIX system directories. A complete
         // shell should keep logical and physical directory state separately.
@@ -169,7 +183,26 @@ where
         return Ok(EXECUTION_SUCCESS);
     }
 
-    if let Err(error) = env::set_current_dir(&target.path) {
+    // G-02: the move itself is a session-state change, not a process
+    // chdir (builtins/cd.def cd_builtin -> chdir moves the SHELL; here
+    // the shell is the session). Probe and physical resolution happen
+    // in one step: canonicalize resolves `.`/`..`/symlinks exactly like
+    // the post-chdir getcwd did, and its failures carry the same OS
+    // error codes chdir reported (ENOENT for a missing target, ENOTDIR
+    // through a file prefix).
+    let native_target = if target.path.is_absolute() {
+        target.path.clone()
+    } else {
+        cwd.join(&target.path)
+    };
+    let probed = match native_target.canonicalize() {
+        Ok(path) if path.is_dir() => Ok(path),
+        Ok(_) => Err(not_a_directory_error()),
+        Err(error) => Err(error),
+    };
+    let physical = match probed {
+        Ok(path) => path,
+        Err(error) => {
         // GNU builtins/cd.def:427: builtin_error("%s: %s", printable_filename(dirname), strerror(e))
         // reports the user-given path, not the Windows-converted path.
         // general.c printable_filename: non-printing bytes render through
@@ -191,15 +224,20 @@ where
             display_path,
             crate::posix_errors::message(&error)
         )?;
-        stderr.flush()?;
-        return Ok(EXECUTION_FAILURE);
-    }
+            stderr.flush()?;
+            return Ok(EXECUTION_FAILURE);
+        }
+    };
+    // The move stands from here on — as with chdir, a readonly-bind
+    // failure below does not move the shell back (cd.def bindpwd runs
+    // after the chdir).
+    *cwd = physical.clone();
 
     let new_pwd = match mode {
         Mode::Logical => {
             logical_destination(&old_pwd, target.display.as_deref().unwrap_or(&target.path))
         }
-        Mode::Physical => env::current_dir().unwrap_or_else(|_| target.path.clone()),
+        Mode::Physical => physical,
     };
     let new_pwd_display = match mode {
         Mode::Logical => {
@@ -290,6 +328,20 @@ where
     Ok(EXECUTION_SUCCESS)
 }
 
+/// The error chdir would have reported for a target that exists but
+/// is not a directory (ENOTDIR / ERROR_DIRECTORY), in a form
+/// `posix_errors::message` renders as "Not a directory".
+fn not_a_directory_error() -> io::Error {
+    #[cfg(windows)]
+    {
+        io::Error::from_raw_os_error(267)
+    }
+    #[cfg(not(windows))]
+    {
+        io::Error::from_raw_os_error(20)
+    }
+}
+
 fn parse_options<W>(
     args: &[&str],
     env_vars: &HashMap<String, String>,
@@ -344,6 +396,7 @@ where
 fn resolve_target<W>(
     operand: Option<&str>,
     env_vars: &HashMap<String, String>,
+    cwd: &Path,
     stderr: &mut W,
 ) -> io::Result<Option<Target>>
 where
@@ -364,7 +417,7 @@ where
             // OPERAND still trips cd.def:331-336's "null directory" — that
             // is the `cd ~` path, not this one.)
             None if env_vars.contains_key("HOME") => Ok(Some(Target {
-                path: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                path: cwd.to_path_buf(),
                 display: None,
                 print: PrintPath::Never,
             })),
@@ -411,7 +464,7 @@ where
     }
 }
 
-fn resolve_cdpath(target: &Target, env_vars: &HashMap<String, String>) -> Option<Target> {
+fn resolve_cdpath(target: &Target, env_vars: &HashMap<String, String>, cwd: &Path) -> Option<Target> {
     if target
         .display
         .as_ref()
@@ -431,7 +484,15 @@ fn resolve_cdpath(target: &Target, env_vars: &HashMap<String, String>) -> Option
         let candidate = filesystem_path_for_display(base, env_vars).join(&target.path);
         let display = Path::new(base).join(&target.path);
 
-        if candidate.is_dir() {
+        // G-02: CDPATH units are relative to the SESSION cwd, not the
+        // process cwd; the returned candidate keeps its as-spelled form
+        // (the caller's move probe joins it onto the session cwd).
+        let probed = if candidate.is_absolute() {
+            candidate.clone()
+        } else {
+            cwd.join(&candidate)
+        };
+        if probed.is_dir() {
             return Some(Target {
                 print: if unit.is_empty() {
                     PrintPath::Never
@@ -447,8 +508,19 @@ fn resolve_cdpath(target: &Target, env_vars: &HashMap<String, String>) -> Option
     None
 }
 
-fn resolve_cdable_vars(target: &Target, env_vars: &HashMap<String, String>) -> Option<Target> {
-    if target.path.is_dir() || !crate::builtins::shopt::cdable_vars_enabled(env_vars) {
+fn resolve_cdable_vars(
+    target: &Target,
+    env_vars: &HashMap<String, String>,
+    cwd: &Path,
+) -> Option<Target> {
+    // G-02: the "is it a real directory here" probe anchors at the
+    // session cwd, not the process cwd.
+    let here = if target.path.is_absolute() {
+        target.path.clone()
+    } else {
+        cwd.join(&target.path)
+    };
+    if here.is_dir() || !crate::builtins::shopt::cdable_vars_enabled(env_vars) {
         return None;
     }
 
@@ -544,13 +616,22 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
+        let mut cwd_slot = std::path::PathBuf::from("/");
         assert_eq!(
-            execute_with_io(["/"], &mut env_vars, &mut stdout, &mut stderr).unwrap(),
+            execute_with_io(["/"], &mut env_vars, &mut cwd_slot, &mut stdout, &mut stderr)
+                .unwrap(),
             0
         );
         assert_eq!(env_vars.get("PWD").map(String::as_str), Some("/"));
         assert_eq!(
-            execute_with_io(["/bin"], &mut env_vars, &mut stdout, &mut stderr).unwrap(),
+            execute_with_io(
+                ["/bin"],
+                &mut env_vars,
+                &mut cwd_slot,
+                &mut stdout,
+                &mut stderr
+            )
+            .unwrap(),
             0
         );
         assert_eq!(env_vars.get("PWD").map(String::as_str), Some("/bin"));
@@ -570,7 +651,7 @@ mod tests {
         env_vars.insert("OLDPWD".to_string(), "/etc".to_string());
         let mut stderr = Vec::new();
 
-        let target = resolve_target(Some("-"), &env_vars, &mut stderr)
+        let target = resolve_target(Some("-"), &env_vars, std::path::Path::new("/"), &mut stderr)
             .unwrap()
             .unwrap();
 

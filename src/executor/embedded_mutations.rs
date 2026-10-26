@@ -2087,11 +2087,10 @@ impl Executor {
         // state — variables, functions, aliases, positional params, the job
         // registry (`$( sleep 5 & )` jobs stay invisible to the parent),
         // coproc names, scopes, RNG, or expansion-error latches — may leak
-        // back. The typed ShellState clone is the whole boundary; process
-        // resources (cwd, OS env, exit code, captures) are handled
-        // separately below.
+        // back. The typed ShellState clone is the whole boundary (the cwd
+        // rides it since G-02); process resources (OS env, exit code,
+        // captures) are handled separately below.
         let saved_state = self.shell_state.clone_for_child_save();
-        let saved_dir = env::current_dir().ok();
         // The forked child owns its descriptor table: `exec 2>/dev/null`
         // inside the body (modernish fatal.sh line 37) must not silence the
         // parent's stderr or xtrace after the substitution returns. The
@@ -2286,7 +2285,7 @@ impl Executor {
             self.latch_command_substitution_parse_error();
         }
 
-        self.restore_flat_subshell(saved_state, saved_dir);
+        self.restore_flat_subshell(saved_state);
         self.restore_discard_latches(&saved_discard_latches);
         self.fd_table = saved_fd_table;
         // rubash#846: the substitution body ran in a fork-equivalent child
@@ -2341,7 +2340,6 @@ impl Executor {
         // (variables.c:1418-1423 get_random_number); saved_state keeps
         // the parent's sequence for restore_flat_subshell.
         self.shell_state.random_state.reseed_fresh();
-        let saved_dir = env::current_dir().ok();
         let saved_capture = self.stdout_capture.take();
         self.stdout_capture = Some(Vec::new());
         // GNU subst.c:7306-7313 command_substitute: the substitution child's
@@ -2497,7 +2495,7 @@ impl Executor {
             }
             Err(_) => trap_status.unwrap_or(1),
         };
-        self.restore_flat_subshell(saved_state, saved_dir);
+        self.restore_flat_subshell(saved_state);
         self.restore_discard_latches(&saved_discard_latches);
         // Same rubash#485 reap contract as the AST substitution tail above:
         // the substitution's status is the executor's $? the moment the

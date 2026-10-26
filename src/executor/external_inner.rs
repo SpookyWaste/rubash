@@ -163,6 +163,9 @@ impl Executor {
             use std::os::unix::process::CommandExt;
             process.arg0(&config.command[0]);
         }
+        // G-02: children are born in the session cwd; the `env -C`
+        // override below replaces it for its own child.
+        process.current_dir(&self.shell_state.cwd);
         apply_env_command_environment(&mut process, &env_vars, !config.ignore_environment);
         if let Some(chdir) = &config.chdir {
             let directory = shell_path_to_windows(chdir, &env_vars);
@@ -695,6 +698,8 @@ impl Executor {
             &self.shell_state.env_vars,
             self.bash_argv0_env_supplied(&cmd.assignments),
         );
+        // G-02: children are born in the session cwd, not the process cwd.
+        process.current_dir(&self.shell_state.cwd);
         self.apply_external_environment(cmd, &mut process);
         self.apply_external_redirects(cmd, &mut process)?;
         self.spawn_external_process(cmd, &program, process, used_shell, dev_ops)
@@ -1547,6 +1552,8 @@ impl Executor {
                         let mut shell_process = Command::new(shell);
                         shell_process.arg(program);
                         shell_process.args(&cmd.words[1..]);
+                        // G-02: children are born in the session cwd.
+                        shell_process.current_dir(&self.shell_state.cwd);
                         self.apply_external_environment(cmd, &mut shell_process);
                         self.apply_external_redirects(cmd, &mut shell_process)?;
                         return self.spawn_external_process(

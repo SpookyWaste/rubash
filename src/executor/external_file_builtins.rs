@@ -374,7 +374,8 @@ impl Executor {
             // parent must fail ENOENT without -p, not silently create
             // the whole chain (on the Android/Termux host it surfaced as
             // a bogus EROFS instead).
-            let path = shell_path_to_windows(&expanded, &self.shell_state.env_vars);
+            let path =
+                self.session_path(shell_path_to_windows(&expanded, &self.shell_state.env_vars));
             let result = if parents {
                 fs::create_dir_all(&path)
             } else {
@@ -1541,10 +1542,9 @@ impl Executor {
                     self.exit_code = 0;
                     return Ok(true);
                 }
-                let mut file = open_redirect_append(&shell_path_to_windows(
-                    &target,
-                    &self.shell_state.env_vars,
-                ))?;
+                let mut file = open_redirect_append(
+                    &self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars)),
+                )?;
                 file.write_all(&output)?;
                 self.exit_code = 0;
                 return Ok(true);
@@ -2663,7 +2663,8 @@ impl Executor {
             let host = if std::path::Path::new(&windows).is_absolute() {
                 std::path::PathBuf::from(&windows)
             } else {
-                std::env::current_dir().unwrap_or_default().join(&windows)
+                // G-02: relative operands anchor at the session cwd.
+                self.shell_state.cwd.join(&windows)
             };
             // Base mode for symbolic clauses: unix reads the file's real
             // inode mode (coreutils chmod(1) applies `+x`/`-w` clauses to

@@ -104,7 +104,11 @@ pub(in crate::builtins) fn append_array_value(
             } else {
                 crate::executor::glob::compound_element_glob_pattern(token)
             };
-            match pathname_expand_word(&glob_word, env_vars) {
+            match pathname_expand_word(
+                &glob_word,
+                env_vars,
+                &crate::executor::glob::env_cwd_path(env_vars),
+            ) {
                 PathnameExpansion::Matches(matches) => {
                     for value in matches {
                         entries.insert(next_index, value);

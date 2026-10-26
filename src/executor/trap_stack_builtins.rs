@@ -257,6 +257,7 @@ impl Executor {
             builtin,
             cmd.words[1..].iter().map(String::as_str),
             &mut self.shell_state.env_vars,
+            &mut self.shell_state.cwd,
             &diagnostic_prefix,
             &mut stdout,
             &mut stderr,

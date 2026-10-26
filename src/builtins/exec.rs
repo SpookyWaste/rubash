@@ -67,9 +67,12 @@ pub fn execute(args: &[String], env_vars: &crate::shell::var_table::VarTable) ->
     // past a downstream pipe element.
     let mut stdout = crate::executor::GlobalStdout;
     let mut stderr = io::stderr().lock();
+    // Standalone entry (no session): the process cwd is the only cwd.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
     execute_with_child_stdio(
         args,
         env_vars,
+        &cwd,
         &mut stdout,
         &mut stderr,
         Stdio::inherit(),
@@ -121,6 +124,7 @@ pub(crate) fn process_replacement_enabled() -> bool {
 pub(crate) fn replace_process_image(
     args: &[String],
     env_vars: &crate::shell::var_table::VarTable,
+    cwd: &std::path::Path,
     stdio: Option<(Stdio, Stdio, Stdio)>,
 ) -> Option<io::Result<i32>> {
     let mut clean_env = false;
@@ -159,6 +163,7 @@ pub(crate) fn replace_process_image(
         env_vars,
         clean_env,
         effective_argv0.as_deref(),
+        cwd,
     );
     // rubash#1175 (redirected forms): the dispatcher resolved the fd
     // table's live bindings (ambient `exec >log`, group redirects) to
@@ -210,6 +215,7 @@ pub(crate) fn replace_process_image(
 pub(crate) fn execute_with_io<W, E>(
     args: &[String],
     env_vars: &crate::shell::var_table::VarTable,
+    cwd: &std::path::Path,
     stdout: &mut W,
     stderr: &mut E,
     child_stdin: Stdio,
@@ -218,12 +224,13 @@ where
     W: Write,
     E: Write,
 {
-    execute_impl(args, env_vars, stdout, stderr, None, child_stdin)
+    execute_impl(args, env_vars, cwd, stdout, stderr, None, child_stdin)
 }
 
 pub(crate) fn execute_with_child_stdio<W, E>(
     args: &[String],
     env_vars: &crate::shell::var_table::VarTable,
+    cwd: &std::path::Path,
     stdout: &mut W,
     stderr: &mut E,
     child_stdout: Stdio,
@@ -237,6 +244,7 @@ where
     execute_impl(
         args,
         env_vars,
+        cwd,
         stdout,
         stderr,
         Some((child_stdout, child_stderr)),
@@ -247,6 +255,7 @@ where
 fn execute_impl<W, E>(
     args: &[String],
     env_vars: &crate::shell::var_table::VarTable,
+    cwd: &std::path::Path,
     stdout: &mut W,
     stderr: &mut E,
     child_stdio: Option<(Stdio, Stdio)>,
@@ -323,28 +332,28 @@ where
             // exec.def's own "cannot execute" wording (EX_NOEXEC).
             if command.contains('/') || command.contains('\\') {
                 let candidate = crate::executor::path::shell_path_to_windows(command, env_vars);
+                // G-02: relative candidates anchor at the session cwd.
+                let candidate = if candidate.is_absolute() {
+                    candidate
+                } else {
+                    cwd.join(&candidate)
+                };
                 let metadata = std::fs::metadata(&candidate)
-                    .or_else(|_| std::fs::metadata(command))
+                    .or_else(|_| std::fs::metadata(cwd.join(command)))
                     .ok();
                 match metadata {
                     None => {
                         // exec.def:166-168 full_pathname: the failing path is
-                        // reported resolved against the current directory.
+                        // reported resolved against the current directory
+                        // (the session cwd, G-02).
                         let full = if command.starts_with('/')
                             || command.starts_with('\\')
                             || command.as_bytes().get(1) == Some(&b':')
                         {
                             command.to_string()
                         } else {
-                            match std::env::current_dir() {
-                                Ok(cwd) => format!(
-                                    "{}/{}",
-                                    cwd.to_string_lossy().replace('\\', "/"),
-                                    command
-                                )
-                                .replace("/./", "/"),
-                                Err(_) => command.to_string(),
-                            }
+                            format!("{}/{}", cwd.to_string_lossy().replace('\\', "/"), command)
+                                .replace("/./", "/")
                         };
                         writeln!(
                             stderr,
@@ -388,6 +397,7 @@ where
                 env_vars,
                 clean_env,
                 effective_argv0.as_deref(),
+                cwd,
                 child_stdout,
                 child_stderr,
                 child_stdin,
@@ -400,6 +410,7 @@ where
                 env_vars,
                 clean_env,
                 effective_argv0.as_deref(),
+                cwd,
                 child_stdin,
                 stdout,
                 stderr,
@@ -501,6 +512,7 @@ fn run_external_exec<W, E>(
     env_vars: &crate::shell::var_table::VarTable,
     clean_env: bool,
     argv0: Option<&str>,
+    cwd: &std::path::Path,
     child_stdin: Stdio,
     stdout: &mut W,
     stderr: &mut E,
@@ -509,8 +521,15 @@ where
     W: Write,
     E: Write,
 {
-    let mut process =
-        external_exec_process(program, command_name, operands, env_vars, clean_env, argv0);
+    let mut process = external_exec_process(
+        program,
+        command_name,
+        operands,
+        env_vars,
+        clean_env,
+        argv0,
+        cwd,
+    );
     process.stdout(Stdio::piped()).stderr(Stdio::piped());
     // std's Command::output() defaults stdin to Stdio::null() when .stdin()
     // is never called — a capture-path `$(exec cat)` then reads EOF on a
@@ -556,6 +575,7 @@ fn run_external_exec_with_stdio<E>(
     env_vars: &crate::shell::var_table::VarTable,
     clean_env: bool,
     argv0: Option<&str>,
+    cwd: &std::path::Path,
     child_stdout: Stdio,
     child_stderr: Stdio,
     child_stdin: Stdio,
@@ -564,8 +584,15 @@ fn run_external_exec_with_stdio<E>(
 where
     E: Write,
 {
-    let mut process =
-        external_exec_process(program, command_name, operands, env_vars, clean_env, argv0);
+    let mut process = external_exec_process(
+        program,
+        command_name,
+        operands,
+        env_vars,
+        clean_env,
+        argv0,
+        cwd,
+    );
     process.stdout(child_stdout).stderr(child_stderr);
     // Explicit for symmetry with run_external_exec: `.status()` would
     // inherit by default, but every spawn site of the exec builtin must
@@ -605,6 +632,7 @@ fn external_exec_process(
     env_vars: &crate::shell::var_table::VarTable,
     clean_env: bool,
     argv0: Option<&str>,
+    cwd: &std::path::Path,
 ) -> Command {
     // GNU builtins/exec.def (exec_builtin): `com2 = full_pathname (command)`
     // rebinds the exec target to its absolute path before shell_execve, so
@@ -613,7 +641,7 @@ fn external_exec_process(
     // script name). Non-script targets keep the dispatcher word form.
     let mut process = if let Some((command, _)) = crate::executor::path::shell_wrapped_command(
         program,
-        &full_pathname_word(program),
+        &full_pathname_word(program, cwd),
         operands,
         env_vars,
     ) {
@@ -642,6 +670,9 @@ fn external_exec_process(
         process.arg0(argv0);
     }
     let _ = argv0;
+    // G-02: the exec'd image starts in the session cwd (for the true
+    // replacement path, std's exec applies the chdir before execve).
+    process.current_dir(cwd);
     process.env_clear();
     if !clean_env {
         apply_exported_environment(&mut process, env_vars);
@@ -656,7 +687,7 @@ fn external_exec_process(
 /// prepended and `.` path components removed (sh_makepath MP_DOCWD|MP_RMDOT
 /// — no symlink resolution). Applied to the slash form so the child shell
 /// sees a forward-slash absolute script name.
-fn full_pathname_word(program: &std::path::Path) -> String {
+fn full_pathname_word(program: &std::path::Path, cwd: &std::path::Path) -> String {
     let display = program.to_string_lossy().replace('\\', "/");
     let bytes = display.as_bytes();
     let absolute =
@@ -664,9 +695,8 @@ fn full_pathname_word(program: &std::path::Path) -> String {
     if absolute {
         return display;
     }
-    let cwd = std::env::current_dir()
-        .map(|dir| dir.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_default();
+    // G-02: general.c's "current working directory" is the session cwd.
+    let cwd = cwd.to_string_lossy().replace('\\', "/");
     let joined = format!("{cwd}/{display}");
     let mut parts: Vec<&str> = Vec::new();
     for part in joined.split('/') {

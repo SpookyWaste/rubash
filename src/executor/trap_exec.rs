@@ -1973,10 +1973,9 @@ impl Executor {
         if path.is_absolute() {
             return target.to_string();
         }
-        match env::current_dir() {
-            Ok(cwd) => shell_display_path(&cwd.join(&path).to_string_lossy()),
-            Err(_) => target.to_string(),
-        }
+        // G-02: relative redirect targets display-resolve against the
+        // session cwd, not the process cwd.
+        shell_display_path(&self.shell_state.cwd.join(&path).to_string_lossy())
     }
 
     fn apply_command_output_redirects_inner(
@@ -2235,6 +2234,7 @@ impl Executor {
             let status = crate::builtins::exec::execute_with_io(
                 &cmd.words[1..],
                 &self.shell_state.env_vars,
+                &self.shell_state.cwd,
                 &mut stdout,
                 &mut stderr,
                 // No spawn happens on this path (a bare `exec` with
@@ -2426,6 +2426,7 @@ impl Executor {
         let status = crate::builtins::exec::replace_process_image(
             &cmd.words[1..],
             &self.shell_state.env_vars,
+            &self.shell_state.cwd,
             Some((stdin, stdout, stderr)),
         )?;
         Some(match status {
@@ -2464,6 +2465,7 @@ impl Executor {
                 let status = crate::builtins::exec::execute_with_child_stdio(
                     &exec_args,
                     &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
                     &mut file,
                     &mut child_diag,
                     child_stdout,
@@ -2496,6 +2498,7 @@ impl Executor {
             let status = crate::builtins::exec::execute_with_child_stdio(
                 &exec_args,
                 &self.shell_state.env_vars,
+                &self.shell_state.cwd,
                 &mut file,
                 &mut std::io::stderr().lock(),
                 child_stdout,
@@ -2532,6 +2535,7 @@ impl Executor {
             let status = crate::builtins::exec::execute_with_child_stdio(
                 &exec_args,
                 &self.shell_state.env_vars,
+                &self.shell_state.cwd,
                 &mut file,
                 &mut std::io::stderr().lock(),
                 child_stdout,
@@ -2565,6 +2569,7 @@ impl Executor {
                     "-" => crate::builtins::exec::execute_with_child_stdio(
                         &exec_args,
                         &self.shell_state.env_vars,
+                        &self.shell_state.cwd,
                         &mut crate::executor::GlobalStdout,
                         &mut std::io::sink(),
                         Stdio::inherit(),
@@ -2574,6 +2579,7 @@ impl Executor {
                     "1" => crate::builtins::exec::execute_with_io(
                         &exec_args,
                         &self.shell_state.env_vars,
+                        &self.shell_state.cwd,
                         &mut crate::executor::GlobalStdout,
                         &mut crate::executor::GlobalStdout,
                         self.exec_inherited_stdin()?,
@@ -2581,6 +2587,7 @@ impl Executor {
                     _ => crate::builtins::exec::execute_with_child_stdio(
                         &exec_args,
                         &self.shell_state.env_vars,
+                        &self.shell_state.cwd,
                         &mut crate::executor::GlobalStdout,
                         &mut std::io::stderr().lock(),
                         self.exec_inherited_stdio(1)?,
@@ -2629,6 +2636,7 @@ impl Executor {
                 crate::builtins::exec::execute_with_io(
                     &exec_args,
                     &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
                     &mut crate::executor::GlobalStdout,
                     &mut file,
                     self.exec_inherited_stdin()?,
@@ -2637,6 +2645,7 @@ impl Executor {
                 crate::builtins::exec::execute_with_child_stdio(
                     &exec_args,
                     &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
                     &mut crate::executor::GlobalStdout,
                     &mut file,
                     Stdio::inherit(),
@@ -2678,6 +2687,7 @@ impl Executor {
                 crate::builtins::exec::execute_with_io(
                     &exec_args,
                     &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
                     &mut crate::executor::GlobalStdout,
                     &mut file,
                     self.exec_inherited_stdin()?,
@@ -2686,6 +2696,7 @@ impl Executor {
                 crate::builtins::exec::execute_with_child_stdio(
                     &exec_args,
                     &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
                     &mut crate::executor::GlobalStdout,
                     &mut file,
                     Stdio::inherit(),
@@ -2724,6 +2735,7 @@ impl Executor {
                 if let Some(status) = crate::builtins::exec::replace_process_image(
                     &cmd.words[1..],
                     &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
                     Some(stdio),
                 ) {
                     return Ok(status?);
@@ -2757,6 +2769,7 @@ impl Executor {
                 crate::builtins::exec::execute_with_io(
                     &exec_args,
                     &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
                     &mut crate::executor::GlobalStdout,
                     &mut crate::executor::GlobalStdout,
                     self.exec_inherited_stdin()?,
@@ -2765,6 +2778,7 @@ impl Executor {
                 crate::builtins::exec::execute_with_io(
                     &exec_args,
                     &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
                     &mut crate::executor::GlobalStdout,
                     &mut std::io::stderr().lock(),
                     self.exec_inherited_stdin()?,
@@ -2783,6 +2797,7 @@ impl Executor {
             crate::builtins::exec::execute_with_child_stdio(
                 &exec_args,
                 &self.shell_state.env_vars,
+                &self.shell_state.cwd,
                 &mut crate::executor::GlobalStdout,
                 &mut std::io::stderr().lock(),
                 child_stdout,
@@ -2963,6 +2978,7 @@ impl Executor {
         child.stdin(Stdio::inherit());
         child.stdout(writer);
         child.stderr(Stdio::inherit());
+        child.current_dir(&self.shell_state.cwd);
         match child.spawn() {
             Ok(child_proc) => {
                 let pid = child_proc.id();

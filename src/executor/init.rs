@@ -249,7 +249,12 @@ impl Executor {
         }
         env::remove_var("__RUBASH_SHELL_NAME");
         env::remove_var(crate::executor::path::COMPATIBLE_SHELL_PATH_ENV);
-        Self::initialize_fresh_shell_env_vars(&mut env_vars);
+        // Birth context: the session cwd field (set in the ShellState
+        // literal below) starts at the process cwd.
+        Self::initialize_fresh_shell_env_vars(
+            &mut env_vars,
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+        );
 
         let shell_pid = env_vars
             .get("__RUBASH_SHELL_PID")
@@ -338,6 +343,11 @@ impl Executor {
             shell_state: ShellState {
                 variables: VariableStore::from_environment(&env_vars),
                 env_vars,
+                // G-02: a root session is born in the process cwd (the
+                // host's directory at Executor::new, exactly what GNU's
+                // startup getcwd reports); from here on the field, not
+                // the process, carries the session's cwd.
+                cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
                 array_compact_budget: HashMap::new(),
                 aliases: HashMap::new(),
                 functions: imported_functions,
@@ -604,6 +614,7 @@ impl Executor {
     /// required Windows host vars).
     pub(in crate::executor) fn initialize_fresh_shell_env_vars(
         env_vars: &mut crate::shell::var_table::VarTable,
+        cwd: &std::path::Path,
     ) {
         env_vars.remove("BASH_ARGV0");
         env_vars.remove("BASH_EXECUTION_STRING");
@@ -615,14 +626,10 @@ impl Executor {
         // actual CWD; trusting it desynchronized cd/OLDPWD, so `cd $OLDPWD`
         // (assoc.tests) landed in the wrong directory and subsequent
         // `./assocN.sub` lookups failed. Always align PWD with the real CWD.
-        let pwd = match std::env::current_dir() {
-            Ok(path) => shell_pwd_display(&path.to_string_lossy().replace('\\', "/")),
-            Err(_) => env_vars
-                .get("PWD")
-                .cloned()
-                .map(|value| shell_pwd_display(&value))
-                .unwrap_or_else(|| "/".to_string()),
-        };
+        // G-02: the "real CWD" is the caller's session cwd field, passed in
+        // (at process birth it is the process cwd; for an in-process fresh
+        // shell it is the parent session's cwd).
+        let pwd = shell_pwd_display(&cwd.to_string_lossy().replace('\\', "/"));
         env_vars.insert("PWD".to_string(), pwd);
         // Windows-only: suites write $TMPDIR/$HOME into generated scripts
         // unquoted (posix2.tests conftest2: `$TMPDIR/conftest2 "$@"`; exp.tests

@@ -65,7 +65,7 @@ impl Executor {
         &self,
         word: &str,
     ) -> Vec<String> {
-        match glob::pathname_expand_word(word, &self.shell_state.env_vars) {
+        match glob::pathname_expand_word(word, &self.shell_state.env_vars, &self.shell_state.cwd) {
             glob::PathnameExpansion::Matches(matches) => matches,
             glob::PathnameExpansion::NoMatch => vec![word.to_string()],
             glob::PathnameExpansion::Fail(_) => vec![word.to_string()],
@@ -883,6 +883,7 @@ impl Executor {
         // substitution pipe read ends at their numbers in the child.
         #[cfg(unix)]
         crate::executor::dev_fd_operands::attach_unix_dev_fd_operands(&mut process, &dev_ops);
+        process.current_dir(&self.shell_state.cwd);
         suppress_orphan_console(&mut process);
         let mut spawned = process.spawn().ok()?;
         adopt_orphan_console(spawned.id());
@@ -978,7 +979,8 @@ impl Executor {
 
     fn command_substitution_redirect_path(&self, target: &str) -> Option<PathBuf> {
         let expanded = strip_matching_quotes(&self.expand_word(target)).to_string();
-        Some(shell_path_to_windows(&expanded, &self.shell_state.env_vars))
+        // G-02: comsub redirect opens anchor at the session cwd.
+        Some(self.session_path(shell_path_to_windows(&expanded, &self.shell_state.env_vars)))
     }
 
     pub(in crate::executor) fn expand_backtick_substitution_typed(

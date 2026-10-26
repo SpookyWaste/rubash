@@ -1120,17 +1120,14 @@ impl Executor {
 
         if words.first().map(String::as_str) == Some("pwd") {
             if words.get(1).map(String::as_str) == Some("-P") {
-                // rubash#537: the raw process cwd is a Windows path; the
+                // rubash#537: the raw session cwd is a Windows path; the
                 // builtin renders get_working_directory in the one
                 // canonical POSIX form — the fast path must agree with it
-                // (pwd.def routes -P through the same display).
-                return std::env::current_dir()
-                    .map(|path| {
-                        crate::executor::path::shell_pwd_display_path(
-                            &path.to_string_lossy().replace('\\', "/"),
-                        )
-                    })
-                    .unwrap_or_default();
+                // (pwd.def routes -P through the same display). G-02: the
+                // physical directory is the session cwd field.
+                return crate::executor::path::shell_pwd_display_path(
+                    &self.shell_state.cwd.to_string_lossy().replace('\\', "/"),
+                );
             }
             return self
                 .shell_state
@@ -1341,7 +1338,9 @@ impl Executor {
             return Some(SubstitutionOutput::readback(Vec::new(), 2, context));
         }
 
-        let saved_dir = env::current_dir().ok();
+        // G-02: no process-cwd save/restore around the child — the comsub
+        // executor is a clone whose session cwd field is independent, so a
+        // `cd` in the body cannot move this session (or the process).
         let mut subshell = self.command_substitution_executor();
         // rubash#815: the comsub frame is opened by the dispatch entries
         // (expand_command_substitution_with_context / the mut typed
@@ -1531,10 +1530,6 @@ impl Executor {
                     )));
                 }
             }
-        }
-
-        if let Some(saved_dir) = saved_dir {
-            let _ = env::set_current_dir(saved_dir);
         }
 
         let readback = SubstitutionOutput::readback(output, status, context);
@@ -1889,7 +1884,7 @@ impl Executor {
             self.last_command_substitution_status.set(Some(2));
             return String::new();
         }
-        let saved_dir = env::current_dir().ok();
+        // G-02: no process-cwd save/restore (see the comsub site above).
         let mut subshell = self.command_substitution_executor();
         // rubash#815 profiler: the `${ ... }` funsub runs as "nofork comsub"
         // (subst.c:7101) — same independent fork-face frame as `$(...)`.
@@ -1941,9 +1936,6 @@ impl Executor {
             self.latch_command_substitution_parse_error();
         }
         let status = command_substitution_result_status(result, subshell.exit_code);
-        if let Some(saved_dir) = saved_dir {
-            let _ = env::set_current_dir(saved_dir);
-        }
         self.last_command_substitution_status.set(Some(status));
         match captured {
             Some(bytes) => crate::executor::substitution_metadata::bytes_to_shell_text(&bytes)

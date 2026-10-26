@@ -67,42 +67,43 @@ impl Executor {
                 && !is_null_device(&target)
                 && !target.starts_with("<(")
                 && !target.starts_with(">(");
-            let opened: Result<File, io::Error> = match redirect.kind {
-                RedirectKind::Output
-                | RedirectKind::ClobberOutput
-                | RedirectKind::CombinedOutput => {
-                    if !plain_file_target {
-                        continue;
+            let opened: Result<File, io::Error> =
+                match redirect.kind {
+                    RedirectKind::Output
+                    | RedirectKind::ClobberOutput
+                    | RedirectKind::CombinedOutput => {
+                        if !plain_file_target {
+                            continue;
+                        }
+                        self.create_redirect_output(&target, redirect.clobber)
                     }
-                    self.create_redirect_output(&target, redirect.clobber)
-                }
-                RedirectKind::Append | RedirectKind::CombinedAppend => {
-                    if !plain_file_target {
-                        continue;
-                    }
-                    open_redirect_append(&shell_path_to_windows(
-                        &target,
-                        &self.shell_state.env_vars,
-                    ))
-                    .map_err(|e| crate::posix_errors::path_error(&target, e))
-                }
-                RedirectKind::Input => {
-                    if !plain_file_target {
-                        continue;
-                    }
-                    // probe_input_redirect's errors already carry the
-                    // `<target>: <strerror>` path_error shape.
-                    self.probe_input_redirect(&target)
-                }
-                RedirectKind::ReadWrite => {
-                    if !plain_file_target {
-                        continue;
-                    }
-                    self.probe_input_redirect_readwrite(&target)
+                    RedirectKind::Append | RedirectKind::CombinedAppend => {
+                        if !plain_file_target {
+                            continue;
+                        }
+                        open_redirect_append(&self.session_path(shell_path_to_windows(
+                            &target,
+                            &self.shell_state.env_vars,
+                        )))
                         .map_err(|e| crate::posix_errors::path_error(&target, e))
-                }
-                _ => continue,
-            };
+                    }
+                    RedirectKind::Input => {
+                        if !plain_file_target {
+                            continue;
+                        }
+                        // probe_input_redirect's errors already carry the
+                        // `<target>: <strerror>` path_error shape.
+                        self.probe_input_redirect(&target)
+                    }
+                    RedirectKind::ReadWrite => {
+                        if !plain_file_target {
+                            continue;
+                        }
+                        self.probe_input_redirect_readwrite(&target)
+                            .map_err(|e| crate::posix_errors::path_error(&target, e))
+                    }
+                    _ => continue,
+                };
             if let Err(error) = opened {
                 let mut line = Vec::new();
                 let _ = writeln!(
@@ -181,7 +182,12 @@ impl Executor {
                     .create(true)
                     .read(true)
                     .write(true)
-                    .open(shell_path_to_windows(&target, &self.shell_state.env_vars))
+                    .open(
+                        self.session_path(shell_path_to_windows(
+                            &target,
+                            &self.shell_state.env_vars,
+                        )),
+                    )
                     .map_err(|e| crate::posix_errors::path_error(&target, e))?;
             } else {
                 self.probe_input_redirect(&target)?;
@@ -236,10 +242,10 @@ impl Executor {
                     if is_null_device(&target) {
                         self.create_redirect_output(&target, true)
                     } else {
-                        open_redirect_append(&shell_path_to_windows(
+                        open_redirect_append(&self.session_path(shell_path_to_windows(
                             &target,
                             &self.shell_state.env_vars,
-                        ))
+                        )))
                         .map_err(|e| crate::posix_errors::path_error(&target, e))
                     }
                 })?;
@@ -273,8 +279,10 @@ impl Executor {
             }
             if redirect.fd_var.is_some() {
             } else if !is_closed_redirect_target(&target) && redirect_target_fd(&target).is_none() {
-                open_redirect_append(&shell_path_to_windows(&target, &self.shell_state.env_vars))
-                    .map_err(|e| crate::posix_errors::path_error(&target, e))?;
+                open_redirect_append(
+                    &self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars)),
+                )
+                .map_err(|e| crate::posix_errors::path_error(&target, e))?;
             }
         }
 

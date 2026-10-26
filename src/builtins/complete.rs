@@ -981,7 +981,11 @@ pub(crate) fn complete_line_candidates_with_dynamic(
         }
         if let Some(globpat) = cs.globpat.as_deref() {
             if let crate::executor::glob::PathnameExpansion::Matches(matches) =
-                crate::executor::glob::pathname_expand_word(globpat, env_vars)
+                crate::executor::glob::pathname_expand_word(
+                    globpat,
+                    env_vars,
+                    &crate::executor::glob::env_cwd_path(env_vars),
+                )
             {
                 c.extend(matches);
             }
@@ -1130,7 +1134,11 @@ where
 
     if let Some(glob_pattern) = parsed.globpat.as_deref() {
         if let crate::executor::glob::PathnameExpansion::Matches(matches) =
-            crate::executor::glob::pathname_expand_word(glob_pattern, env_vars)
+            crate::executor::glob::pathname_expand_word(
+                glob_pattern,
+                env_vars,
+                &crate::executor::glob::env_cwd_path(env_vars),
+            )
         {
             candidates.extend(matches);
         }

@@ -118,7 +118,8 @@ impl Executor {
         input: &str,
         streaming_stdin: bool,
     ) -> Result<(String, String, i32), ExecuteError> {
-        let saved_dir = env::current_dir().ok();
+        // G-02: no process-cwd save/restore — the stage subshell is a clone
+        // with its own session cwd field.
         let mut subshell = self.command_substitution_executor();
         // A compound pipeline element passes execute_in_subshell, which
         // resets loop_level to 0 (execute_cmd.c:1642, Posix interp 842):
@@ -234,9 +235,6 @@ impl Executor {
         crate::executor::shell_options::capture_timing_set_prefix(&output);
         output.append(&mut thread_output);
 
-        if let Some(saved_dir) = saved_dir {
-            let _ = env::set_current_dir(saved_dir);
-        }
         let status = match (result, trap_result) {
             (Ok(()), Ok(trap_status)) => trap_status,
             (Err(ExecuteError::ExitCode(code)), Ok(_)) => code,
@@ -316,7 +314,7 @@ impl Executor {
         call.redirect_out = None;
         call.append = None;
 
-        let saved_dir = env::current_dir().ok();
+        // G-02: no process-cwd save/restore (stage subshell clone, as above).
         let mut subshell = self.command_substitution_executor();
         // A pipeline member runs in a subshell: caught signal traps reset to
         // the inherited disposition (execute_cmd.c subshell trap reset), so
@@ -386,9 +384,6 @@ impl Executor {
         }
         let stderr = subshell.stderr_capture.take().unwrap_or_default();
 
-        if let Some(saved_dir) = saved_dir {
-            let _ = env::set_current_dir(saved_dir);
-        }
         let status = match (result, trap_result) {
             (Ok(()), Ok(trap_status)) => trap_status,
             (Err(ExecuteError::ExitCode(code)), Ok(_)) => code,
@@ -713,7 +708,11 @@ impl Executor {
                     args.push(value);
                     continue;
                 }
-                match glob::pathname_expand_word(&value, &self.shell_state.env_vars) {
+                match glob::pathname_expand_word(
+                    &value,
+                    &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
+                ) {
                     glob::PathnameExpansion::Matches(matches) => args.extend(matches),
                     glob::PathnameExpansion::NoMatch => args.push(value),
                     // rubash#1540: same failglob funnel as the stage
@@ -1075,6 +1074,7 @@ impl Executor {
         // literal argv word resolves through the OS /dev/fd layer.
         #[cfg(unix)]
         crate::executor::dev_fd_operands::attach_unix_dev_fd_operands(&mut process, &dev_ops);
+        process.current_dir(&self.shell_state.cwd);
         suppress_orphan_console(&mut process);
         let mut child = process.spawn()?;
         adopt_orphan_console(child.id());

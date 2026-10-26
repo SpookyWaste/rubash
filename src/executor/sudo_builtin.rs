@@ -50,7 +50,8 @@ impl Executor {
         } else {
             self.child_shell_environment()
         };
-        let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // G-02: the elevation request's working directory is the session cwd.
+        let current_dir = self.shell_state.cwd.clone();
         let request = ElevationRequest {
             command: invocation.command,
             resolved_program,

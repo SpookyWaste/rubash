@@ -365,7 +365,7 @@ impl Executor {
             // readonly, UID/EUID/PPID, SHELLOPTS/BASHOPTS replay, SHLVL+1,
             // IFS default). Without this the in-process child fell back to
             // indexed-array handling for ${!BASH_CMDS[@]} (assoc audit C1).
-            Self::initialize_fresh_shell_env_vars(&mut child_env);
+            Self::initialize_fresh_shell_env_vars(&mut child_env, &self.shell_state.cwd.clone());
             // The in-process child shares the parent's OS process, so the
             // child's PPID is the parent shell's pid (a real child would see
             // getppid() == the parent shell's getpid()).
@@ -453,7 +453,8 @@ impl Executor {
         let saved_bash_lineno_stack = self.shell_state.bash_lineno_stack.clone();
         let saved_bash_argc_stack = self.shell_state.bash_argc_stack.clone();
         let saved_bash_argv_stack = self.shell_state.bash_argv_stack.clone();
-        let saved_cwd = env::current_dir().ok();
+        // G-02: the fresh-shell child's cwd boundary is the session field.
+        let saved_cwd = self.shell_state.cwd.clone();
         // GNU execute_cmd.c:6139-6233: a ${THIS_SH} script invocation is a
         // fresh shell process, not a subshell. subshell_depth must NOT be
         // incremented, or run_sigchld_trap_for_reaped_child suppresses
@@ -785,9 +786,7 @@ impl Executor {
             .set(saved_parameter_assignment_failure_prev_status);
         self.evalerror_exec_depth.set(saved_evalerror_exec_depth);
         self.assignment_command_name = saved_assignment_command_name;
-        if let Some(cwd) = saved_cwd {
-            let _ = env::set_current_dir(cwd);
-        }
+        self.shell_state.cwd = saved_cwd;
         self.exit_code = status;
 
         // A child script is a process boundary: every fatal error becomes
@@ -874,12 +873,12 @@ impl Executor {
         // ${THIS_SH} ./intl1.sub, and the child must not inherit it).
         // OLDPWD and SHELL are shell-local values maintained for every
         // shell instance even when not exported to native children.
-        if let Ok(current_dir) = env::current_dir() {
-            child.insert(
-                "PWD".to_string(),
-                shell_display_path(&current_dir.to_string_lossy().replace('\\', "/")),
-            );
-        }
+        // G-02: the child's PWD is the session cwd it will start in (its
+        // spawn is stamped with the same directory).
+        child.insert(
+            "PWD".to_string(),
+            shell_display_path(&self.shell_state.cwd.to_string_lossy().replace('\\', "/")),
+        );
         for name in ["OLDPWD", "SHELL"] {
             if let Some(value) = self.shell_state.env_vars.get(name) {
                 child

@@ -44,6 +44,7 @@ impl Executor {
         crate::builtins::pwd::execute_with_env_and_io(
             args.iter().map(String::as_str),
             &self.shell_state.env_vars,
+            &self.shell_state.cwd,
             stdout,
             stderr,
         )
