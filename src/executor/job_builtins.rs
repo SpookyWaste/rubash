@@ -239,10 +239,7 @@ impl Executor {
         result
     }
 
-    fn execute_wait_inner(
-        &mut self,
-        cmd: &CommandNode,
-    ) -> Result<i32, ExecuteError> {
+    fn execute_wait_inner(&mut self, cmd: &CommandNode) -> Result<i32, ExecuteError> {
         self.refresh_background_jobs_observed()?;
         // GNU wait.def wait_builtin() internal_getopt "fnp:": a dangling
         // `-p` (no joined text, no next word) is a getopt error, reported
@@ -1163,15 +1160,7 @@ impl Executor {
             .set(self.foreground_wait_count.get() + 1);
     }
 
-    fn refresh_background_jobs_impl(
-        &mut self,
-        force_observe: bool,
-    ) -> Result<(), ExecuteError> {
-        // rubash#1494: job-state transitions the shell's own kill sent
-        // become visible only after a full intervening reader command
-        // (GNU waitchld notification lag) — apply the ripe ones here, at
-        // the same per-command boundary that reaps finished children.
-        self.shell_state.job_table.apply_deferred_state_marks();
+    fn refresh_background_jobs_impl(&mut self, force_observe: bool) -> Result<(), ExecuteError> {
         // part_036 (jobs.c waitchld lag): a reap becomes VISIBLE in the
         // job table only at a GNU observation point — the shell blocked
         // in wait() for a foreground process, the reader advanced to a
@@ -1187,8 +1176,29 @@ impl Executor {
             self.foreground_wait_count.get(),
         );
         let observation_happened = mark != self.reap_prev_mark.get();
+        // rubash#1607/#1612: publication of the shell's own kill
+        // state marks uses a NARROWER event set than reap visibility.
+        // A mere reader-line advance must not publish (kill -STOP,
+        // one intervening builtin, then `jobs` still shows Running —
+        // #1607); the events that publish are an explicit wait/fg
+        // (force_observe), the shell having blocked on a foreground
+        // process since the last refresh (foreground_wait_count
+        // moved), or job control live on a terminal (under a pty
+        // GNU publishes on the very next command — #1612). One
+        // predicate, computed here at the notification point, feeds
+        // both the state marks and (via `observe`) the reap side.
+        let foreground_blocked = mark.2 != self.reap_prev_mark.get().2;
         self.reap_prev_mark.set(mark);
         let observe = force_observe || observation_happened;
+        let state_observe = force_observe
+            || foreground_blocked
+            || (crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "monitor")
+                && self.stdin_source_is_terminal());
+        // rubash#1494: apply the ripe kill state marks at the same
+        // per-command boundary that reaps finished children.
+        self.shell_state
+            .job_table
+            .apply_deferred_state_marks(state_observe);
         self.apply_pending_job_completions(observe)?;
         let mut finished = Vec::new();
         for (pid, child) in &mut self.background_children {
@@ -1230,10 +1240,28 @@ impl Executor {
             // and at an observation point a completion applies at once;
             // anything else is stashed until the next observation
             // point (see the waitchld-lag note above).
-            if observe || self.shell_state.coproc_names.contains_key(&pid) {
+            //
+            // rubash#1604: one exception to "applies at once" — a job
+            // the shell's OWN kill fatally signalled during this same
+            // reader command. GNU's wait_for reaps such a job itself
+            // when a `wait` follows, and a waited-for job's death
+            // notice is suppressed (jobs.c wait_for/notify); if this
+            // incidental sweep applies the completion first, the
+            // notice is queued outside the wait and escapes raw —
+            // even past `wait $p 2>/dev/null` — whenever the zombie
+            // happens to be ready this early (~1/6 of runs). Stash
+            // it instead; a wait/fg observed refresh (force_observe)
+            // still applies it inside the wait, where the notice
+            // drains through the wait's own fd 2.
+            let fresh_fatal = !force_observe
+                && term_signal.is_some()
+                && !self.shell_state.coproc_names.contains_key(&pid)
+                && self.shell_state.job_table.take_fresh_fatal(pid);
+            if !fresh_fatal && (observe || self.shell_state.coproc_names.contains_key(&pid)) {
                 self.apply_job_completion(pid, status, term_signal)?;
             } else {
-                self.pending_job_completions.push((pid, status, term_signal));
+                self.pending_job_completions
+                    .push((pid, status, term_signal));
             }
         }
         Ok(())
@@ -2581,13 +2609,9 @@ impl Executor {
         // a session history on demand so the builtin can read/list —
         // but only when no host provider is installed: an installed
         // provider IS the history list (the host owns interactive
-        // history), so an auto-created empty session must not shadow it.
-        if self.shell_state.session_history.is_none() && self.history_provider.is_none() {
-            let session = std::rc::Rc::new(std::cell::RefCell::new(
-                crate::history::SessionHistory::new(),
-            ));
-            self.set_session_history(Some(session));
-        }
+        // history), so an auto-created empty session must not shadow
+        // it (Executor::ensure_session_history owns the rule).
+        self.ensure_session_history();
         if let Some(session) = self.shell_state.session_history.clone() {
             // The shell's own session history (scripts that ran
             // "set -o history") takes precedence over the host provider.
@@ -2792,21 +2816,33 @@ impl Executor {
             } else {
                 provider.borrow_mut().entries()?
             };
+            let mut surplus = false;
             let status = crate::builtins::history::execute_with_history(
                 args,
                 &self.diagnostic_prefix(),
                 &entries,
                 &mut stdout,
                 &mut stderr,
+                &mut surplus,
             )?;
+            if surplus {
+                // rubash#1660: no_args DISCARD (see history_exec.rs).
+                self.raise_evalerror_abort();
+                self.evalerror_exit_toomany_pending.set(true);
+            }
             self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
             return Ok(status);
         }
-        let status = crate::builtins::history::execute_with_io(
+        let (status, surplus) = crate::builtins::history::execute_with_io(
             args,
             &self.diagnostic_prefix(),
             &mut stderr,
         )?;
+        if surplus {
+            // rubash#1660: no_args DISCARD (see history_exec.rs).
+            self.raise_evalerror_abort();
+            self.evalerror_exit_toomany_pending.set(true);
+        }
         self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
         Ok(status)
     }

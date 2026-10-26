@@ -49,12 +49,54 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<bool, ExecuteError> {
+        if let Some(error) = self.redirect_setup_open_error(cmd)? {
+            let mut line = Vec::new();
+            let _ = writeln!(
+                &mut line,
+                "{}{}",
+                self.diagnostic_prefix(),
+                crate::posix_errors::message(&error)
+            );
+            let _ = self.write_redirect_diagnostic_routed(cmd, &line);
+            self.exit_code = 1;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// The open walk behind apply_redirect_setup_side_effects, minus the
+    /// diagnostic: returns the first failed open's error (already in the
+    /// `<target>: <strerror>` path_error shape the printing caller
+    /// renders) or None when every plain entry opened. Callers that own
+    /// a different failure channel — the no-output builtin pass, whose
+    /// fd 0/1/2 failures travel as ExecuteError::IoError — use this form
+    /// so an fd>=3 failure stays indistinguishable from a mirror-field
+    /// failure (rubash#1665).
+    fn redirect_setup_open_error(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<Option<io::Error>, ExecuteError> {
         use crate::parser::RedirectKind;
         for redirect in &cmd.redirects {
             if redirect.fd_var.is_some()
                 || crate::executor::support_names::is_injected_group_redirect(redirect)
             {
                 continue;
+            }
+            // Only the open-performing kinds consult a filesystem target
+            // here; heredoc / herestring / dup kinds name no path, so
+            // expanding their target word would be a side effect of its
+            // own (GNU never expands a heredoc delimiter at redirect
+            // time either).
+            match redirect.kind {
+                RedirectKind::Output
+                | RedirectKind::ClobberOutput
+                | RedirectKind::CombinedOutput
+                | RedirectKind::Append
+                | RedirectKind::CombinedAppend
+                | RedirectKind::Input
+                | RedirectKind::ReadWrite => {}
+                _ => continue,
             }
             let target = self.expand_redirect_target(redirect);
             // A plain file target is the only shape this walk opens:
@@ -104,19 +146,10 @@ impl Executor {
                 _ => continue,
             };
             if let Err(error) = opened {
-                let mut line = Vec::new();
-                let _ = writeln!(
-                    &mut line,
-                    "{}{}",
-                    self.diagnostic_prefix(),
-                    crate::posix_errors::message(&error)
-                );
-                let _ = self.write_redirect_diagnostic_routed(cmd, &line);
-                self.exit_code = 1;
-                return Ok(true);
+                return Ok(Some(error));
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     pub(in crate::executor) fn write_builtin_not_found(
@@ -151,6 +184,25 @@ impl Executor {
         // redir_varassign); the conditional and empty-words paths invoke it
         // before calling here. This helper only sees commands whose fd_var
         // redirects are already applied, so it must not re-apply them.
+        //
+        // GNU redir.c do_redirections (redir.c:260
+        // do_redirection_internal) performs every redirect of a simple
+        // command before the body runs, but the mirror fields below only
+        // carry fds 0/1/2 — the fd>=3 entries in cmd.redirects never got
+        // their open (rubash#1665: `true 3>f` created nothing and a bad
+        // target failed silently). Run the same open walk the read /
+        // external-file paths use, FIRST, so list order decides which
+        // failure is fatal: an earlier entry's side effect stands and a
+        // later entry is never opened. The walk's opens of the fd 0/1/2
+        // entries are repeated by the mirror code below; a repeated
+        // truncate/probe is unobservable, and redirect targets are
+        // memoized per command, so no expansion runs twice. The error is
+        // already path_error-shaped, so it joins the IoError channel the
+        // mirror failures use and every caller renders and marks it
+        // exactly like an fd 0/1/2 failure.
+        if let Some(error) = self.redirect_setup_open_error(cmd)? {
+            return Err(ExecuteError::IoError(error));
+        }
         let redirect_failed = false;
 
         if let Some(redirect) = &cmd.redirect_in {

@@ -122,8 +122,9 @@ impl Executor {
         raw: &str,
         target: &str,
     ) -> bool {
+        let extglob = crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "extglob");
         if !target.chars().any(char::is_whitespace) {
-            return redirect_target_is_ambiguous(raw, target);
+            return redirect_target_is_ambiguous(raw, target, extglob);
         }
         let posix_nosplit = self.posix_mode_enabled()
             && !self
@@ -142,7 +143,7 @@ impl Executor {
                 return false;
             }
         }
-        redirect_target_is_ambiguous(raw, target)
+        redirect_target_is_ambiguous(raw, target, extglob)
     }
 
     pub(crate) fn expand_redirect_target(&self, redirect: &crate::parser::Redirect) -> String {

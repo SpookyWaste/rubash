@@ -164,7 +164,29 @@ impl Executor {
                         // status is the signal death 128+sig, like GNU
                         // reaping a real sleep killed the same way.
                         match self.sleep_interruptibly(seconds)? {
-                            Some(signal) => self.exit_code = 128 + signal,
+                            Some(signal) => {
+                                self.exit_code = 128 + signal;
+                                // rubash#1639: an UNTRAPPED SIGINT abort
+                                // of the virtual child is GNU's foreground
+                                // job dying by SIGINT with the shell
+                                // receiving the same terminal delivery —
+                                // wait_for throws and the rest of the line
+                                // is discarded. A trapped SIGINT already
+                                // ran its action inside sleep_interruptibly
+                                // and the list continues, so only the
+                                // no-trap case marks the discard.
+                                #[cfg(unix)]
+                                if signal == libc::SIGINT
+                                    && self.interactive_reader_session()
+                                    && crate::builtins::trap::get_trap_action(
+                                        &self.shell_state.env_vars,
+                                        "INT",
+                                    )
+                                    .is_none()
+                                {
+                                    self.fg_sigint_unwind = true;
+                                }
+                            }
                             None => self.exit_code = 0,
                         }
                     } else {

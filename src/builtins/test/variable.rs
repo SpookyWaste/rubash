@@ -123,6 +123,7 @@ fn dynamic_parameter_is_set(name: &str, env_vars: &crate::shell::var_table::VarT
         name,
         "EPOCHSECONDS"
             | "EPOCHREALTIME"
+            | "BASH_MONOSECONDS"
             | "SECONDS"
             | "RANDOM"
             | "SRANDOM"

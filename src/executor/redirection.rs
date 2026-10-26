@@ -1288,7 +1288,14 @@ impl Executor {
                         state.redirect_failed = true;
                         return Ok(true);
                     }
-                    if redirect_target_is_ambiguous(&redirect.target_metadata.raw, &target) {
+                    if redirect_target_is_ambiguous(
+                        &redirect.target_metadata.raw,
+                        &target,
+                        crate::builtins::shopt::option_enabled(
+                            &self.shell_state.env_vars,
+                            "extglob",
+                        ),
+                    ) {
                         self.write_ambiguous_redirect_diagnostic(
                             state,
                             &redirect.target_metadata.raw,

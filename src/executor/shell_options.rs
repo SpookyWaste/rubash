@@ -251,6 +251,20 @@ impl Executor {
             Some(FdReadEndpoint::File(file_fd)) => crate::fd::duplicate_handle(file_fd.handle)
                 .map(crate::fd::handle_to_file)
                 .map_err(|e| crate::posix_errors::path_error(&file_fd.path.to_string_lossy(), e)),
+            // rubash#1659: a coproc pipe read end is handle-backed
+            // exactly like a file (its FileFd carries the pipe
+            // handle); every sibling reader (read_all_bytes,
+            // take_buffered_input_line, inherited_async_stdin)
+            // already serves it, but this helper dropped it to
+            // Bad file descriptor — so mapfile's `<&${COPROC[0]}`
+            // string channel failed and fell through to reading
+            // inherited process stdin (a hang on a held-open
+            // pipe, or 0 lines on /dev/null).
+            Some(FdReadEndpoint::CoprocStdout { fd: file_fd, .. }) => {
+                crate::fd::duplicate_handle(file_fd.handle)
+                    .map(crate::fd::handle_to_file)
+                    .map_err(|e| crate::posix_errors::path_error(&file_fd.path.to_string_lossy(), e))
+            }
             Some(FdReadEndpoint::Text(_)) | Some(FdReadEndpoint::ProcessSubstitution(_)) => {
                 let bytes = self
                     .virtual_fd_stdin_remaining_bytes(fd)
@@ -284,7 +298,10 @@ impl Executor {
     /// body reads FUNCTION_STDIN — pipe content in GNU terms
     /// (execute_cmd.c execute_pipeline binds the pipe to fd 0) — never the
     /// terminal, whatever the process stdin happens to be.
-    fn stdin_source_is_terminal(&self) -> bool {
+    // pub(in crate::executor): the jobs refresh (job_builtins.rs)
+    // also consults it — job control live on a terminal is one of
+    // GNU's state-publication events (rubash#1612).
+    pub(in crate::executor) fn stdin_source_is_terminal(&self) -> bool {
         if self.shell_state.env_vars.contains_key(FUNCTION_STDIN) {
             return false;
         }
@@ -1141,6 +1158,28 @@ impl Executor {
         Some(input[offset..].to_string())
     }
 
+    /// rubash#1651: the winning fd-0 stdin body for a coproc child,
+    /// if the winning redirect is memory-backed (here-string or
+    /// heredoc). Same ordering as stdin_string_for_command_mut
+    /// (GNU redir.c do_redirections: the last fd-0 input redirect
+    /// wins); file and dup winners return None so their existing
+    /// paths stay untouched. The mut variant matters: its
+    /// here-string expansion strips quotes segment-wise
+    /// (expand_here_string_mut), while the read-only fallback
+    /// leaves them (`coproc cat <<< "hello"` fed `"hello"`
+    /// with quotes). For a well-formed body the mut variant
+    /// returns from the body branches before its FUNCTION_STDIN
+    /// drain tail, so the drain never fires here.
+    pub(crate) fn coproc_stdin_body(&mut self, cmd: &CommandNode) -> Option<String> {
+        match fd0_stdin_redirect_winner(cmd) {
+            Some(crate::parser::RedirectKind::HereDoc)
+            | Some(crate::parser::RedirectKind::HereString) => {
+                self.stdin_string_for_command_mut(cmd)
+            }
+            _ => None,
+        }
+    }
+
     pub(in crate::executor) fn stdin_string_for_command_mut(
         &mut self,
         cmd: &CommandNode,
@@ -1529,6 +1568,25 @@ impl Executor {
         };
         input.push('\n');
         Some(input)
+    }
+
+    /// rubash#1642: the stdin text `source /dev/stdin` must read for a
+    /// command — GNU source.def opens /dev/stdin, a dup of fd 0, so the
+    /// bytes are whatever fd 0 is bound to for this command (its own
+    /// `< file` / `<<<` / `<<EOF` redirections, an enclosing scope's fd-0
+    /// binding, or the pipeline stage buffer), resolved by the same
+    /// ladder every other stdin consumer uses. None when no channel
+    /// binds stdin (plain inherited process stdin).
+    pub(crate) fn command_stdin_text(&self, cmd: &CommandNode) -> Option<String> {
+        self.stdin_string_for_command(cmd)
+    }
+
+    /// rubash#1642: whether the command carries its own fd-0 input
+    /// redirection. When it does but resolves to no text (missing file,
+    /// closed fd), `source /dev/stdin` must source nothing rather than
+    /// fall through to a process stdin GNU never consults for it.
+    pub(crate) fn command_has_fd0_input_redirect(&self, cmd: &CommandNode) -> bool {
+        fd0_stdin_redirect_winner(cmd).is_some()
     }
 }
 

@@ -1737,6 +1737,7 @@ impl Executor {
             // always exits its own frame, so a live parent cannot carry it).
             exec_replaced: false,
             subshell_signal_death: None,
+            fg_sigint_unwind: false,
             // rubash#1175: a fork copy shares the parent shell's process;
             // it must never execve that process away.
             owns_process_image: false,
