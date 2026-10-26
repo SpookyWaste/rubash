@@ -116,7 +116,6 @@ fn issue1643_builtin_with_name_still_runs_it() {
 }
 
 #[test]
-#[ignore = "adjacent gap: the shared no-output redirect helper walks only the stdio fields, so numbered-fd redirects (3>) are not performed for bare `builtin` — nor for `:`; GNU creates the file for both"]
 fn issue1643_bare_builtin_numbered_fd_redirect_known_gap() {
     let dir = tempdir("fd3");
     let run = rubash_c(
