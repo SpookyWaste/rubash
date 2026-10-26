@@ -42,6 +42,17 @@ pub(super) fn parse_coproc_command(tokens: &[Token], start: usize) -> Option<(Co
         }
     }
 
+    // GNU parse.y: the coproc operand is a shell_command or a
+    // simple_command — neither can begin with the pipeline-level `!'
+    // (BANG belongs to pipeline grammar, and a coproc is not a
+    // pipeline), so `coproc ! ...` and `coproc NAME ! ...` are syntax
+    // errors, not negated coprocs (rubash#1652). The `!' used to fall
+    // into the simple-command word collection below and reach the
+    // respawned child, which quietly executed it as a negation.
+    if is_keyword(tokens, i, "!") {
+        return Some((coproc_bang_error_node(tokens, start), i + 1));
+    }
+
     // Parse the body
     if let Some(token) = tokens.get(i) {
         // Brace group body (single token from lexer)
@@ -154,14 +165,43 @@ pub(super) fn parse_coproc_command(tokens: &[Token], start: usize) -> Option<(Co
     }
 
     // Simple command: collect remaining tokens as words
-    let mut words = Vec::new();
+    let mut words: Vec<String> = Vec::new();
     let mut word_metadata = Vec::new();
     while i < tokens.len() {
+        // rubash#1652 (cont.): a standalone `!' directly after the
+        // command-name word is the same grammar error as in operand
+        // position — GNU's lexer still returns BANG there, and the
+        // coproc productions have no slot for it (`coproc echo ! hi'
+        // and `coproc NC ! echo hi' both exit 2 under GNU). Once an
+        // assignment prefix or a second word intervenes, `!' is an
+        // ordinary argument word (`coproc x=1 ! echo hi',
+        // `coproc echo a ! hi' both run), so the check is exactly:
+        // one collected word, and it is not an assignment.
+        if is_keyword(tokens, i, "!")
+            && words.len() == 1
+            && !coproc_word_is_assignment(words[0].as_str())
+        {
+            return Some((coproc_bang_error_node(tokens, start), i + 1));
+        }
         if let Some((word, next_i)) = collect_compound_or_keyword_word_value(tokens, i) {
             let raw = if next_i == i + 1 {
                 tokens[i].raw.as_str()
             } else {
                 word.as_str()
+            };
+            // rubash#1653: a leading `time` KEYWORD token is the simple
+            // command's first word (see parse_coproc_compound_body), not
+            // a prefix. The coproc body is respawned from the words'
+            // source text, where a bare `time` would regain keyword
+            // status and never report `time: command not found`; the
+            // quoted raw keeps it a plain command name in the child.
+            let raw = if words.is_empty()
+                && tokens[i].kind == TokenKind::Keyword
+                && tokens[i].value == "time"
+            {
+                "'time'"
+            } else {
+                raw
             };
             word_metadata.push(build_word_metadata(words.len(), &word, raw));
             words.push(word);
@@ -245,6 +285,44 @@ fn coproc_command(
 
 fn synthetic_delimiter_metadata(delimiter: &str) -> Box<WordMetadata> {
     Box::new(build_word_metadata(0, delimiter, delimiter))
+}
+
+/// The parse-error marker node for a `!' the coproc grammar cannot
+/// place (rubash#1652); rendered by the executor as
+/// `syntax error near unexpected token `!'' with exit status 2.
+fn coproc_bang_error_node(tokens: &[Token], start: usize) -> CommandNode {
+    let mut command = CommandNode::new();
+    command.line = tokens.get(start).map(|t| t.position);
+    command.logical_line = tokens.get(start).map(|t| t.logical_line);
+    command.insert_assignment(
+        "__RUBASH_PARSE_ERROR__".to_string(),
+        "unexpected token `!'".to_string(),
+    );
+    command
+}
+
+/// GNU assignment-word shape at the head of a simple command: a name
+/// (`[A-Za-z_][A-Za-z0-9_]*`, optionally with a `[...]` subscript)
+/// followed by `=` or `+=`.
+fn coproc_word_is_assignment(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    let mut i = 0;
+    if i >= bytes.len() || !(bytes[i] == b'_' || bytes[i].is_ascii_alphabetic()) {
+        return false;
+    }
+    while i < bytes.len() && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b'[' {
+        match word[i..].find(']') {
+            Some(close) => i += close + 1,
+            None => return false,
+        }
+    }
+    if i < bytes.len() && bytes[i] == b'+' {
+        i += 1;
+    }
+    i < bytes.len() && bytes[i] == b'='
 }
 
 fn is_coproc_shell_command_start(tokens: &[Token], index: usize) -> bool {

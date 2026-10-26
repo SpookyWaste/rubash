@@ -717,6 +717,40 @@ fn issue1625_named_coproc_brace_body_in_then_clause_inside_group() {
 }
 
 #[test]
+fn issue1652_coproc_bang_prefix_is_a_syntax_error() {
+    // GNU: `!` after coproc is a syntax error (parse.y has no coproc
+    // production for it); rubash silently dropped the negation.
+    let output = rubash_command()
+        .arg("-c")
+        .arg("coproc ! echo hi")
+        .output()
+        .expect("run rubash");
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("syntax error near unexpected token `!'"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn issue1652_named_coproc_bang_is_a_syntax_error() {
+    let output = rubash_command()
+        .arg("-c")
+        .arg("coproc NC ! echo hi")
+        .output()
+        .expect("run rubash");
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("syntax error near unexpected token `!'"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn typed_cell_stays_consistent_across_builtin_writes() {
     // Typed-cell reads must agree with the mirror after every kind of
     // write: plain/compound/append element writes, declare/typeset/local,
