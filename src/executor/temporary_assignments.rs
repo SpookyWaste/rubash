@@ -1606,6 +1606,7 @@ impl Executor {
                             integer,
                             self.shell_state.env_vars.get("IFS").map(String::as_str),
                             &self.shell_state.env_vars,
+                            &self.shell_state.cwd,
                         ) {
                             Ok(outcome) => render_indexed_outcome(&current, outcome),
                             Err(_) => current,
@@ -1709,6 +1710,7 @@ impl Executor {
                     is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name),
                     self.shell_state.env_vars.get("IFS").map(String::as_str),
                     &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
                 ) {
                     Ok(outcome) => {
                         element_values_converted = true;
@@ -1858,6 +1860,7 @@ impl Executor {
                 is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name),
                 self.shell_state.env_vars.get("IFS").map(String::as_str),
                 &self.shell_state.env_vars,
+                &self.shell_state.cwd,
             ) {
                 Ok(outcome) => {
                     element_values_converted = true;

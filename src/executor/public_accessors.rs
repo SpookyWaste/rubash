@@ -647,6 +647,16 @@ impl Executor {
             .env_vars
             .insert(name.to_string(), value.clone());
         if is_valid_process_env(name, &value) {
+            // G-03: a host-directed write is this lineage's mirror write
+            // and must be journaled exactly like remove_env's — set_env
+            // is called between runs, when no journal is on the stack,
+            // so without the push the write escaped the journal and
+            // leaked past Drop into every later Executor in the process
+            // (the __RUBASH_IS_C / __RUBASH_INTERACTIVE protocol markers
+            // are the observed case: a sibling session's markers became
+            // a later session's invocation context at Executor::new's
+            // process-env import).
+            let _journal = push_env_journal(&self.env_write_journal);
             set_process_env(name, &value);
         }
         // Keep the shell-variable view in sync with the environment mirror.
@@ -745,7 +755,10 @@ impl Executor {
 
     pub fn remove_env(&mut self, name: &str) {
         self.shell_state.env_vars.remove(name);
-        env::remove_var(name);
+        // G-03: a host-directed removal is still this lineage's
+        // mirror write — journal it so Drop treats it like any other.
+        let _journal = push_env_journal(&self.env_write_journal);
+        mirror_env_remove(name);
     }
 
     pub fn get_env(&self, name: &str) -> Option<&str> {
@@ -935,16 +948,17 @@ impl Executor {
             return self.call_function_inner(name, args, temporary_env);
         }
 
-        let _guard = EXECUTION_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let original_dir = env::current_dir().ok();
+        // G-01: no whole-call lock hold anymore (see execute_ast).
+        // G-02: the pre-call cwd restore now targets the session cwd field
+        // (formerly the process cwd). The $PWD variable is deliberately
+        // NOT restored, preserving the pre-G-02 observable shape.
+        let original_cwd = self.shell_state.cwd.clone();
         EXECUTION_LOCK_DEPTH.with(|depth| depth.set(1));
+        // G-03: journal this call's mirror writes to this executor.
+        let _env_journal_guard = push_env_journal(&self.env_write_journal);
         let result = self.call_function_inner(name, args, temporary_env);
         EXECUTION_LOCK_DEPTH.with(|depth| depth.set(0));
-        if let Some(original_dir) = original_dir {
-            let _ = env::set_current_dir(original_dir);
-        }
+        self.shell_state.cwd = original_cwd;
         result
     }
 
@@ -1033,7 +1047,8 @@ impl Executor {
         let old_names: Vec<String> = self.shell_state.env_vars.keys().cloned().collect();
         for name in old_names {
             if !saved_env.contains_key(&name) {
-                env::remove_var(&name);
+                // G-03: journal the removal as this lineage's write.
+                mirror_env_remove(&name);
             }
         }
 
@@ -1052,7 +1067,7 @@ impl Executor {
             if is_valid_process_env(name, value) {
                 set_process_env(name, value);
             } else {
-                env::remove_var(name);
+                mirror_env_remove(name);
             }
         }
 
@@ -1063,13 +1078,14 @@ impl Executor {
     /// state is the pre-entry ShellState clone — restore it wholesale so
     /// every semantic field (aliases, functions, scopes, positional params,
     /// env-carried traps, job bookkeeping) returns to the parent value.
-    /// Process env and cwd are shared in-place resources, so they resync
+    /// The process env is a shared in-place resource, so it resyncs
     /// separately: restore_shell_env must run before the swap because it
-    /// diffs the child's env_vars against the saved map.
+    /// diffs the child's env_vars against the saved map. The cwd needs no
+    /// separate resync since G-02: it is a ShellState field and rides the
+    /// wholesale swap.
     pub(in crate::executor) fn restore_flat_subshell(
         &mut self,
         saved_state: crate::shell::ShellState,
-        saved_cwd: Option<PathBuf>,
     ) {
         // Every caller is a fork boundary (flat `( )` regions and
         // command-substitution children): the region's descriptor copies
@@ -1079,9 +1095,6 @@ impl Executor {
         self.flush_region_owned_output_process_substitutions(&saved_state.env_vars);
         self.restore_shell_env(saved_state.env_vars.clone());
         self.shell_state = saved_state;
-        if let Some(dir) = saved_cwd {
-            let _ = env::set_current_dir(dir);
-        }
     }
 
     pub fn aliases_snapshot(&self) -> HashMap<String, String> {
@@ -1119,6 +1132,13 @@ impl Executor {
             }
         }
         snapshot
+    }
+
+    /// G-02: the session's current working directory (physical form).
+    /// cd/pushd/popd move this field only; the process cwd is never a
+    /// session-semantics source.
+    pub fn session_cwd(&self) -> &std::path::Path {
+        &self.shell_state.cwd
     }
 
     pub fn env_vars(&self) -> &HashMap<String, String> {
@@ -2485,34 +2505,45 @@ impl Drop for Executor {
         // startup21: the process-env restore models an in-process child
         // leaving its parent's env untouched (rubash#182). The process-exit
         // executor's process dies with this drop — nothing can observe its
-        // environment afterward — so the diff + ~one putenv per startup
-        // variable (~0.45ms) is skipped there.
+        // environment afterward — so the restore is skipped there.
         if self.is_process_exit_executor {
             return;
         }
-        let current_names: Vec<String> = env::vars().map(|(name, _)| name).collect();
-        for name in current_names {
-            if !self.process_env_snapshot.contains_key(&name) {
-                env::remove_var(name);
-            }
-        }
-
-        for (name, value) in &self.process_env_snapshot {
-            // A fork-time snapshot restore is not an assignment mirror, so
-            // the #916 special-name gate in set_process_env must not apply:
-            // a comsub child that unbound an ordinary inherited name
-            // removed the real process-env copy (unset_process_env removes
-            // it now — rubash#917), and the parent's copy must come back
-            // exactly as the snapshot recorded it. TMPDIR keeps its
-            // pre-#916 exclusion (never mirrored, so leave it alone rather
-            // than restoring or removing it).
+        // G-03: the restore is scoped to this executor lineage's own
+        // process-env mirror writes (env_write_journal). The pre-G-03
+        // restore rolled EVERY name back to the birth snapshot — including
+        // names a still-live sibling session wrote after this executor was
+        // born, so the first session to Drop silently un-wrote the other
+        // sessions' variables. A journaled key returns to its snapshot
+        // state only when the current process value still equals the
+        // journal's final written state (no other writer has touched it
+        // since); otherwise the live owner's value stands. A fork-time
+        // snapshot restore is not an assignment mirror, so the #916
+        // special-name gate in set_process_env must not apply here
+        // (rubash#917). TMPDIR keeps its pre-#916 exclusion (never
+        // mirrored, so leave it alone rather than restoring or removing).
+        let journal = self.env_write_journal.borrow();
+        // G-01: the whole compare-and-restore sequence is one
+        // process-state critical section — a sibling's funnel write
+        // must not interleave between the compare and the restore.
+        let _process_state = crate::executor::local_helpers::acquire_process_state();
+        for (name, final_state) in journal.iter() {
             if name == "TMPDIR" {
                 continue;
             }
-            if is_valid_process_env(name, value) {
-                env::set_var(name, value);
-            } else {
-                env::remove_var(name);
+            let current = env::var_os(name).and_then(|value| value.into_string().ok());
+            if current.as_deref() != final_state.as_deref() {
+                continue;
+            }
+            match self.process_env_snapshot.get(name) {
+                Some(value) => {
+                    if is_valid_process_env(name, value) {
+                        env::set_var(name, value);
+                    } else {
+                        env::remove_var(name);
+                    }
+                }
+                None => env::remove_var(name),
             }
         }
     }

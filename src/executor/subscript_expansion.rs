@@ -1298,7 +1298,11 @@ impl Executor {
             // removal on the stored value).
             if compound_element_word_has_no_expansion(token) {
                 let glob_word = crate::executor::glob::compound_element_glob_pattern(token);
-                match super::glob::pathname_expand_word(&glob_word, &self.shell_state.env_vars) {
+                match super::glob::pathname_expand_word(
+                    &glob_word,
+                    &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
+                ) {
                     super::glob::PathnameExpansion::Matches(matches) => {
                         for value in matches {
                             elements.push(format!(
@@ -1353,20 +1357,23 @@ impl Executor {
                 continue;
             }
             for field in self.expand_alternate_word_fragment(token) {
-                let fields =
-                    match super::glob::pathname_expand_word(&field, &self.shell_state.env_vars) {
-                        super::glob::PathnameExpansion::Matches(matches) => matches,
-                        super::glob::PathnameExpansion::NoMatch => vec![field],
-                        super::glob::PathnameExpansion::Fail(pattern) => {
-                            self.report_failglob(&pattern);
-                            // rubash#753: same failglob-class arming as the
-                            // alternate-word arm above — the declare caller
-                            // must fail the operand, not bind the partial.
-                            self.raise_evalerror_abort();
-                            self.evalerror_failglob_pending.set(true);
-                            return Err(format!("({})", elements.join(" ")));
-                        }
-                    };
+                let fields = match super::glob::pathname_expand_word(
+                    &field,
+                    &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
+                ) {
+                    super::glob::PathnameExpansion::Matches(matches) => matches,
+                    super::glob::PathnameExpansion::NoMatch => vec![field],
+                    super::glob::PathnameExpansion::Fail(pattern) => {
+                        self.report_failglob(&pattern);
+                        // rubash#753: same failglob-class arming as the
+                        // alternate-word arm above — the declare caller
+                        // must fail the operand, not bind the partial.
+                        self.raise_evalerror_abort();
+                        self.evalerror_failglob_pending.set(true);
+                        return Err(format!("({})", elements.join(" ")));
+                    }
+                };
                 for field in fields {
                     // \x10 marks the field as a word-expansion product so the
                     // storage layer stores it bare even when it looks like a

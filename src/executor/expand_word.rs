@@ -363,7 +363,11 @@ impl Executor {
             // the literal filename.
             return (redirect_operand_literal(&expanded), false);
         }
-        match glob::pathname_expand_word(&expanded, &self.shell_state.env_vars) {
+        match glob::pathname_expand_word(
+            &expanded,
+            &self.shell_state.env_vars,
+            &self.shell_state.cwd,
+        ) {
             // Multiple matches are multiple fields (`> $multi` where the
             // value globs to two files, or a literal `> amb*` with two
             // matches): joined for the ambiguity gate, GNU reports

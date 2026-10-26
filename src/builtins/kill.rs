@@ -2897,6 +2897,11 @@ pub fn reconcile_kernel_trap_dispositions(env_vars: &std::collections::HashMap<S
     {
         return;
     }
+    // G-01: the slow path mutates process-wide kernel dispositions —
+    // serialize it against sibling sessions' reconciles and env
+    // mirror writes. The fast path above reads only atomics and
+    // stays lock-free.
+    let _process_state = crate::executor::local_helpers::acquire_process_state();
     let reset = env_vars
         .get("__RUBASH_TRAP_RESET")
         .map(|value| value.as_str())

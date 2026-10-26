@@ -568,10 +568,10 @@ impl Executor {
             // niubash#177: same operand resolution as open_input_redirect —
             // a virtual-root input operand may exist only under its `.exe`
             // spelling on disk.
-            let path = crate::executor::path::windows_operand_file_path(
+            let path = self.session_path(crate::executor::path::windows_operand_file_path(
                 shell_path_to_windows(&expanded_target, &self.shell_state.env_vars),
                 &self.shell_state.env_vars,
-            );
+            ));
             if redirect.append {
                 let _ = OpenOptions::new()
                     .create(true)
@@ -1078,7 +1078,8 @@ impl Executor {
             return None;
         }
 
-        let saved_dir = env::current_dir().ok();
+        // G-02: no process-cwd save/restore — the procsub subshell is a
+        // clone with its own session cwd field.
         let mut subshell = self.command_substitution_executor();
         // GNU subst.c:6618 runs the process-substitution body through
         // parse_and_execute ("process substitution") → evalstring.c:348
@@ -1131,10 +1132,6 @@ impl Executor {
         // output form keeps its placeholder live: with /dev/fd pipes the
         // child outlives the command.)
         self.reap_procsub_placeholder(pid, true);
-
-        if let Some(saved_dir) = saved_dir {
-            let _ = env::set_current_dir(saved_dir);
-        }
 
         match result {
             Ok(())

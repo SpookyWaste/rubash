@@ -3877,7 +3877,8 @@ impl Executor {
         ] {
             self.shell_state.env_vars.remove(name);
             self.shell_state.variables.remove(name);
-            env::remove_var(name);
+            // G-03: journal the completion-state cleanup removal.
+            crate::executor::local_helpers::mirror_env_remove(name);
         }
     }
 }

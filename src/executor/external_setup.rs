@@ -256,7 +256,8 @@ impl Executor {
                 return Ok(());
             }
             let file = if redirect.append {
-                let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
+                let path =
+                    self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars));
                 // niubash#519: CON has no read+write handle; a child's fd 0
                 // only needs the console input half (FileFd::
                 // open_readwrite_pair splits the fd-table binds).
@@ -1202,6 +1203,7 @@ impl Executor {
             .stdin(Stdio::piped())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
+        process.current_dir(&self.shell_state.cwd);
         suppress_orphan_console(&mut process);
         let mut child = process.spawn()?;
         let pid = child.id();
@@ -1409,10 +1411,10 @@ impl Executor {
             let fallback = std::env::temp_dir();
             if Self::dir_usable_for_scratch(&fallback) {
                 dir = fallback;
-            } else if let Ok(cwd) = std::env::current_dir() {
-                dir = cwd;
             } else {
-                fs::create_dir_all(&dir)?;
+                // G-02: "the shell cwd" (the pre-G-02 code's last-resort
+                // process cwd) is the session cwd field.
+                dir = self.shell_state.cwd.clone();
             }
         }
         let nanos = SystemTime::now()

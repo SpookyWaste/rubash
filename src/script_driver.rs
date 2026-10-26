@@ -3467,12 +3467,15 @@ fn bind_lines_columns(executor: &mut Executor, lines: i32, columns: i32) {
         .shell_state
         .env_vars
         .insert("COLUMNS".to_string(), columns.to_string());
-    if std::env::var_os("LINES").is_some() {
-        std::env::set_var("LINES", lines.to_string());
-    }
-    if std::env::var_os("COLUMNS").is_some() {
-        std::env::set_var("COLUMNS", columns.to_string());
-    }
+    // G-01: winsize sync writes the process env — serialize it.
+    crate::executor::local_helpers::with_process_state_lock(|| {
+        if std::env::var_os("LINES").is_some() {
+            std::env::set_var("LINES", lines.to_string());
+        }
+        if std::env::var_os("COLUMNS").is_some() {
+            std::env::set_var("COLUMNS", columns.to_string());
+        }
+    });
 }
 
 /// jobs.c:2618 get_tty_state -> jobs.c:2647-2648 `if (check_window_size)

@@ -681,7 +681,21 @@ fn fd_pipe_test(
 }
 
 fn test_path(operand: &str, env_vars: &crate::shell::var_table::VarTable) -> std::path::PathBuf {
-    crate::executor::path::shell_path_to_windows_for_lookup(operand, env_vars)
+    let path = crate::executor::path::shell_path_to_windows_for_lookup(operand, env_vars);
+    if path.is_absolute() {
+        return path;
+    }
+    // G-02: relative operands anchor at the session cwd, whose logical
+    // display form is $PWD (the cd family keeps the variable and the
+    // ShellState.cwd field in sync; before G-02 the process cwd resolved
+    // them). The one documented exception is call_function_owned's
+    // field-only cwd restore, where $PWD keeps the function's value.
+    match env_vars.get("PWD") {
+        Some(pwd) => {
+            crate::executor::path::shell_path_to_windows_for_lookup(pwd, env_vars).join(path)
+        }
+        None => path,
+    }
 }
 
 fn marked_vars(env_vars: &crate::shell::var_table::VarTable, key: &str) -> Vec<String> {

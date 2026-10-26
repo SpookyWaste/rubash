@@ -834,20 +834,26 @@ pub fn sync_process_locale(env_vars: &std::collections::HashMap<String, String>)
     // rubash#1531: the full watcher family (GNU variables.c special_vars
     // binds every LC_* category plus LANG to sv_locale), not only the
     // collate/ctype subset the #1512 fix needed.
-    for name in [
-        "LC_ALL",
-        "LC_CTYPE",
-        "LC_COLLATE",
-        "LC_MESSAGES",
-        "LC_NUMERIC",
-        "LC_TIME",
-        "LANG",
-    ] {
-        match env_vars.get(name) {
-            Some(value) => std::env::set_var(name, value),
-            None => std::env::remove_var(name),
+    // G-01: the locale process-env sync is a process-global write —
+    // serialize it. It is deliberately NOT journaled (G-03): locale
+    // state is process-wide by C-library nature, and per-session
+    // locale isolation is WP-3 territory (see ms-stopbleed REPORT).
+    crate::executor::local_helpers::with_process_state_lock(|| {
+        for name in [
+            "LC_ALL",
+            "LC_CTYPE",
+            "LC_COLLATE",
+            "LC_MESSAGES",
+            "LC_NUMERIC",
+            "LC_TIME",
+            "LANG",
+        ] {
+            match env_vars.get(name) {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
         }
-    }
+    });
 }
 
 /// Initialize locale state at shell startup, mirroring GNU shell.c's

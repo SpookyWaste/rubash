@@ -1712,7 +1712,11 @@ impl Executor {
                         .replace(crate::executor::markers::DATA_SQUOTE, "'");
                     words.push(remark(materialized));
                 } else {
-                    match pathname_expand_word(word_text, &self.shell_state.env_vars) {
+                    match pathname_expand_word(
+                        word_text,
+                        &self.shell_state.env_vars,
+                        &self.shell_state.cwd,
+                    ) {
                         PathnameExpansion::Matches(matches) => {
                             words.extend(matches.into_iter().map(|value| {
                                 remark(value.replace(crate::executor::markers::DATA_SQUOTE, "'"))

@@ -38,6 +38,17 @@ pub struct ShellState {
     /// see `var_table`). Kept in sync with `variables` at mutation sites
     /// during the ongoing typed-store migration.
     pub(crate) env_vars: VarTable,
+    /// The session's current working directory, in physical (native)
+    /// form. GNU keeps the cwd in the process (builtins/cd.def cd_builtin
+    /// -> chdir), so a forked child inherits a COPY of it — ShellState
+    /// Clone is this port's fork boundary, and this field rides the
+    /// clone. The PROCESS cwd is not session state (multi-session
+    /// stop-bleed G-02): `cd`/`pushd`/`popd` move only this field, every
+    /// spawn passes it as `Command::current_dir`, and engine-internal
+    /// relative path resolution anchors here. `$PWD` in `env_vars` is
+    /// the logical display twin maintained by the cd family; this field
+    /// is the physical truth the filesystem sees.
+    pub(crate) cwd: std::path::PathBuf,
     /// rubash#618/#616: element writes append one storage segment in O(1)
     /// instead of re-rendering every key, so the storage string accumulates
     /// duplicate segments until the next canonical render folds them. This is
@@ -547,6 +558,7 @@ impl Clone for ShellState {
         Self {
             variables: self.variables.clone(),
             env_vars: self.env_vars.clone(),
+            cwd: self.cwd.clone(),
             array_compact_budget: self.array_compact_budget.clone(),
             aliases: self.aliases.clone(),
             functions: self.functions.clone(),

@@ -58,10 +58,17 @@ impl Executor {
             .replace(Some(crate::locale::locale_name()));
         self.line_lex_locales.borrow_mut().clear();
 
-        let _guard = EXECUTION_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // G-01: EXECUTION_LOCK is no longer held for the whole run.
+        // EXECUTION_LOCK_DEPTH is now only the run-nesting marker (it
+        // still gates the latch resets above); the lock itself lives
+        // at the process-global touch points — see
+        // local_helpers::acquire_process_state.
         EXECUTION_LOCK_DEPTH.with(|depth| depth.set(1));
+        // G-03: attribute this run's process-env mirror writes to this
+        // executor's journal (nested runs on the same executor share the
+        // push; child executors running under this run journal into it as
+        // the same lineage — see local_helpers::push_env_journal).
+        let _env_journal_guard = push_env_journal(&self.env_write_journal);
         let result = self.execute_ast_inner(&ast.commands);
         EXECUTION_LOCK_DEPTH.with(|depth| depth.set(0));
         // rubash#1639: a marked SIGINT discard whose foreground command
@@ -87,8 +94,16 @@ impl Executor {
         // undo fired per interactive LINE and every child spawned by the
         // NEXT line (external ls, sed, ...) saw the stale startup cwd while
         // the shell's own PWD already moved (`cd dir && ls` on one line was
-        // correct, two lines were not). Removing it makes the process cwd
-        // live, like GNU.
+        // correct, two lines were not).
+        //
+        // G-02 (multi-session stopbleed): the #423 invariant survives, but
+        // its carrier changes. The session cwd is now the ShellState.cwd
+        // FIELD: `cd` moves only the field (never the process cwd), every
+        // spawn is stamped current_dir(field), and every relative open
+        // anchors at the field — so the cwd stays live across execute_ast
+        // calls exactly like GNU, while two sessions hosted in one process
+        // no longer share one process cwd. The process cwd is no longer a
+        // session-semantics source at all.
         super::exec_profile::print_summary();
         result
     }
@@ -299,10 +314,10 @@ impl Executor {
         // region runs in place on this executor, so the boundary is the
         // saved ShellState clone — aliases, functions, scopes, positional
         // params, traps (env-carried), job bookkeeping and history all
-        // restore wholesale. The process cwd stays a shared in-place
-        // resource (niubash#100) and is restored separately.
+        // restore wholesale. Since G-02 the cwd is a ShellState field, so
+        // it restores with the clone too (it was a shared in-place process
+        // resource before, niubash#100).
         let mut subshell_state: Option<crate::shell::ShellState> = None;
-        let mut subshell_cwd: Option<PathBuf> = None;
         // The fd table is executor state, outside ShellState: a forked
         // child's descriptor table is a copy, so `( exec 3<&- )` must not
         // close the parent's fd 3. Rc-shared endpoints still alias the same
@@ -348,7 +363,7 @@ impl Executor {
                     self.evalerror_exit_toomany_pending.set(false);
                     self.evalerror_line.set(None);
                     if let Some(saved_state) = subshell_state.take() {
-                        self.restore_flat_subshell(saved_state, subshell_cwd.take());
+                        self.restore_flat_subshell(saved_state);
                         if let Some(saved) = subshell_fd_table.take() {
                             self.fd_table = saved;
                         }
@@ -386,7 +401,7 @@ impl Executor {
                     return Err(ExecuteError::ExitCode(code));
                 }
                 if let Some(saved_state) = subshell_state.take() {
-                    self.restore_flat_subshell(saved_state, subshell_cwd.take());
+                    self.restore_flat_subshell(saved_state);
                     if let Some(saved) = subshell_fd_table.take() {
                         self.fd_table = saved;
                     }
@@ -443,7 +458,7 @@ impl Executor {
                         index += 1;
                     }
                     if let Some(saved_state) = subshell_state.take() {
-                        self.restore_flat_subshell(saved_state, subshell_cwd.take());
+                        self.restore_flat_subshell(saved_state);
                         if let Some(saved) = subshell_fd_table.take() {
                             self.fd_table = saved;
                         }
@@ -590,7 +605,7 @@ impl Executor {
                 if subshell_state.is_some() {
                     if command.subshell_end {
                         if let Some(saved_state) = subshell_state.take() {
-                            self.restore_flat_subshell(saved_state, subshell_cwd.take());
+                            self.restore_flat_subshell(saved_state);
                             if let Some(saved) = subshell_fd_table.take() {
                                 self.fd_table = saved;
                             }
@@ -837,7 +852,7 @@ impl Executor {
                 }
                 if command.subshell_end {
                     if let Some(saved_state) = subshell_state.take() {
-                        self.restore_flat_subshell(saved_state, subshell_cwd.take());
+                        self.restore_flat_subshell(saved_state);
                         if let Some(saved) = subshell_fd_table.take() {
                             self.fd_table = saved;
                         }
@@ -892,7 +907,6 @@ impl Executor {
                 subshell_state = Some(self.shell_state.clone_for_child_save());
                 subshell_fd_table = Some(self.fd_table.clone());
                 subshell_timed_stdin = Some(self.timed_stdin.clone());
-                subshell_cwd = env::current_dir().ok();
                 self.shell_state.loop_depth = 0;
                 // execute_in_subshell resets loop_level (execute_cmd.c:1642):
                 // fork-inherited depth does not cross a `( )` region either.
@@ -2039,7 +2053,7 @@ impl Executor {
                         index += 1;
                     }
                     if let Some(saved_state) = subshell_state.take() {
-                        self.restore_flat_subshell(saved_state, subshell_cwd.take());
+                        self.restore_flat_subshell(saved_state);
                         if let Some(saved) = subshell_fd_table.take() {
                             self.fd_table = saved;
                         }
@@ -2194,7 +2208,7 @@ impl Executor {
                 self.evalerror_exit_toomany_pending.set(false);
                 self.evalerror_line.set(None);
                 if let Some(saved_state) = subshell_state.take() {
-                    self.restore_flat_subshell(saved_state, subshell_cwd.take());
+                    self.restore_flat_subshell(saved_state);
                     if let Some(saved) = subshell_fd_table.take() {
                         self.fd_table = saved;
                     }

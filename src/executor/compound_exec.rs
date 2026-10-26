@@ -614,6 +614,7 @@ impl Executor {
                     process.pre_exec(crate::builtins::kill::child_pre_exec_reset_async);
                 }
             }
+            process.current_dir(&self.shell_state.cwd);
             suppress_orphan_console(&mut process);
             match process.spawn() {
                 Ok(child) => {
@@ -1014,6 +1015,8 @@ impl Executor {
             env: env_map.into_iter().collect(),
             std_handles,
             extra_handles,
+            // G-02: the respawned child starts in the session cwd.
+            cwd: Some(self.shell_state.cwd.clone()),
         });
         for h in owned_handles {
             crate::fd::close_handle(h);
@@ -1495,10 +1498,10 @@ impl Executor {
                     } else if is_null_device(&target) {
                         BackgroundStdio::Null
                     } else {
-                        match open_redirect_append(&shell_path_to_windows(
+                        match open_redirect_append(&self.session_path(shell_path_to_windows(
                             &target,
                             &self.shell_state.env_vars,
-                        )) {
+                        ))) {
                             Ok(file) => BackgroundStdio::File(file),
                             Err(_) => continue,
                         }
@@ -1506,7 +1509,8 @@ impl Executor {
                 }
                 RedirectKind::ReadWrite => {
                     let target = self.expand_redirect_target(redirect);
-                    let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
+                    let path = self
+                        .session_path(shell_path_to_windows(&target, &self.shell_state.env_vars));
                     // niubash#519: CON rejects a read+write handle; the
                     // stdin side needs only its CONIN$ half.
                     let opened = if is_con_device_path(&path) {
@@ -1533,10 +1537,10 @@ impl Executor {
                         continue;
                     } else {
                         let opened = if redirect.kind == RedirectKind::CombinedAppend {
-                            open_redirect_append(&shell_path_to_windows(
+                            open_redirect_append(&self.session_path(shell_path_to_windows(
                                 &target,
                                 &self.shell_state.env_vars,
-                            ))
+                            )))
                         } else {
                             self.create_redirect_output(&target, false)
                         };
@@ -2658,10 +2662,8 @@ impl Executor {
         // GNU execute_cmd.c runs `( list )` via execute_in_subshell ->
         // make_child: the forked child owns its own cwd, so a `cd` in the
         // body never reaches the parent. The body here runs in place on
-        // this executor, so the process directory is part of the subshell
-        // environment and must be restored like env_vars (niubash#100).
-        // Same convention as command substitution's saved_dir handling.
-        let saved_cwd = env::current_dir().ok();
+        // this executor; since G-02 the cwd is a ShellState field, so the
+        // saved_state clone below carries the boundary (niubash#100).
         // rubash#439: the body's word-expansion error mark dies with the
         // forked child (GNU's DISCARD jump cannot cross the fork boundary) —
         // the parent judges the subshell only by its exit STATUS, so
@@ -2831,7 +2833,7 @@ impl Executor {
                 // early apply-failure return skipped the restore below and
                 // leaked subshell_depth + the child trap reset into the
                 // parent.
-                self.restore_flat_subshell(saved_state, saved_cwd);
+                self.restore_flat_subshell(saved_state);
                 self.fd_table = saved_fd_table;
                 self.command_expansion_failed.set(saved_expansion_failed);
                 self.exec_replaced = saved_exec_replaced;
@@ -2963,7 +2965,7 @@ impl Executor {
                 if let Some(saved) = saved_fork_collapse {
                     self.subshell_fork_collapse.set(saved);
                 }
-                self.restore_flat_subshell(saved_state.clone(), saved_cwd.clone());
+                self.restore_flat_subshell(saved_state.clone());
                 self.fd_table = saved_fd_table.clone();
                 self.command_expansion_failed.set(saved_expansion_failed);
                 self.exec_replaced = saved_exec_replaced;
@@ -2976,7 +2978,7 @@ impl Executor {
                 if let Some(saved) = saved_fork_collapse {
                     self.subshell_fork_collapse.set(saved);
                 }
-                self.restore_flat_subshell(saved_state.clone(), saved_cwd.clone());
+                self.restore_flat_subshell(saved_state.clone());
                 self.fd_table = saved_fd_table.clone();
                 self.command_expansion_failed.set(saved_expansion_failed);
                 self.exec_replaced = saved_exec_replaced;
@@ -2988,7 +2990,7 @@ impl Executor {
         if let Some(saved) = saved_fork_collapse {
             self.subshell_fork_collapse.set(saved);
         }
-        self.restore_flat_subshell(saved_state, saved_cwd);
+        self.restore_flat_subshell(saved_state);
         self.fd_table = saved_fd_table;
         self.command_expansion_failed.set(saved_expansion_failed);
         self.exec_replaced = saved_exec_replaced;
@@ -3515,6 +3517,7 @@ impl Executor {
             }
 
             suppress_orphan_console(&mut child);
+            child.current_dir(&self.shell_state.cwd);
             match child.spawn() {
                 Ok(mut child_proc) => {
                     // Rubash does not expose real coproc file descriptors yet,
@@ -3868,9 +3871,8 @@ impl Executor {
             if is_closed_redirect_target(&target) {
                 child.stdout(Stdio::null());
             } else if redirect_target_fd(&target).is_none() {
-                child.stdout(Stdio::from(open_redirect_append(&shell_path_to_windows(
-                    &target,
-                    &self.shell_state.env_vars,
+                child.stdout(Stdio::from(open_redirect_append(&self.session_path(
+                    shell_path_to_windows(&target, &self.shell_state.env_vars),
                 ))?));
             }
         }
@@ -3889,9 +3891,8 @@ impl Executor {
             if is_closed_redirect_target(&target) {
                 child.stderr(Stdio::null());
             } else if redirect_target_fd(&target).is_none() {
-                child.stderr(Stdio::from(open_redirect_append(&shell_path_to_windows(
-                    &target,
-                    &self.shell_state.env_vars,
+                child.stderr(Stdio::from(open_redirect_append(&self.session_path(
+                    shell_path_to_windows(&target, &self.shell_state.env_vars),
                 ))?));
             }
         }
