@@ -1240,6 +1240,12 @@ impl Executor {
         // them here for the child alone: GNU do_redirections opens them in
         // the parent, the fork inherits, and the parent's copy closes at
         // command end (redir.c undo) — the parent's fd table stays untouched.
+        // rubash#1686: on Unix each opened descriptor is also recorded as a
+        // pin (merged into the pin registration below): the env channel
+        // reaches only rubash children, so a foreign child otherwise gets
+        // EBADF on the command's own fds even though the file was created.
+        #[cfg(unix)]
+        let mut command_fd_pins: Vec<(std::os::unix::io::RawFd, u32)> = Vec::new();
         for redirect in &cmd.redirects {
             if redirect.fd_var.is_some() {
                 continue;
@@ -1263,11 +1269,16 @@ impl Executor {
                     | crate::parser::RedirectKind::CloseInput
                     | crate::parser::RedirectKind::ReadWrite
             );
-            if self.fd_table.entries.contains_key(&fd) {
-                // A compound applied this redirect to its real descriptors
-                // already (staged group redirect) and injected the mirror
-                // entry: re-opening would truncate the file description it
-                // shares with the parent.
+            if self.fd_table.entries.contains_key(&fd)
+                && crate::executor::support_names::is_injected_group_redirect(redirect)
+            {
+                // The table entry already IS this redirect's binding (a
+                // compound applied it to its real descriptors and injected
+                // the mirror); re-opening would truncate the shared
+                // description. The pin registration below delivers the
+                // table entry instead (rubash#1686). A merely ambient
+                // entry does NOT skip: the command's binding is the more
+                // local one and must win the slot.
                 continue;
             }
             let opened = if write {
@@ -1299,6 +1310,8 @@ impl Executor {
             let Ok(dup) = crate::fd::duplicate_handle_inheritable(raw) else {
                 continue;
             };
+            #[cfg(unix)]
+            command_fd_pins.push((dup, fd));
             process.env(
                 format!("__RUBASH_FD_{}HANDLE_{fd}", if write { "W" } else { "" }),
                 format!("{dup:#x}"),
@@ -1324,7 +1337,15 @@ impl Executor {
         // computed by ambient_fd_pins_for so hand-built pipeline stage
         // processes inherit the same descriptors (rubash#1688).
         #[cfg(unix)]
-        let ambient_fd_pins: Vec<(std::os::unix::io::RawFd, u32)> = self.ambient_fd_pins_for(cmd);
+        let ambient_fd_pins: Vec<(std::os::unix::io::RawFd, u32)> = {
+            let mut pins = self.ambient_fd_pins_for(cmd);
+            // rubash#1686: the command's own redirect descriptors ride
+            // the same registration, appended after the ambient pins so
+            // a command binding wins any slot both sides name (the pin
+            // helper dup2's in list order).
+            pins.extend(command_fd_pins);
+            pins
+        };
         // rubash#229: restore GNU's child signal dispositions between fork
         // and exec (trap.c:1489 restore_original_signals) — without this a
         // policy/trap SIG_IGN in the shell survives exec and makes children
