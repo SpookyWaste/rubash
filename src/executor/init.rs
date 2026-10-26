@@ -56,10 +56,12 @@ impl Executor {
         // then is skipped. GNU has no such snapshot because it has no
         // table: redir.c checks the kernel per redirect (redir.c:1160).
         let inherited_fds_snapshot = crate::fd::inherited_open_fds();
+        // G-01: the birth snapshot is a process-state read — take it
+        // under the lock so a sibling's mirror write cannot tear it.
         let process_env_snapshot: HashMap<String, String> = if process_exit {
             HashMap::new()
         } else {
-            std::env::vars().collect()
+            crate::executor::local_helpers::with_process_state_lock(|| std::env::vars().collect())
         };
         // G-03: this executor's process-env write journal, pushed for the
         // rest of construction so the init-time __RUBASH_* clears below
@@ -231,7 +233,11 @@ impl Executor {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(0);
         env_vars.remove("__RUBASH_SUBSHELL_DEPTH");
-        env::remove_var("__RUBASH_SUBSHELL_DEPTH");
+        // G-03/G-01: the init-time process-env clears route through
+        // mirror_env_remove — journaled to this executor's lineage
+        // (the journal guard above is still held) and serialized
+        // against sibling sessions' mirror writes.
+        mirror_env_remove("__RUBASH_SUBSHELL_DEPTH");
         // Rubash#234: a respawned `rubash -c` child is GNU's forked child —
         // it inherits the parent's job_control state and never re-runs
         // initialize_job_control. The env marker is stripped below, so
@@ -248,14 +254,14 @@ impl Executor {
         }
         env_vars.remove("__RUBASH_SHELL_NAME");
         env_vars.remove(crate::executor::path::COMPATIBLE_SHELL_PATH_ENV);
-        env::remove_var("__RUBASH_CURRENT_FUNCTION");
-        env::remove_var("__RUBASH_IN_SOURCE");
+        mirror_env_remove("__RUBASH_CURRENT_FUNCTION");
+        mirror_env_remove("__RUBASH_IN_SOURCE");
         if !internal_respawn {
-            env::remove_var("__RUBASH_SCRIPT_NAME");
-            env::remove_var("__RUBASH_ARGV0_AFTER_UNSET");
+            mirror_env_remove("__RUBASH_SCRIPT_NAME");
+            mirror_env_remove("__RUBASH_ARGV0_AFTER_UNSET");
         }
-        env::remove_var("__RUBASH_SHELL_NAME");
-        env::remove_var(crate::executor::path::COMPATIBLE_SHELL_PATH_ENV);
+        mirror_env_remove("__RUBASH_SHELL_NAME");
+        mirror_env_remove(crate::executor::path::COMPATIBLE_SHELL_PATH_ENV);
         // Birth context: the session cwd field (set in the ShellState
         // literal below) starts at the process cwd.
         Self::initialize_fresh_shell_env_vars(
@@ -280,12 +286,12 @@ impl Executor {
             .get("__RUBASH_BG_DEPTH")
             .and_then(|value| value.parse::<usize>().ok());
         env_vars.remove("__RUBASH_BG_DEPTH");
-        std::env::remove_var("__RUBASH_BG_DEPTH");
+        mirror_env_remove("__RUBASH_BG_DEPTH");
         let bg_bashpid_base = env_vars
             .get("__RUBASH_BG_BASHPID_BASE")
             .and_then(|value| value.parse::<usize>().ok());
         env_vars.remove("__RUBASH_BG_BASHPID_BASE");
-        std::env::remove_var("__RUBASH_BG_BASHPID_BASE");
+        mirror_env_remove("__RUBASH_BG_BASHPID_BASE");
 
         // Forked-child fd table restore: a `rubash -c` background/subshell
         // child inherits the parent's fd>=3 File endpoints through the
@@ -311,10 +317,10 @@ impl Executor {
                 if let Ok(fd) = num.parse::<u32>() {
                     inherited_fd_handles.entry(fd).or_default().2 = Some(value.clone());
                 }
-                std::env::remove_var(key);
+                mirror_env_remove(key);
                 return false;
             } else if let Some(num) = key.strip_prefix("__RUBASH_FD_WPATH_") {
-                std::env::remove_var(key);
+                mirror_env_remove(key);
                 return false;
             } else {
                 return true;
@@ -329,7 +335,7 @@ impl Executor {
                     entry.0 = handle;
                 }
             }
-            std::env::remove_var(key);
+            mirror_env_remove(key);
             false
         });
         let owns_signal_mailbox =
@@ -726,7 +732,7 @@ impl Executor {
             // Word expansion falls back to the live process environment
             // when a name is absent from env_vars, so clear it there too or
             // `$OLDPWD` would still expand to the rejected value.
-            env::remove_var("OLDPWD");
+            mirror_env_remove("OLDPWD");
         }
         initialize_shell_level(env_vars);
         mark_initial_exported_vars(env_vars);

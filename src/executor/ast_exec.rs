@@ -58,9 +58,11 @@ impl Executor {
             .replace(Some(crate::locale::locale_name()));
         self.line_lex_locales.borrow_mut().clear();
 
-        let _guard = EXECUTION_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // G-01: EXECUTION_LOCK is no longer held for the whole run.
+        // EXECUTION_LOCK_DEPTH is now only the run-nesting marker (it
+        // still gates the latch resets above); the lock itself lives
+        // at the process-global touch points — see
+        // local_helpers::acquire_process_state.
         EXECUTION_LOCK_DEPTH.with(|depth| depth.set(1));
         // G-03: attribute this run's process-env mirror writes to this
         // executor's journal (nested runs on the same executor share the

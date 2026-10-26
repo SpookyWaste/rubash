@@ -221,6 +221,53 @@ impl Drop for EnvJournalGuard {
     }
 }
 
+thread_local! {
+    static PROCESS_STATE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// G-01: RAII hold on the process-state lock (`super::EXECUTION_LOCK`).
+/// The lock used to be held for whole `execute_ast` runs, serializing
+/// every session behind the longest command. It now serializes only
+/// the points that touch process-global mutable state: env mirror
+/// writes (the funnel below), trap disposition reconcile, Executor
+/// birth snapshots, the Drop restore, and the fresh-shell env swap.
+/// Reentrant per thread — a holder passes through funnel writes
+/// without re-locking, and pure session-state execution never takes
+/// it at all. The audit of which surfaces stay inside the lock (and
+/// which were proven self-synchronized or session-local) is in the
+/// ms-stopbleed cluster REPORT.md.
+pub(crate) struct ProcessStateGuard {
+    owned: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+pub(crate) fn acquire_process_state() -> ProcessStateGuard {
+    let depth = PROCESS_STATE_DEPTH.with(|depth| depth.get());
+    if depth > 0 {
+        PROCESS_STATE_DEPTH.with(|cell| cell.set(depth + 1));
+        return ProcessStateGuard { owned: None };
+    }
+    let guard = super::EXECUTION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    PROCESS_STATE_DEPTH.with(|depth| depth.set(1));
+    ProcessStateGuard { owned: Some(guard) }
+}
+
+impl Drop for ProcessStateGuard {
+    fn drop(&mut self) {
+        PROCESS_STATE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        // The MutexGuard drops after the depth clears, so a funnel
+        // write triggered by another thread's wakeup can never observe
+        // this thread as still holding the lock.
+        drop(self.owned.take());
+    }
+}
+
+pub(crate) fn with_process_state_lock<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = acquire_process_state();
+    f()
+}
+
 fn record_env_write(name: &str, value: Option<&str>) {
     ENV_JOURNAL_STACK.with(|stack| {
         if let Some(top) = stack.borrow().last() {
@@ -235,14 +282,21 @@ fn record_env_write(name: &str, value: Option<&str>) {
 /// the #916 assignment gate must not filter: whatever they write is this
 /// lineage's final state for the key.
 pub(crate) fn mirror_env_set(name: &str, value: &str) {
-    env::set_var(name, value);
-    record_env_write(name, Some(value));
+    // G-01: the mutation + journal record are one process-state
+    // critical section — a concurrent Drop restore must never slip
+    // between the write and its record.
+    with_process_state_lock(|| {
+        env::set_var(name, value);
+        record_env_write(name, Some(value));
+    });
 }
 
 /// Removal counterpart of `mirror_env_set`.
 pub(crate) fn mirror_env_remove(name: &str) {
-    env::remove_var(name);
-    record_env_write(name, None);
+    with_process_state_lock(|| {
+        env::remove_var(name);
+        record_env_write(name, None);
+    });
 }
 
 pub(crate) fn set_process_env(name: &str, value: impl AsRef<str>) {
@@ -257,8 +311,10 @@ pub(crate) fn set_process_env(name: &str, value: impl AsRef<str>) {
         && shell_assignment_needs_process_env(name)
         && is_valid_process_env(name, value)
     {
-        env::set_var(name, value);
-        record_env_write(name, Some(value));
+        with_process_state_lock(|| {
+            env::set_var(name, value);
+            record_env_write(name, Some(value));
+        });
     }
 }
 
@@ -274,8 +330,10 @@ pub(crate) fn set_process_env(name: &str, value: impl AsRef<str>) {
 /// "never mirrored" unset off the locked environ mutation path.
 pub(crate) fn unset_process_env(name: &str) {
     if is_valid_process_env(name, "") && env::var_os(name).is_some() {
-        env::remove_var(name);
-        record_env_write(name, None);
+        with_process_state_lock(|| {
+            env::remove_var(name);
+            record_env_write(name, None);
+        });
     }
 }
 

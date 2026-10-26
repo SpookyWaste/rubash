@@ -745,7 +745,10 @@ impl Executor {
 
     pub fn remove_env(&mut self, name: &str) {
         self.shell_state.env_vars.remove(name);
-        env::remove_var(name);
+        // G-03: a host-directed removal is still this lineage's
+        // mirror write — journal it so Drop treats it like any other.
+        let _journal = push_env_journal(&self.env_write_journal);
+        mirror_env_remove(name);
     }
 
     pub fn get_env(&self, name: &str) -> Option<&str> {
@@ -915,9 +918,7 @@ impl Executor {
             return self.call_function_inner(name, args, temporary_env);
         }
 
-        let _guard = EXECUTION_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // G-01: no whole-call lock hold anymore (see execute_ast).
         // G-02: the pre-call cwd restore now targets the session cwd field
         // (formerly the process cwd). The $PWD variable is deliberately
         // NOT restored, preserving the pre-G-02 observable shape.
@@ -2492,6 +2493,10 @@ impl Drop for Executor {
         // (rubash#917). TMPDIR keeps its pre-#916 exclusion (never
         // mirrored, so leave it alone rather than restoring or removing).
         let journal = self.env_write_journal.borrow();
+        // G-01: the whole compare-and-restore sequence is one
+        // process-state critical section — a sibling's funnel write
+        // must not interleave between the compare and the restore.
+        let _process_state = crate::executor::local_helpers::acquire_process_state();
         for (name, final_state) in journal.iter() {
             if name == "TMPDIR" {
                 continue;

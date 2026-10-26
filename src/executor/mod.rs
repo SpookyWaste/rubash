@@ -338,9 +338,18 @@ pub use self::support_names::machtype_value;
 // prefixes, etc.) live in `types.rs` and are re-exported via
 // `pub(crate) use types::*;` above. Do not redeclare them here.
 
+// G-01: the process-state lock. Once held for whole execute_ast
+// runs; now taken only at process-global touch points through
+// local_helpers::acquire_process_state (env mirror writes, trap
+// disposition reconcile, birth snapshots, Drop restore, fresh-shell
+// env swap).
 static EXECUTION_LOCK: Mutex<()> = Mutex::new(());
 
 thread_local! {
+    // Run-nesting marker for execute_ast / call_function_owned: at
+    // depth 0 the caller is a fresh reader-level run and the
+    // evalerror latches reset. (Historically this tracked the
+    // EXECUTION_LOCK hold; the lock no longer spans runs.)
     static EXECUTION_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 

@@ -660,6 +660,17 @@ impl Executor {
         // var) leak into the "fresh" child. Any writes the child makes die
         // with the scope, exactly like a real child's env block dying on
         // exit.
+        // G-01: the swap + run + restore bracket holds the
+        // process-state lock — while the process env shows the child's
+        // env, a sibling session must not read it as its own fallback
+        // env or land mirror writes that the restore would wipe. The
+        // child's own funnel writes pass through reentrantly on this
+        // thread. (GNU has no such window: the child is a real fork.)
+        let _process_state_guard = if fresh_shell {
+            Some(crate::executor::local_helpers::acquire_process_state())
+        } else {
+            None
+        };
         let saved_process_env: Option<HashMap<String, String>> = if fresh_shell {
             let saved: HashMap<String, String> = env::vars().collect();
             for (name, _) in env::vars() {
