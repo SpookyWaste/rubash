@@ -8,6 +8,7 @@
 //! - builtins/history.def: file I/O entry points (-a -w -r -n)
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs;
 use std::io;
@@ -256,12 +257,31 @@ impl SessionHistory {
     /// a timestamp that are not themselves timestamps are appended to
     /// the previous entry when the file has multi-line entries.
     pub fn load_file(&mut self, path: &str, histsize: Option<usize>) -> io::Result<usize> {
+        self.load_file_with_arming(path, histsize, true)
+    }
+
+    /// `load_file` with the readline comment-char state made explicit.
+    /// histfile.c:375-383: `#<digit>` lines are timestamps only while
+    /// history_comment_char is armed — by a HISTTIMEFORMAT assignment
+    /// (variables.c:6168 sv_histtimefmt) or, for this one read, by the
+    /// file itself starting with a timestamp line. An unarmed read
+    /// treats `#` lines as literal entries, and the stamp add_history
+    /// gives each entry carries the unarmed (NUL) comment char — an
+    /// empty string in this model — so those entries render as `??`
+    /// once a HISTTIMEFORMAT appears (rubash#1669).
+    pub fn load_file_with_arming(
+        &mut self,
+        path: &str,
+        histsize: Option<usize>,
+        timestamps_armed: bool,
+    ) -> io::Result<usize> {
         let content = fs::read_to_string(path)?;
         let lines: Vec<&str> = content.lines().collect();
         // histfile.c:377-381: detect timestamps (# followed by digit).
         let has_timestamps = lines.first().is_some_and(|l| {
             l.starts_with('#') && l[1..].chars().next().is_some_and(|c| c.is_ascii_digit())
         });
+        let timestamps_active = timestamps_armed || has_timestamps;
         // histfile.c:387: default_skipblanks = 0 when multiline entries.
         let has_multiline = has_timestamps;
         let default_skipblanks = !has_multiline;
@@ -269,7 +289,8 @@ impl SessionHistory {
         let mut last_ts: Option<String> = None;
         let mut count = 0usize;
         for line in &lines {
-            let is_timestamp = line.starts_with('#')
+            let is_timestamp = timestamps_active
+                && line.starts_with('#')
                 && line[1..].chars().next().is_some_and(|c| c.is_ascii_digit());
             if is_timestamp {
                 // histfile.c:448-453: save timestamp, skip leading blanks.
@@ -294,10 +315,15 @@ impl SessionHistory {
                 // timestamp (add_history_time). A line with no timestamp
                 // of its own still enters through add_history, so it
                 // carries the read time (hist_inittime) — never stamp 0
-                // (rubash#1628).
+                // (rubash#1628). With timestamps inactive the read-time
+                // stamp carries the unarmed (NUL) comment char instead —
+                // an empty string here (rubash#1669).
                 self.entries.push(line.to_string());
-                self.timestamps
-                    .push(last_ts.clone().unwrap_or_else(Self::now_stamp));
+                self.timestamps.push(match last_ts.clone() {
+                    Some(ts) => ts,
+                    None if timestamps_active => Self::now_stamp(),
+                    None => String::new(),
+                });
                 self.stifle(histsize);
                 count += 1;
             }
@@ -422,17 +448,42 @@ impl SessionHistory {
         self.load_file(path, histsize)
     }
 
+    /// `read_file` with explicit timestamp arming (see
+    /// `load_file_with_arming`).
+    pub fn read_file_with_arming(
+        &mut self,
+        path: &str,
+        histsize: Option<usize>,
+        timestamps_armed: bool,
+    ) -> io::Result<usize> {
+        self.load_file_with_arming(path, histsize, timestamps_armed)
+    }
+
     /// builtins/history.def -n: append file lines not already in the list.
     pub fn read_new_file(&mut self, path: &str, histsize: Option<usize>) -> io::Result<usize> {
+        self.read_new_file_with_arming(path, histsize, true)
+    }
+
+    /// `read_new_file` with explicit timestamp arming (see
+    /// `load_file_with_arming`). Stamp lines are consumed only while
+    /// timestamps are active; unstamped entries take the read-time
+    /// stamp when active and the empty stamp when not.
+    pub fn read_new_file_with_arming(
+        &mut self,
+        path: &str,
+        histsize: Option<usize>,
+        timestamps_armed: bool,
+    ) -> io::Result<usize> {
         let content = fs::read_to_string(path)?;
         // Same #<digit> detection as load_file (histfile.c:377-381).
         let has_timestamps = content.lines().next().is_some_and(|l| {
             l.starts_with('#') && l[1..].chars().next().is_some_and(|c| c.is_ascii_digit())
         });
+        let timestamps_active = timestamps_armed || has_timestamps;
         let mut count = 0usize;
         let mut last_ts: Option<String> = None;
         for line in content.lines() {
-            if has_timestamps
+            if timestamps_active
                 && line.starts_with('#')
                 && line[1..].chars().next().is_some_and(|c| c.is_ascii_digit())
             {
@@ -444,15 +495,97 @@ impl SessionHistory {
                 continue;
             }
             self.entries.push(line.to_string());
-            // Same read-time stamp rule as load_file (rubash#1628).
-            self.timestamps
-                .push(last_ts.clone().unwrap_or_else(Self::now_stamp));
+            // Same read-time stamp rule as load_file (rubash#1628, #1669).
+            self.timestamps.push(match last_ts.clone() {
+                Some(ts) => ts,
+                None if timestamps_active => Self::now_stamp(),
+                None => String::new(),
+            });
             self.stifle(histsize);
             last_ts = None;
             count += 1;
         }
         Ok(count)
     }
+}
+
+/// lib/readline/history.c:304 history_get_time: the entry's stamp read
+/// as a time — `#` followed by a strtol parse of the rest. strtol
+/// consumes leading digits and ignores the remainder (`#12x` yields
+/// 12); a missing `#`, no digits, or an ERANGE overflow all yield 0.
+pub fn stamp_epoch(stamp: &str) -> i64 {
+    let Some(text) = stamp.strip_prefix('#') else {
+        return 0;
+    };
+    strtol_seconds(text)
+}
+
+/// strtol's base-10 prefix parse with this platform's long (i64)
+/// range: skips leading whitespace, takes an optional sign, consumes
+/// digits; overflow clamps the parse into the ERANGE case, reported
+/// here as 0 like history_get_time does.
+fn strtol_seconds(text: &str) -> i64 {
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    let mut negative = false;
+    if index < bytes.len() && (bytes[index] == b'+' || bytes[index] == b'-') {
+        negative = bytes[index] == b'-';
+        index += 1;
+    }
+    let mut value: i64 = 0;
+    let mut digits = false;
+    let mut overflow = false;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        digits = true;
+        if !overflow {
+            let digit = i64::from(bytes[index] - b'0');
+            let next = if negative {
+                value.checked_mul(10).and_then(|v| v.checked_sub(digit))
+            } else {
+                value.checked_mul(10).and_then(|v| v.checked_add(digit))
+            };
+            match next {
+                Some(v) => value = v,
+                None => overflow = true,
+            }
+        }
+        index += 1;
+    }
+    if !digits || overflow {
+        0
+    } else {
+        value
+    }
+}
+
+/// builtins/history.def histtime: render one entry's stamp through
+/// HISTTIMEFORMAT. A stamp that parses to a nonzero time localtime
+/// can represent renders through strftime; a stamp that parses to 0
+/// (or whose local year does not fit a C int) with non-empty text
+/// renders `<stamp text>: invalid timestamp`; an entry carrying no
+/// stamp at all renders `??`.
+pub fn render_timestamp(
+    stamp: Option<&str>,
+    format: &str,
+    env_vars: &HashMap<String, String>,
+) -> String {
+    let stamp = stamp.unwrap_or("");
+    let epoch = stamp_epoch(stamp);
+    if epoch != 0 {
+        if let Some(rendered) =
+            crate::builtins::printf::time::format_epoch_time_if_valid(format, epoch, env_vars)
+        {
+            return rendered;
+        }
+    }
+    if !stamp.is_empty() {
+        let shown = stamp.strip_prefix('#').unwrap_or(stamp);
+        return format!("{shown}: invalid timestamp");
+    }
+    "??".to_string()
 }
 
 /// A point-in-time view of the list, satisfying the engine's HistLookup

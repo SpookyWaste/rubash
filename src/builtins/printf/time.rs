@@ -88,6 +88,64 @@ pub(crate) fn format_epoch_time(
     strftime_subset(format, &local)
 }
 
+/// `format_epoch_time` restricted to the epochs the civil
+/// conversion can represent: GNU renders a history timestamp only
+/// when localtime succeeds (builtins/history.def histtime), and
+/// localtime fails when the local year minus 1900 (tm_year) does
+/// not fit a C int. Returns None outside the representable domain
+/// so the caller can print GNU's "invalid timestamp" form
+/// (rubash#1669). The domain check runs on an i64 year recomputed
+/// from the day count, before `local_time` is consulted — the
+/// conversion behind it wraps its i32 year arithmetic for epochs
+/// this large.
+pub(crate) fn format_epoch_time_if_valid(
+    format: &str,
+    epoch: i64,
+    env_vars: &HashMap<String, String>,
+) -> Option<String> {
+    // Screen on the UTC year first, in i64: the civil conversion
+    // behind `local_time` does its year arithmetic in i32 and wraps
+    // (or, in debug builds, panics) for epochs this large, so an
+    // out-of-domain epoch must never reach it. Zone offsets are
+    // bounded by a day, so a two-year margin absorbs any local/UTC
+    // year difference.
+    let utc_year = civil_year_from_days(epoch.div_euclid(86_400));
+    if utc_year < i64::from(i32::MIN) + 2 || utc_year > i64::from(i32::MAX) - 2 {
+        return None;
+    }
+    let timezone = TimeZoneRule::from_env(env_vars.get("TZ").map(String::as_str));
+    let local = timezone.local_time(epoch);
+    let local_days = (epoch + i64::from(local.offset)).div_euclid(86_400);
+    if civil_year_from_days(local_days) != i64::from(local.year) {
+        return None;
+    }
+    Some(strftime_subset(format, &local))
+}
+
+/// The proleptic Gregorian year containing a day count (days since
+/// 1970-01-01), computed in i64 so years far outside the C int range
+/// stay exact (the Hinnant civil-from-days algorithm).
+fn civil_year_from_days(days: i64) -> i64 {
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    if month <= 2 {
+        year + 1
+    } else {
+        year
+    }
+}
+
 fn current_epoch_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
