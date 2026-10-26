@@ -180,13 +180,53 @@ struct CoprocRedirectDups {
 #[derive(Default)]
 struct CoprocRedirectOutcome {
     /// The child's stdout no longer points at the coproc pipe (file,
-    /// null, or a `>&2` dup): the parent retains its writer duplicate
-    /// for the coproc's lifetime (rubash#1632).
+    /// null, or a `>&2` dup): a writer on the read pipe must outlive
+    /// the displacement for the child's whole life (rubash#1632).
     stdout_displaced: bool,
     /// The child's stderr no longer points at the forwarder pipe (file,
     /// null, or a `2>&1` dup onto the coproc pipe): no forwarder thread
     /// is needed for this child.
     stderr_displaced: bool,
+}
+
+/// rubash#1632: pin the retained coproc-pipe writer duplicate in
+/// the child at fd 10 — the slot GNU's coproc child holds its own
+/// writer in (the oracle's fd dump shows fd 10 = the read pipe's
+/// write end for the child's whole life) — so the parent's readers
+/// see EOF when the CHILD exits. Keeping the duplicate in the
+/// parent instead defers EOF to reap time, which deadlocks a
+/// blocking reader: the reap cannot run while that reader is in
+/// the foreground (`coproc { echo hi; } >f; cat <&${COPROC[0]}`
+/// hung forever). The File travels with the closure so the source
+/// descriptor stays open until the fork; dup2 clears CLOEXEC on
+/// the target. The parent map (coproc_retained_stdout_writers)
+/// remains the mechanism where pre_exec is unavailable.
+#[cfg(unix)]
+fn pin_coproc_writer_in_child(child: &mut Command, writer: std::fs::File) {
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let source = writer.as_raw_fd();
+    // SAFETY: the closure runs in the forked child before exec and
+    // only calls async-signal-safe fcntl/dup2 on a descriptor the
+    // closure itself owns (the dev_fd_operands pin does the same).
+    unsafe {
+        child.pre_exec(move || {
+            let _keep_alive = &writer;
+            if source == 10 {
+                // Already at the target number: dup2 onto self would
+                // not clear CLOEXEC, so clear it explicitly (the
+                // dev_fd_operands pin does the same).
+                let flags = libc::fcntl(source, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(source, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else if libc::dup2(source, 10) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 /// Resolved stdio disposition for one of a background child's fds 0-2,
@@ -3590,12 +3630,12 @@ impl Executor {
             // command's own redirections may move it (GNU applies them
             // after the pipe wiring, in the child). Two duplicates of
             // the writer are prepared before the original is consumed:
-            // one the parent retains when the writer ends up displaced
-            // (rubash#1632 — GNU's child keeps a writer on the read
-            // pipe for its whole life, so the parent's reads see EOF
-            // only when the coproc exits), and one
-            // apply_coproc_redirects can hand to the child's stderr for
-            // a `2>&1` dup (rubash#1644).
+            // one that keeps a writer on the read pipe for the child's
+            // whole life when its stdout ends up displaced (rubash
+            // #1632 — pinned into the child at fd 10 on Unix, retained
+            // by the parent elsewhere), and one apply_coproc_redirects
+            // can hand to the child's stderr for a `2>&1` dup
+            // (rubash#1644).
             let stdout_handle = crate::fd::into_handle(stdout_writer);
             let retained_stdout_writer = crate::fd::duplicate_handle(stdout_handle)
                 .ok()
@@ -3657,6 +3697,22 @@ impl Executor {
             };
 
             suppress_orphan_console(&mut child);
+            // rubash#1632: on Unix the displaced-stdout writer goes
+            // into the child (fd 10), not the parent's map — EOF must
+            // track the child's exit, not its reap (see
+            // pin_coproc_writer_in_child).
+            #[cfg(unix)]
+            let retained_stdout_writer = if redirect_outcome.stdout_displaced {
+                match retained_stdout_writer {
+                    Some(writer) => {
+                        pin_coproc_writer_in_child(&mut child, writer);
+                        None
+                    }
+                    None => None,
+                }
+            } else {
+                retained_stdout_writer
+            };
             match child.spawn() {
                 Ok(mut child_proc) => {
                     // Rubash does not expose real coproc file descriptors yet,
