@@ -1309,6 +1309,7 @@ fn time_prefix_from_command(command: &mut CommandNode) -> Option<TimePipelinePre
     if command.word_metadata.len() == old_word_len {
         command.word_metadata = command.word_metadata[index..].to_vec();
     }
+    reclassify_leading_assignment_words(command);
     Some(TimePipelinePrefix {
         keyword,
         keyword_metadata,
@@ -1317,6 +1318,92 @@ fn time_prefix_from_command(command: &mut CommandNode) -> Option<TimePipelinePre
         posix_format,
         inverted,
     })
+}
+
+/// rubash#1661: restore the parse-time assignment classification of a
+/// timed command's inner words.
+///
+/// GNU's grammar gives the timed pipeline its own simple command
+/// (parse.y: the `time` production's pipeline is built from command ->
+/// simple_command, whose leading assignment words the grammar itself
+/// separates; execute_cmd.c execute_simple_command then applies them
+/// as prefix assignments, or as the command's whole effect when no
+/// command name follows). rubash instead lexes `time` as the simple
+/// command's name word and folds the keyword away afterwards (here,
+/// and again in the executor's `time` name-dispatch). While `time`
+/// occupied the name slot, handle_token saw a non-empty word list, so
+/// every following assignment token stayed a plain command word; the
+/// stripped inner command then dispatched its first assignment word
+/// (`x=1`) as a command name — 127 "command not found" — and never
+/// applied the assignment at all.
+///
+/// Re-run exactly the classification handle_token applies to a
+/// standalone simple command: leading words the lexer flagged
+/// TokenKind::Assignment become prefix assignments, in source order,
+/// with the same name/value/raw-RHS split token_actions performs
+/// (extglob LHS patterns recorded the same way). The token-kind gate
+/// is the classification record — a quoted 'x=1' is TokenKind::Word
+/// and stays a command name; no text-shape re-derivation (the
+/// executor's assignment_dispatch documents why that is unsound).
+///
+/// Two word families deliberately stay in the word list:
+/// - Array-element words (`name[sub]=v`): push_command_word records
+///   them through a separate channel and the executor consumes the
+///   leading run itself (strip_invalid_env_assignment_prefixes /
+///   execute_assignment_or_comment_command) — `time arr[0]=x` already
+///   behaves per GNU untouched.
+/// - Compound values (values carrying COMPOUND_ASSIGNMENT_MARKER):
+///   token_actions collects them into compound_assignments through
+///   parser state (token spans) this stripped node no longer holds.
+///   (`time arr=(...)` is additionally rejected earlier, at parse
+///   time, by compound_assignment_position_ok.)
+pub(crate) fn reclassify_leading_assignment_words(command: &mut CommandNode) {
+    if !command.assignments.is_empty()
+        || !command.compound_assignments.is_empty()
+        || !command.array_element_assignments.is_empty()
+    {
+        return;
+    }
+    // Legacy nodes without a recorded token kind per word carry no
+    // classification to restore.
+    if command.word_kinds.len() != command.words.len() {
+        return;
+    }
+    let metadata_aligned = command.word_metadata.len() == command.words.len();
+    let mut consumed = 0usize;
+    while consumed < command.words.len() && command.word_kinds[consumed] == TokenKind::Assignment {
+        let (name, value, raw_rhs) = {
+            let word = &command.words[consumed];
+            let Some((name, value)) = word.split_once('=') else {
+                break;
+            };
+            if name.contains('[')
+                || value.starts_with(crate::executor::types::COMPOUND_ASSIGNMENT_MARKER)
+            {
+                break;
+            }
+            let raw_rhs = if metadata_aligned {
+                command.word_metadata[consumed]
+                    .raw
+                    .split_once('=')
+                    .map_or_else(|| value.to_string(), |(_, raw)| raw.to_string())
+            } else {
+                value.to_string()
+            };
+            (name.to_string(), value.to_string(), raw_rhs)
+        };
+        let pattern_name = name.strip_suffix('+').unwrap_or(&name).to_string();
+        record_extglob_patterns_for_assignment(command, &pattern_name, &value, &raw_rhs, None);
+        command.insert_assignment_with_raw(name, value, raw_rhs);
+        consumed += 1;
+    }
+    if consumed > 0 {
+        command.words.drain(..consumed);
+        command.word_kinds.drain(..consumed);
+        if metadata_aligned {
+            command.word_metadata.drain(..consumed);
+        }
+    }
 }
 
 fn try_parse_compound_start(tokens: &[Token], i: usize, state: &mut ParseState) -> Option<usize> {
