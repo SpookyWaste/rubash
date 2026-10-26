@@ -496,6 +496,29 @@ fn issue1644_coproc_dup_stderr_to_stdout_joins_the_pipe() {
 }
 
 #[test]
+fn issue1655_named_group_coproc_dup_to_stderr() {
+    // #1644's group form: the output goes to the shell's stderr; the
+    // coproc pipe yields nothing while the child lives (GNU: the
+    // child holds the pipe writer, so the timed read expires).
+    let output = rubash_command()
+        .arg("-c")
+        .arg(
+            "coproc C2 { echo hi; sleep 1; } >&2; \
+             read -t 0.3 -u ${C2[0]} l; echo \"pipe rc=$? l=[$l]\"; \
+             wait $C2_PID",
+        )
+        .output()
+        .expect("run rubash");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "pipe rc=142 l=[]\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "hi\n");
+}
+
+#[test]
 fn issue1638_append_procsub_redirect_drains_before_next_command() {
     // GNU forks the `>(...)` consumer at expansion time, so a fast
     // consumer's output is on disk when the next command runs. The
