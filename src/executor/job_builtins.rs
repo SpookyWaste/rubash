@@ -1619,7 +1619,7 @@ impl Executor {
             if let Some(done) = child.try_wait()? {
                 // rubash#1776: sample the reaped child's CPU for the
                 // Windows CHILDREN half while its handle is live.
-                super::read_helpers::note_reaped_child_cpu(child);
+                super::read_helpers::note_reaped_child_cpu(&child);
                 // rubash#229: queue the signal-death notice (the job entry
                 // still exists here, so its command text is available).
                 if let Some(signal) = crate::executor::wait_status::exit_status_signal(&done) {

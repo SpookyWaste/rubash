@@ -1514,6 +1514,19 @@ impl SpawnedChild {
         }
     }
 
+    /// Raw process handle for the rubash#1776 CHILDREN sampler. The Std
+    /// form delegates to its std Child; the Whitelisted form has no std
+    /// Child at all (stable Rust cannot wrap a raw handle in one), so it
+    /// yields its OwnedHandle directly. Callers sample only at reap
+    /// points, while this wrapper is still live.
+    pub fn process_handle(&self) -> HANDLE {
+        use std::os::windows::io::AsRawHandle;
+        match &self.inner {
+            SpawnedChildInner::Std(child) => child.as_raw_handle() as HANDLE,
+            SpawnedChildInner::Whitelisted { process, .. } => process.as_raw_handle() as HANDLE,
+        }
+    }
+
     fn whitelisted_status(
         process: &std::os::windows::io::OwnedHandle,
         timeout_ms: DWORD,

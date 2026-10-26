@@ -66,18 +66,49 @@ static REAPED_CHILDREN_CPU: std::sync::LazyLock<
     std::sync::Mutex::new((std::collections::HashSet::new(), RusageCounters::default()))
 });
 
+/// A reaped child that can still yield its live process handle to the
+/// CHILDREN sampler below. std::process::Child and fd::SpawnedChild
+/// differ only in how the handle is reached: SpawnedChild's Whitelisted
+/// form holds a raw OwnedHandle, not a std Child, so demanding a Child
+/// here made the two job_builtins reap sites uncompilable (E0308).
+pub(in crate::executor) trait ReapedChildCpu {
+    fn reaped_pid(&self) -> u32;
+    #[cfg(windows)]
+    fn reaped_handle(&self) -> windows_sys::Win32::Foundation::HANDLE;
+}
+
+impl ReapedChildCpu for std::process::Child {
+    fn reaped_pid(&self) -> u32 {
+        self.id()
+    }
+    #[cfg(windows)]
+    fn reaped_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        use std::os::windows::io::AsRawHandle;
+        self.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE
+    }
+}
+
+impl ReapedChildCpu for crate::fd::SpawnedChild {
+    fn reaped_pid(&self) -> u32 {
+        self.id()
+    }
+    #[cfg(windows)]
+    fn reaped_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.process_handle() as windows_sys::Win32::Foundation::HANDLE
+    }
+}
+
 /// Sample one reaped child's CPU into the CHILDREN accumulator. Call
-/// only at a reap point, while the Child's handle is still live (after
-/// try_wait/wait returns a status, before the Child is dropped). On
+/// only at a reap point, while the child's handle is still live (after
+/// try_wait/wait returns a status, before the child is dropped). On
 /// non-Windows this is a no-op: getrusage(RUSAGE_CHILDREN) already
 /// covers waited children there.
-pub(in crate::executor) fn note_reaped_child_cpu(child: &std::process::Child) {
+pub(in crate::executor) fn note_reaped_child_cpu<C: ReapedChildCpu>(child: &C) {
     #[cfg(windows)]
     {
-        use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::FILETIME;
         use windows_sys::Win32::System::Threading::GetProcessTimes;
-        let handle = child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+        let handle = child.reaped_handle();
         let mut creation: FILETIME = unsafe { std::mem::zeroed() };
         let mut exit: FILETIME = unsafe { std::mem::zeroed() };
         let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
@@ -88,7 +119,7 @@ pub(in crate::executor) fn note_reaped_child_cpu(child: &std::process::Child) {
             return;
         }
         let ticks = |ft: FILETIME| ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64;
-        let key = (child.id(), ticks(creation));
+        let key = (child.reaped_pid(), ticks(creation));
         let mut guard = REAPED_CHILDREN_CPU
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
