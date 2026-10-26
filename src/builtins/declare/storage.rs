@@ -135,6 +135,21 @@ pub(super) fn eval_arith_value(value: &str) -> i128 {
         .sum()
 }
 
+/// GNU make_variable_value (variables.c:2905): a value bound to an
+/// integer-attributed variable is evaluated with the FULL evalexp
+/// (expr.c) — variables, `*`/`-`/`**`, parentheses and all. The
+/// subscript-shaped subset in `eval_arith_value` above is NOT that
+/// evaluator (rubash#1617: `declare -ia a=('2*3')` stored 0). The
+/// table is rebuilt from the plain value map because the declare
+/// storage layer works on the serialized mirror, not the typed one.
+pub(super) fn eval_integer_value(
+    value: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> i128 {
+    let table = crate::shell::var_table::VarTable::from_values(env_vars.clone());
+    crate::executor::arithmetic::eval_conditional_arith_value(value, &table).unwrap_or(0)
+}
+
 trait Parenthesized {
     fn pipe_parenthesized(self) -> String;
 }

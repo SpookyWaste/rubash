@@ -1713,13 +1713,6 @@ pub(in crate::executor) fn requote_arith_span_token_text(text: &str) -> String {
     output
 }
 
-pub(super) fn eval_arith_value(value: &str) -> i128 {
-    value
-        .split('+')
-        .map(|part| part.trim().parse::<i128>().unwrap_or(0))
-        .sum()
-}
-
 fn empty_quoted_operand_has_operator(expression: &str) -> bool {
     let chars = expression.chars().collect::<Vec<_>>();
     let mut outside = String::new();
