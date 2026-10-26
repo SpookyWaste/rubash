@@ -3700,10 +3700,16 @@ mod posix_sigspec_tests {
         assert_eq!(translate_signal("sighup"), Some("1"));
         assert_eq!(translate_signal("SigHup"), Some("1"));
         // The SIGNALS table is cfg-gated per platform (USR1 is 10 on
-        // Linux/Android but 30 on macOS/FreeBSD); the test must follow
-        // the platform number, not hardcode the Linux one.
-        let usr1 = libc::SIGUSR1.to_string();
-        assert_eq!(translate_signal("sigusr1"), Some(usr1.as_str()));
+        // Linux/Android/Windows but 30 on macOS/FreeBSD); the test must
+        // follow the platform number, not hardcode the Linux one, and
+        // must not reach for libc: the crate is a unix-only dependency
+        // while this test module also compiles on Windows (the goldens
+        // job runs cargo test --lib there).
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        let usr1 = "30";
+        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+        let usr1 = "10";
+        assert_eq!(translate_signal("sigusr1"), Some(usr1));
     }
 
     /// rubash#1386: the EXIT pseudo-signal takes no SIG prefix in GNU
@@ -3731,7 +3737,10 @@ mod posix_sigspec_tests {
         assert_eq!(signal_number_from_spec("sighup"), Some(1));
         assert_eq!(signal_number_from_spec("SigHup"), Some(1));
         // Same platform-number note as mixed_case_prefixed_names_translate.
-        assert_eq!(signal_number_from_spec("sigusr1"), Some(libc::SIGUSR1 as i32));
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        assert_eq!(signal_number_from_spec("sigusr1"), Some(30));
+        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+        assert_eq!(signal_number_from_spec("sigusr1"), Some(10));
     }
 
     /// rubash#1385: bare EXIT (any case) decodes to signal 0 in both
