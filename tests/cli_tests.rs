@@ -940,6 +940,72 @@ fn issue1653_coproc_time_word_is_a_simple_command() {
 }
 
 #[test]
+fn issue1652_coproc_time_bang_combination_is_a_syntax_error() {
+    // The combination shape neither fix covers alone: under
+    // rubash#1653 `time` collects as the coproc's first word, and
+    // the `!` after it is then the illegal operand-level negation
+    // of rubash#1652. GNU: syntax error, exit 2, nothing runs.
+    let output = rubash_command()
+        .arg("-c")
+        .arg("coproc time ! echo hi; echo after")
+        .output()
+        .expect("run rubash");
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("syntax error near unexpected token `!'"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn issue1653_coproc_time_before_brace_body_is_the_coproc_name() {
+    // GNU parse.y `COPROC WORD shell_command`: `time` directly
+    // before a compound body is the coproc NAME (time_PID set,
+    // COPROC_PID unset), not a timing prefix.
+    let output = rubash_command()
+        .arg("-c")
+        .arg(
+            "coproc time { echo hi; }; \
+             echo \"named=${time_PID:+set} anon=${COPROC_PID:+set}\"; \
+             read -t 2 -u ${time[0]} l; echo \"l=[$l]\"",
+        )
+        .output()
+        .expect("run rubash");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "named=set anon=\nl=[hi]\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
+fn issue1653_coproc_time_before_for_loop_is_the_coproc_name() {
+    // Same WORD production in front of a for loop: the loop runs
+    // as the `time`-named coproc and its output drains from
+    // ${time[0]} until the child exits.
+    let output = rubash_command()
+        .arg("-c")
+        .arg(
+            "coproc time for i in 1 2; do echo $i; done; \
+             echo \"named=${time_PID:+set} anon=${COPROC_PID:+set}\"; \
+             cat <&${time[0]}",
+        )
+        .output()
+        .expect("run rubash");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "named=set anon=\n1\n2\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
 fn typed_cell_stays_consistent_across_builtin_writes() {
     // Typed-cell reads must agree with the mirror after every kind of
     // write: plain/compound/append element writes, declare/typeset/local,
