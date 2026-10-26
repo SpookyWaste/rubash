@@ -40,6 +40,11 @@ fn passwd_home(user: &str) -> Option<String> {
     for line in passwd.lines() {
         let mut fields = line.split(':');
         if fields.next() == Some(user) {
+            // passwd(5) layout: name:passwd:uid:gid:gecos:home:shell —
+            // home is the sixth field. (An earlier version of this
+            // helper skipped one field too few and returned the gecos
+            // field — "root" for root — as the expected home.)
+            let _passwd = fields.next();
             let _uid = fields.next();
             let _gid = fields.next();
             let _gecos = fields.next();
