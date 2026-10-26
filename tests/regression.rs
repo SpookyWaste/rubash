@@ -3328,10 +3328,14 @@ mod k1_batch2 {
     /// Windows because resolve_net_service_port only read
     /// /etc/services, so GNU's getservbyname parity (http -> 80) was
     /// missing and the shell printed "Servname not supported" plus
-    /// "Invalid argument". The pin asserts the post-resolution
-    /// refused-connect shape (port 80 on loopback has no listener).
-    /// On unix the name already resolved, so this guards the shared
-    /// parser path there and pins the Windows fix here.
+    /// "Invalid argument". The pin asserts the resolution invariant,
+    /// not the listener state: loopback:80 may or may not have a
+    /// listener (CI runners do, local machines do not), so the
+    /// connect must be attempted at the resolved port either way —
+    /// rc=0 on connect, rc=1 with the GNU refused shape otherwise —
+    /// and must never fail with a resolution error. On unix the name
+    /// already resolved, so this guards the shared parser path there
+    /// and pins the Windows fix here.
     #[test]
     fn issue1775_dev_tcp_service_name_http_resolves() {
         let (stdout, stderr, code) = run(
@@ -3339,19 +3343,24 @@ mod k1_batch2 {
             "( exec 3<>/dev/tcp/127.0.0.1/http ); echo \"http rc=$?\"\n",
         );
         assert_eq!(code, Some(0), "stderr:\n{stderr}");
-        assert_eq!(stdout, "http rc=1\n", "stderr:\n{stderr}");
         assert!(
-            !stderr.contains("Servname not supported"),
+            stdout == "http rc=0\n" || stdout == "http rc=1\n",
+            "connect must be attempted at the resolved port, got stdout: {stdout:?}, stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("Servname not supported") && !stderr.contains("Invalid argument"),
             "service name failed to resolve in:\n{stderr}"
         );
-        assert!(
-            stderr.contains("connect: Connection refused"),
-            "missing GNU connect line in:\n{stderr}"
-        );
-        assert!(
-            stderr.contains("/dev/tcp/127.0.0.1/http: Connection refused"),
-            "missing GNU redirection line in:\n{stderr}"
-        );
+        if stdout == "http rc=1\n" {
+            assert!(
+                stderr.contains("connect: Connection refused"),
+                "missing GNU connect line in:\n{stderr}"
+            );
+            assert!(
+                stderr.contains("/dev/tcp/127.0.0.1/http: Connection refused"),
+                "missing GNU redirection line in:\n{stderr}"
+            );
+        }
     }
 
     /// rubash#1215: `hash <builtin>` is a silent no-op (no entry, rc 0);
