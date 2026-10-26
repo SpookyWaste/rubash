@@ -1,5 +1,4 @@
 use super::parse_loop::{
-    parse_time_prefixed_compound_command, parse_time_prefixed_shell_command,
     scan_time_prefix_tokens, time_prefixed_shell_command_allows_simple_pipeline,
 };
 use super::*;
@@ -421,8 +420,14 @@ fn parse_coproc_compound_body(tokens: &[Token], start: usize) -> Option<(Command
     }
 
     match tokens.get(start)?.value.as_str() {
-        "time" => parse_time_prefixed_shell_command(tokens, start)
-            .or_else(|| parse_time_prefixed_compound_command(tokens, start)),
+        // GNU parse.y coproc productions take a shell_command or a
+        // simple_command — `time` is a pipeline-level prefix, never a
+        // shell_command, so after `coproc` it can only be the first
+        // word of a simple command (`coproc time echo hi` runs the
+        // command named `time`, which does not exist — rubash#1653).
+        // Routing it to the time-prefixed productions swallowed a
+        // following pipeline into the coproc body and bound the fds in
+        // the parent. The simple-command collection below takes it.
         "for" => parse_for_command(tokens, start, None, 0),
         "if" => parse_if_command_standalone(tokens, start, None, 0),
         "while" | "until" => parse_loop_command(tokens, start, None, 0),
