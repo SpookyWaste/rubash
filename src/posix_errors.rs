@@ -100,6 +100,51 @@ fn win32_message(code: i32) -> &'static str {
         206 => "File name too long",        // ERROR_FILENAME_EXCED_RANGE
         232 => "Broken pipe",               // ERROR_NO_DATA
         267 => "Not a directory",           // ERROR_DIRECTORY
+        // Winsock WSAE* block (rubash#1774): socket errors surface as raw
+        // OS codes (WSAECONNREFUSED 10061 etc.) through std::io::Error,
+        // and without a table entry message() falls back to the long
+        // FormatMessageW text — a refused /dev/tcp connect then leaked
+        // "No connection could be made because the target machine
+        // actively refused it. (os error 10061)" where GNU prints the
+        // short strerror "Connection refused". The texts below are the
+        // POSIX strerror wordings for the matching errnos, so every
+        // message()/path_error() consumer (including /dev/tcp and
+        // /dev/udp redirect failures) renders the GNU shape. Name
+        // resolution failures (WSAHOST_NOT_FOUND/WSATRY_AGAIN) map to
+        // the gai_strerror wordings GNU netopen prints.
+        10035 => "Resource temporarily unavailable", // WSAEWOULDBLOCK
+        10036 => "Operation now in progress",        // WSAEINPROGRESS
+        10037 => "Operation already in progress",    // WSAEALREADY
+        10038 => "Socket operation on non-socket",   // WSAENOTSOCK
+        10039 => "Destination address required",     // WSAEDESTADDRREQ
+        10040 => "Message too long",                 // WSAEMSGSIZE
+        10041 => "Protocol wrong type for socket",   // WSAEPROTOTYPE
+        10042 => "Protocol not available",           // WSAENOPROTOOPT
+        10043 => "Protocol not supported",           // WSAEPROTONOSUPPORT
+        10044 => "Socket type not supported",        // WSAESOCKTNOSUPPORT
+        10045 => "Operation not supported",          // WSAEOPNOTSUPP
+        10046 => "Protocol family not supported",    // WSAEPFNOSUPPORT
+        10047 => "Address family not supported by protocol", // WSAEAFNOSUPPORT
+        10048 => "Address already in use",           // WSAEADDRINUSE
+        10049 => "Cannot assign requested address",  // WSAEADDRNOTAVAIL
+        10050 => "Network is down",                  // WSAENETDOWN
+        10051 => "Network is unreachable",           // WSAENETUNREACH
+        10052 => "Network dropped connection on reset", // WSAENETRESET
+        10053 => "Software caused connection abort", // WSAECONNABORTED
+        10054 => "Connection reset by peer",         // WSAECONNRESET
+        10055 => "No buffer space available",        // WSAENOBUFS
+        10056 => "Transport endpoint is already connected", // WSAEISCONN
+        10057 => "Transport endpoint is not connected", // WSAENOTCONN
+        10058 => "Cannot send after transport endpoint shutdown", // WSAESHUTDOWN
+        10059 => "Too many references: cannot splice", // WSAETOOMANYREFS
+        10060 => "Connection timed out",             // WSAETIMEDOUT
+        10061 => "Connection refused",               // WSAECONNREFUSED
+        10062 => "Too many levels of symbolic links", // WSAELOOP
+        10063 => "File name too long",               // WSAENAMETOOLONG
+        10064 => "Host is down",                     // WSAEHOSTDOWN
+        10065 => "No route to host",                 // WSAEHOSTUNREACH
+        11001 => "Name or service not known",        // WSAHOST_NOT_FOUND
+        11002 => "Temporary failure in name resolution", // WSATRY_AGAIN
         _ => "Unknown error",
     }
 }

@@ -3225,6 +3225,39 @@ mod k1_batch2 {
         );
     }
 
+    /// rubash#1774: a refused /dev/tcp connect on Windows leaked the
+    /// long FormatMessageW text ("No connection could be made because
+    /// the target machine actively refused it. (os error 10061)")
+    /// where GNU prints the short strerror "Connection refused"
+    /// (redir.c netopen; golden issue1237-net-redir). The rendering
+    /// funnel is posix_errors::message()'s Win32 table, so the pin
+    /// asserts the GNU shape on every platform: the sys_error line
+    /// plus the redirection_error line, and no raw OS long text.
+    #[test]
+    fn issue1774_dev_tcp_connect_failure_gnu_diagnostic() {
+        let (stdout, stderr, code) = run(
+            "k1-1774",
+            "( exec 3<>/dev/tcp/127.0.0.1/1 ); echo \"tcp rc=$?\"\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "tcp rc=1\n", "stderr:\n{stderr}");
+        assert!(
+            stderr.contains("connect: Connection refused"),
+            "missing GNU connect line in:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("/dev/tcp/127.0.0.1/1: Connection refused"),
+            "missing GNU redirection line in:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("actively refused") && !stderr.contains("os error"),
+            "raw OS text leaked in:\n{stderr}"
+        );
+    }
+
+
+
+
     /// rubash#1213: `return` with too many arguments is the no_args
     /// DISCARD class — message, status 2, rest of the line abandoned,
     /// in functions, at top level, and for the numeric path's caller.
