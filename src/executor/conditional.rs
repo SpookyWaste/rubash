@@ -1372,6 +1372,16 @@ impl Executor {
         let left_expanded = self.expand_cond_arith_operand(left);
         let right_expanded = self.expand_cond_arith_operand(right);
         self.xtrace_conditional_term(op, &left_expanded, Some(&right_expanded));
+        // GNU test.c:357 arithcomp -> evalexp: expr.c:1190-1216
+        // expr_streval raises err_unboundvar for a bare unset name when
+        // unbound_vars_is_error. The raw evaluator below reads unset
+        // names as 0, so the nounset prologue the (( ))/let paths run
+        // has to run here too, per operand, in evaluation order
+        // (rubash#1709 — the #1130/#1201 family covered the $-expansion
+        // path; a bare name never expands, it reaches evalexp as text).
+        if let Some(status) = self.conditional_nounset_arith_trap(&left_expanded) {
+            return status;
+        }
 
         // GNU execute_cmd.c:4049-4068 -> test.c:357-372 arithcomp -> evalexp:
         // the operands were word-expanded by cond_expand_word (mode 3,
@@ -1403,6 +1413,9 @@ impl Executor {
         // only; sync the typed variables map at this boundary like the
         // `(( ))` / `let` / subscript evaluators do.
         super::arithmetic::sync_arith_writes(self);
+        if let Some(status) = self.conditional_nounset_arith_trap(&right_expanded) {
+            return status;
+        }
         let right_eval = self.expand_arith_indexed_subscripts(&right_expanded);
         let right_dynamic = self.arith_dynamic_context();
         let (Some(right_val), _) = eval_mutable_arith_value_with_random_flags(
@@ -1420,6 +1433,37 @@ impl Executor {
         self.flush_arith_diags(Some("[["));
         super::arithmetic::sync_arith_writes(self);
         i32::from(!conditional_numeric_matches(left_val, op, right_val))
+    }
+
+    /// The `set -u` side of GNU's arithcomp evaluation (expr.c:1190-1216
+    /// expr_streval -> err_unboundvar): scan one already-expanded
+    /// numeric operand for a bare unset name. On a trap, mirror
+    /// expand_conditional_word's FATAL branch — print the diagnostic
+    /// through the conditional's fd 2 and park the fatal status for
+    /// execute_conditional_command_with_redirects to unwind with the
+    /// FORCE_EOF / interactive-DISCARD classes (rubash#1709).
+    fn conditional_nounset_arith_trap(&mut self, operand: &str) -> Option<i32> {
+        if !crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "nounset") {
+            return None;
+        }
+        let name =
+            super::arithmetic::arithmetic_unbound_variable(operand, &self.shell_state.env_vars)?;
+        let line = format!(
+            "{}{}: {}\n",
+            self.diagnostic_prefix(),
+            name,
+            "unbound variable"
+        );
+        let _ = self.write_diagnostic_fd2(line.as_bytes());
+        self.exit_code = if self.expansion_error_is_interactive_discard() {
+            1
+        } else {
+            self.expansion_fatal_status()
+        };
+        self.conditional_fatal_status.set(Some(self.exit_code));
+        self.command_expansion_failed.set(true);
+        self.conditional_expansion_fatal.set(true);
+        Some(self.exit_code)
     }
 }
 
