@@ -451,6 +451,48 @@ fn issue1645_jobs_omits_implicit_name_for_simple_coproc() {
 }
 
 #[test]
+fn issue1659_mapfile_reads_coproc_fd_via_redirect() {
+    // GNU mapfile.def reads the descriptor the `<&N` redirection bound;
+    // the coproc read end has no text mirror, so mapfile used to drain
+    // the inherited stdin instead (0 lines, or a block on the terminal).
+    let output = rubash_command()
+        .arg("-c")
+        .arg(
+            "coproc printf 'a\\nb\\n'; \
+             mapfile -t arr <&${COPROC[0]}; \
+             echo \"n=${#arr[@]}\"; printf 'e=[%s]\\n' \"${arr[@]}\"; \
+             kill $COPROC_PID 2>/dev/null; wait 2>/dev/null",
+        )
+        .output()
+        .expect("run rubash");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "n=2\ne=[a]\ne=[b]\n"
+    );
+}
+
+#[test]
+fn issue1659_mapfile_blocks_for_late_coproc_producer() {
+    // The producer delivers after ~1s; GNU mapfile waits on the pipe
+    // (it does not mistake the live coproc fd for an exhausted one).
+    let output = rubash_command()
+        .arg("-c")
+        .arg(
+            "coproc { sleep 1; echo late; }; \
+             mapfile -t arr <&${COPROC[0]}; \
+             echo \"n=${#arr[@]} e0=[${arr[0]}]\"; \
+             kill $COPROC_PID 2>/dev/null; wait 2>/dev/null",
+        )
+        .output()
+        .expect("run rubash");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "n=1 e0=[late]\n");
+}
+
+#[test]
 fn issue1632_coproc_redirected_stdout_read_end_blocks_until_exit() {
     // GNU: with the coproc child's stdout redirected to a file, the
     // child still holds a writer on the coproc read pipe for its whole

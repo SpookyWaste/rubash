@@ -197,6 +197,18 @@ impl Executor {
                     }
                 }
             }
+            // rubash#1659: when the winning fd-0 redirect is a dup
+            // (`<&N`) whose source is a coproc read end, the descriptor
+            // mapfile must drain is that pipe — it has no text mirror,
+            // so the generic stdin resolution below falls through to
+            // the inherited process stdin and reads (or blocks on) the
+            // WRONG stream. GNU mapfile.def reads the descriptor the
+            // redirection bound, exactly like `read -u N` does.
+            if let Some(source_fd) = self.mapfile_coproc_dup_source(cmd) {
+                if let Some(input) = self.fd_table.read_all_text(source_fd) {
+                    return Some(input);
+                }
+            }
             if let Some(input) = self.stdin_string_for_command_mut(cmd) {
                 return Some(input);
             }
@@ -230,6 +242,49 @@ impl Executor {
             return Some(input);
         }
         self.mapfile_heredoc_fd_input(cmd, fd)
+    }
+
+    /// The fd a `mapfile ... <&N` command must drain when the winning
+    /// fd-0 redirect dups a coproc read end (rubash#1659). Mirrors the
+    /// winner rule of fd0_stdin_redirect_winner: the LAST fd-0 input
+    /// redirect decides; only a dup/alias winner naming a CoprocStdout
+    /// endpoint qualifies (file and heredoc winners keep their own
+    /// serving paths).
+    fn mapfile_coproc_dup_source(&self, cmd: &CommandNode) -> Option<u32> {
+        let winner = cmd.redirects.iter().rev().find(|redirect| {
+            redirect.fd.unwrap_or(0) == 0
+                && matches!(
+                    redirect.kind,
+                    crate::parser::RedirectKind::Input
+                        | crate::parser::RedirectKind::DuplicateInput
+                        | crate::parser::RedirectKind::ReadWrite
+                        | crate::parser::RedirectKind::CloseInput
+                        | crate::parser::RedirectKind::HereDoc
+                        | crate::parser::RedirectKind::HereString
+                )
+        });
+        let source_fd = match winner {
+            Some(redirect) => {
+                if redirect.kind != crate::parser::RedirectKind::DuplicateInput {
+                    return None;
+                }
+                let target = self.expand_redirect_target(redirect);
+                redirect_target_fd(&target)?
+            }
+            None => {
+                let redirect = cmd.redirect_in.as_ref()?;
+                if redirect.fd.unwrap_or(0) != 0 {
+                    return None;
+                }
+                let target = self.expand_redirect_target(redirect);
+                redirect_target_fd(&target)?
+            }
+        };
+        matches!(
+            self.fd_table.read_endpoint(source_fd),
+            Some(FdReadEndpoint::CoprocStdout { .. })
+        )
+        .then_some(source_fd)
     }
 
     pub(in crate::executor) fn mapfile_fd_is_available(&self, cmd: &CommandNode, fd: u32) -> bool {
