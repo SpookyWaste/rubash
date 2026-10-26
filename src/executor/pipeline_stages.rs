@@ -337,13 +337,61 @@ impl Executor {
 
         subshell.stdout_capture = Some(Vec::new());
         subshell.stderr_capture = Some(Vec::new());
+        // GNU: a pipeline element's forked child runs the element's simple
+        // command itself, so the command's assignment words are processed
+        // in the child — subst.c:13153 expand_word_list_internal picks
+        // assign_in_env (variables.c:3536) to build the temporary_env, and
+        // execute_function (execute_cmd.c:5181) receives it as the
+        // function's variable context via push_context
+        // (execute_cmd.c:5233/5252). The non-pipeline invocation path
+        // (execute_function_command_invocation) performs exactly this
+        // apply on the executing executor; the stage clone IS the forked
+        // child, so the apply belongs on the clone, before the body runs
+        // (rubash#1765: the stage used to drop the prefix assignments
+        // entirely and the body saw the outer values).
+        let assignment_raws = (materialized_command.assignment_raws.len()
+            == materialized_command.assignments.len())
+        .then(|| materialized_command.assignment_raws.as_slice());
+        let (temporary_assignments, assignments_failed) = subshell
+            .apply_temporary_assignments(&materialized_command.assignments, assignment_raws);
+        // GNU variables.c push_context: the call tempenv becomes the
+        // function's variable context — recorded so a posix special
+        // builtin's merged tempenv inside the body can tell a context
+        // binding from an ordinary command tempenv binding (mirrors
+        // execute_function_command_invocation).
+        subshell.function_tempenv_names.push(
+            materialized_command
+                .assignments
+                .iter()
+                .map(|(name, _)| assignment_name_and_append(name).0.to_string())
+                .collect(),
+        );
         // Direct-stdout builtins in the function consult the thread-local
         // capture, which belongs to an enclosing capture when this stage
         // runs inside one; give the call its own capture.
-        let (thread_captured, result) = crate::executor::shell_options::capture_stdout_streamed(
-            self.pipeline_stdout_stream,
-            || subshell.execute_function(&function_name, &args, &call),
-        );
+        // The failure classes mirror execute_function_command_invocation:
+        // a posix-fatal tempenv failure or a DISCARD-class expansion error
+        // skips the body with status 1 (in the child both end the element);
+        // any other failure (default-mode readonly) only diagnosed — the
+        // window stays partially applied and the body still runs.
+        let (thread_captured, result) = if assignments_failed
+            && (subshell.posix_assignment_failure_is_fatal() || subshell.evalerror_pending.get())
+        {
+            subshell.exit_code = 1;
+            (Vec::new(), Err(ExecuteError::ExpansionFailure(1)))
+        } else {
+            crate::executor::shell_options::capture_stdout_streamed(
+                self.pipeline_stdout_stream,
+                || subshell.execute_function(&function_name, &args, &call),
+            )
+        };
+        // The window dies with the command, before the element's EXIT
+        // trap runs (the trap is subshell teardown, after the command
+        // completed and its temp vars were popped). The clone is dropped
+        // after the stage, so this restore only keeps the clone's own
+        // bookkeeping balanced for the trap run below.
+        subshell.restore_temporary_assignments(temporary_assignments);
+        subshell.function_tempenv_names.pop();
         // GNU execute_cmd.c:1761-1763 (execute_in_subshell): a pipeline
         // element is a forked subshell whose exit — implicit after the body
         // as much as via `exit` — runs the subshell's EXIT trap. The trap
