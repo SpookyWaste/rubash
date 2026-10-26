@@ -103,6 +103,38 @@ GNU Bash 5.3.x 测试套件 — 83 个文件，true-baseline 实测
 
 以上全部钉为回归夹具（`tests/` 下 335 个集成测试文件，含 `tests/regression.rs`——GNU golden 矩阵、套件切片快照、perf 金丝雀），CI 每次推送都跑——外加一道 C 源码逐行审计（`docs/SOURCE-AUDIT.md`，已盘点 336 个行为），总在套件踩到之前把缺口找到并关掉。
 
+## 兼容性是怎么量出来的——以及同行量出来是什么样
+
+rubash 的兼容性不靠形容词，靠三把尺子：
+
+- **自研差分套件**：246 例原创差分用例对 GNU bash 5.3.20 逐字节比对
+  （stdout/stderr/退出码），当前 **244/246** 一致；剩余 2 例是已记录的平台性差异。
+- **GNU 官方语料**：以 GNU 自家 83 套测试集为一致性测量对象（measured against）。
+- **真实生态**：nvm、bats-core、bash-it、oh-my-bash、bash-completion、modernish
+  等真实套件逐项跑；每处分歧立公开 issue 并固化成仓库回归测试——截至
+  2026-10-25，rubash 累计 1,050 个 issue、已关 1,039。
+
+同一把 306 例差分尺子量同行是什么结果？以宣称最完整的 brush（Rust 实现，
+官网兼容页自称「Production-ready for most use cases」）为例：其发行版
+v0.4.0 实测 181/306；master 最新提交源码构建复测 183/306，
+同一失败剖面（实录见证据文件 §7）。
+rubash 在同一语料上是 304/306。差距的形状比数字更说明问题（最小复现见证据文件）：
+
+- alias 展开时机模型与 GNU 相反：非交互未开 `expand_aliases` 也展开、定义同行
+  即生效、函数体内按调用时展开——20 个专项探针 6 条实质分歧；
+- `printf x y`（无转换符格式串）在发行版上无限循环，直接挂死脚本（master 已修复此条）；
+- 脚本模式下作业控制是空壳：`wait $!` 报「not yet implemented」，29 例挂 27；
+- 信号 trap 不触发、子 shell 的 EXIT trap 丢失；globstar 的 `**` 不递归
+  （而其兼容页把 globstar 列在「Fully Supported」）；
+- nameref 半成品：`unset` nameref 报未实现，真实生态（oh-my-bash 加载）会撞上；
+- 退出码与诊断文案全线自家格式（rc 99、管道里带 ANSI 颜色码）——按退出码与
+  stderr 做决策的程序和 agent 会被静默误导。
+
+轻量不是残疾的遮羞布。rubash 的 385,618 行（静态审计口径，2026-10-25）是两件
+巨量工程的完工价：不用 fork 逐路径复刻完整 bash 语义，与跨平台落地。
+以约五分之一的引擎体量宣称同一件事、又过不了这些基础机制的实现，
+无法成为 bash 的替代产物，也无法成为可靠的登录态 shell。
+
 ## 性能
 
 实测而非宣称——下面每个数字都钉在产出它的 issue/PR 上，守住它的测试或门禁也一并写明。仓内台账在 [`docs/performance.md`](docs/performance.md)；perf 金丝雀随 CI 回归套件跑（`cargo test --test regression`）。

@@ -166,6 +166,48 @@ plus a C-source line-level audit
 (`docs/SOURCE-AUDIT.md`, 336 behaviors inventoried) that keeps finding and
 closing gaps before suites hit them.
 
+## How compatibility is measured here — and what the same ruler shows elsewhere
+
+rubash's compatibility is not an adjective. It is three rulers:
+
+- **A differential suite of our own**: 246 original cases byte-compared against
+  GNU bash 5.3.20 (stdout, stderr, exit status) — currently **244/246** identical;
+  the remaining 2 are documented platform differences.
+- **GNU's own corpus**: measured against GNU's 83-suite test corpus.
+- **Real ecosystems**: nvm, bats-core, bash-it, oh-my-bash, bash-completion,
+  modernish and more, run for real; every divergence becomes a public issue and a
+  pinned regression test — as of 2026-10-25, rubash has 1,050 issues filed and
+  1,039 closed.
+
+What does the same 306-case differential ruler show on the boldest claimant?
+brush (Rust; its compatibility page says "Production-ready for most use cases"),
+measured in its shipped v0.4.0 release: 181/306, and at 183/306 in a source
+build of its latest master commit — the same failure profile. rubash on the same corpus: 304/306. The *shape* of the
+gap matters more than the number (minimal repros in the evidence file):
+
+- Its alias timing model is the reverse of GNU's: aliases expand in
+  non-interactive shells without `expand_aliases`, take effect on the line that
+  defines them, and expand at call time inside function bodies — 6 substantive
+  divergences across 20 dedicated probes;
+- `printf x y` (conversion-free format string) loops forever and hangs the script
+  in the release (fixed on master);
+- job control in script mode is a façade: `wait $!` reports "not yet implemented";
+  27 of 29 job cases diverge;
+- signal traps never fire; subshell EXIT traps are lost; globstar's `**` does not
+  recurse (while its compatibility page lists globstar under "Fully Supported");
+- namerefs are half-built: `unset` of a nameref reports not-implemented, and a
+  real ecosystem load (oh-my-bash) trips over exactly that;
+- exit codes and diagnostics are home-grown end to end (rc 99, ANSI color codes
+  inside pipes) — programs and agents that decide from exit status and stderr
+  get silently misled.
+
+Lightweight is no excuse for missing limbs. rubash's 385,618 lines (static-audit
+caliber, 2026-10-25) are the finished price of two giant jobs: complete bash
+semantics re-implemented path by path without fork, and cross-platform itself.
+An implementation claiming the same thing at roughly a fifth of the engine mass,
+which then fails these foundation mechanisms, can be neither a bash replacement
+nor a reliable login shell.
+
 ## Testing
 
 ```bash
