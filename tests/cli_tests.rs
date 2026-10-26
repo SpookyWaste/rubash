@@ -410,6 +410,27 @@ fn issue1624_coproc_vars_unset_after_eof_and_reap() {
 }
 
 #[test]
+fn issue1638_append_procsub_redirect_drains_before_next_command() {
+    // GNU forks the `>(...)` consumer at expansion time, so a fast
+    // consumer's output is on disk when the next command runs. The
+    // append form's deferred respawn used to start only after the
+    // owning command returned, and the immediate read found nothing
+    // (the same shape as executor_command_chaining part_080).
+    let dir = std::env::temp_dir().join(format!("rubash-cli-issue1638-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let output = rubash_command()
+        .current_dir(&dir)
+        .arg("-c")
+        .arg("echo appended >> >(cat > out.txt); echo \"now=[$(cat out.txt)]\"")
+        .output()
+        .expect("run rubash");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "now=[appended]\n");
+}
+
+#[test]
 fn typed_cell_stays_consistent_across_builtin_writes() {
     // Typed-cell reads must agree with the mirror after every kind of
     // write: plain/compound/append element writes, declare/typeset/local,

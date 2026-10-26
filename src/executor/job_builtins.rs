@@ -5,7 +5,7 @@ use std::io::Write;
 /// 128+signal status GNU's wait_intr_flag longjmp produces
 /// (wait.def:181-191): the job stays live and the signal is re-queued so
 /// the trap action still runs at the next command boundary.
-enum WaitPidOutcome {
+pub(in crate::executor) enum WaitPidOutcome {
     NotFound,
     Status(i32),
     Interrupted(i32),
@@ -1507,7 +1507,7 @@ impl Executor {
         self.coproc_unset_vars(pid);
     }
 
-    fn wait_for_background_pid(
+    pub(in crate::executor) fn wait_for_background_pid(
         &mut self,
         pid: u32,
         _retain_for_explicit_wait: bool,

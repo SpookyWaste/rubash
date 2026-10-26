@@ -18,6 +18,19 @@ struct OutputProcessSubstitution {
     /// fork (subst.c:6362) inherits the parent's line_number at fork
     /// time (rubash#1184 f4).
     line: Option<usize>,
+    /// rubash#1638: the substitution was the target of an APPEND
+    /// redirect (`>>`, `&>>`, `2>>`). GNU forks the consumer at
+    /// expansion time for every form, so delivery speed is the
+    /// consumer's own; the deferred carrier model cannot reproduce
+    /// that uniformly, and the tree's standing specs pin opposite
+    /// edges: the truncate form must never block the next command
+    /// (rubash#1220), while the append form's consumers are expected
+    /// to have drained by the time the owning command returns
+    /// (executor_command_chaining part_080). Append-form finishes
+    /// therefore spawn the consumer and drain it synchronously (the
+    /// exit status still lands in completed_statuses, so a later
+    /// `wait $!` observes it exactly as for the detached form).
+    drain_synchronously: bool,
 }
 
 fn exec_keeps_output_process_substitution(words: &[String], redirect: &Redirect) -> bool {
@@ -486,6 +499,7 @@ impl Executor {
                 path,
                 source,
                 line: cmd_line,
+                drain_synchronously: true,
             });
         }
         if let Some(source) = shared_combined_output_process_substitution(
@@ -508,6 +522,7 @@ impl Executor {
                 path,
                 source,
                 line: cmd_line,
+                drain_synchronously: true,
             });
         }
         if let Some(redirect) = &mut rewritten.redirect_out {
@@ -526,6 +541,7 @@ impl Executor {
                         path,
                         source,
                         line: cmd_line,
+                        drain_synchronously: false,
                     });
                 }
             }
@@ -546,6 +562,7 @@ impl Executor {
                         path,
                         source,
                         line: cmd_line,
+                        drain_synchronously: true,
                     });
                 }
             }
@@ -566,6 +583,7 @@ impl Executor {
                         path,
                         source,
                         line: cmd_line,
+                        drain_synchronously: false,
                     });
                 }
             }
@@ -586,6 +604,7 @@ impl Executor {
                         path,
                         source,
                         line: cmd_line,
+                        drain_synchronously: true,
                     });
                 }
             }
@@ -638,6 +657,7 @@ impl Executor {
                 path,
                 source,
                 line: line,
+                drain_synchronously: false,
             });
         }
         Ok(())
@@ -657,6 +677,7 @@ impl Executor {
                     path: path.clone(),
                     source: substitution.source,
                     line,
+                    drain_synchronously: false,
                 });
                 let display_path = self.process_substitution_output_fd_word(&path);
                 *word = word.replacen(&substitution.target, &display_path, 1);
@@ -922,6 +943,7 @@ impl Executor {
                 path,
                 source,
                 line,
+                drain_synchronously: false,
             })?;
         }
         Ok(())
@@ -1060,7 +1082,20 @@ impl Executor {
         // stall the parent's next command (rubash#1220), and the child's own
         // `exit`/traps/variables stay child-local by construction (subst.c
         // 6421 restore_original_signals, :6628 exit).
-        self.spawn_output_process_substitution_child(&output.source, input, output.line)
+        let pid =
+            self.spawn_output_process_substitution_child(&output.source, input, output.line)?;
+        if output.drain_synchronously {
+            if let Some(pid) = pid {
+                // rubash#1638: append-form consumers drain before the
+                // owning command returns (see the field's note). Any
+                // non-Status outcome (a pending trapped signal won the
+                // wait, the handle was put back) leaves the child on
+                // the ordinary detached path — signal semantics win
+                // over the drain, as they do for `wait` itself.
+                let _ = self.wait_for_background_pid(pid, true);
+            }
+        }
+        Ok(())
     }
 
     /// Spawn the `>(body)` consumer detached, the stand-in for GNU's
@@ -1078,7 +1113,7 @@ impl Executor {
         body: &str,
         input: Vec<u8>,
         line: Option<usize>,
-    ) -> Result<(), ExecuteError> {
+    ) -> Result<Option<u32>, ExecuteError> {
         let exe = std::env::var_os("CARGO_BIN_EXE_rubash")
             .map(std::path::PathBuf::from)
             .or_else(test_rubash_binary_from_current_exe)
@@ -1187,7 +1222,7 @@ impl Executor {
         self.background_children
             .insert(pid, crate::fd::SpawnedChild::from(child));
         self.shell_state.last_background_pid = Some(pid);
-        Ok(())
+        Ok(Some(pid))
     }
 
     /// GNU subst.c:6362 process_substitute(): the substituted word is
