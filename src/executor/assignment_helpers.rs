@@ -428,6 +428,53 @@ pub(in crate::executor) fn append_assoc_scalar_value(current: &str, value: &str)
     format_assoc_storage(entries)
 }
 
+/// The ASS_APPEND form of the scalar assoc bind above. GNU
+/// variables.c:3138-3142 bind_variable_internal: for a variable with an
+/// assign_func (array/assoc) under ASS_APPEND, make_variable_value
+/// (variables.c:2905) first combines the old value with the new word —
+/// integer variables add the two evaluated operands, plain variables
+/// concatenate old + new — and the assign_func (arrayfunc.c:299
+/// bind_assoc_variable) then stores the combined value at key "0". A
+/// missing key "0" stores the right-hand side alone, evaluated first
+/// when the variable is integer. Contrast append_assoc_scalar_value: a
+/// plain (non-append) scalar bind REPLACES key "0" (rubash#1677).
+/// Like append_assoc_value, the stored value runs through the variable's
+/// case attribute on the POST-append (combined) text — GNU
+/// make_variable_value's ASS_APPEND case branch (variables.c:2970-2986);
+/// the integer branch preempts the case branch (rubash#1618).
+pub(in crate::executor) fn append_assoc_scalar_append_value(
+    current: &str,
+    value: &str,
+    integer: bool,
+    env_vars: &crate::shell::var_table::VarTable,
+    name: &str,
+) -> String {
+    let convert = |value: String| -> String {
+        if integer {
+            value
+        } else {
+            super::variable_state::apply_case_attributes(env_vars, name, value)
+        }
+    };
+    let mut entries = assoc_entries(current);
+    let value = unquote_storage_value(value);
+    if let Some((_, entry_value)) = entries.iter_mut().rev().find(|(key, _)| key == "0") {
+        if integer {
+            *entry_value = (eval_conditional_arith_value(entry_value, env_vars).unwrap_or(0)
+                + eval_conditional_arith_value(&value, env_vars).unwrap_or(0))
+            .to_string();
+        } else {
+            *entry_value = convert(append_scalar_value(entry_value, &value));
+        }
+    } else if integer {
+        let evaluated = eval_conditional_arith_value(&value, env_vars).unwrap_or(0);
+        entries.push(("0".to_string(), evaluated.to_string()));
+    } else {
+        entries.push(("0".to_string(), convert(value)));
+    }
+    format_assoc_storage(entries)
+}
+
 /// Collapse duplicated `[k]=v` segments to a single binding per key, using the
 /// contract `bash_assoc_order` documents: the FIRST occurrence fixes the key's
 /// slot and the LAST occurrence supplies its value.

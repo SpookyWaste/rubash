@@ -191,6 +191,46 @@ pub(in crate::builtins) fn append_assoc_value(
     format_assoc_storage(entries)
 }
 
+/// The scalar (non-compound) ASS_APPEND bind for an associative array on
+/// the declare path. GNU variables.c:3138-3142 bind_variable_internal
+/// combines the old value at key "0" with the new word through
+/// make_variable_value (variables.c:2905) — integer variables add the
+/// evaluated operands, plain variables concatenate — before the
+/// assign_func stores at key "0"; a missing key "0" stores the
+/// (integer: evaluated) right-hand side alone. Routing the bare word
+/// through append_assoc_value instead fed it to the kvpair branch,
+/// which stored it as a new empty KEY (rubash#1677: `declare B+=y`
+/// created key `y` and left [0] untouched).
+pub(in crate::builtins) fn append_assoc_scalar_append_value(
+    current: &str,
+    value: &str,
+    integer: bool,
+    variables: &crate::shell::var_table::VarTable,
+) -> String {
+    let mut entries = parse_assoc_words(current);
+    let value = unquote_storage_value(value);
+    if let Some((_, entry_value)) = entries.iter_mut().rev().find(|(key, _)| key == "0") {
+        if integer {
+            *entry_value =
+                (crate::executor::arithmetic::eval_conditional_arith_value(entry_value, variables)
+                    .unwrap_or(0)
+                    + crate::executor::arithmetic::eval_conditional_arith_value(&value, variables)
+                        .unwrap_or(0))
+                .to_string();
+        } else {
+            entry_value.push_str(&value);
+        }
+    } else if integer {
+        let evaluated =
+            crate::executor::arithmetic::eval_conditional_arith_value(&value, variables)
+                .unwrap_or(0);
+        entries.push(("0".to_string(), evaluated.to_string()));
+    } else {
+        entries.push(("0".to_string(), value));
+    }
+    format_assoc_storage(entries)
+}
+
 /// Split an assoc assignment token (`[key]=value` / `[key]+=value`) at the
 /// subscript-closing `]`, honoring quotes and escapes: GNU parses the raw
 /// compound assignment text so quoted `]`/`=` inside a key stay literal

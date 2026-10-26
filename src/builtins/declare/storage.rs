@@ -7,6 +7,7 @@ pub(in crate::builtins) use array::append_array_value;
 pub(in crate::builtins) use array::{
     fold_indexed_storage_dupes, format_indexed_array_storage, indexed_array_entries,
 };
+pub(in crate::builtins) use assoc::append_assoc_scalar_append_value;
 pub(in crate::builtins) use assoc::append_assoc_value;
 pub(in crate::builtins) use assoc::{format_assoc_storage, parse_assoc_words};
 pub(super) use assoc::{quote_assoc_key, quote_assoc_storage_value};

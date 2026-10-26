@@ -1652,8 +1652,13 @@ impl Executor {
                     )
                 } else {
                     element_values_converted = true;
-                    let value = self.apply_case_assignment_attributes(base_name, value);
-                    append_assoc_scalar_value(current, &value)
+                    append_assoc_scalar_append_value(
+                        current,
+                        &value,
+                        is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name),
+                        &self.shell_state.env_vars,
+                        base_name,
+                    )
                 }
             } else if is_array_storage(current)
                 || is_marked_var(&self.shell_state.env_vars, ARRAY_VARS, base_name)
