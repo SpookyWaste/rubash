@@ -2439,6 +2439,13 @@ impl Executor {
                 return if invalid_name {
                     self.finish_read_error(cmd, &stderr, 1)
                 } else {
+                    // rubash#1639 (read arm): an interrupted read is an
+                    // untrapped-SIGINT foreground wait — the flag is
+                    // only ever set under the armed guard (interactive
+                    // + untrapped) — so the rest of the line is
+                    // discarded like the sleep/external waits. Shape
+                    // ported from PR #1702 (a-rookie-of-C-language).
+                    self.fg_sigint_unwind = true;
                     128 + signal
                 };
             }
@@ -2601,6 +2608,10 @@ impl Executor {
                 // it from the flag. Do not fall through to the EOF /
                 // timeout / fallback arms (the fallback would block
                 // on a second raw read).
+                // rubash#1639 (read arm): the same untrapped-SIGINT
+                // foreground-wait discard as the sleep/external waits
+                // (ported from PR #1702's shape set).
+                self.fg_sigint_unwind = true;
                 130
             } else if self.fd_table.read_error.is_some() {
                 // GNU read.def:911: a hard read(2) failure (EISDIR when
@@ -2826,7 +2837,9 @@ impl Executor {
             // assigns nothing (rubash#1250); on timeout the vars keep
             // the partial assignment above and the builtin returns
             // 128+SIGALRM=142 (read.def:539-562).
+            let mut interrupt_signal = None;
             let status = if let Some(signal) = self.take_read_interrupted_signal() {
+                interrupt_signal = Some(signal);
                 128 + signal
             } else if self.take_read_timed_out() {
                 142
@@ -2836,6 +2849,13 @@ impl Executor {
             return if invalid_name || fail_after_read {
                 self.finish_read_error(cmd, &stderr, 1)
             } else {
+                // rubash#1639 (read arm): arm the line discard only
+                // when the interrupted status is the one actually
+                // returned (the error arms above return 1 instead).
+                // Ported from PR #1702 (a-rookie-of-C-language).
+                if interrupt_signal.is_some() {
+                    self.fg_sigint_unwind = true;
+                }
                 status
             };
         }
