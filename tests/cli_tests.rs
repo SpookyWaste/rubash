@@ -751,6 +751,50 @@ fn issue1652_named_coproc_bang_is_a_syntax_error() {
 }
 
 #[test]
+fn issue1653_coproc_time_word_binds_in_pipeline_stage_only() {
+    // GNU parse.y: after `coproc`, `time` is the first word of a
+    // simple command, never a prefix — so in a pipeline the coproc
+    // binds in the stage's subshell and the parent never sees
+    // COPROC_PID.
+    let output = rubash_command()
+        .arg("-c")
+        .arg(
+            "coproc time echo hi | cat; \
+             echo \"parent=[${COPROC_PID+set}]\"",
+        )
+        .output()
+        .expect("run rubash");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "parent=[]\n");
+}
+
+#[test]
+fn issue1653_coproc_time_word_is_a_simple_command() {
+    // The unpiped form: the coproc runs the command named `time`,
+    // which does not exist — the child reports it exactly like GNU,
+    // and the coproc binds in the parent.
+    let output = rubash_command()
+        .arg("-c")
+        .arg(
+            "coproc time echo hi; \
+             p=${COPROC_PID+set}; \
+             wait $COPROC_PID 2>/dev/null; \
+             echo \"pid=[$p]\"",
+        )
+        .output()
+        .expect("run rubash");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "pid=[set]\n");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("time: command not found"),
+        "child must report the missing `time` command: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn typed_cell_stays_consistent_across_builtin_writes() {
     // Typed-cell reads must agree with the mirror after every kind of
     // write: plain/compound/append element writes, declare/typeset/local,
