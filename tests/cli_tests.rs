@@ -355,6 +355,35 @@ fn c_command_closing_named_coproc_stdin_fd_produces_eof() {
 }
 
 #[test]
+fn issue1623_read_u_coproc_read_status_matches_gnu() {
+    // GNU read.def: a `read -u` that serves a full record from a coproc
+    // returns 0; only the EOF-without-delimiter record returns 1. The
+    // coproc path used to mark every served record as EOF (status 1
+    // with correct data).
+    let output = rubash_command()
+        .arg("-c")
+        .arg(
+            "coproc MYC { cat; }; \
+             echo hello >&${MYC[1]}; \
+             read -u ${MYC[0]} line; echo \"read1 rc=$? line=$line\"; \
+             printf '\\n' >&${MYC[1]}; \
+             read -u ${MYC[0]} l2; echo \"read2 rc=$? l2=[$l2]\"; \
+             printf 'abc' >&${MYC[1]}; exec {MYC[1]}>&-; \
+             read -u ${MYC[0]} l3; echo \"read3 rc=$? l3=[$l3]\"; \
+             wait $MYC_PID 2>/dev/null",
+        )
+        .output()
+        .expect("run rubash");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "read1 rc=0 line=hello\nread2 rc=0 l2=[]\nread3 rc=1 l3=[abc]\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
 fn typed_cell_stays_consistent_across_builtin_writes() {
     // Typed-cell reads must agree with the mirror after every kind of
     // write: plain/compound/append element writes, declare/typeset/local,

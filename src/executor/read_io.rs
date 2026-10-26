@@ -326,8 +326,12 @@ impl Executor {
                 escape_aware,
                 raw,
             ) {
-                self.read_eof_no_delimiter |=
-                    !record_contains_delimiter(&output, delimiter, escape_aware);
+                // read_coproc_stdout already adjudicated
+                // read_eof_no_delimiter from the RAW record bytes
+                // (read.def:731-738: EOF with no delimiter). Recomputing
+                // it here from the trimmed line — whose delimiter was
+                // already stripped — marked every successful coproc
+                // read as EOF and returned status 1 (rubash#1623).
                 return Some(trim_read_input(
                     output,
                     delimiter,
