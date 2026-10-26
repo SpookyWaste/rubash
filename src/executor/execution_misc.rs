@@ -361,7 +361,11 @@ pub(in crate::executor) fn raw_word_has_quoted_span(raw: &str) -> bool {
     raw.chars().any(|ch| ch == '\'' || ch == '"' || ch == '\\')
 }
 
-pub(in crate::executor) fn redirect_target_is_ambiguous(raw: &str, expanded: &str) -> bool {
+pub(in crate::executor) fn redirect_target_is_ambiguous(
+    raw: &str,
+    expanded: &str,
+    extglob: bool,
+) -> bool {
     if !expanded.chars().any(char::is_whitespace) {
         return false;
     }
@@ -433,6 +437,16 @@ pub(in crate::executor) fn redirect_target_is_ambiguous(raw: &str, expanded: &st
         // (substitution), `{` (braces.c brace expansion), and the glob
         // metacharacters `*`, `?`, `[` (pathexp.c unquoted_glob_pattern_p).
         if matches!(ch, '$' | '`' | '{' | '*' | '?' | '[') {
+            has_unquoted_expansion = true;
+        }
+        // pathexp.c unquoted_glob_pattern_p (the `+`/`@`/`!` case): with
+        // extended_glob on, one of those characters followed by `(` is
+        // also a glob introducer — an extglob group can expand to several
+        // fields exactly like a plain glob can, so `> @(a|b)` with two
+        // matches is AMBIGUOUS_REDIRECT, not one space-joined filename
+        // (rubash#1673). `?(` and `*(` are already covered by the plain
+        // metacharacters above.
+        if extglob && matches!(ch, '+' | '@' | '!') && raw_chars.get(index + 1) == Some(&'(') {
             has_unquoted_expansion = true;
         }
         index += 1;
