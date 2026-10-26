@@ -365,7 +365,11 @@ impl Executor {
         }
 
         if let [not, rest @ ..] = args {
-            if not == "!" {
+            // GNU parse.y:3168-3181 CHECK_FOR_RESERVED_WORD recognizes
+            // the negation word from the RAW token text: a quoted `'!'`
+            // (raw != "!") is an ordinary WORD operand, never BANG
+            // (rubash#1706). Only the bare spelling negates.
+            if not == "!" && metadata.first().is_some_and(|entry| entry.raw == "!") {
                 // Same invert-pending bookkeeping as execute_conditional:
                 // `!` marks the next leaf term unless it negates a
                 // parenthesized group (GNU parse.y CMD_INVERT_RETURN).
@@ -420,6 +424,56 @@ impl Executor {
         if let [left, op, right] = args {
             if is_conditional_numeric_op(op) {
                 return Some(self.conditional_numeric_binary_status(left, op, right));
+            }
+        }
+
+        // rubash#1706: a quoted `'!'` in the left-operand slot is data
+        // (see the negation gate above), but the cooked-args evaluator
+        // this function falls back to cannot tell it apart from the
+        // negation operator and would invert a mangled primary, so the
+        // binary primaries it heads are evaluated here, where the raw
+        // spelling is still available. ==/!=/=~ with a quoted RHS stay
+        // with quoted_conditional_pattern_status below (its literal /
+        // quoted-regex handling owns those spellings).
+        if args.first().map(String::as_str) == Some("!")
+            && metadata.first().is_some_and(|entry| entry.raw != "!")
+        {
+            let operands = match args {
+                [left, op, right, end] if end == "]]" => Some((left, op, right)),
+                [left, op, right] => Some((left, op, right)),
+                _ => None,
+            };
+            if let Some((left, op, right)) = operands {
+                let rhs_quoted = metadata.get(2).is_some_and(|entry| {
+                    Self::conditional_rhs_word_is_quoted(&entry.raw) || entry.raw.contains('\\')
+                });
+                let status = match op.as_str() {
+                    "=" | "==" | "!=" if !rhs_quoted => {
+                        Some(i32::from(!self.conditional_string_binary(left, op, right)))
+                    }
+                    "<" | ">" => Some(i32::from(!self.conditional_string_binary(left, op, right))),
+                    "=~" if !rhs_quoted => Some(self.conditional_regex_match_status(left, right)),
+                    _ if is_conditional_file_binary(op) => {
+                        Some(i32::from(!self.conditional_file_binary(left, op, right)))
+                    }
+                    _ => None,
+                };
+                if status.is_some() {
+                    return status;
+                }
+            }
+            // The single-word shape (`[[ '!' ]]`) is a plain -n test of
+            // the word (parse.y:5174-5178); left to the cooked fallback
+            // it would be read as a negation with an empty term.
+            let single = match args {
+                [word] => Some(word),
+                [word, end] if end == "]]" => Some(word),
+                _ => None,
+            };
+            if let Some(word) = single {
+                let value = self.expand_conditional_word(word);
+                self.xtrace_conditional_term("-n", &value, None);
+                return Some(i32::from(value.is_empty()));
             }
         }
 
