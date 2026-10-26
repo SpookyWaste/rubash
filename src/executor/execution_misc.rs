@@ -864,9 +864,16 @@ pub(in crate::executor) fn current_epoch_micros() -> i64 {
 }
 
 pub(in crate::executor) fn eval_source_for_reparse(source: &str) -> String {
+    // rubash#1634: the two ASCII markers are NOT stripped here. The
+    // only caller feeds this function the joined EXPANDED eval
+    // arguments — pure runtime text, where a literal `__RUBASH_CA1__`
+    // or `__RUBASH_HD1__` in user data is data, not protocol (GNU eval
+    // re-parses the string as written). The transport producers for
+    // eval operands are kept in source form by the dedicated gates in
+    // command_prepare, so no marker-serialized form reaches this text;
+    // the blanket replaces only ate user data. The C0/PUA carrier
+    // restores below stay: those codepoints are not typeable text.
     let source = source
-        .replace(crate::lexer::QUOTED_HEREDOC_MARKER, "")
-        .replace(crate::executor::types::COMPOUND_ASSIGNMENT_MARKER, "")
         .replace(crate::executor::markers::IFS_GLUE, "")
         .replace(DATA_DOLLAR, "$")
         .replace(crate::executor::markers::DATA_SQUOTE, "'")
