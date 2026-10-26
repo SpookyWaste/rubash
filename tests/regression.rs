@@ -3279,6 +3279,36 @@ mod k1_batch2 {
         );
     }
 
+    /// rubash#1775: /dev/tcp with a service name ('http') failed on
+    /// Windows because resolve_net_service_port only read
+    /// /etc/services, so GNU's getservbyname parity (http -> 80) was
+    /// missing and the shell printed "Servname not supported" plus
+    /// "Invalid argument". The pin asserts the post-resolution
+    /// refused-connect shape (port 80 on loopback has no listener).
+    /// On unix the name already resolved, so this guards the shared
+    /// parser path there and pins the Windows fix here.
+    #[test]
+    fn issue1775_dev_tcp_service_name_http_resolves() {
+        let (stdout, stderr, code) = run(
+            "k1-1775",
+            "( exec 3<>/dev/tcp/127.0.0.1/http ); echo \"http rc=$?\"\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "http rc=1\n", "stderr:\n{stderr}");
+        assert!(
+            !stderr.contains("Servname not supported"),
+            "service name failed to resolve in:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("connect: Connection refused"),
+            "missing GNU connect line in:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("/dev/tcp/127.0.0.1/http: Connection refused"),
+            "missing GNU redirection line in:\n{stderr}"
+        );
+    }
+
     /// rubash#1215: `hash <builtin>` is a silent no-op (no entry, rc 0);
     /// external names hash and report normally.
     #[test]
