@@ -22,6 +22,18 @@ impl Executor {
             crate::builtins::shift::ShiftAction::Complete(status) => {
                 self.exit_code = status;
             }
+            // rubash#1650: the no_args DISCARD channel, shared with
+            // `exit 1 2` (command_dispatch_primary.rs): set
+            // EX_BADUSAGE, then arm the reader-level discard — the
+            // list loop skips the rest of the failing logical line,
+            // a function body unwinds with status 2 and its caller
+            // continues, a subshell ends with 2, and under `-c` the
+            // whole string is abandoned with status 1.
+            crate::builtins::shift::ShiftAction::TooManyArguments => {
+                self.exit_code = crate::builtins::shift::EX_USAGE;
+                self.raise_evalerror_abort();
+                self.evalerror_exit_toomany_pending.set(true);
+            }
             crate::builtins::shift::ShiftAction::Shift(amount) => {
                 if amount > self.shell_state.positional_len() {
                     // GNU general.c:112 (posix_initialize): `set -o posix'
