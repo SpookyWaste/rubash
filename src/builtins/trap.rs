@@ -835,6 +835,20 @@ pub(crate) fn seed_startup_traps(env_vars: &mut VarTable) {
     // Idempotent (orig list is sorted/deduped), so subshell executors
     // re-entering this constructor keep the same set.
     for number in crate::builtins::kill::entry_ignored_signal_numbers() {
+        // rubash#1035 vs the golden trap-signal-matrix: an async child's
+        // entry SIGINT/SIGQUIT ignore comes from the spawn site's
+        // setup_async_signals, not from inheritance — it must NOT become
+        // a hard ignore, or a compound background body's later `trap`
+        // would be silently refused (the spawn site deliberately merges
+        // ORIG_IGN only for exec-like bodies; compound bodies stay
+        // trappable). Foreign entry ignores still fold to hard here, and
+        // exec-like bodies still arrive hard via the ORIG_IGN transport.
+        #[cfg(unix)]
+        if crate::builtins::kill::async_child_entry()
+            && (number == libc::SIGINT as i32 || number == libc::SIGQUIT as i32)
+        {
+            continue;
+        }
         if let Some(key) = entry_ignored_key(number) {
             add_orig_ignored_signal(env_vars, &key);
         }
@@ -871,6 +885,26 @@ pub(crate) fn seed_startup_traps(env_vars: &mut VarTable) {
     // disposition (probe: a parent `trap '' RTMIN` makes the child list
     // `trap -- '' SIGRTMIN`) — and that path is served by the
     // TRAP_ORIG_IGNORES / per-signal-"" transports above, not by a seed.
+    //
+    // Async-child tail (see the entry-fold skip above): GNU's async child
+    // still LISTS `trap -- '' SIGINT` — the ignore is a real trap-table
+    // entry with an empty action, just not a hard one. Seed those empty
+    // entries here, AFTER the loop above that promotes empty entries to
+    // ORIG_IGN, so they stay listed-but-trappable. A body that already
+    // set a real action (or an exec-like body that arrived hard via the
+    // transport) keeps its entry untouched.
+    #[cfg(unix)]
+    if crate::builtins::kill::async_child_entry() {
+        for signal in ["INT", "QUIT"] {
+            let key = trap_key(signal);
+            if env_vars.get(&key).is_none() {
+                env_vars.insert(key, String::new());
+                let mut signals = trap_list(env_vars);
+                signals.insert(signal.to_string());
+                store_trap_list(env_vars, signals);
+            }
+        }
+    }
 }
 
 /// A script executed through the same-shell ENOEXEC path runs in a fresh
