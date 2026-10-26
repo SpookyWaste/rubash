@@ -817,10 +817,12 @@ impl Executor {
             } else if let Some(redirect) = &command.redirect_err_append {
                 let target = self.expand_redirect_target(redirect);
                 if !is_closed_redirect_target(&target) && redirect_target_fd(&target).is_none() {
-                    if let Ok(mut file) = open_redirect_append(&shell_path_to_windows(
-                        &target,
-                        &self.shell_state.env_vars,
-                    )) {
+                    if let Ok(mut file) =
+                        open_redirect_append(&self.session_path(shell_path_to_windows(
+                            &target,
+                            &self.shell_state.env_vars,
+                        )))
+                    {
                         let _ = file.write_all(diagnostic.as_bytes());
                     }
                     return Ok(Some((String::new(), String::new(), 127)));
@@ -1057,9 +1059,8 @@ impl Executor {
                         if !is_closed_redirect_target(&target)
                             && redirect_target_fd(&target).is_none()
                         {
-                            if let Ok(file) = open_redirect_append(&shell_path_to_windows(
-                                &target,
-                                &self.shell_state.env_vars,
+                            if let Ok(file) = open_redirect_append(&self.session_path(
+                                shell_path_to_windows(&target, &self.shell_state.env_vars),
                             )) {
                                 process.stderr(Stdio::from(file));
                             }
@@ -1141,9 +1142,8 @@ impl Executor {
                 // an empty pipe (GNU's next element reads nothing).
                 match target {
                     MergedSharedFile::Path(path) => {
-                        let mut file = open_redirect_append(&shell_path_to_windows(
-                            &path,
-                            &self.shell_state.env_vars,
+                        let mut file = open_redirect_append(&self.session_path(
+                            shell_path_to_windows(&path, &self.shell_state.env_vars),
                         ))
                         .map_err(ExecuteError::IoError)?;
                         file.write_all(&merged)?;

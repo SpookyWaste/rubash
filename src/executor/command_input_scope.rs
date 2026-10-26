@@ -1240,10 +1240,10 @@ impl Executor {
         // niubash#177: same operand resolution as open_input_redirect —
         // a virtual-root input operand may exist only under its `.exe`
         // spelling on disk.
-        let path = super::path::windows_operand_file_path(
+        let path = self.session_path(super::path::windows_operand_file_path(
             super::path::shell_path_to_windows(&target, &self.shell_state.env_vars),
             &self.shell_state.env_vars,
-        );
+        ));
         // `<> word` (r_input_output) opens O_RDWR|O_CREAT (make_cmd.c:682),
         // so a missing name is CREATED by the open and never fails here
         // (rubash#264); a genuine open error (bad directory, permission)

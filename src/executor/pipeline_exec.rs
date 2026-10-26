@@ -4786,9 +4786,11 @@ impl Executor {
                         // its `.exe` spelling (`/usr/bin/seq`) opens like the
                         // spawned cat.exe sees it (same exists-first rule as
                         // the argv funnel).
-                        match fs::read(crate::executor::path::windows_operand_file_path(
-                            shell_path_to_windows(&path, &self.shell_state.env_vars),
-                            &self.shell_state.env_vars,
+                        match fs::read(self.session_path(
+                            crate::executor::path::windows_operand_file_path(
+                                shell_path_to_windows(&path, &self.shell_state.env_vars),
+                                &self.shell_state.env_vars,
+                            ),
                         )) {
                             Ok(bytes) => stream.extend(bytes),
                             Err(_) => {

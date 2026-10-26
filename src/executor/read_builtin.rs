@@ -2389,8 +2389,7 @@ impl Executor {
                 // characters read, then the array is located and the
                 // assignment attempted), so a readonly -a target fails
                 // here too (rubash#1457; see the post-read guard below).
-                if !invalid_name
-                    && is_marked_var(&self.shell_state.env_vars, READONLY_VARS, &name)
+                if !invalid_name && is_marked_var(&self.shell_state.env_vars, READONLY_VARS, &name)
                 {
                     let _ = writeln!(
                         &mut stderr,
@@ -2457,8 +2456,7 @@ impl Executor {
             // before the array is ever located, so `read -t 0 -a
             // readonly` stays silent) and -n 0 has its own guard at its
             // early return (rubash#1457).
-            if !invalid_name && is_marked_var(&self.shell_state.env_vars, READONLY_VARS, &name)
-            {
+            if !invalid_name && is_marked_var(&self.shell_state.env_vars, READONLY_VARS, &name) {
                 let _ = writeln!(
                     &mut stderr,
                     "{}{name}: readonly variable",
@@ -3114,10 +3112,10 @@ impl Executor {
                     // niubash#177: same operand resolution as
                     // open_input_redirect so `-t` sees the same regular
                     // file the read itself opens.
-                    let path = crate::executor::path::windows_operand_file_path(
+                    let path = self.session_path(crate::executor::path::windows_operand_file_path(
                         shell_path_to_windows(&target, &self.shell_state.env_vars),
                         &self.shell_state.env_vars,
-                    );
+                    ));
                     return std::fs::metadata(&path)
                         .map(|m| m.is_file())
                         .unwrap_or(false);

@@ -64,8 +64,9 @@ impl Executor {
             if let Some(result) = self.write_dev_stdio_redirect_output(&target, output) {
                 return result;
             }
-            let mut file =
-                open_redirect_append(&shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+            let mut file = open_redirect_append(
+                &self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars)),
+            )?;
             file.write_all(output)?;
         } else {
             self.write_default_stdout(output)?;

@@ -1015,10 +1015,12 @@ impl Executor {
                 // substitution capture, and GNU read_comsub discards NUL
                 // bytes while reading the child pipe (substitution_metadata
                 // SubstitutionOutput::readback), so drop NUL first.
-                match fs::read(crate::executor::path::windows_operand_file_path(
-                    shell_path_to_windows(&path, &self.shell_state.env_vars),
-                    &self.shell_state.env_vars,
-                )) {
+                match fs::read(
+                    self.session_path(crate::executor::path::windows_operand_file_path(
+                        shell_path_to_windows(&path, &self.shell_state.env_vars),
+                        &self.shell_state.env_vars,
+                    )),
+                ) {
                     Ok(mut bytes) => {
                         bytes.retain(|byte| *byte != 0);
                         output.push_str(&bytes_to_shell_text(&bytes));

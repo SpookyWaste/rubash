@@ -337,7 +337,10 @@ impl Executor {
                         // the same open file description.
                         let path = target.strip_prefix('&').unwrap_or(&target);
                         let file = FileFd::open_write(
-                            shell_path_to_windows(path, &self.shell_state.env_vars),
+                            self.session_path(shell_path_to_windows(
+                                path,
+                                &self.shell_state.env_vars,
+                            )),
                             redirect.append,
                             false,
                         )
@@ -367,7 +370,10 @@ impl Executor {
                             RedirectKind::Append | RedirectKind::CombinedAppend
                         );
                     let file = FileFd::open_write(
-                        shell_path_to_windows(&target, &self.shell_state.env_vars),
+                        self.session_path(shell_path_to_windows(
+                            &target,
+                            &self.shell_state.env_vars,
+                        )),
                         append,
                         false,
                     )
