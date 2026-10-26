@@ -1,6 +1,3 @@
-use super::parse_loop::{
-    scan_time_prefix_tokens, time_prefixed_shell_command_allows_simple_pipeline,
-};
 use super::*;
 use crate::lexer::{Token, TokenKind};
 
@@ -332,6 +329,13 @@ fn coproc_word_is_assignment(word: &str) -> bool {
     i < bytes.len() && bytes[i] == b'='
 }
 
+/// Does a compound (shell_command) body start at `index`?
+/// rubash#1653: `time` is deliberately NOT a start and has no
+/// prefix form here — GNU's coproc productions (parse.y:1125-1173)
+/// are only `COPROC [WORD] shell_command | simple_command`, and a
+/// timed pipeline is neither, so `coproc time { ...; }` binds
+/// `time` as the coproc NAME (the WORD production) and `coproc
+/// time CMD` runs the simple command whose head word is `time`.
 fn is_coproc_shell_command_start(tokens: &[Token], index: usize) -> bool {
     tokens.get(index).is_some_and(|token| {
         matches!(
@@ -339,30 +343,7 @@ fn is_coproc_shell_command_start(tokens: &[Token], index: usize) -> bool {
             "for" | "case" | "select" | "coproc" | "if" | "while" | "until" | "[["
         ) || token.value.starts_with("((")
             || parse_function_command(tokens, index).is_some()
-            || time_prefixed_shell_command_allows_simple_pipeline(tokens, index)
-            || time_prefixed_compound_command_start(tokens, index)
     })
-}
-
-fn time_prefixed_compound_command_start(tokens: &[Token], start: usize) -> bool {
-    if !is_keyword(tokens, start, "time") {
-        return false;
-    }
-
-    // rubash#1548: same operand window as the other time-prefix
-    // scanners (parse.y special_case_tokens).
-    let index = scan_time_prefix_tokens(tokens, start).next;
-
-    tokens.get(index).is_some_and(|token| {
-        is_brace_group_token(token)
-            || matches!(
-                token.value.as_str(),
-                "for" | "case" | "select" | "coproc" | "if" | "while" | "until" | "[["
-            )
-            || token.value.starts_with("((")
-            || parse_function_command(tokens, index).is_some()
-    }) || is_keyword(tokens, index, "{")
-        || is_keyword(tokens, index, "(")
 }
 
 fn parse_coproc_command_sequence_body(
