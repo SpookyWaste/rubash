@@ -1128,6 +1128,15 @@ fn posix_class_matches(class: &str, candidate: char) -> bool {
         Some(byte) => char::from(byte),
         None => candidate,
     };
+    // Under a UTF-8 locale GNU resolves classes through wctype/iswctype
+    // (lib/glob/smatch.c), so multibyte characters classify by the
+    // locale's Unicode-derived tables (rubash#1621) — É is `upper`
+    // there. The ASCII table below is the single-byte-locale semantics
+    // and stays byte-exact for it (rubash#1533). Which table applies is
+    // locale::is_utf8's decision alone; no other site re-decides it.
+    if crate::locale::is_utf8() {
+        return crate::locale::utf8_posix_class_matches(class, candidate);
+    }
     match class {
         "alnum" => candidate.is_ascii_alphanumeric(),
         "alpha" => candidate.is_ascii_alphabetic(),
