@@ -365,7 +365,11 @@ impl Executor {
         }
 
         if let [not, rest @ ..] = args {
-            if not == "!" {
+            // GNU parse.y:3168-3181 CHECK_FOR_RESERVED_WORD recognizes
+            // the negation word from the RAW token text: a quoted `'!'`
+            // (raw != "!") is an ordinary WORD operand, never BANG
+            // (rubash#1706). Only the bare spelling negates.
+            if not == "!" && metadata.first().is_some_and(|entry| entry.raw == "!") {
                 // Same invert-pending bookkeeping as execute_conditional:
                 // `!` marks the next leaf term unless it negates a
                 // parenthesized group (GNU parse.y CMD_INVERT_RETURN).
@@ -420,6 +424,56 @@ impl Executor {
         if let [left, op, right] = args {
             if is_conditional_numeric_op(op) {
                 return Some(self.conditional_numeric_binary_status(left, op, right));
+            }
+        }
+
+        // rubash#1706: a quoted `'!'` in the left-operand slot is data
+        // (see the negation gate above), but the cooked-args evaluator
+        // this function falls back to cannot tell it apart from the
+        // negation operator and would invert a mangled primary, so the
+        // binary primaries it heads are evaluated here, where the raw
+        // spelling is still available. ==/!=/=~ with a quoted RHS stay
+        // with quoted_conditional_pattern_status below (its literal /
+        // quoted-regex handling owns those spellings).
+        if args.first().map(String::as_str) == Some("!")
+            && metadata.first().is_some_and(|entry| entry.raw != "!")
+        {
+            let operands = match args {
+                [left, op, right, end] if end == "]]" => Some((left, op, right)),
+                [left, op, right] => Some((left, op, right)),
+                _ => None,
+            };
+            if let Some((left, op, right)) = operands {
+                let rhs_quoted = metadata.get(2).is_some_and(|entry| {
+                    Self::conditional_rhs_word_is_quoted(&entry.raw) || entry.raw.contains('\\')
+                });
+                let status = match op.as_str() {
+                    "=" | "==" | "!=" if !rhs_quoted => {
+                        Some(i32::from(!self.conditional_string_binary(left, op, right)))
+                    }
+                    "<" | ">" => Some(i32::from(!self.conditional_string_binary(left, op, right))),
+                    "=~" if !rhs_quoted => Some(self.conditional_regex_match_status(left, right)),
+                    _ if is_conditional_file_binary(op) => {
+                        Some(i32::from(!self.conditional_file_binary(left, op, right)))
+                    }
+                    _ => None,
+                };
+                if status.is_some() {
+                    return status;
+                }
+            }
+            // The single-word shape (`[[ '!' ]]`) is a plain -n test of
+            // the word (parse.y:5174-5178); left to the cooked fallback
+            // it would be read as a negation with an empty term.
+            let single = match args {
+                [word] => Some(word),
+                [word, end] if end == "]]" => Some(word),
+                _ => None,
+            };
+            if let Some(word) = single {
+                let value = self.expand_conditional_word(word);
+                self.xtrace_conditional_term("-n", &value, None);
+                return Some(i32::from(value.is_empty()));
             }
         }
 
@@ -1070,7 +1124,11 @@ impl Executor {
         // operand). rubash#729 widened the protected byte set, so this
         // decode boundary is what keeps the sentinel out of regcomp.
         let pattern = crate::executor::execution_misc::decode_command_substitution_payload(pattern);
-        let pattern = translate_posix_bracket_classes(&pattern);
+        // In a UTF-8 locale the bracket classes expand to Unicode
+        // tables (glibc regcomp resolves them through wctype); in byte
+        // mode they pass through to the regex crate's ASCII classes,
+        // which are exactly the single-byte tables (rubash#1621).
+        let pattern = translate_posix_bracket_classes(&pattern, !byte_mode);
         // GNU regcomp rejects an unknown `[:name:]` with REG_ECTYPE
         // ("Invalid character class name"); the regex crate parses the
         // span as a nested class instead, so validate names before
@@ -1078,6 +1136,7 @@ impl Executor {
         if !posix_bracket_class_names_valid(&pattern)
             || posix_ere_has_extended_group(&pattern)
             || posix_ere_has_dangling_quantifier(&pattern)
+            || posix_ere_has_empty_min_interval(&pattern)
         {
             return Err(regex::Regex::new("(").unwrap_err());
         }
@@ -1089,11 +1148,10 @@ impl Executor {
         // sh_regmatch), so `.` matches a newline (rubash#1058).
         // Granularity follows the locale model (rubash#1061): glibc
         // regexec matches one multibyte CHARACTER in a UTF-8 locale and
-        // one BYTE otherwise; rubash's locale model (locale.rs is_utf8,
-        // unset locale = UTF-8 default) names the active case, and an
-        // explicitly non-UTF-8 or unset locale in the oracle's C-locale
-        // sense takes the byte engine. A UTF-8 locale that is actually
-        // active keeps the char engine.
+        // one BYTE otherwise; rubash's locale model (locale.rs is_utf8)
+        // names the active case — an unset locale resolves to C there
+        // (rubash#1622), so only an actually active UTF-8 locale keeps
+        // the char engine.
         if byte_mode {
             regex::bytes::RegexBuilder::new(&pattern)
                 .case_insensitive(case_insensitive)
@@ -1318,6 +1376,16 @@ impl Executor {
         let left_expanded = self.expand_cond_arith_operand(left);
         let right_expanded = self.expand_cond_arith_operand(right);
         self.xtrace_conditional_term(op, &left_expanded, Some(&right_expanded));
+        // GNU test.c:357 arithcomp -> evalexp: expr.c:1190-1216
+        // expr_streval raises err_unboundvar for a bare unset name when
+        // unbound_vars_is_error. The raw evaluator below reads unset
+        // names as 0, so the nounset prologue the (( ))/let paths run
+        // has to run here too, per operand, in evaluation order
+        // (rubash#1709 — the #1130/#1201 family covered the $-expansion
+        // path; a bare name never expands, it reaches evalexp as text).
+        if let Some(status) = self.conditional_nounset_arith_trap(&left_expanded) {
+            return status;
+        }
 
         // GNU execute_cmd.c:4049-4068 -> test.c:357-372 arithcomp -> evalexp:
         // the operands were word-expanded by cond_expand_word (mode 3,
@@ -1349,6 +1417,9 @@ impl Executor {
         // only; sync the typed variables map at this boundary like the
         // `(( ))` / `let` / subscript evaluators do.
         super::arithmetic::sync_arith_writes(self);
+        if let Some(status) = self.conditional_nounset_arith_trap(&right_expanded) {
+            return status;
+        }
         let right_eval = self.expand_arith_indexed_subscripts(&right_expanded);
         let right_dynamic = self.arith_dynamic_context();
         let (Some(right_val), _) = eval_mutable_arith_value_with_random_flags(
@@ -1366,6 +1437,37 @@ impl Executor {
         self.flush_arith_diags(Some("[["));
         super::arithmetic::sync_arith_writes(self);
         i32::from(!conditional_numeric_matches(left_val, op, right_val))
+    }
+
+    /// The `set -u` side of GNU's arithcomp evaluation (expr.c:1190-1216
+    /// expr_streval -> err_unboundvar): scan one already-expanded
+    /// numeric operand for a bare unset name. On a trap, mirror
+    /// expand_conditional_word's FATAL branch — print the diagnostic
+    /// through the conditional's fd 2 and park the fatal status for
+    /// execute_conditional_command_with_redirects to unwind with the
+    /// FORCE_EOF / interactive-DISCARD classes (rubash#1709).
+    fn conditional_nounset_arith_trap(&mut self, operand: &str) -> Option<i32> {
+        if !crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "nounset") {
+            return None;
+        }
+        let name =
+            super::arithmetic::arithmetic_unbound_variable(operand, &self.shell_state.env_vars)?;
+        let line = format!(
+            "{}{}: {}\n",
+            self.diagnostic_prefix(),
+            name,
+            "unbound variable"
+        );
+        let _ = self.write_diagnostic_fd2(line.as_bytes());
+        self.exit_code = if self.expansion_error_is_interactive_discard() {
+            1
+        } else {
+            self.expansion_fatal_status()
+        };
+        self.conditional_fatal_status.set(Some(self.exit_code));
+        self.command_expansion_failed.set(true);
+        self.conditional_expansion_fatal.set(true);
+        Some(self.exit_code)
     }
 }
 
@@ -1670,14 +1772,15 @@ impl CompiledConditionalRegex {
 }
 
 /// Whether `=~` matches byte-wise. GNU regexec is byte-oriented in a
-/// single-byte locale and character-oriented in a UTF-8 locale;
-/// rubash's locale model keeps an UNSET locale in the UTF-8 default for
-/// character counting, but the oracle shells this build is diffed
-/// against run their unset locale as C/POSIX (byte semantics), which is
-/// also what the Android filing measured, so an unset locale name takes
-/// the byte engine here.
+/// single-byte locale and character-oriented in a UTF-8 locale. The
+/// locale decision itself lives in [`crate::locale::is_utf8`]: since
+/// rubash#1622 an unset locale resolves to the C locale there (GNU's
+/// setlocale(LC_ALL, "") startup default), so this is the plain
+/// negation — the empty-name clause this function used to carry was a
+/// one-surface compensation for the old unset-means-UTF-8 default
+/// (rubash#1061) and is gone with it.
 fn conditional_regex_byte_mode() -> bool {
-    !crate::locale::is_utf8() || crate::locale::locale_name().is_empty()
+    !crate::locale::is_utf8()
 }
 
 /// Convert one byte-mode capture into rubash's storage spelling: valid
@@ -1782,7 +1885,7 @@ fn ere_interval_at(chars: &[char], start: usize) -> Option<(usize, u64, Option<u
 /// Index just past the bracket expression at chars[start] == '[', or
 /// None when it never closes (the `[` is then literal text).
 fn bracket_expression_end(chars: &[char], start: usize) -> Option<usize> {
-    translate_bracket_expression(chars, start).map(|(next, _)| next)
+    translate_bracket_expression(chars, start, false).map(|(next, _)| next)
 }
 
 /// glibc regcomp (REG_BADRPT): a repetition operator with no
@@ -1876,6 +1979,31 @@ fn posix_ere_has_bad_interval(pattern: &str) -> bool {
     false
 }
 
+/// Whether the pattern contains an interval with an omitted minimum
+/// (`{,5}` / `{,}`) outside brackets and escapes. POSIX ERE requires
+/// the leading number; glibc regcomp accepts the omission as {0,5},
+/// but the strict regcomp reading — the GNU oracle rubash#1658 was
+/// filed against — rejects it with "invalid repetition count(s)", so
+/// the compile gate does too.
+fn posix_ere_has_empty_min_interval(pattern: &str) -> bool {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 2,
+            '[' => i = bracket_expression_end(&chars, i).unwrap_or(i + 1),
+            '{' => {
+                if chars.get(i + 1) == Some(&',') && ere_interval_at(&chars, i).is_some() {
+                    return true;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 /// Rewrite the two POSIX ERE quantifier spellings the regex crate
 /// reads differently, leaving everything else byte-identical:
 ///
@@ -1886,8 +2014,9 @@ fn posix_ere_has_bad_interval(pattern: &str) -> bool {
 ///   `a+?` -> `(?:a+)?`, `a{2,}?` -> `(?:a{2,})?`, `(aa)+?` ->
 ///   `(?:(aa)+)?`. Other stacked operators (`**`, `*{2}`, `?+`) nest
 ///   identically in both engines and pass through.
-/// - The glibc empty-minimum intervals `{,m}` / `{,}` (== `{0,m}` /
-///   `{0,}`), which the regex crate rejects outright.
+///
+/// Empty-minimum intervals (`{,m}` / `{,}`) never reach this rewrite:
+/// the compile gate rejects them first (rubash#1658).
 fn translate_posix_ere_quantifiers(pattern: &str) -> String {
     let chars: Vec<char> = pattern.chars().collect();
     let mut out: Vec<char> = Vec::with_capacity(chars.len() + 8);
@@ -1977,31 +2106,22 @@ fn translate_posix_ere_quantifiers(pattern: &str) -> String {
                 }
                 i += 1;
             }
-            '{' => {
-                match ere_interval_at(&chars, i) {
-                    Some((next, _, _)) => {
-                        // `{,m}` / `{,}`: emit the explicit `{0,...}`.
-                        if chars.get(i + 1) == Some(&',') {
-                            out.push('{');
-                            out.push('0');
-                            out.extend_from_slice(&chars[i + 1..next]);
-                        } else {
-                            out.extend_from_slice(&chars[i..next]);
-                        }
-                        if last_atom.is_some() {
-                            quantified = true;
-                        }
-                        i = next;
+            '{' => match ere_interval_at(&chars, i) {
+                Some((next, _, _)) => {
+                    out.extend_from_slice(&chars[i..next]);
+                    if last_atom.is_some() {
+                        quantified = true;
                     }
-                    None => {
-                        let start = out.len();
-                        out.push('{');
-                        last_atom = Some((start, out.len()));
-                        quantified = false;
-                        i += 1;
-                    }
+                    i = next;
                 }
-            }
+                None => {
+                    let start = out.len();
+                    out.push('{');
+                    last_atom = Some((start, out.len()));
+                    quantified = false;
+                    i += 1;
+                }
+            },
             _ => {
                 let start = out.len();
                 out.push(chars[i]);
@@ -2024,8 +2144,9 @@ fn translate_posix_ere_quantifiers(pattern: &str) -> String {
 ///   `a|*b`, `{2}a`; stacked operators after an atom (`a**`) are fine;
 /// - `{...}` after an atom: unclosed is REG_EBRACE "Unmatched \{"
 ///   (`a{2`), closed with invalid content is REG_BADBR "Invalid
-///   content of \{\}" (`a{}`, `a{abc}`, `a{2,1}`); `{,5}`/`{5,}` are
-///   valid intervals.
+///   content of \{\}" (`a{}`, `a{abc}`, `a{2,1}`); `{5,}` is a valid
+///   interval, while `{,5}` (omitted minimum) is rejected with
+///   "invalid repetition count(s)" (rubash#1658).
 fn regexp_repetition_error(pattern: &str) -> Option<&'static str> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut prev_atom = false;
@@ -2086,6 +2207,13 @@ fn regexp_repetition_error(pattern: &str) -> Option<&'static str> {
                         return Some("Unmatched \\{");
                     }
                     return None;
+                }
+                // An omitted minimum (`{,5}` / `{,}`) after an atom is
+                // an invalid repetition count (rubash#1658); without a
+                // preceding atom the interval is a dangling operator
+                // and the interval_like path below reports it as such.
+                if prev_atom && content.starts_with(',') && ere_interval_at(&chars, i).is_some() {
+                    return Some("invalid repetition count(s)");
                 }
                 // Interval syntax: digits with an optional comma and
                 // optional upper bound (`{2}`, `{2,}`, `{,5}`, `{2,3}`).
@@ -2176,9 +2304,9 @@ fn regexp_error_reason(pattern: &str) -> &'static str {
                             .map(|pos| j + 2 + pos);
                         if let Some(end) = name_end {
                             let name: String = chars[j + 2..end].iter().collect();
-                            const CLASSES: [&str; 14] = [
-                                "alnum", "alpha", "ascii", "blank", "cntrl", "digit", "graph",
-                                "lower", "print", "punct", "space", "upper", "word", "xdigit",
+                            const CLASSES: [&str; 12] = [
+                                "alnum", "alpha", "blank", "cntrl", "digit", "graph", "lower",
+                                "print", "punct", "space", "upper", "xdigit",
                             ];
                             if !CLASSES.contains(&name.as_str()) {
                                 return "Invalid character class name";
@@ -2263,9 +2391,14 @@ fn append_literal_glob_text(output: &mut String, text: &str) {
 /// no such validation (an unknown name degrades to a nested class), so
 /// scan the post-translation pattern the same way regcomp does.
 fn posix_bracket_class_names_valid(pattern: &str) -> bool {
-    const CLASSES: [&str; 14] = [
-        "alnum", "alpha", "ascii", "blank", "cntrl", "digit", "graph", "lower", "print", "punct",
-        "space", "upper", "word", "xdigit",
+    // The twelve wctype property names (glibc and bionic alike);
+    // `word`/`ascii` are regex-crate Perl classes, not regcomp
+    // classes, and GNU rejects them with REG_ECTYPE (rubash#1717).
+    // The glob matcher has its own 14-name table on purpose
+    // (lib/glob/smatch.c cclass_name[]) — that side is not this gate.
+    const CLASSES: [&str; 12] = [
+        "alnum", "alpha", "blank", "cntrl", "digit", "graph", "lower", "print", "punct", "space",
+        "upper", "xdigit",
     ];
     let chars: Vec<char> = pattern.chars().collect();
     let mut i = 0usize;
@@ -2310,7 +2443,7 @@ fn posix_bracket_class_names_valid(pattern: &str) -> bool {
     true
 }
 
-fn translate_posix_bracket_classes(pattern: &str) -> String {
+fn translate_posix_bracket_classes(pattern: &str, unicode_classes: bool) -> String {
     let chars: Vec<char> = pattern.chars().collect();
     let mut out = String::with_capacity(pattern.len());
     let mut index = 0usize;
@@ -2322,7 +2455,9 @@ fn translate_posix_bracket_classes(pattern: &str) -> String {
             continue;
         }
         if chars[index] == '[' {
-            if let Some((next, translated)) = translate_bracket_expression(&chars, index) {
+            if let Some((next, translated)) =
+                translate_bracket_expression(&chars, index, unicode_classes)
+            {
                 out.push_str(&translated);
                 index = next;
                 continue;
@@ -2338,7 +2473,11 @@ fn translate_posix_bracket_classes(pattern: &str) -> String {
 /// index just past its closing ] and the regex-crate text with [=c=] and
 /// [.s.] spans rewritten. Returns None when the bracket is unterminated,
 /// in which case the caller emits the [ literally.
-fn translate_bracket_expression(chars: &[char], start: usize) -> Option<(usize, String)> {
+fn translate_bracket_expression(
+    chars: &[char],
+    start: usize,
+    unicode_classes: bool,
+) -> Option<(usize, String)> {
     let mut out = String::from("[");
     let mut index = start + 1;
     if index < chars.len() && chars[index] == '^' {
@@ -2371,7 +2510,7 @@ fn translate_bracket_expression(chars: &[char], start: usize) -> Option<(usize, 
             continue;
         }
         if c == '[' {
-            if let Some((next, text)) = translate_bracket_prefix(chars, index) {
+            if let Some((next, text)) = translate_bracket_prefix(chars, index, unicode_classes) {
                 out.push_str(&text);
                 index = next;
                 continue;
@@ -2402,8 +2541,14 @@ fn translate_bracket_expression(chars: &[char], start: usize) -> Option<(usize, 
 /// Handles the three [-led bracket prefixes at index. Returns None for a
 /// plain literal [ member. [=c=] becomes the equivalent character, [.s.]
 /// the collating symbol, and [:class:] passes through verbatim (the regex
-/// crate understands POSIX classes).
-fn translate_bracket_prefix(chars: &[char], index: usize) -> Option<(usize, String)> {
+/// crate understands POSIX classes) — except in a UTF-8 locale, where
+/// [:class:] expands to the locale's Unicode tables instead
+/// (rubash#1621, [`posix_class_unicode_expansion`]).
+fn translate_bracket_prefix(
+    chars: &[char],
+    index: usize,
+    unicode_classes: bool,
+) -> Option<(usize, String)> {
     let close = |open: char, from: usize| -> Option<usize> {
         let mut scan = from;
         while scan + 1 < chars.len() {
@@ -2439,6 +2584,12 @@ fn translate_bracket_prefix(chars: &[char], index: usize) -> Option<(usize, Stri
         }
         Some(':') => {
             let end = close(':', index + 2)?;
+            if unicode_classes {
+                let name: String = chars[index + 2..end - 2].iter().collect();
+                if let Some(expanded) = posix_class_unicode_expansion(&name) {
+                    return Some((end, expanded));
+                }
+            }
             // The body spans from the leading [ (already part of the text) so
             // it is passed through verbatim without prepending another one.
             let body: String = chars[index..end].iter().collect();
@@ -2446,6 +2597,44 @@ fn translate_bracket_prefix(chars: &[char], index: usize) -> Option<(usize, Stri
         }
         _ => None,
     }
+}
+
+/// The regex-crate text for one POSIX class under a UTF-8 locale,
+/// mirroring [`crate::locale::utf8_posix_class_matches`] — the pattern
+/// matcher's predicate form of the same glibc tables (rubash#1621).
+/// `print`/`graph`/`punct` come out as single negated classes by De
+/// Morgan: graph = print minus blank, punct = graph minus alnum.
+/// `digit` and `xdigit` return None: the crate's own [:name:]
+/// classes already are glibc's ASCII-only tables there. `word` and
+/// `ascii` have no expansion either — they are not regcomp classes
+/// at all, so the verbatim span reaches the class-name gate in
+/// [`posix_bracket_class_names_valid`] and fails with REG_ECTYPE
+/// (rubash#1717).
+fn posix_class_unicode_expansion(class: &str) -> Option<String> {
+    const BLANK_ITEMS: &str = "\\t \\u{1680}\\u{2000}-\\u{200A}\\u{205F}\\u{3000}";
+    const CNTRL_ITEMS: &str = "\\p{Cc}\\u{2028}\\u{2029}";
+    Some(match class {
+        "upper" => "\\p{Uppercase}".to_string(),
+        "lower" => "\\p{Lowercase}".to_string(),
+        "alpha" => format!(
+            "\\p{{Alphabetic}}{}",
+            crate::locale::non_ascii_nd_class_items()
+        ),
+        "alnum" => "\\p{Alphabetic}\\p{Nd}".to_string(),
+        "cntrl" => CNTRL_ITEMS.to_string(),
+        "print" => format!("[^{}]", CNTRL_ITEMS),
+        "graph" => format!("[^{}{}]", CNTRL_ITEMS, BLANK_ITEMS),
+        "punct" => format!(
+            "[^{}{}\\p{{Alphabetic}}\\p{{Nd}}]",
+            CNTRL_ITEMS, BLANK_ITEMS
+        ),
+        "space" => {
+            "\\t\\n\\x0B\\f\\r \\u{1680}\\u{2000}-\\u{200A}\\u{2028}\\u{2029}\\u{205F}\\u{3000}"
+                .to_string()
+        }
+        "blank" => BLANK_ITEMS.to_string(),
+        _ => return None,
+    })
 }
 
 fn escape_bracket_char(c: char) -> Vec<char> {

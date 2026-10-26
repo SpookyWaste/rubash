@@ -133,17 +133,22 @@ pub fn locale_name() -> String {
 /// Whether multibyte (UTF-8) character semantics are in effect, i.e. whether
 /// the locale named by the environment is actually active.
 ///
-/// An unset locale keeps rubash's default UTF-8 model. `C`/`POSIX` and any
-/// named single-byte locale (ru_RU.CP1251, en_US.ISO-8859-1, ...) select
-/// byte semantics. A UTF-8-named locale selects UTF-8 only when the C library
-/// can activate it; otherwise GNU bash - and rubash - fall back to the C
-/// locale, which is what makes `${#var}` count bytes on a machine that does
-/// not have `en_US.UTF-8` compiled in (intl1.sub: 31/30 for a 15-character
-/// Cyrillic word, not 16/15).
+/// GNU bash resolves the locale at startup with setlocale(LC_ALL, "")
+/// (locale.c set_default_locale, called from shell.c), so with NO locale
+/// variable set — or every one of them empty — the C locale is in effect
+/// and character semantics are byte semantics (rubash#1622; this branch
+/// used to keep a default UTF-8 model, a leftover of the locale port
+/// that #1464's explicit-locale fixes never reached). `C`/`POSIX` and
+/// any named single-byte locale (ru_RU.CP1251, en_US.ISO-8859-1, ...)
+/// likewise select byte semantics. A UTF-8-named locale selects UTF-8
+/// only when the C library can activate it; otherwise GNU bash - and
+/// rubash - fall back to the C locale, which is what makes `${#var}`
+/// count bytes on a machine that does not have `en_US.UTF-8` compiled
+/// in (intl1.sub: 31/30 for a 15-character Cyrillic word, not 16/15).
 pub fn is_utf8() -> bool {
     let name = locale_name();
     if name.is_empty() {
-        return true;
+        return false;
     }
     let lower = name.to_lowercase();
     if lower == "c" || lower == "posix" {
@@ -165,6 +170,179 @@ pub fn is_multi_byte() -> bool {
 pub fn is_utf8_locale_name(name: &str) -> bool {
     let lower = name.to_lowercase();
     lower.contains("utf-8") || lower.contains("utf8")
+}
+
+/// Non-ASCII decimal-digit (general category Nd) codepoint ranges.
+/// glibc's C.UTF-8 `alpha` class admits Nd characters beyond ASCII
+/// (measured against the oracle: Arabic-Indic, Devanagari, Thai and
+/// fullwidth digits are all `alpha`), while its `digit`/`xdigit`
+/// classes stay ASCII-only, and Rust's `char` predicates cannot
+/// express the set (`is_numeric`/`is_alphanumeric` also admit No/Nl
+/// characters like '²', which glibc keeps out of `alnum`). Generated
+/// from the Unicode data tables; this is the single source both the
+/// pattern matcher (predicate form, [`utf8_posix_class_matches`]) and
+/// the `=~` class translator (regex-text form,
+/// [`non_ascii_nd_class_items`]) draw from (rubash#1621).
+const NON_ASCII_ND_RANGES: &[(u32, u32)] = &[
+    (0x0660, 0x0669),
+    (0x06F0, 0x06F9),
+    (0x07C0, 0x07C9),
+    (0x0966, 0x096F),
+    (0x09E6, 0x09EF),
+    (0x0A66, 0x0A6F),
+    (0x0AE6, 0x0AEF),
+    (0x0B66, 0x0B6F),
+    (0x0BE6, 0x0BEF),
+    (0x0C66, 0x0C6F),
+    (0x0CE6, 0x0CEF),
+    (0x0D66, 0x0D6F),
+    (0x0DE6, 0x0DEF),
+    (0x0E50, 0x0E59),
+    (0x0ED0, 0x0ED9),
+    (0x0F20, 0x0F29),
+    (0x1040, 0x1049),
+    (0x1090, 0x1099),
+    (0x17E0, 0x17E9),
+    (0x1810, 0x1819),
+    (0x1946, 0x194F),
+    (0x19D0, 0x19D9),
+    (0x1A80, 0x1A89),
+    (0x1A90, 0x1A99),
+    (0x1B50, 0x1B59),
+    (0x1BB0, 0x1BB9),
+    (0x1C40, 0x1C49),
+    (0x1C50, 0x1C59),
+    (0xA620, 0xA629),
+    (0xA8D0, 0xA8D9),
+    (0xA900, 0xA909),
+    (0xA9D0, 0xA9D9),
+    (0xA9F0, 0xA9F9),
+    (0xAA50, 0xAA59),
+    (0xABF0, 0xABF9),
+    (0xFF10, 0xFF19),
+    (0x104A0, 0x104A9),
+    (0x10D30, 0x10D39),
+    (0x11066, 0x1106F),
+    (0x110F0, 0x110F9),
+    (0x11136, 0x1113F),
+    (0x111D0, 0x111D9),
+    (0x112F0, 0x112F9),
+    (0x11450, 0x11459),
+    (0x114D0, 0x114D9),
+    (0x11650, 0x11659),
+    (0x116C0, 0x116C9),
+    (0x11730, 0x11739),
+    (0x118E0, 0x118E9),
+    (0x11950, 0x11959),
+    (0x11C50, 0x11C59),
+    (0x11D50, 0x11D59),
+    (0x11DA0, 0x11DA9),
+    (0x11F50, 0x11F59),
+    (0x16A60, 0x16A69),
+    (0x16AC0, 0x16AC9),
+    (0x16B50, 0x16B59),
+    (0x1D7CE, 0x1D7FF),
+    (0x1E140, 0x1E149),
+    (0x1E2F0, 0x1E2F9),
+    (0x1E4F0, 0x1E4F9),
+    (0x1E950, 0x1E959),
+    (0x1FBF0, 0x1FBF9),
+];
+
+/// Whether `ch` is a decimal digit (category Nd) outside ASCII.
+pub(crate) fn is_non_ascii_nd(ch: char) -> bool {
+    let cp = ch as u32;
+    NON_ASCII_ND_RANGES
+        .binary_search_by(|&(lo, hi)| {
+            if cp < lo {
+                std::cmp::Ordering::Greater
+            } else if cp > hi {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
+/// [`NON_ASCII_ND_RANGES`] rendered as regex character-class items,
+/// for the `=~` bracket-class translator in executor::conditional.
+pub(crate) fn non_ascii_nd_class_items() -> &'static str {
+    static ITEMS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ITEMS.get_or_init(|| {
+        let mut out = String::new();
+        for &(lo, hi) in NON_ASCII_ND_RANGES {
+            if lo == hi {
+                out.push_str(&format!("\\u{{{lo:x}}}"));
+            } else {
+                out.push_str(&format!("\\u{{{lo:x}}}-\\u{{{hi:x}}}"));
+            }
+        }
+        out
+    })
+}
+
+/// glibc C.UTF-8 `space` membership: the Unicode White_Space set MINUS
+/// U+00A0 and U+202F, which glibc keeps in `print`/`graph`/`punct`
+/// only (measured against the oracle, rubash#1621).
+pub(crate) fn is_glibc_space(ch: char) -> bool {
+    matches!(
+        ch,
+        '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{205f}' | '\u{3000}'
+    )
+}
+
+/// glibc C.UTF-8 `blank` membership: tab, space, and the space-class
+/// members in category Zs (U+2028/U+2029 are `space` but not `blank`).
+pub(crate) fn is_glibc_blank(ch: char) -> bool {
+    matches!(
+        ch,
+        '\t' | ' ' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{205f}' | '\u{3000}'
+    )
+}
+
+/// glibc C.UTF-8 `cntrl` membership: category Cc plus U+2028/U+2029,
+/// which glibc counts as control (and therefore not `print`); other
+/// format characters (Cf, e.g. U+00AD, U+200B) are `print` there.
+pub(crate) fn is_glibc_cntrl(ch: char) -> bool {
+    ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}')
+}
+
+/// POSIX character-class membership under a UTF-8 locale, following
+/// glibc's C.UTF-8 tables — GNU resolves classes through
+/// wctype/iswctype (lib/glob/smatch.c for the pattern matcher, the
+/// regcomp tables for `=~`). Measured divergences from the naive
+/// Unicode reading, all pinned by oracle probes (rubash#1621):
+/// `digit`/`xdigit` are ASCII-only; `alpha` adds non-ASCII Nd;
+/// `alnum` is `alpha` plus every Nd; `word` is `alnum` plus '_';
+/// `print` is the complement of the cntrl table above, so unassigned
+/// codepoints count as print — the one place the tables cannot be
+/// reproduced exactly from Rust predicates.
+pub(crate) fn utf8_posix_class_matches(class: &str, ch: char) -> bool {
+    fn is_alpha(ch: char) -> bool {
+        ch.is_alphabetic() || is_non_ascii_nd(ch)
+    }
+    fn is_alnum(ch: char) -> bool {
+        is_alpha(ch) || ch.is_ascii_digit()
+    }
+    match class {
+        "alpha" => is_alpha(ch),
+        "alnum" => is_alnum(ch),
+        "upper" => ch.is_uppercase(),
+        "lower" => ch.is_lowercase(),
+        "digit" => ch.is_ascii_digit(),
+        "xdigit" => ch.is_ascii_hexdigit(),
+        "ascii" => ch.is_ascii(),
+        "cntrl" => is_glibc_cntrl(ch),
+        "print" => !is_glibc_cntrl(ch),
+        "graph" => !is_glibc_cntrl(ch) && !is_glibc_blank(ch),
+        "punct" => !is_glibc_cntrl(ch) && !is_glibc_blank(ch) && !is_alnum(ch),
+        "space" => is_glibc_space(ch),
+        "blank" => is_glibc_blank(ch),
+        "word" => is_alnum(ch) || ch == '_',
+        _ => false,
+    }
 }
 
 // Cached outcome of the locale activation probe, keyed by the locale name so
@@ -431,16 +609,218 @@ pub fn locale_request_active() -> bool {
     !is_utf8_locale_name(&name) || utf8_locale_active(&name)
 }
 
-/// Emit setlocale warning if locale is requested but not available.
+/// The locale variable family GNU binds to sv_locale (variables.c:5800
+/// special_vars table -> variables.c:6272 sv_locale).
+pub fn is_locale_family_name(name: &str) -> bool {
+    matches!(
+        name,
+        "LANG" | "LC_ALL" | "LC_COLLATE" | "LC_CTYPE" | "LC_MESSAGES" | "LC_NUMERIC" | "LC_TIME"
+    )
+}
+
+/// POSIX category precedence (locale.c:343 get_locale_var): LC_ALL wins,
+/// then the category's own variable, then LANG, then "" (the
+/// environment-default locale).
+fn get_locale_var(var: &str, env_vars: &std::collections::HashMap<String, String>) -> String {
+    let nonempty = |name: &str| {
+        env_vars
+            .get(name)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    nonempty("LC_ALL")
+        .or_else(|| nonempty(var))
+        .or_else(|| nonempty("LANG"))
+        .unwrap_or("")
+        .to_string()
+}
+
+#[cfg(unix)]
+fn category_constant(var: &str) -> Option<libc::c_int> {
+    Some(match var {
+        "LC_ALL" => libc::LC_ALL,
+        "LC_COLLATE" => libc::LC_COLLATE,
+        "LC_CTYPE" => libc::LC_CTYPE,
+        "LC_MESSAGES" => libc::LC_MESSAGES,
+        "LC_NUMERIC" => libc::LC_NUMERIC,
+        "LC_TIME" => libc::LC_TIME,
+        _ => return None,
+    })
+}
+
+/// Address of the calling thread's errno cell — the storage behind
+/// C's `errno` lvalue, which GNU clears before the setlocale call and
+/// reads after it (locale.c:191, in set_locale_var). The accessor's
+/// spelling is libc-specific: glibc and musl call it
+/// `__errno_location`, Darwin and FreeBSD call it `__error`, and
+/// Android's bionic calls it `__errno`. The fallthrough keeps the
+/// glibc spelling, which the remaining Unix libcs in the libc crate
+/// (DragonFly, emscripten, Fuchsia, ...) also use.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "freebsd"
+    ))
+))]
+fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "freebsd"
+    )
+))]
+fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+#[cfg(all(unix, target_os = "android"))]
+fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno() }
+}
+
+/// One real setlocale attempt, mirroring GNU locale.c set_locale_var:
+/// errno is cleared first (locale.c:191), and on failure the caller
+/// reports `strerror(errno)` only when the call left errno set — glibc
+/// sets ENOENT on the first failed lookup of a (category, name) pair
+/// and leaves errno clear on repeat lookups it has already cached, so
+/// the `: No such file or directory` suffix appears exactly on the
+/// first failing bind of each name, as in GNU.
+#[cfg(unix)]
+fn attempt_setlocale(category: libc::c_int, name: &str) -> Result<(), Option<String>> {
+    let Ok(c_name) = std::ffi::CString::new(name) else {
+        return Err(None);
+    };
+    unsafe {
+        *errno_location() = 0;
+        let result = libc::setlocale(category, c_name.as_ptr());
+        if !result.is_null() {
+            return Ok(());
+        }
+        let errno = *errno_location();
+        if errno == 0 {
+            Err(None)
+        } else {
+            let message = std::ffi::CStr::from_ptr(libc::strerror(errno));
+            Err(Some(message.to_string_lossy().into_owned()))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn attempt_setlocale(_category: std::ffi::c_int, _name: &str) -> Result<(), Option<String>> {
+    // The Windows CRT has no compiled locale archive to reject a name
+    // (see utf8_locale_active); GNU's warning has no failing call to
+    // mirror there. (std::ffi::c_int keeps the signature identical to
+    // the unix form; no caller reaches this on non-unix.)
+    Ok(())
+}
+
+/// locale.c reset_locale_vars: composite re-apply when LC_ALL is
+/// empty — setlocale(LC_ALL, lang) then each category from its
+/// precedence value. Never warns (the function has no diagnostic).
+#[cfg(unix)]
+fn reset_locale_vars_mirror(env_vars: &std::collections::HashMap<String, String>) {
+    let lang = env_vars.get("LANG").cloned().unwrap_or_default();
+    // locale.c reset_locale_vars returns at once when the composite
+    // apply fails; the per-category applies never run.
+    if attempt_setlocale(libc::LC_ALL, &lang).is_err() {
+        return;
+    }
+    for category in [
+        "LC_CTYPE",
+        "LC_COLLATE",
+        "LC_MESSAGES",
+        "LC_NUMERIC",
+        "LC_TIME",
+    ] {
+        if let Some(constant) = category_constant(category) {
+            let _ = attempt_setlocale(constant, &get_locale_var(category, env_vars));
+        }
+    }
+}
+
+/// Mirror one locale-family bind the way GNU sv_locale does
+/// (variables.c:6272 -> locale.c:185 set_locale_var / locale.c:313
+/// set_lang), performing the same real setlocale call GNU performs
+/// and returning the warning text (without the caller's diagnostic
+/// prefix) when GNU would print one:
 ///
-/// GNU bash warns when setlocale() fails (variables.c:1476-1488), e.g.
-/// "bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8)".
-/// Emission is intentionally suppressed: the diagnostic prefix is
-/// this_command_name, which does not normalize across the two shells, so the
-/// warning would be diff noise in every suite that reassigns LC_ALL. The
-/// semantic consequence - single-byte fallback - is applied by is_utf8().
-pub fn check_setlocale_warning() {
-    let _ = locale_request_active();
+/// * `LC_ALL` non-empty: one setlocale(LC_ALL, value) attempt; failure
+///   warns `setlocale: LC_ALL: cannot change locale (<value>)`.
+/// * `LC_ALL` empty/unset: the silent reset path (no warning even
+///   when a category value is bad).
+/// * A category (LC_COLLATE/LC_CTYPE/LC_MESSAGES/LC_NUMERIC/LC_TIME):
+///   attempted only while LC_ALL is empty, with the precedence value
+///   from get_locale_var — so `LANG=bad` followed by `LC_CTYPE=` warns
+///   about LC_CTYPE with LANG's value, exactly as locale.c:301 does.
+/// * `LANG`: never warns (set_lang is silent); still runs the reset
+///   so the process locale follows, like GNU.
+///
+/// `env_vars` must already hold the just-committed values (sv_locale
+/// reads the stored binding via get_string_value).
+pub fn locale_assignment_warning(
+    var: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    if !is_locale_family_name(var) {
+        return None;
+    }
+    // The Windows CRT has no compiled locale archive to reject a name,
+    // so GNU's failing-setlocale warning has no counterpart there.
+    #[cfg(not(unix))]
+    {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        let lc_all = env_vars.get("LC_ALL").cloned().unwrap_or_default();
+        if var == "LC_ALL" {
+            if lc_all.is_empty() {
+                reset_locale_vars_mirror(env_vars);
+                return None;
+            }
+            return match attempt_setlocale(libc::LC_ALL, &lc_all) {
+                Ok(()) => None,
+                Err(suffix) => Some(format!(
+                    "setlocale: LC_ALL: cannot change locale ({lc_all}){}",
+                    suffix.map(|text| format!(": {text}")).unwrap_or_default()
+                )),
+            };
+        }
+        if var == "LANG" {
+            if lc_all.is_empty() {
+                reset_locale_vars_mirror(env_vars);
+            }
+            return None;
+        }
+        // A category variable.
+        if !lc_all.is_empty() {
+            return None;
+        }
+        let applied = get_locale_var(var, env_vars);
+        let constant = category_constant(var)?;
+        match attempt_setlocale(constant, &applied) {
+            Ok(()) => None,
+            Err(suffix) => Some(format!(
+                "setlocale: {var}: cannot change locale ({applied}){}",
+                suffix.map(|text| format!(": {text}")).unwrap_or_default()
+            )),
+        }
+    }
 }
 
 /// Sync the locale-category variables into the PROCESS environment so the
@@ -454,26 +834,52 @@ pub fn sync_process_locale(env_vars: &std::collections::HashMap<String, String>)
     // rubash#1531: the full watcher family (GNU variables.c special_vars
     // binds every LC_* category plus LANG to sv_locale), not only the
     // collate/ctype subset the #1512 fix needed.
-    for name in [
-        "LC_ALL",
-        "LC_CTYPE",
-        "LC_COLLATE",
-        "LC_MESSAGES",
-        "LC_NUMERIC",
-        "LC_TIME",
-        "LANG",
-    ] {
-        match env_vars.get(name) {
-            Some(value) => std::env::set_var(name, value),
-            None => std::env::remove_var(name),
+    // G-01: the locale process-env sync is a process-global write —
+    // serialize it. It is deliberately NOT journaled (G-03): locale
+    // state is process-wide by C-library nature, and per-session
+    // locale isolation is WP-3 territory (see ms-stopbleed REPORT).
+    crate::executor::local_helpers::with_process_state_lock(|| {
+        for name in [
+            "LC_ALL",
+            "LC_CTYPE",
+            "LC_COLLATE",
+            "LC_MESSAGES",
+            "LC_NUMERIC",
+            "LC_TIME",
+            "LANG",
+        ] {
+            match env_vars.get(name) {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
         }
-    }
+    });
 }
 
-/// Initialize locale state. Kept as a no-op hook for parity with GNU bash's
-/// startup setlocale() pass; rubash re-derives the locale on demand.
+/// Initialize locale state at shell startup, mirroring GNU shell.c's
+/// startup sequence: set_default_locale (locale.c:85) applies
+/// setlocale(LC_ALL, "") — the environment composite, silently — then
+/// set_default_lang (locale.c set_default_lang) runs
+/// set_locale_var("LC_ALL", <env value>), which is the one startup
+/// bind that can warn (`<shell_name>: warning: setlocale: LC_ALL:
+/// cannot change locale (<value>)`, no line number, and never the
+/// strerror suffix: the priming composite attempt already consumed
+/// the first-failure errno for the name), and set_lang applies LANG
+/// silently. Invalid LANG or LC_* values in the startup environment
+/// warn about nothing (rubash#1692).
 pub fn init_locale() {
-    let _ = locale_request_active();
+    #[cfg(unix)]
+    {
+        let _ = attempt_setlocale(libc::LC_ALL, "");
+        let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+        if let Some(warning) = locale_assignment_warning("LC_ALL", &env) {
+            let shell_name = std::env::args()
+                .next()
+                .unwrap_or_else(|| "rubash".to_string());
+            eprintln!("{shell_name}: warning: {warning}");
+        }
+        let _ = locale_assignment_warning("LANG", &env);
+    }
 }
 
 /// Decode rubash's internal transport text into user-visible text.

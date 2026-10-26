@@ -1475,7 +1475,10 @@ fn unclosed_compound_open_line(text: &str) -> Option<usize> {
     let tokens = tokenize(text);
     let mut stack: Vec<(&str, usize)> = Vec::new();
     for token in &tokens {
-        if token.kind != TokenKind::Keyword {
+        // rubash#1721: structural keywords only (see
+        // Token::structural_keyword) — an argument-position keyword
+        // word is not an open compound.
+        if !token.structural_keyword() {
             continue;
         }
         match token.value.as_str() {
@@ -1586,7 +1589,14 @@ pub fn stdin_source_needs_more_posix(source: &str, posix: bool) -> bool {
             }
             continue;
         }
-        if token.kind != TokenKind::Keyword {
+        // rubash#1721: only structural keywords fold — a keyword-spelled
+        // argument word (`echo if', `command -vkb if' in a case clause)
+        // is not a reserved word to GNU's reader (parse.y:3168
+        // CHECK_FOR_RESERVED_WORD via parse.y:5899
+        // reserved_word_acceptable; PST_CASEPAT parse.y:3177-3186), so
+        // it pushes no phantom frame here either. Mirror of
+        // GroupScanFeeder::fold_token.
+        if !token.structural_keyword() {
             continue;
         }
         match token.value.as_str() {
@@ -3310,6 +3320,11 @@ fn run_source_impl(
         // ExpansionFailure is GNU's DISCARD: the command list aborted but
         // the reader continues with the next complete command.
         Err(ExecuteError::ExpansionFailure(code)) => code,
+        // SigintUnwind is the same DISCARD shape with a fixed verdict
+        // (rubash#1639): GNU threw to the top-level reader on the
+        // foreground job's SIGINT death — no diagnostic, the reader
+        // continues, and $? is the 130 the wait recorded.
+        Err(ExecuteError::SigintUnwind) => 130,
         // A `return` that unwinds to this unit's top ends the unit with
         // its status as an ordinary value (builtins/evalfile.c
         // source_file returns it; no jump_to_top_level). It can only
@@ -3452,12 +3467,15 @@ fn bind_lines_columns(executor: &mut Executor, lines: i32, columns: i32) {
         .shell_state
         .env_vars
         .insert("COLUMNS".to_string(), columns.to_string());
-    if std::env::var_os("LINES").is_some() {
-        std::env::set_var("LINES", lines.to_string());
-    }
-    if std::env::var_os("COLUMNS").is_some() {
-        std::env::set_var("COLUMNS", columns.to_string());
-    }
+    // G-01: winsize sync writes the process env — serialize it.
+    crate::executor::local_helpers::with_process_state_lock(|| {
+        if std::env::var_os("LINES").is_some() {
+            std::env::set_var("LINES", lines.to_string());
+        }
+        if std::env::var_os("COLUMNS").is_some() {
+            std::env::set_var("COLUMNS", columns.to_string());
+        }
+    });
 }
 
 /// jobs.c:2618 get_tty_state -> jobs.c:2647-2648 `if (check_window_size)
@@ -4623,19 +4641,13 @@ pub fn run_stdin_script(executor: &mut Executor) -> i32 {
             continue;
         }
 
-        // bashhist.c:869 bash_add_history: in interactive mode, each
-        // complete command is recorded to the session history.
-        if let Some(session) = executor.get_session_history() {
-            let trimmed = pending.trim_end();
-            if !trimmed.is_empty() {
-                let control = executor.get_env("HISTCONTROL").unwrap_or_default();
-                let ignore = executor.get_env("HISTIGNORE").unwrap_or_default();
-                let histsize = SessionHistory::size_limit(executor.get_env("HISTSIZE"));
-                session
-                    .borrow_mut()
-                    .record(trimmed, &control, &ignore, histsize);
-            }
-        }
+        // bashhist.c maybe_add_history gates recording on
+        // remember_on_history — the `history' set option, which defaults
+        // OFF for a non-interactive shell. This driver is the
+        // non-interactive stdin path, so input lines enter the history
+        // list only after `set -o history' (or `-o history' at startup)
+        // turns the option on (rubash#1629).
+        record_stdin_group_if_armed(executor, &pending);
 
         // eval.c:178: one current_command_number increment per command
         // list read happens in the execute_ast walk; no driver increment
@@ -4675,6 +4687,9 @@ pub fn run_stdin_script(executor: &mut Executor) -> i32 {
     if !pending.trim().is_empty() {
         // Final list gathered at EOF (e.g. no trailing newline) — still
         // one reader_loop iteration (eval.c:178); the walk increments it.
+        // The final group is read too, so the same read-time recording
+        // applies before it executes (rubash#1668).
+        record_stdin_group_if_armed(executor, &pending);
         let status = run_source_with_line_offset(
             executor,
             &pending,
@@ -4699,6 +4714,34 @@ pub fn run_stdin_script(executor: &mut Executor) -> i32 {
     let status = executor.last_exit_code();
     let interactive = executor.get_env("__RUBASH_INTERACTIVE").as_deref() == Some("1");
     finish_shell(executor, status, interactive)
+}
+
+/// bashhist.c maybe_add_history gates recording on remember_on_history
+/// — the `history' set option, which defaults OFF for a non-interactive
+/// shell. This driver is the non-interactive stdin path, so an input
+/// group enters the history list only when the option is on at read
+/// time (after `set -o history', or `-o history' at startup). The list
+/// is created on demand under the history builtin's rule: this driver
+/// installs no session up front, so without the on-demand step every
+/// line between `set -o history' and the first `history' builtin was
+/// silently dropped (rubash#1629, #1668).
+fn record_stdin_group_if_armed(executor: &mut Executor, pending: &str) {
+    if executor.get_env("__RUBASH_SETOPT_history").as_deref() != Some("1") {
+        return;
+    }
+    let Some(session) = executor.ensure_session_history() else {
+        return;
+    };
+    let trimmed = pending.trim_end();
+    if trimmed.is_empty() {
+        return;
+    }
+    let control = executor.get_env("HISTCONTROL").unwrap_or_default();
+    let ignore = executor.get_env("HISTIGNORE").unwrap_or_default();
+    let histsize = SessionHistory::size_limit(executor.get_env("HISTSIZE"));
+    session
+        .borrow_mut()
+        .record(trimmed, &control, &ignore, histsize);
 }
 
 pub fn finish_shell(executor: &mut Executor, status: i32, interactive: bool) -> i32 {

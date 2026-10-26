@@ -262,7 +262,8 @@ impl ComsubPrinter {
                     // every canonical re-print (rubash#1704: a comsub
                     // `$(echo abc | awk '...')` inside a respawned
                     // background function body ran as `echo abc awk
-                    // '...'`).
+                    // '...'`; rubash#1664: a respawned background child
+                    // re-parsed `$(echo hi | cat)` as `$(echo hi cat)`).
                     self.cprintf(" | ");
                     self.skip_this_indent += 1;
                 }

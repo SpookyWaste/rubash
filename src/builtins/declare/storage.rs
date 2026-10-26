@@ -7,6 +7,7 @@ pub(in crate::builtins) use array::append_array_value;
 pub(in crate::builtins) use array::{
     fold_indexed_storage_dupes, format_indexed_array_storage, indexed_array_entries,
 };
+pub(in crate::builtins) use assoc::append_assoc_scalar_append_value;
 pub(in crate::builtins) use assoc::append_assoc_value;
 pub(in crate::builtins) use assoc::{format_assoc_storage, parse_assoc_words};
 pub(super) use assoc::{quote_assoc_key, quote_assoc_storage_value};
@@ -133,6 +134,21 @@ pub(super) fn eval_arith_value(value: &str) -> i128 {
             }
         })
         .sum()
+}
+
+/// GNU make_variable_value (variables.c:2905): a value bound to an
+/// integer-attributed variable is evaluated with the FULL evalexp
+/// (expr.c) — variables, `*`/`-`/`**`, parentheses and all. The
+/// subscript-shaped subset in `eval_arith_value` above is NOT that
+/// evaluator (rubash#1617: `declare -ia a=('2*3')` stored 0). The
+/// table is rebuilt from the plain value map because the declare
+/// storage layer works on the serialized mirror, not the typed one.
+pub(super) fn eval_integer_value(
+    value: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> i128 {
+    let table = crate::shell::var_table::VarTable::from_values(env_vars.clone());
+    crate::executor::arithmetic::eval_conditional_arith_value(value, &table).unwrap_or(0)
 }
 
 trait Parenthesized {

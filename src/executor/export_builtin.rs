@@ -134,7 +134,10 @@ impl Executor {
                     || word.starts_with("LC_COLLATE=")
                     || word.starts_with("LANG=")
                 {
-                    crate::locale::check_setlocale_warning();
+                    // rubash#1692: the setlocale warning itself is
+                    // emitted at the bind site (builtins/setattr) —
+                    // GNU's sv_locale fires inside bind_variable, not
+                    // after the builtin returns.
                     // GNU variables.c sv_lang/sv_lc* call setlocale on the
                     // assignment; sync the process env so the dynamic
                     // locale readers (locale::is_utf8 - the dollar-quote

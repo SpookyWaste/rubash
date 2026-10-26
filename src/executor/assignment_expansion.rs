@@ -572,8 +572,20 @@ impl Executor {
             if let Ok(materialized) =
                 self.materialize_assignment_process_substitutions_from_raw(raw)
             {
+                // rubash#1690: the materialized text is re-derived from the
+                // raw RHS, which never carried the cooked value's markers.
+                // Dropping COMPOUND_ASSIGNMENT_MARKER here made the inner
+                // expansion treat a compound RHS as a plain scalar, so
+                // `a=(<(echo one) <(echo two))` stored ONE element whose
+                // text was the whole parenthesized string. GNU
+                // arrayfunc.c:557 expand_compound_array_assignment splits
+                // the body into element words first and expands each one,
+                // so compoundness is a property of the assignment, not of
+                // the expansion route the value happened to take.
                 let materialized = if value.starts_with(tilde_expand::QUOTED_ASSIGNMENT_VALUE) {
                     format!("{}{materialized}", tilde_expand::QUOTED_ASSIGNMENT_VALUE)
+                } else if value.starts_with(COMPOUND_ASSIGNMENT_MARKER) {
+                    format!("{COMPOUND_ASSIGNMENT_MARKER}{materialized}")
                 } else {
                     materialized
                 };
@@ -2380,11 +2392,20 @@ impl Executor {
                     {
                         if let Some(storage) = self.parameter_array_storage(array_name) {
                             changed = true;
-                            let sliced = array_parameter_slice(
-                                &storage,
-                                offset,
-                                length.and_then(|length| usize::try_from(length).ok()),
-                            );
+                            // A scalar base under [@]/[*] is VT_VARIABLE:
+                            // slice the string itself, signed length
+                            // included (subst.c:9083; rubash#1600). Real
+                            // arrays keep the element-slice path.
+                            let sliced = if self.parameter_is_array_variable(array_name) {
+                                array_parameter_slice(
+                                    &storage,
+                                    offset,
+                                    length.and_then(|length| usize::try_from(length).ok()),
+                                )
+                            } else {
+                                self.array_subscript_range_values(array_name, offset, length)
+                                    .unwrap_or_default()
+                            };
                             if starred {
                                 // GNU array_subrange + string_list_pos_params:
                                 // a quoted `arr[*]:off` joins the slice into
@@ -3259,11 +3280,18 @@ impl Executor {
                 .or_else(|| var_name.strip_suffix("[*]"))
             {
                 let storage = self.parameter_array_storage(array_name)?;
-                let sliced = array_parameter_slice(
-                    &storage,
-                    offset,
-                    length.and_then(|length| usize::try_from(length).ok()),
-                );
+                // Scalar base under [@]/[*]: VT_VARIABLE string slice
+                // with the signed length (subst.c:9083; rubash#1600).
+                let sliced = if self.parameter_is_array_variable(array_name) {
+                    array_parameter_slice(
+                        &storage,
+                        offset,
+                        length.and_then(|length| usize::try_from(length).ok()),
+                    )
+                } else {
+                    self.array_subscript_range_values(array_name, offset, length)
+                        .unwrap_or_default()
+                };
                 return Some(if starred {
                     vec![format!(
                         "{ARRAY_FIELD_SPLIT_MARKER}{}",

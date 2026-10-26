@@ -180,22 +180,48 @@ where
         // read end inherited as stdin ("echo x | . /dev/stdin" from
         // source6.sub). Read the shell's stdin instead of resolving a
         // filesystem path (Windows has no /dev node for it).
-        // Inside a pipeline stage the upstream text is carried in
-        // __RUBASH_FUNCTION_STDIN (execute_builtin_pipeline_stage); prefer it
-        // over the process stdin, which is not wired for builtin stages.
-        let piped = executor
-            .get_env(crate::executor::types::FUNCTION_STDIN)
-            .map(str::to_string);
-        let buffer = match piped {
+        // rubash#1642: /dev/stdin is a dup of fd 0, so the bytes are
+        // whatever fd 0 is bound to for THIS command — its own
+        // `< file` / `<<<` / `<<EOF` redirections, an enclosing scope's
+        // fd-0 binding, or the pipeline stage buffer. The process stdin
+        // is only the binding when nothing else claimed fd 0; reading it
+        // unconditionally made `source /dev/stdin <<< '...'` and
+        // `source /dev/stdin < f` silently source nothing (the binding
+        // lives in the command node / virtual fd table and never reaches
+        // the process handle). Resolve through the same ladder every
+        // other stdin consumer uses. When the command carries its own
+        // fd-0 redirection but it resolves to no text (missing file,
+        // closed fd), GNU never reaches a body — source nothing rather
+        // than fall through to a stdin GNU would not consult.
+        let resolved = redirect_cmd.and_then(|cmd| executor.command_stdin_text(cmd));
+        let buffer = match resolved {
             Some(text) => text,
+            None if redirect_cmd
+                .map(|cmd| executor.command_has_fd0_input_redirect(cmd))
+                .unwrap_or(false) =>
+            {
+                String::new()
+            }
             None => {
-                use std::io::Read;
-                let mut buffer = Vec::new();
-                match std::io::stdin().read_to_end(&mut buffer) {
-                    Ok(_) => crate::script_driver::bytes_to_script_text(&buffer),
-                    Err(_) => {
-                        executor.set_exit_code(1);
-                        return Ok(());
+                // Inside a pipeline stage the upstream text is carried in
+                // __RUBASH_FUNCTION_STDIN (execute_builtin_pipeline_stage);
+                // prefer it over the process stdin, which is not wired for
+                // builtin stages.
+                let piped = executor
+                    .get_env(crate::executor::types::FUNCTION_STDIN)
+                    .map(str::to_string);
+                match piped {
+                    Some(text) => text,
+                    None => {
+                        use std::io::Read;
+                        let mut buffer = Vec::new();
+                        match std::io::stdin().read_to_end(&mut buffer) {
+                            Ok(_) => crate::script_driver::bytes_to_script_text(&buffer),
+                            Err(_) => {
+                                executor.set_exit_code(1);
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }

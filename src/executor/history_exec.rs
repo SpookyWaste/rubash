@@ -197,6 +197,13 @@ pub(in crate::executor) fn execute_history_session(
                 "{}history: too many arguments",
                 executor.diagnostic_prefix()
             );
+            // rubash#1660: the no_args DISCARD channel, shared with
+            // `exit 1 2` and `shift 1 2` (rubash#1650): EX_BADUSAGE
+            // plus the reader-level discard — the list loop skips
+            // the rest of the failing logical line, a function body
+            // unwinds with status 2 and its caller continues.
+            executor.raise_evalerror_abort();
+            executor.evalerror_exit_toomany_pending.set(true);
             return Ok(2);
         }
     }
@@ -384,6 +391,11 @@ pub(in crate::executor) fn execute_history_session(
                 shell.entries.pop();
                 shell.timestamps.pop();
             }
+            // builtins/history.def expand_and_print_history: every
+            // operand is processed in order and successful expansions
+            // still print, but any failure flips the overall result to
+            // EXECUTION_FAILURE (rubash#1627).
+            let mut any_failed = false;
             for operand in &operands {
                 let result = shell.expand(operand, ctx);
                 if result.status < 0 {
@@ -392,9 +404,13 @@ pub(in crate::executor) fn execute_history_session(
                         "{}history: {operand}: history expansion failed",
                         executor.diagnostic_prefix()
                     );
+                    any_failed = true;
                     continue;
                 }
                 let _ = writeln!(stdout, "{}", result.text);
+            }
+            if any_failed {
+                return Ok(1);
             }
         }
         HistoryMode::Append | HistoryMode::Write | HistoryMode::Read | HistoryMode::ReadNew => {
@@ -406,12 +422,17 @@ pub(in crate::executor) fn execute_history_session(
                 .cloned()
                 .or_else(|| executor.get_env("HISTFILE").map(String::from))
             else {
+                // builtins/history.def history_builtin file branch: with
+                // no operand the filename comes from $HISTFILE, and an
+                // unset $HISTFILE draws the `parameter null or not set'
+                // diagnostic with EXECUTION_FAILURE — for -a/-n/-r/-w
+                // alike (rubash#1633).
                 let _ = writeln!(
                     stderr,
-                    "{}history: filename not specified",
+                    "{}history: HISTFILE: parameter null or not set",
                     executor.diagnostic_prefix()
                 );
-                return Ok(2);
+                return Ok(1);
             };
             // GNU history.def: a null $HISTFILE is its own diagnostic
             // (rubash#1289 B3), for both -w and -a.
@@ -423,12 +444,26 @@ pub(in crate::executor) fn execute_history_session(
                 );
                 return Ok(1);
             }
+            // builtins/history.def: an explicitly empty operand is the
+            // separate `empty filename' diagnostic (rubash#1633).
+            if !from_histfile && path.is_empty() {
+                let _ = writeln!(
+                    stderr,
+                    "{}history: empty filename",
+                    executor.diagnostic_prefix()
+                );
+                return Ok(1);
+            }
             // Translate Git-Bash/POSIX spellings (/c/..., /dev/null) to the
             // Windows forms the file APIs need; children see the same file.
             let path =
                 crate::executor::path::shell_path_to_windows(&path, &executor.shell_state.env_vars)
                     .to_string_lossy()
                     .to_string();
+            // variables.c:6168 sv_histtimefmt: this same condition (the
+            // variable exists) is what arms readline's timestamp comment
+            // char; the read paths take their arming state from it
+            // (rubash#1669).
             let write_ts = write_timestamps_of(executor);
             let outcome = match mode {
                 HistoryMode::Append => shell.append_file(&path, write_ts).map(|_| 0),
@@ -439,8 +474,12 @@ pub(in crate::executor) fn execute_history_session(
                 // finish_shell of lines already written by -w
                 // (rubash#1049: GNU re-appends them at exit).
                 HistoryMode::Write => shell.write_file(&path, write_ts).map(|_| 0),
-                HistoryMode::Read => shell.read_file(&path, histsize).map(|_| 0),
-                HistoryMode::ReadNew => shell.read_new_file(&path, histsize).map(|_| 0),
+                HistoryMode::Read => shell
+                    .read_file_with_arming(&path, histsize, write_ts)
+                    .map(|_| 0),
+                HistoryMode::ReadNew => shell
+                    .read_new_file_with_arming(&path, histsize, write_ts)
+                    .map(|_| 0),
                 _ => Ok(0),
             };
             if let Err(err) = outcome {
@@ -480,10 +519,8 @@ pub(in crate::executor) fn execute_history_session(
             let timestamps = shell.timestamps.clone();
             // GNU builtins/history.def (display_history): with
             // HISTTIMEFORMAT set and non-null, each line carries the
-            // entry's timestamp rendered through strftime between the
-            // marker and the entry text (rubash#1070). An entry without a
-            // recorded stamp renders against the epoch, matching GNU's
-            // zero-initialized hist_inittime for unstamped entries.
+            // entry's timestamp rendered by histtime between the
+            // marker and the entry text (rubash#1070, #1669).
             let time_format = executor
                 .get_env("HISTTIMEFORMAT")
                 .filter(|value| !value.is_empty());
@@ -499,14 +536,14 @@ pub(in crate::executor) fn execute_history_session(
                 let mark = " ";
                 match &time_format {
                     Some(format) => {
-                        let epoch = timestamps
-                            .get(index)
-                            .and_then(|stamp| stamp.strip_prefix('#'))
-                            .and_then(|seconds| seconds.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        let rendered = crate::builtins::printf::time::format_epoch_time(
+                        // builtins/history.def histtime via
+                        // lib/readline/history.c history_get_time
+                        // (rubash#1669): strtol stamp parsing, the
+                        // `<text>: invalid timestamp` form, and `??`
+                        // for stamp-less entries.
+                        let rendered = crate::history::render_timestamp(
+                            timestamps.get(index).map(String::as_str),
                             format,
-                            epoch,
                             &executor.shell_state.env_vars,
                         );
                         let _ =

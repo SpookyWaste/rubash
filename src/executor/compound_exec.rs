@@ -614,6 +614,7 @@ impl Executor {
                     process.pre_exec(crate::builtins::kill::child_pre_exec_reset_async);
                 }
             }
+            process.current_dir(&self.shell_state.cwd);
             suppress_orphan_console(&mut process);
             match process.spawn() {
                 Ok(child) => {
@@ -679,6 +680,26 @@ impl Executor {
         env_map.retain(|key, _| {
             !(key.starts_with("__RUBASH_TRAP") && key != "__RUBASH_TRAP_ORIG_IGN")
         });
+        // rubash#1630: dropping the table outright also dropped its
+        // VISIBILITY — GNU's forked child lists the inherited traps in
+        // reset form (`trap -p` inside `( ... ) &` prints the parent's
+        // USR1 and EXIT entries) while the dispositions stay reset, so
+        // nothing fires and the inherited EXIT trap in particular never
+        // runs in the child. The in-process subshell path gets exactly
+        // that shape from reset_for_subshell_child applied to the live
+        // table; run the same transform on a clone of the live table
+        // and forward the resulting __RUBASH_TRAP* keys, so the
+        // respawned child seeds the identical reset-but-listed table
+        // (including the save/restore idiom `eval "$(trap -p ...)"`).
+        // The retain above ran first, so only the live table's entries
+        // can land here — no stale OS-env copies.
+        let mut child_trap_table = self.shell_state.env_vars.clone();
+        crate::builtins::trap::reset_for_subshell_child(&mut child_trap_table);
+        for (key, value) in &child_trap_table {
+            if key.starts_with("__RUBASH_TRAP") {
+                env_map.insert(key.clone(), value.clone());
+            }
+        }
         // rubash#1035: GNU execute_cmd.c setup_async_signals ignores
         // SIGINT/SIGQUIT in the forked async child while job_control is off
         // (the `monitor` option is unset). A respawned `rubash -c` child
@@ -994,6 +1015,8 @@ impl Executor {
             env: env_map.into_iter().collect(),
             std_handles,
             extra_handles,
+            // G-02: the respawned child starts in the session cwd.
+            cwd: Some(self.shell_state.cwd.clone()),
         });
         for h in owned_handles {
             crate::fd::close_handle(h);
@@ -1475,10 +1498,10 @@ impl Executor {
                     } else if is_null_device(&target) {
                         BackgroundStdio::Null
                     } else {
-                        match open_redirect_append(&shell_path_to_windows(
+                        match open_redirect_append(&self.session_path(shell_path_to_windows(
                             &target,
                             &self.shell_state.env_vars,
-                        )) {
+                        ))) {
                             Ok(file) => BackgroundStdio::File(file),
                             Err(_) => continue,
                         }
@@ -1486,7 +1509,8 @@ impl Executor {
                 }
                 RedirectKind::ReadWrite => {
                     let target = self.expand_redirect_target(redirect);
-                    let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
+                    let path = self
+                        .session_path(shell_path_to_windows(&target, &self.shell_state.env_vars));
                     // niubash#519: CON rejects a read+write handle; the
                     // stdin side needs only its CONIN$ half.
                     let opened = if is_con_device_path(&path) {
@@ -1513,10 +1537,10 @@ impl Executor {
                         continue;
                     } else {
                         let opened = if redirect.kind == RedirectKind::CombinedAppend {
-                            open_redirect_append(&shell_path_to_windows(
+                            open_redirect_append(&self.session_path(shell_path_to_windows(
                                 &target,
                                 &self.shell_state.env_vars,
-                            ))
+                            )))
                         } else {
                             self.create_redirect_output(&target, false)
                         };
@@ -2638,10 +2662,8 @@ impl Executor {
         // GNU execute_cmd.c runs `( list )` via execute_in_subshell ->
         // make_child: the forked child owns its own cwd, so a `cd` in the
         // body never reaches the parent. The body here runs in place on
-        // this executor, so the process directory is part of the subshell
-        // environment and must be restored like env_vars (niubash#100).
-        // Same convention as command substitution's saved_dir handling.
-        let saved_cwd = env::current_dir().ok();
+        // this executor; since G-02 the cwd is a ShellState field, so the
+        // saved_state clone below carries the boundary (niubash#100).
         // rubash#439: the body's word-expansion error mark dies with the
         // forked child (GNU's DISCARD jump cannot cross the fork boundary) —
         // the parent judges the subshell only by its exit STATUS, so
@@ -2811,7 +2833,7 @@ impl Executor {
                 // early apply-failure return skipped the restore below and
                 // leaked subshell_depth + the child trap reset into the
                 // parent.
-                self.restore_flat_subshell(saved_state, saved_cwd);
+                self.restore_flat_subshell(saved_state);
                 self.fd_table = saved_fd_table;
                 self.command_expansion_failed.set(saved_expansion_failed);
                 self.exec_replaced = saved_exec_replaced;
@@ -2943,7 +2965,7 @@ impl Executor {
                 if let Some(saved) = saved_fork_collapse {
                     self.subshell_fork_collapse.set(saved);
                 }
-                self.restore_flat_subshell(saved_state.clone(), saved_cwd.clone());
+                self.restore_flat_subshell(saved_state.clone());
                 self.fd_table = saved_fd_table.clone();
                 self.command_expansion_failed.set(saved_expansion_failed);
                 self.exec_replaced = saved_exec_replaced;
@@ -2956,7 +2978,7 @@ impl Executor {
                 if let Some(saved) = saved_fork_collapse {
                     self.subshell_fork_collapse.set(saved);
                 }
-                self.restore_flat_subshell(saved_state.clone(), saved_cwd.clone());
+                self.restore_flat_subshell(saved_state.clone());
                 self.fd_table = saved_fd_table.clone();
                 self.command_expansion_failed.set(saved_expansion_failed);
                 self.exec_replaced = saved_exec_replaced;
@@ -2968,7 +2990,7 @@ impl Executor {
         if let Some(saved) = saved_fork_collapse {
             self.subshell_fork_collapse.set(saved);
         }
-        self.restore_flat_subshell(saved_state, saved_cwd);
+        self.restore_flat_subshell(saved_state);
         self.fd_table = saved_fd_table;
         self.command_expansion_failed.set(saved_expansion_failed);
         self.exec_replaced = saved_exec_replaced;
@@ -3372,10 +3394,29 @@ impl Executor {
                     child.arg(word);
                 }
             } else {
-                child.arg("-c").arg(command_words_source_text(
-                    &coproc_cmd.words,
-                    &coproc_cmd.word_metadata,
-                ));
+                // rubash#1653: the child re-parses this text, so a bare
+                // head word `time` would regain keyword status in the
+                // child even though the coproc parser never granted it
+                // (GNU parse.y:1125-1175: after `coproc`, `time` is a
+                // plain word — GNU forks the same parse tree, rubash
+                // respawns through `-c`). Quote the bare head word so
+                // the re-parse keeps it an ordinary command name: the
+                // child's lookup then matches GNU's forked child
+                // (function, builtin, PATH, else 127 `time: command
+                // not found`). A head word already quoted in source
+                // keeps its own raw spelling; only the bare `time`
+                // spelling needs the quote.
+                let mut metadata = coproc_cmd.word_metadata.clone();
+                if coproc_cmd.words.first().map(String::as_str) == Some("time")
+                    && metadata
+                        .first()
+                        .is_some_and(|meta| meta.value == "time" && meta.raw == "time")
+                {
+                    metadata[0].raw = "'time'".to_string();
+                }
+                child
+                    .arg("-c")
+                    .arg(command_words_source_text(&coproc_cmd.words, &metadata));
             }
             child
         } else {
@@ -3476,6 +3517,7 @@ impl Executor {
             }
 
             suppress_orphan_console(&mut child);
+            child.current_dir(&self.shell_state.cwd);
             match child.spawn() {
                 Ok(mut child_proc) => {
                     // Rubash does not expose real coproc file descriptors yet,
@@ -3757,11 +3799,53 @@ impl Executor {
     }
 
     fn apply_coproc_redirects(
-        &self,
+        &mut self,
         cmd: &CommandNode,
         child: &mut Command,
     ) -> Result<(), ExecuteError> {
-        if let Some(redirect) = &cmd.redirect_in {
+        // rubash#1651: a memory-backed stdin body (here-string,
+        // heredoc) that wins fd 0 replaces the coproc pipe as the
+        // child's stdin. GNU redir.c do_redirections binds fd 0
+        // to the body before the child runs, so the coproc
+        // consumes it and exits; the old code left the child on
+        // the pipe and `coproc cat <<< hi` blocked forever. The
+        // body rides a pre-filled pipe (writer thread: a body
+        // larger than the pipe buffer must not block the spawn
+        // waiting for a reader that does not exist yet; EPIPE
+        // when the child exits early is ignored). Only
+        // HereDoc/HereString winners take this path: `< file`
+        // keeps the real-file path below, and `<&N` dups keep
+        // the pipe — streaming a dup through a string buffer
+        // would change blocking behavior. When the body wins,
+        // it outranks redirect_in (GNU left-to-right order: the
+        // last fd-0 redirect wins).
+        let mut body_stdin: Option<std::process::Stdio> = None;
+        if let Some(text) = self.coproc_stdin_body(cmd) {
+            use std::io::Write as _;
+            if let Ok((reader, mut writer)) = std::io::pipe() {
+                std::thread::spawn(move || {
+                    let _ = writer.write_all(text.as_bytes());
+                });
+                #[cfg(windows)]
+                {
+                    use std::os::windows::io::{FromRawHandle as _, IntoRawHandle as _};
+                    let handle = reader.into_raw_handle();
+                    body_stdin = Some(std::process::Stdio::from(unsafe {
+                        std::fs::File::from_raw_handle(handle)
+                    }));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::{FromRawFd as _, IntoRawFd as _};
+                    let fd = reader.into_raw_fd();
+                    body_stdin = Some(std::process::Stdio::from(unsafe {
+                        std::fs::File::from_raw_fd(fd)
+                    }));
+                }
+            }
+        }
+        if body_stdin.is_none() {
+            if let Some(redirect) = &cmd.redirect_in {
             if redirect.fd.unwrap_or(0) == 0 {
                 let target = self.expand_redirect_target(redirect);
                 if is_closed_redirect_target(&target) {
@@ -3769,6 +3853,7 @@ impl Executor {
                 } else if redirect_target_fd(&target).is_none() {
                     child.stdin(Stdio::from(self.open_input_redirect(&target)?));
                 }
+            }
             }
         }
 
@@ -3786,9 +3871,8 @@ impl Executor {
             if is_closed_redirect_target(&target) {
                 child.stdout(Stdio::null());
             } else if redirect_target_fd(&target).is_none() {
-                child.stdout(Stdio::from(open_redirect_append(&shell_path_to_windows(
-                    &target,
-                    &self.shell_state.env_vars,
+                child.stdout(Stdio::from(open_redirect_append(&self.session_path(
+                    shell_path_to_windows(&target, &self.shell_state.env_vars),
                 ))?));
             }
         }
@@ -3807,11 +3891,17 @@ impl Executor {
             if is_closed_redirect_target(&target) {
                 child.stderr(Stdio::null());
             } else if redirect_target_fd(&target).is_none() {
-                child.stderr(Stdio::from(open_redirect_append(&shell_path_to_windows(
-                    &target,
-                    &self.shell_state.env_vars,
+                child.stderr(Stdio::from(open_redirect_append(&self.session_path(
+                    shell_path_to_windows(&target, &self.shell_state.env_vars),
                 ))?));
             }
+        }
+
+        // The body pipe replaces the coproc pipe set by the caller
+        // (the parent's write end stays registered as ${COPROC[1]},
+        // useless but present, like GNU's rebound pipe end).
+        if let Some(stdio) = body_stdin {
+            child.stdin(stdio);
         }
 
         Ok(())

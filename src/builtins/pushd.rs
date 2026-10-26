@@ -16,6 +16,7 @@ use stack::{
     resolved_index, stack_index,
 };
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 const EXECUTION_SUCCESS: i32 = 0;
 const EXECUTION_FAILURE: i32 = 1;
@@ -72,10 +73,15 @@ pub fn execute(
 ) -> io::Result<i32> {
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
+    // Standalone entry (no session): moves land in a throwaway cwd
+    // slot seeded from the process cwd; session callers use
+    // execute_with_io with the ShellState cwd slot (G-02).
+    let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     execute_with_io(
         builtin,
         args.iter().map(String::as_str),
         env_vars,
+        &mut cwd,
         diagnostic_prefix,
         &mut stdout,
         &mut stderr,
@@ -86,6 +92,7 @@ pub(crate) fn execute_with_io<'a, I, W, E>(
     builtin: StackBuiltin,
     args: I,
     env_vars: &mut crate::shell::var_table::VarTable,
+    cwd: &mut PathBuf,
     diagnostic_prefix: &str,
     stdout: &mut W,
     stderr: &mut E,
@@ -255,6 +262,9 @@ where
                         .unwrap_or_else(|| "/".to_string());
                     stack.swap(0, 1);
                     let new_pwd = stack[0].clone();
+                    // G-02: change_to_temp's chdir moves the session
+                    // cwd field; it stands even if bindpwd fails.
+                    *cwd = physical_cwd_for(&new_pwd, env_vars, cwd);
                     if bindpwd_write(env_vars, &old_pwd, &new_pwd, stderr)? {
                         save_stack(env_vars, &stack);
                         return Ok(EXECUTION_FAILURE);
@@ -306,6 +316,9 @@ where
                         .unwrap_or_else(|| "/".to_string());
                     stack.rotate_left(index);
                     let new_pwd = stack[0].clone();
+                    // G-02: the rotation's chdir moves the session cwd
+                    // field; it stands even if bindpwd fails.
+                    *cwd = physical_cwd_for(&new_pwd, env_vars, cwd);
                     if bindpwd_write(env_vars, &old_pwd, &new_pwd, stderr)? {
                         save_stack(env_vars, &stack);
                         return Ok(EXECUTION_FAILURE);
@@ -399,6 +412,8 @@ where
                         // never runs. The chdir itself stands — GNU's cwd
                         // moved to the operand — so the display's cwd slot
                         // follows it, the same verdict popd inherits.
+                        // G-02: that chdir is the session cwd field move.
+                        *cwd = physical_cwd_for(&resolved_dir, env_vars, cwd);
                         if bindpwd_write(env_vars, &old_pwd, &resolved_dir, stderr)? {
                             if stack.is_empty() {
                                 stack.push(resolved_dir);
@@ -470,7 +485,9 @@ where
                 // its EXECUTION_FAILURE are the only effects (rubash#830;
                 // GNU bash 5.3.0 probes: rc 1, `dirs` still shows the entry).
                 let target = stack[1].clone();
-                let Some(chdir) = popd_chdir(&target, env_vars, stderr, diagnostic_prefix)? else {
+                let Some(chdir) =
+                    popd_chdir(&target, env_vars, cwd, stderr, diagnostic_prefix)?
+                else {
                     return Ok(EXECUTION_FAILURE);
                 };
                 let old_pwd = env_vars
@@ -611,7 +628,7 @@ fn var_is_readonly(env_vars: &crate::shell::var_table::VarTable, name: &str) -> 
 
 /// How the top-of-stack popd's inner cd (GNU cd_to_string) resolved.
 enum PopdChdir {
-    /// set_current_dir moved the shell process.
+    /// The session cwd field moved to the target.
     Real,
     /// cd's Windows-host bridge (cd.rs logical_posix_test_dir): with no
     /// configured logical root, `/bin`-class POSIX names are not physical
@@ -620,12 +637,45 @@ enum PopdChdir {
     Bridged,
 }
 
+/// G-02: the physical session-cwd value for a stack directory word
+/// (the logical display form the stack and $PWD carry): map to the
+/// native form, join the session cwd for relative words, canonicalize
+/// — the same physical resolution cd's move probe performs.
+fn physical_cwd_for(
+    word: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    cwd: &Path,
+) -> PathBuf {
+    let native = crate::executor::path::shell_path_to_windows(word, env_vars);
+    let joined = if native.is_absolute() {
+        native
+    } else {
+        cwd.join(native)
+    };
+    joined.canonicalize().unwrap_or(joined)
+}
+
+/// The error chdir would have reported for a target that exists but
+/// is not a directory (ENOTDIR / ERROR_DIRECTORY), in a form
+/// `posix_errors::message` renders as "Not a directory".
+fn not_a_directory_error() -> io::Error {
+    #[cfg(windows)]
+    {
+        io::Error::from_raw_os_error(267)
+    }
+    #[cfg(not(windows))]
+    {
+        io::Error::from_raw_os_error(20)
+    }
+}
+
 /// The top-of-stack popd chdir, GNU cd_to_string (pushd.def:559-572): a
 /// cd_builtin call with the raw stack word. Returns None when the chdir
 /// failed (diagnostic already printed).
 fn popd_chdir<E: Write>(
     target: &str,
     env_vars: &mut VarTable,
+    cwd: &mut PathBuf,
     stderr: &mut E,
     diagnostic_prefix: &str,
 ) -> io::Result<Option<PopdChdir>> {
@@ -645,7 +695,22 @@ fn popd_chdir<E: Write>(
         return Ok(Some(PopdChdir::Bridged));
     }
     let native = crate::executor::path::shell_path_to_windows(target, env_vars);
-    if let Err(error) = std::env::set_current_dir(&native) {
+    // G-02: the chdir is a session cwd field move, probed the way cd
+    // probes (canonicalize carries chdir's error codes; a plain file
+    // canonicalizes fine but is ENOTDIR to chdir). Raw stack words can
+    // be relative (`pushd -n ./sub` stores them verbatim) — they anchor
+    // at the session cwd.
+    let joined = if native.is_absolute() {
+        native
+    } else {
+        cwd.join(&native)
+    };
+    let probed = match joined.canonicalize() {
+        Ok(path) if path.is_dir() => Ok(path),
+        Ok(_) => Err(not_a_directory_error()),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = probed {
         // cd.def:427: builtin_error("%s: %s", dirname, strerror(e)) reports
         // the stored word, not the Windows-mapped path.
         writeln!(
@@ -656,5 +721,6 @@ fn popd_chdir<E: Write>(
         stderr.flush()?;
         return Ok(None);
     }
+    *cwd = probed.unwrap();
     Ok(Some(PopdChdir::Real))
 }

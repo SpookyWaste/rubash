@@ -232,50 +232,55 @@ fn test_named_coproc_parses_for_body() {
 }
 
 #[test]
-fn test_named_coproc_parses_time_prefixed_pipeline_body() {
+fn test_coproc_time_word_is_simple_command_in_pipeline() {
+    // rubash#1653: GNU parse.y:1125-1175 gives coproc only
+    // `COPROC shell_command` / `COPROC WORD shell_command` /
+    // `COPROC simple_command`; `time` is a timespec on
+    // `pipeline_command` (parse.y:1416), never a shell_command
+    // starter, so after `coproc` it is a plain word. `MYC` here is
+    // therefore the simple command's argv[0] (GNU: `MYC: command
+    // not found`), not a coproc name, and the `| wc -c` stays
+    // outside the coproc as the pipeline's second stage.
     let input = "coproc MYC time echo hi | wc -c";
     let tokens = tokenize(input);
     let ast = parse(&tokens);
 
     assert_eq!(ast.commands.len(), 1);
-    let coproc = ast.commands[0].coproc_command.as_ref().unwrap();
-    assert_eq!(coproc.name.as_deref(), Some("MYC"));
-    assert!(coproc.words.is_empty());
-    assert_eq!(coproc.body_kind, CoprocBodyKind::CompoundCommand);
-    let time_command = coproc.body.as_ref().unwrap()[0]
-        .time_command
-        .as_ref()
-        .unwrap();
-    assert_eq!(time_command.keyword, "time");
-    let pipeline = time_command.command.pipeline_command.as_ref().unwrap();
+    let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
     assert_eq!(pipeline.operators, ["|"]);
-    assert_eq!(pipeline.stages[0].words, ["echo", "hi"]);
+    let coproc = pipeline.stages[0].coproc_command.as_ref().unwrap();
+    assert_eq!(coproc.name, None);
+    assert_eq!(coproc.body_kind, CoprocBodyKind::SimpleCommand);
+    assert_eq!(coproc.words, ["MYC", "time", "echo", "hi"]);
     assert_eq!(pipeline.stages[1].words, ["wc", "-c"]);
 }
 
 #[test]
-fn test_named_coproc_time_pipeline_keeps_inversion_prefix() {
+fn test_coproc_time_word_keeps_bang_as_simple_word() {
+    // `!` is a pipeline modifier only at pipeline start; mid
+    // simple-command it is a literal word (GNU: `echo a ! echo b`
+    // prints `a ! echo b`), so it rides along in the coproc
+    // simple body here rather than negating anything.
     let input = "coproc MYC time ! echo hi | wc -c";
     let tokens = tokenize(input);
     let ast = parse(&tokens);
 
     assert_eq!(ast.commands.len(), 1);
-    let coproc = ast.commands[0].coproc_command.as_ref().unwrap();
-    assert_eq!(coproc.name.as_deref(), Some("MYC"));
-    assert_eq!(coproc.body_kind, CoprocBodyKind::CompoundCommand);
-    let time_command = coproc.body.as_ref().unwrap()[0]
-        .time_command
-        .as_ref()
-        .unwrap();
-    assert!(time_command.inverted);
-    let pipeline = time_command.command.pipeline_command.as_ref().unwrap();
+    let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
     assert_eq!(pipeline.operators, ["|"]);
-    assert_eq!(pipeline.stages[0].words, ["echo", "hi"]);
+    let coproc = pipeline.stages[0].coproc_command.as_ref().unwrap();
+    assert_eq!(coproc.name, None);
+    assert_eq!(coproc.body_kind, CoprocBodyKind::SimpleCommand);
+    assert_eq!(coproc.words, ["MYC", "time", "!", "echo", "hi"]);
     assert_eq!(pipeline.stages[1].words, ["wc", "-c"]);
 }
 
 #[test]
-fn test_named_coproc_time_pipeline_allows_compound_later_stages() {
+fn test_coproc_time_pipeline_allows_compound_later_stages() {
+    // Same #1653 rule as above: the first stage is an unnamed
+    // coproc of the simple command [MYC, time, echo, hi]; the
+    // compound command after the `|` is the pipeline's second
+    // stage, not part of any timed coproc body.
     let if_tokens = tokenize("coproc MYC time echo hi | if read value; then echo $value; fi");
     let if_ast = parse(&if_tokens);
     let subshell_tokens = tokenize("coproc MYC time echo hi | ( read value; echo $value )");
@@ -283,75 +288,52 @@ fn test_named_coproc_time_pipeline_allows_compound_later_stages() {
     let brace_tokens = tokenize("coproc MYC time echo hi | { read value; echo $value; }");
     let brace_ast = parse(&brace_tokens);
 
-    let if_time = if_ast.commands[0]
-        .coproc_command
-        .as_ref()
-        .unwrap()
-        .body
-        .as_ref()
-        .unwrap()[0]
-        .time_command
-        .as_ref()
-        .unwrap();
-    let subshell_time = subshell_ast.commands[0]
-        .coproc_command
-        .as_ref()
-        .unwrap()
-        .body
-        .as_ref()
-        .unwrap()[0]
-        .time_command
+    for ast in [&if_ast, &subshell_ast, &brace_ast] {
+        assert_eq!(ast.commands.len(), 1);
+        let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
+        assert_eq!(pipeline.operators, ["|"]);
+        let coproc = pipeline.stages[0].coproc_command.as_ref().unwrap();
+        assert_eq!(coproc.name, None);
+        assert_eq!(coproc.body_kind, CoprocBodyKind::SimpleCommand);
+        assert_eq!(coproc.words, ["MYC", "time", "echo", "hi"]);
+    }
+    let if_pipeline = if_ast.commands[0].pipeline_command.as_ref().unwrap();
+    let subshell_pipeline = subshell_ast.commands[0]
+        .pipeline_command
         .as_ref()
         .unwrap();
-    let brace_time = brace_ast.commands[0]
-        .coproc_command
-        .as_ref()
-        .unwrap()
-        .body
-        .as_ref()
-        .unwrap()[0]
-        .time_command
-        .as_ref()
-        .unwrap();
+    let brace_pipeline = brace_ast.commands[0].pipeline_command.as_ref().unwrap();
 
-    let if_pipeline = if_time.command.pipeline_command.as_ref().unwrap();
-    let subshell_pipeline = subshell_time.command.pipeline_command.as_ref().unwrap();
-    let brace_pipeline = brace_time.command.pipeline_command.as_ref().unwrap();
-
-    assert_eq!(if_pipeline.operators, ["|"]);
-    assert_eq!(subshell_pipeline.operators, ["|"]);
-    assert_eq!(brace_pipeline.operators, ["|"]);
     assert!(if_pipeline.stages[1].if_command.is_some());
     assert!(subshell_pipeline.stages[1].subshell_command.is_some());
     assert!(brace_pipeline.stages[1].brace_group.is_some());
 }
 
 #[test]
-fn test_named_coproc_parses_time_prefixed_compound_body() {
-    let cases = [
-        ("coproc MYC time -p for x in a; do echo $x; done", "for"),
-        ("coproc MYC time (( 1 ))", "arithmetic"),
-        ("coproc MYC time { echo hi; }", "brace"),
-    ];
-
-    for (input, body_kind) in cases {
-        let tokens = tokenize(input);
-        let ast = parse(&tokens);
-        let coproc = ast.commands[0].coproc_command.as_ref().unwrap();
-        let time_command = coproc.body.as_ref().expect(input)[0]
-            .time_command
-            .as_ref()
-            .expect(input);
-
-        assert_eq!(coproc.name.as_deref(), Some("MYC"), "{input}");
-        assert_eq!(coproc.body_kind, CoprocBodyKind::CompoundCommand, "{input}");
-        match body_kind {
-            "for" => assert!(time_command.command.for_command.is_some(), "{input}"),
-            "arithmetic" => assert!(time_command.command.arithmetic_command.is_some(), "{input}"),
-            "brace" => assert!(time_command.command.brace_group.is_some(), "{input}"),
-            _ => unreachable!(),
-        }
-    }
+fn test_coproc_time_word_keeps_keywords_as_simple_words() {
+    // rubash#1653: reserved words after the first simple-command
+    // words are literal words, not compound starters — GNU runs
+    // `coproc MYC time -p for x in a; do ...` into `syntax error
+    // near 'do'` (the `for` never opens a loop). Rubash rejects
+    // the unit the same way: the parse collapses to a single
+    // parse-error node instead of a coproc-plus-loop list. The
+    // exact diagnostic text is covered end-to-end in
+    // tests/issue1653_coproc_time.rs.
+    // (The `(( ... ))` / `{ ...; }` siblings of this shape are
+    // NOT asserted here: after the coproc simple body, rubash
+    // still swallows the trailing compound token instead of
+    // reporting GNU's `syntax error near '('` / `'}'` — a
+    // coproc-trailing-token gap recorded in the #1653 PR, not a
+    // time-keyword question.)
+    let input = "coproc MYC time -p for x in a; do echo $x; done";
+    let tokens = tokenize(input);
+    let ast = parse(&tokens);
+    assert_eq!(ast.commands.len(), 1);
+    assert!(ast.commands[0].coproc_command.is_none());
+    assert!(ast.commands[0]
+        .assignments
+        .iter()
+        .any(|(key, _)| key.starts_with("__RUBASH_PARSE_ERROR")));
 }
 
 #[test]
@@ -373,22 +355,28 @@ fn test_named_coproc_parses_function_body() {
 }
 
 #[test]
-fn test_named_coproc_parses_time_prefixed_function_body() {
+fn test_coproc_time_word_before_function_parens_is_simple_word() {
+    // rubash#1653: function definitions are not GNU coproc bodies
+    // at all (GNU: `syntax error near '('` for both `coproc MYC
+    // foo() ...` and `coproc MYC time foo() ...`), so the old
+    // timed-function-body expectation is dropped. What IS pinned
+    // here is the #1653 direction: `MYC` is the simple command's
+    // argv[0], not a coproc name, and `time` is its second word.
+    // (The trailing `(` still lacks GNU's syntax error — same
+    // coproc-trailing-token gap as the `{ ...; }` / `(( ... ))`
+    // siblings noted above.)
     let input = "coproc MYC time foo() { echo hi; }";
     let tokens = tokenize(input);
     let ast = parse(&tokens);
     let coproc = ast.commands[0].coproc_command.as_ref().unwrap();
-    let time_command = coproc.body.as_ref().unwrap()[0]
-        .time_command
-        .as_ref()
-        .unwrap();
-    let function = time_command.command.function_command.as_ref().unwrap();
-
-    assert_eq!(coproc.name.as_deref(), Some("MYC"));
-    assert_eq!(coproc.body_kind, CoprocBodyKind::CompoundCommand);
-    assert_eq!(function.name, "foo");
-    assert!(function.has_parentheses);
-    assert_eq!(function.body[0].words, ["echo", "hi"]);
+    assert_eq!(coproc.name, None);
+    assert_eq!(coproc.body_kind, CoprocBodyKind::SimpleCommand);
+    // Only the head is pinned: `MYC` is argv[0], `time` its
+    // second word. The tail (`(`, `)`, the brace-group token) is
+    // swallowed by simple-word collection today — the same
+    // trailing-token gap noted above — so it is deliberately
+    // not pinned here.
+    assert_eq!(&coproc.words[..3], ["MYC", "time", "foo"]);
 }
 
 #[test]
@@ -622,3 +610,4 @@ fn test_coproc_command_consumes_trailing_stdout_redirect() {
     assert_eq!(coproc.body_kind, CoprocBodyKind::BraceGroup);
     assert_eq!(command.redirect_out.as_ref().unwrap().target, "out.txt");
 }
+

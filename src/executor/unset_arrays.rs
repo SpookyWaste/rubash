@@ -45,8 +45,9 @@ impl Executor {
                         &mut std::io::sink(),
                     );
                 }
-                let mut file =
-                    File::create(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+                let mut file = File::create(
+                    self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars)),
+                )?;
                 return self.execute_unset_with_stderr(&cmd.words[1..], &arrayref_flags, &mut file);
             }
         }
@@ -54,10 +55,9 @@ impl Executor {
         if let Some(redirect) = &cmd.redirect_err_append {
             let target = self.expand_redirect_target(redirect);
             if !target.starts_with('&') {
-                let mut file = open_redirect_append(&shell_path_to_windows(
-                    &target,
-                    &self.shell_state.env_vars,
-                ))?;
+                let mut file = open_redirect_append(
+                    &self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars)),
+                )?;
                 return self.execute_unset_with_stderr(&cmd.words[1..], &arrayref_flags, &mut file);
             }
         }
@@ -205,7 +205,7 @@ impl Executor {
                     && !self.unset_outer_local_variable(&name)
                 {
                     self.shell_state.env_vars.remove(&name);
-                    std::env::remove_var(&name);
+                    crate::executor::local_helpers::mirror_env_remove(&name);
                     self.shell_state.variables.remove(&name);
                     for key in [
                         EXPORTED_VARS,
@@ -498,7 +498,7 @@ impl Executor {
                     return Some(1);
                 }
                 self.shell_state.env_vars.remove(&cell);
-                std::env::remove_var(&cell);
+                crate::executor::local_helpers::mirror_env_remove(&cell);
                 self.shell_state.variables.remove(&cell);
                 for key in [
                     EXPORTED_VARS,
@@ -569,7 +569,7 @@ impl Executor {
             let keep_exported = is_marked_var(&self.shell_state.env_vars, EXPORTED_VARS, name)
                 && self.tempenv_names.iter().any(|tempenv| tempenv == name);
             self.shell_state.env_vars.remove(name);
-            env::remove_var(name);
+            crate::executor::local_helpers::mirror_env_remove(name);
             self.shell_state.variables.remove(name);
             let mut attrs = VarAttrs {
                 declared_unset: true,
@@ -673,7 +673,7 @@ impl Executor {
                 || is_array_storage(&current))
         {
             self.shell_state.env_vars.remove(array_name);
-            std::env::remove_var(array_name);
+            crate::executor::local_helpers::mirror_env_remove(array_name);
             self.shell_state.variables.remove(array_name);
             for key in [
                 EXPORTED_VARS,
@@ -875,7 +875,7 @@ impl Executor {
             return None;
         }
         self.shell_state.env_vars.remove(array_name);
-        std::env::remove_var(array_name);
+        crate::executor::local_helpers::mirror_env_remove(array_name);
         self.shell_state.variables.remove(array_name);
         for key in [
             EXPORTED_VARS,

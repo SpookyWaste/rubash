@@ -21,49 +21,60 @@ impl Executor {
             return self.scalar_assignment_transform(array_name);
         }
 
-        if let Some((array_name, index)) = parse_array_numeric_subscript(name) {
+        if let Some((array_name, subscript)) = parse_array_subscript(name) {
             let Some(array_name) = self.resolved_variable_name(array_name) else {
                 return String::new();
             };
-            let Some(value) = self
-                .shell_state
-                .env_vars
-                .get(&array_name)
-                .and_then(|value| array_value_at(value, index))
-            else {
-                // GNU string_var_assignment (subst.c:8645): a declared-unset
-                // variable renders `declare -<flags> name` with no `=` body.
-                let flags = self.variable_assignment_flags(&array_name, false);
-                return format!("declare {flags} {array_name}");
-            };
-            let array_flag = if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, &array_name) {
-                "-A"
+            // GNU string_var_assignment (subst.c:8645) renders the CELL,
+            // not the subscript: the flags are the variable's own
+            // var_attribute_string set — an `a`/`A` letter appears only
+            // when the cell really is an array — and the body is the
+            // addressed element's value. A scalar cell addressed at [0]
+            // renders its scalar form (rubash#1599: pure scalars rendered
+            // `declare -a v='...'` here, an unset scalar rendered
+            // `declare  v`, and an attributed array's element render
+            // dropped the cell's other attributes). A missing element on
+            // an attributed variable renders `declare -<flags> name`
+            // with no `=` body; with no attributes the expansion is
+            // empty.
+            let assoc = is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, &array_name);
+            let array_typed = assoc || self.parameter_is_array_variable(&array_name);
+            let stored = self.shell_state.env_vars.get(&array_name);
+            let element = if assoc {
+                let key = self.assoc_subscript_key(subscript);
+                stored.and_then(|value| assoc_value_at(value, &key))
             } else {
-                "-a"
+                // GNU evaluates the subscript like any array reference
+                // (arrayfunc.c array_expand_index): `a[1+1]`, `a[i]` and
+                // negative counts back from the last element all resolve
+                // before the render.
+                match (
+                    array_typed,
+                    eval_conditional_arith_value(subscript, &self.shell_state.env_vars),
+                ) {
+                    (true, Some(raw)) if raw >= 0 => usize::try_from(raw)
+                        .ok()
+                        .and_then(|index| stored.and_then(|value| array_value_at(value, index))),
+                    (true, Some(raw)) => stored.and_then(|value| {
+                        resolve_indexed_array_subscript(value, raw)
+                            .and_then(|index| array_value_at(value, index))
+                    }),
+                    (false, Some(0)) => stored.cloned(),
+                    _ => None,
+                }
             };
-            return format!(
-                "declare {array_flag} {array_name}={}",
-                shell_reusable_quote(&value)
-            );
-        }
-
-        if let Some((array_name, key)) = parse_array_subscript(name) {
-            let Some(array_name) = self.resolved_variable_name(array_name) else {
-                return String::new();
+            let flags = self.variable_assignment_flags(&array_name, array_typed);
+            return match element {
+                Some(value) if flags.is_empty() => {
+                    format!("{array_name}={}", shell_reusable_quote(&value))
+                }
+                Some(value) => format!(
+                    "declare -{flags} {array_name}={}",
+                    shell_reusable_quote(&value)
+                ),
+                None if flags.is_empty() => String::new(),
+                None => format!("declare -{flags} {array_name}"),
             };
-            if !is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, &array_name) {
-                return String::new();
-            }
-            let key = self.assoc_subscript_key(key);
-            let Some(value) = self
-                .shell_state
-                .env_vars
-                .get(&array_name)
-                .and_then(|value| assoc_value_at(value, &key))
-            else {
-                return format!("declare -A {array_name}");
-            };
-            return format!("declare -A {array_name}={}", shell_reusable_quote(&value));
         }
 
         self.scalar_assignment_transform(name)
@@ -72,7 +83,8 @@ impl Executor {
     /// GNU string_var_assignment (subst.c:8645) for a scalar variable: the
     /// flags come from the variable cell in var_attribute_string order
     /// (builtins/setattr.def:415 — a/A, f, i, n, r, t, x, c, l, u; the i, r,
-    /// x, l, u subset applies here), the value part is sh_quote_reusable, and
+    /// t, x, c, l, u subset applies here — rubash#1599: t and c were
+    /// dropped), the value part is sh_quote_reusable, and
     /// a declared-unset variable keeps its attributes but loses the `=value`
     /// body. A variable with no attributes at all renders `name=value`.
     fn scalar_assignment_transform(&self, raw_name: &str) -> String {
@@ -115,6 +127,8 @@ impl Executor {
         let readonly = is_marked_var(&self.shell_state.env_vars, READONLY_VARS, name);
         let exported = is_marked_var(&self.shell_state.env_vars, EXPORTED_VARS, name);
         let integer = is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, name);
+        let trace = is_marked_var(&self.shell_state.env_vars, TRACE_VARS, name);
+        let capcase = is_marked_var(&self.shell_state.env_vars, CAPCASE_VARS, name);
         let uppercase = is_marked_var(&self.shell_state.env_vars, UPPERCASE_VARS, name);
         let lowercase = is_marked_var(&self.shell_state.env_vars, LOWERCASE_VARS, name);
 
@@ -125,8 +139,14 @@ impl Executor {
         if readonly {
             flags.push('r');
         }
+        if trace {
+            flags.push('t');
+        }
         if exported {
             flags.push('x');
+        }
+        if capcase {
+            flags.push('c');
         }
         if lowercase {
             flags.push('l');
@@ -157,9 +177,10 @@ impl Executor {
         }
     }
 
-    /// var_attribute_string attribute letters for an array-typed variable:
-    /// the array attribute comes first (a indexed, A associative), then
-    /// i, r, x, l, u in GNU's setattr.def order.
+    /// var_attribute_string attribute letters for a variable: the array
+    /// attribute comes first when the cell is array-typed (a indexed, A
+    /// associative), then i, r, t, x, c, l, u in GNU's setattr.def order
+    /// (rubash#1599: t and c were dropped).
     pub(in crate::executor) fn variable_assignment_flags(
         &self,
         name: &str,
@@ -179,8 +200,14 @@ impl Executor {
         if is_marked_var(&self.shell_state.env_vars, READONLY_VARS, name) {
             flags.push('r');
         }
+        if is_marked_var(&self.shell_state.env_vars, TRACE_VARS, name) {
+            flags.push('t');
+        }
         if is_marked_var(&self.shell_state.env_vars, EXPORTED_VARS, name) {
             flags.push('x');
+        }
+        if is_marked_var(&self.shell_state.env_vars, CAPCASE_VARS, name) {
+            flags.push('c');
         }
         if is_marked_var(&self.shell_state.env_vars, LOWERCASE_VARS, name) {
             flags.push('l');

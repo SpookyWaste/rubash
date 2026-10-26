@@ -107,6 +107,23 @@ pub struct Token {
     /// the top level of an open group is GNU's `syntax error near
     /// unexpected token `)''.
     pub case_pattern_close: bool,
+    /// rubash#1721: this word-path keyword token was read where a
+    /// reserved word is acceptable — GNU CHECK_FOR_RESERVED_WORD
+    /// (parse.y:3168) recognizes a reserved word only when
+    /// reserved_word_acceptable(last_read_token) (parse.y:5899) holds,
+    /// and under PST_CASEPAT (parse.y:3177-3186) only `esac' (not after
+    /// `|') is recognized at all. The word path marks every
+    /// keyword-VALUED word TokenKind::Keyword and lets consumers
+    /// demote it; the reader stamps that demotion verdict here at read
+    /// time (scanner.rs record_token, from the same reader state its
+    /// history demotion uses), so completeness scans that fold tokens
+    /// into a keyword stack can tell a structural keyword from an
+    /// argument-position word with the same spelling (`echo if',
+    /// `command -vkb if' inside a case clause). Dedicated-branch
+    /// tokens (`(', `)', `{', `}', `!') are structural by construction
+    /// and never consult this stamp. Defaults to false for synthetic
+    /// tokens.
+    pub reserved_position: bool,
 }
 
 impl Token {
@@ -127,7 +144,21 @@ impl Token {
             heredoc_end_line: None,
             regexp_rhs_fragment: false,
             case_pattern_close: false,
+            reserved_position: false,
         }
+    }
+
+    /// Whether this token is a GRAMMAR keyword for completeness
+    /// folding (keyword-stack scans): dedicated-branch tokens (`(',
+    /// `)', `{', `}', `!', folded groups — values outside
+    /// classification::is_keyword) are structural by construction;
+    /// a word-path keyword is structural only when it was read in a
+    /// reserved position (see `reserved_position`). Everything else
+    /// with Keyword kind is an argument/pattern word that merely
+    /// spells like a reserved word (rubash#1721).
+    pub fn structural_keyword(&self) -> bool {
+        self.kind == TokenKind::Keyword
+            && (!super::classification::is_keyword(&self.value) || self.reserved_position)
     }
 
     /// Whether this HereDocBody token never reached its delimiter. The
@@ -161,6 +192,7 @@ impl Token {
             heredoc_end_line: None,
             regexp_rhs_fragment: false,
             case_pattern_close: false,
+            reserved_position: false,
         }
     }
 
@@ -185,6 +217,7 @@ impl Token {
             heredoc_end_line: None,
             regexp_rhs_fragment: false,
             case_pattern_close: false,
+            reserved_position: false,
         }
     }
 }

@@ -8,6 +8,27 @@ use crate::executor::glob::{pathname_expand_word, PathnameExpansion};
 /// somewhere for `99999` instead of failing), and a non-numeric word is
 /// a service name looked up in /etc/services (getservbyname). Returns
 /// None when the service name is unknown (EAI_SERVICE).
+/// The system services database getservbyname walks: /etc/services on
+/// unix; the resolver file the Windows TCP/IP stack reads on Windows
+/// (rubash#1775 — resolve_net_service_port used to read /etc/services
+/// unconditionally, so every service name failed on Windows with
+/// "Servname not supported" even though the Windows file lists http).
+/// Same file src/builtins/complete.rs consults for service-name
+/// completion (rubash#1044), same fallback chain.
+#[cfg(unix)]
+fn services_db_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/etc/services")
+}
+
+#[cfg(windows)]
+fn services_db_path() -> std::path::PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("windir"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    root.join(r"System32\drivers\etc\services")
+}
+
 fn resolve_net_service_port(port_text: &str, udp: bool) -> Option<u16> {
     if let Ok(port) = port_text.parse::<u16>() {
         return Some(port);
@@ -19,7 +40,7 @@ fn resolve_net_service_port(port_text: &str, udp: bool) -> Option<u16> {
             .map(|value| (value % 65536) as u16);
     }
     let proto = if udp { "udp" } else { "tcp" };
-    let services = std::fs::read_to_string("/etc/services").ok()?;
+    let services = std::fs::read_to_string(services_db_path()).ok()?;
     for line in services.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -62,7 +83,7 @@ impl Executor {
         &self,
         target: &str,
     ) -> io::Result<File> {
-        let path = shell_path_to_windows(target, &self.shell_state.env_vars);
+        let path = self.session_path(shell_path_to_windows(target, &self.shell_state.env_vars));
         // niubash#519: CON has no read+write handle (GENERIC_READ|
         // GENERIC_WRITE -> ERROR_INVALID_PARAMETER); the real `<>` bind
         // splits it into CONIN$/CONOUT$ (FileFd::open_readwrite_pair),
@@ -218,10 +239,10 @@ impl Executor {
         // opens the same file `test -f /usr/bin/seq` says exists; the
         // POSIX target word is kept for diagnostics. A path that exists
         // (or misses under both spellings) keeps the plain mapped form.
-        let win_path = crate::executor::path::windows_operand_file_path(
+        let win_path = self.session_path(crate::executor::path::windows_operand_file_path(
             shell_path_to_windows(target, &self.shell_state.env_vars),
             &self.shell_state.env_vars,
-        );
+        ));
         // A spawned child reading a `<(cmd)` carrier must get the stream's
         // REMAINING bytes — GNU hands it a dup of the shared pipe offset,
         // so the parent's next open sees what the child left
@@ -234,6 +255,13 @@ impl Executor {
                     .map_err(|_| {
                         io::Error::new(io::ErrorKind::Other, "failed to materialize input")
                     })?;
+                // rubash#1691: this fresh carrier backs the returned
+                // File only — park the path so the per-command procsub
+                // finish removes it once the consumer is done.
+                self.shell_state
+                    .procsub_adhoc_carriers
+                    .borrow_mut()
+                    .push(path.clone());
                 return File::open(&path).map_err(|e| crate::posix_errors::path_error(target, e));
             }
         }
@@ -251,6 +279,20 @@ impl Executor {
             Some(FdReadEndpoint::File(file_fd)) => crate::fd::duplicate_handle(file_fd.handle)
                 .map(crate::fd::handle_to_file)
                 .map_err(|e| crate::posix_errors::path_error(&file_fd.path.to_string_lossy(), e)),
+            // rubash#1659: a coproc pipe read end is handle-backed
+            // exactly like a file (its FileFd carries the pipe
+            // handle); every sibling reader (read_all_bytes,
+            // take_buffered_input_line, inherited_async_stdin)
+            // already serves it, but this helper dropped it to
+            // Bad file descriptor — so mapfile's `<&${COPROC[0]}`
+            // string channel failed and fell through to reading
+            // inherited process stdin (a hang on a held-open
+            // pipe, or 0 lines on /dev/null).
+            Some(FdReadEndpoint::CoprocStdout { fd: file_fd, .. }) => {
+                crate::fd::duplicate_handle(file_fd.handle)
+                    .map(crate::fd::handle_to_file)
+                    .map_err(|e| crate::posix_errors::path_error(&file_fd.path.to_string_lossy(), e))
+            }
             Some(FdReadEndpoint::Text(_)) | Some(FdReadEndpoint::ProcessSubstitution(_)) => {
                 let bytes = self
                     .virtual_fd_stdin_remaining_bytes(fd)
@@ -266,6 +308,12 @@ impl Executor {
                     .map_err(|_| {
                         io::Error::new(io::ErrorKind::Other, "failed to materialize fd input")
                     })?;
+                // rubash#1691: same ad-hoc carrier bookkeeping as
+                // open_input_redirect's consume branch.
+                self.shell_state
+                    .procsub_adhoc_carriers
+                    .borrow_mut()
+                    .push(path.clone());
                 File::open(&path)
             }
             Some(FdReadEndpoint::InheritedProcessStdin) => {
@@ -284,7 +332,10 @@ impl Executor {
     /// body reads FUNCTION_STDIN — pipe content in GNU terms
     /// (execute_cmd.c execute_pipeline binds the pipe to fd 0) — never the
     /// terminal, whatever the process stdin happens to be.
-    fn stdin_source_is_terminal(&self) -> bool {
+    // pub(in crate::executor): the jobs refresh (job_builtins.rs)
+    // also consults it — job control live on a terminal is one of
+    // GNU's state-publication events (rubash#1612).
+    pub(in crate::executor) fn stdin_source_is_terminal(&self) -> bool {
         if self.shell_state.env_vars.contains_key(FUNCTION_STDIN) {
             return false;
         }
@@ -477,6 +528,18 @@ impl Executor {
         false
     }
 
+    /// G-02: absolutize a host path against the session cwd.
+    /// `shell_path_to_windows` deliberately keeps relative spellings
+    /// relative; every open performed by the session itself must anchor
+    /// them at `ShellState.cwd`, never at the process cwd.
+    pub(in crate::executor) fn session_path(&self, path: std::path::PathBuf) -> std::path::PathBuf {
+        if path.is_absolute() {
+            path
+        } else {
+            self.shell_state.cwd.join(path)
+        }
+    }
+
     pub(in crate::executor) fn create_redirect_output(
         &self,
         target: &str,
@@ -494,7 +557,7 @@ impl Executor {
             ));
         }
         let target = self.redirect_output_path_target(target);
-        let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
+        let path = self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars));
         if !clobber
             && crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "noclobber")
             && !Self::noclobber_target_is_device_like(&path)
@@ -569,7 +632,7 @@ impl Executor {
             return target.to_string();
         }
 
-        match pathname_expand_word(target, &self.shell_state.env_vars) {
+        match pathname_expand_word(target, &self.shell_state.env_vars, &self.shell_state.cwd) {
             PathnameExpansion::Matches(matches) if matches.len() == 1 => matches[0].clone(),
             _ => target.to_string(),
         }
@@ -1141,6 +1204,28 @@ impl Executor {
         Some(input[offset..].to_string())
     }
 
+    /// rubash#1651: the winning fd-0 stdin body for a coproc child,
+    /// if the winning redirect is memory-backed (here-string or
+    /// heredoc). Same ordering as stdin_string_for_command_mut
+    /// (GNU redir.c do_redirections: the last fd-0 input redirect
+    /// wins); file and dup winners return None so their existing
+    /// paths stay untouched. The mut variant matters: its
+    /// here-string expansion strips quotes segment-wise
+    /// (expand_here_string_mut), while the read-only fallback
+    /// leaves them (`coproc cat <<< "hello"` fed `"hello"`
+    /// with quotes). For a well-formed body the mut variant
+    /// returns from the body branches before its FUNCTION_STDIN
+    /// drain tail, so the drain never fires here.
+    pub(crate) fn coproc_stdin_body(&mut self, cmd: &CommandNode) -> Option<String> {
+        match fd0_stdin_redirect_winner(cmd) {
+            Some(crate::parser::RedirectKind::HereDoc)
+            | Some(crate::parser::RedirectKind::HereString) => {
+                self.stdin_string_for_command_mut(cmd)
+            }
+            _ => None,
+        }
+    }
+
     pub(in crate::executor) fn stdin_string_for_command_mut(
         &mut self,
         cmd: &CommandNode,
@@ -1529,6 +1614,25 @@ impl Executor {
         };
         input.push('\n');
         Some(input)
+    }
+
+    /// rubash#1642: the stdin text `source /dev/stdin` must read for a
+    /// command — GNU source.def opens /dev/stdin, a dup of fd 0, so the
+    /// bytes are whatever fd 0 is bound to for this command (its own
+    /// `< file` / `<<<` / `<<EOF` redirections, an enclosing scope's fd-0
+    /// binding, or the pipeline stage buffer), resolved by the same
+    /// ladder every other stdin consumer uses. None when no channel
+    /// binds stdin (plain inherited process stdin).
+    pub(crate) fn command_stdin_text(&self, cmd: &CommandNode) -> Option<String> {
+        self.stdin_string_for_command(cmd)
+    }
+
+    /// rubash#1642: whether the command carries its own fd-0 input
+    /// redirection. When it does but resolves to no text (missing file,
+    /// closed fd), `source /dev/stdin` must source nothing rather than
+    /// fall through to a process stdin GNU never consults for it.
+    pub(crate) fn command_has_fd0_input_redirect(&self, cmd: &CommandNode) -> bool {
+        fd0_stdin_redirect_winner(cmd).is_some()
     }
 }
 

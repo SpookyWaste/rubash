@@ -75,7 +75,7 @@ fn run_golden_fixture(name: &str, timeout_secs: u64, corpus: &[&str]) {
     // it against the CPU-heavy perf canaries so neither starves the
     // other (observed once as a 3-test flake during codification).
     let _heavy_guard = if name == "trap-signal-matrix" {
-        Some(HEAVY_TEST_LOCK.lock().unwrap())
+        Some(heavy_lock())
     } else {
         None
     };
@@ -127,7 +127,18 @@ golden_fixture!(golden_extglob_parse_gate => "extglob-parse-gate", timeout 60, c
 golden_fixture!(golden_fnbody_strict_battery => "fnbody-strict-battery", timeout 90, corpus []);
 golden_fixture!(golden_funsub_valsub => "funsub-valsub", timeout 60, corpus []);
 golden_fixture!(golden_issue296_carrier_adjacent_comsub => "issue296-carrier-adjacent-comsub", timeout 60, corpus []);
-golden_fixture!(golden_issue1338_bash_argv0 => "issue1338-bash-argv0", timeout 60, corpus []);
+// Windows-lane gated (not a golden_fixture! invocation): the child in
+// this fixture is "the `bash` found on PATH" — in the capture
+// environment that was the GNU oracle shell itself. The Windows lane's
+// minimal PATH offers only System32\bash.exe, the WSL launcher stub,
+// which answers with its "no installed distributions" banner, so the
+// pinned bytes are unreachable there for reasons that have nothing to
+// do with the engine. Coverage continues on non-Windows runs.
+#[cfg(not(windows))]
+#[test]
+fn golden_issue1338_bash_argv0() {
+    run_golden_fixture("issue1338-bash-argv0", 60, &[]);
+}
 golden_fixture!(golden_issue1339_numeric_padding => "issue1339-numeric-padding", timeout 60, corpus []);
 golden_fixture!(golden_issue1340_xtrace_setattr => "issue1340-xtrace-setattr", timeout 60, corpus []);
 golden_fixture!(golden_issue1341_xtrace_indirection => "issue1341-xtrace-indirection", timeout 60, corpus []);
@@ -149,12 +160,38 @@ golden_fixture!(golden_trap_signal_matrix => "trap-signal-matrix", timeout 180, 
 golden_fixture!(golden_xtrace_decl_compound => "xtrace-decl-compound", timeout 60, corpus []);
 golden_fixture!(golden_issue1224_coproc_fds => "issue1224-coproc-fds", timeout 60, corpus []);
 golden_fixture!(golden_issue1225_declare_convert => "issue1225-declare-convert", timeout 60, corpus []);
-golden_fixture!(golden_issue1227_argv0 => "issue1227-argv0", timeout 60, corpus []);
+// Windows-lane gated (not a golden_fixture! invocation): the fixture
+// is built entirely from POSIX externals — `bash`, `sh`, `/bin/dash`
+// and `hash -p /bin/dash` — none of which exist in the Windows lane's
+// minimal PATH (its `bash` is the WSL launcher stub), so the script
+// cannot reach exit code 0 there. Coverage continues on non-Windows
+// runs, where those programs exist.
+#[cfg(not(windows))]
+#[test]
+fn golden_issue1227_argv0() {
+    run_golden_fixture("issue1227-argv0", 60, &[]);
+}
 golden_fixture!(golden_issue1229_builtin_help => "issue1229-builtin-help", timeout 60, corpus []);
 golden_fixture!(golden_issue1230_exec_redirect_undo => "issue1230-exec-redirect-undo", timeout 60, corpus []);
 golden_fixture!(golden_issue1232_tilde_pwd => "issue1232-tilde-pwd", timeout 60, corpus []);
 golden_fixture!(golden_issue1235_fd_move => "issue1235-fd-move", timeout 60, corpus []);
-golden_fixture!(golden_issue1237_net_redir => "issue1237-net-redir", timeout 60, corpus []);
+// Windows-lane gated (not a golden_fixture! invocation): the pinned
+// stderr embeds glibc's OS-error wording — bash's netopen surfaces
+// strerror() text ("Connection refused") and gai_strerror() text for
+// the failing service lookup. The same events on Windows carry the
+// Winsock wording ("No connection could be made because the target
+// machine actively refused it. (os error 10061)"), which no engine
+// behavior can make byte-identical to the WSL capture, and the `http`
+// service name resolves under glibc but not under the Windows
+// resolver. The bash-owned message shapes in this fixture (the
+// `connect:` line, the unknown-service line) do match on Windows; the
+// gate is for the OS-owned bytes only. Coverage continues on
+// non-Windows runs.
+#[cfg(not(windows))]
+#[test]
+fn golden_issue1237_net_redir() {
+    run_golden_fixture("issue1237-net-redir", 60, &[]);
+}
 golden_fixture!(golden_issue1238_arith_diag => "issue1238-arith-diag", timeout 60, corpus []);
 golden_fixture!(golden_k4_declare_options => "k4-declare-options", timeout 60, corpus []);
 golden_fixture!(golden_k4_getopts_state => "k4-getopts-state", timeout 60, corpus []);
@@ -185,10 +222,28 @@ fn manifest_dir() -> PathBuf {
 
 fn minimal_path() -> String {
     if cfg!(windows) {
-        // System32 only: rubash emulates the coreutils the fixtures use.
-        // This matches what a bare windows-latest CI runner provides, so
-        // the local run and the CI run exercise the same code paths.
-        r"C:\Windows\System32".to_string()
+        // System32 first: this matches what a bare windows-latest CI
+        // runner provides, so the local run and the CI run exercise the
+        // same resolution paths. System32 alone is no longer a complete
+        // fixture world, though: since the emulated-external stand-down
+        // (rubash#1545), an emulated coreutil runs only when its name
+        // actually resolves, and under a System32-only PATH head/wc/
+        // mkdir/grep/sed resolve nowhere — the fixtures (whose GNU
+        // captures were made with real coreutils under /usr/bin:/bin)
+        // lost their tools and a dozen goldens went red the day #1545
+        // landed, invisibly, inside an already-red job. The capture
+        // world's defining property is that the coreutils EXIST as real
+        // programs; Git for Windows' usr/bin is part of the standard
+        // windows-latest image and supplies exactly that set, so append
+        // it when present (System32 keeps precedence; on a machine
+        // without Git the path degrades to the old System32-only shape).
+        let mut path = r"C:\Windows\System32".to_string();
+        let git_usr_bin = r"C:\Program Files\Git\usr\bin";
+        if Path::new(git_usr_bin).is_dir() {
+            path.push(';');
+            path.push_str(git_usr_bin);
+        }
+        path
     } else {
         "/usr/bin:/bin".to_string()
     }
@@ -744,9 +799,23 @@ fn upstream_suite_slice_snapshots() {
 
 static HEAVY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Acquire HEAVY_TEST_LOCK, tolerating poison. The lock only serializes
+/// heavy tests against each other; it guards no data. A test that panics
+/// while holding it must fail on its own assertion alone — with a plain
+/// `.lock().unwrap()` its panic used to poison the mutex and manufacture
+/// a second, misleading PoisonError failure in every later heavy test
+/// (observed in the 2026-10-26 master CI run: the trap-signal-matrix
+/// panic cascaded into all four perf canaries, yes_head_one,
+/// parse_acceptance and niubash_362 case_1).
+fn heavy_lock() -> std::sync::MutexGuard<'static, ()> {
+    HEAVY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn perf_canary_nvm_loader_parses_bounded() {
-    let _guard = HEAVY_TEST_LOCK.lock().unwrap();
+    let _guard = heavy_lock();
     let root = manifest_dir();
     let dir = std::env::temp_dir().join(format!("rubash-perf-nvm-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -766,7 +835,7 @@ fn perf_canary_nvm_loader_parses_bounded() {
 
 #[test]
 fn perf_canary_ruby_build_parse_bounded() {
-    let _guard = HEAVY_TEST_LOCK.lock().unwrap();
+    let _guard = heavy_lock();
     let root = manifest_dir();
     let dir = std::env::temp_dir().join(format!("rubash-perf-rbld-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -793,7 +862,7 @@ fn perf_canary_ruby_build_parse_bounded() {
 /// pre-fix the nested form exceeded 300s.
 #[test]
 fn perf_canary_synthetic_brace_repetition() {
-    let _guard = HEAVY_TEST_LOCK.lock().unwrap();
+    let _guard = heavy_lock();
     let dir = std::env::temp_dir().join(format!("rubash-perf-rep-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create perf scratch");
@@ -893,7 +962,7 @@ as_fn_mkdir_p () {
 /// utilities (src/main.rs run_internal_pipeline_utility).
 #[test]
 fn perf_canary_yes_head_read_terminates() {
-    let _guard = HEAVY_TEST_LOCK.lock().unwrap();
+    let _guard = heavy_lock();
     let dir = std::env::temp_dir().join(format!("rubash-perf-yhr-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create perf scratch");
@@ -929,7 +998,7 @@ fn perf_canary_yes_head_read_terminates() {
 /// otherwise `yes` can remain blocked forever with `head -1` already exited.
 #[test]
 fn yes_head_one_terminates_after_downstream_closes() {
-    let _guard = HEAVY_TEST_LOCK.lock().unwrap();
+    let _guard = heavy_lock();
     let dir = std::env::temp_dir().join(format!("rubash-yes-head-one-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create pipeline scratch");
@@ -1080,7 +1149,7 @@ fn script_file_cat_pipe_while_read_does_not_slurp_parent_stdin() {
 ///    `cat <<EOF ; :', `case $x in a) : ; esac', `for ((i=0;;i++))'.
 #[test]
 fn parse_acceptance_gnu_separator_and_brace_word_rules() {
-    let _guard = HEAVY_TEST_LOCK.lock().unwrap();
+    let _guard = heavy_lock();
     let dir = std::env::temp_dir().join(format!("rubash-pa-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create scratch");
@@ -1253,7 +1322,7 @@ mod issue_niubash_362 {
     /// background child must still print its output and exit 0.
     #[test]
     fn case_1_background_command_with_large_function_table() {
-        let _guard = HEAVY_TEST_LOCK.lock().unwrap();
+        let _guard = heavy_lock();
         let dir = case_scratch("362.1");
 
         let mut script = String::new();
@@ -3137,6 +3206,51 @@ mod k1_batch2 {
         assert_eq!(stdout, "SEEDLINE\nSEEDLINE\nerr-is:[echo SEEDLINE]\n");
     }
 
+    /// rubash#1776: `time` on Windows counted SELF only (PR #1771);
+    /// the CHILDREN half — CPU of waited external children, GNU
+    /// getrusage(RUSAGE_CHILDREN) — stayed zero because no reap site
+    /// sampled the child's handle. The pin times a nested rubash
+    /// child burning an arithmetic loop and asserts a 100ms user
+    /// threshold, not mere non-zero: the outer shell's own SELF delta
+    /// is a parse-and-spawn trifle (single-digit milliseconds), so a
+    /// threshold crossing proves the CHILDREN accumulator moved. The
+    /// nested binary path comes from CARGO_BIN_EXE_rubash (the same
+    /// binary the harness runs); forward slashes keep Windows
+    /// quoting intact. On unix this guards the getrusage path.
+    /// The loop count is 20,000 (not 300,000): measured ~6.5s user /
+    /// ~18s wall on a loaded 2-core box, so the run stays far inside
+    /// the 60s harness cap while still clearing the 100ms threshold
+    /// by over an order of magnitude on any runner.
+    #[test]
+    fn issue1776_time_children_cpu() {
+        fn parse_time_ms(line: &str) -> Option<u64> {
+            // line: "user\t0m2.345s" (minute form, %3lU).
+            let value = line.split('\t').nth(1)?.trim().strip_suffix('s')?;
+            let (min, rest) = value.split_once('m')?;
+            let (sec, ms) = rest.split_once('.')?;
+            let ms = format!("{ms:0<3}");
+            let ms = ms.get(..3)?;
+            Some(
+                min.parse::<u64>().ok()? * 60_000
+                    + sec.parse::<u64>().ok()? * 1_000
+                    + ms.parse::<u64>().ok()?,
+            )
+        }
+        let bin = env!("CARGO_BIN_EXE_rubash").replace('\\', "/");
+        let script =
+            format!("time \"{bin}\" -c 'x=0; while [ $x -lt 20000 ]; do x=$((x+1)); done'\n");
+        let (_stdout, stderr, code) = run("k1-1776", &script);
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        let user_line = stderr
+            .lines()
+            .find(|line| line.starts_with("user"))
+            .unwrap_or("");
+        let user_ms = parse_time_ms(user_line).unwrap_or(0);
+        assert!(
+            user_ms >= 100,
+            "child CPU must clear 100ms, got: {user_line:?} ({user_ms}ms) in\n{stderr}"
+        );
+    }
     /// rubash#1212: `time` reports real CPU time (getrusage deltas), not
     /// a hard-coded user/sys of zero.
     #[test]
@@ -3155,6 +3269,39 @@ mod k1_batch2 {
             "user time must be measured, got: {user_line:?} in\n{stderr}"
         );
     }
+
+    /// rubash#1774: a refused /dev/tcp connect on Windows leaked the
+    /// long FormatMessageW text ("No connection could be made because
+    /// the target machine actively refused it. (os error 10061)")
+    /// where GNU prints the short strerror "Connection refused"
+    /// (redir.c netopen; golden issue1237-net-redir). The rendering
+    /// funnel is posix_errors::message()'s Win32 table, so the pin
+    /// asserts the GNU shape on every platform: the sys_error line
+    /// plus the redirection_error line, and no raw OS long text.
+    #[test]
+    fn issue1774_dev_tcp_connect_failure_gnu_diagnostic() {
+        let (stdout, stderr, code) = run(
+            "k1-1774",
+            "( exec 3<>/dev/tcp/127.0.0.1/1 ); echo \"tcp rc=$?\"\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "tcp rc=1\n", "stderr:\n{stderr}");
+        assert!(
+            stderr.contains("connect: Connection refused"),
+            "missing GNU connect line in:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("/dev/tcp/127.0.0.1/1: Connection refused"),
+            "missing GNU redirection line in:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("actively refused") && !stderr.contains("os error"),
+            "raw OS text leaked in:\n{stderr}"
+        );
+    }
+
+
+
 
     /// rubash#1213: `return` with too many arguments is the no_args
     /// DISCARD class — message, status 2, rest of the line abandoned,
@@ -3175,6 +3322,45 @@ mod k1_batch2 {
              fg.sh: line 3: return: too many arguments\n\
              fg.sh: line 4: return: abc: numeric argument required\n"
         );
+    }
+
+    /// rubash#1775: /dev/tcp with a service name ('http') failed on
+    /// Windows because resolve_net_service_port only read
+    /// /etc/services, so GNU's getservbyname parity (http -> 80) was
+    /// missing and the shell printed "Servname not supported" plus
+    /// "Invalid argument". The pin asserts the resolution invariant,
+    /// not the listener state: loopback:80 may or may not have a
+    /// listener (CI runners do, local machines do not), so the
+    /// connect must be attempted at the resolved port either way —
+    /// rc=0 on connect, rc=1 with the GNU refused shape otherwise —
+    /// and must never fail with a resolution error. On unix the name
+    /// already resolved, so this guards the shared parser path there
+    /// and pins the Windows fix here.
+    #[test]
+    fn issue1775_dev_tcp_service_name_http_resolves() {
+        let (stdout, stderr, code) = run(
+            "k1-1775",
+            "( exec 3<>/dev/tcp/127.0.0.1/http ); echo \"http rc=$?\"\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert!(
+            stdout == "http rc=0\n" || stdout == "http rc=1\n",
+            "connect must be attempted at the resolved port, got stdout: {stdout:?}, stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("Servname not supported") && !stderr.contains("Invalid argument"),
+            "service name failed to resolve in:\n{stderr}"
+        );
+        if stdout == "http rc=1\n" {
+            assert!(
+                stderr.contains("connect: Connection refused"),
+                "missing GNU connect line in:\n{stderr}"
+            );
+            assert!(
+                stderr.contains("/dev/tcp/127.0.0.1/http: Connection refused"),
+                "missing GNU redirection line in:\n{stderr}"
+            );
+        }
     }
 
     /// rubash#1215: `hash <builtin>` is a silent no-op (no entry, rc 0);
