@@ -3150,8 +3150,7 @@ pub const ASYNC_CHILD_ENV_KEY: &str = "__RUBASH_ASYNC_CHILD";
 /// hard (trap.c original_signals). This flag is the marker: it is set
 /// here, before the trap table seeds, and read only by that fold.
 #[cfg(unix)]
-static ASYNC_CHILD_ENTRY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static ASYNC_CHILD_ENTRY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// True when this process started as an asynchronous (`&`) job child
 /// (entry SIGINT/SIGQUIT ignored by the spawn site, not by inheritance).
