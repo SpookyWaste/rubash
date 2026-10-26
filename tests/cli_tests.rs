@@ -410,6 +410,38 @@ fn issue1624_coproc_vars_unset_after_eof_and_reap() {
 }
 
 #[test]
+fn issue1632_coproc_redirected_stdout_read_end_blocks_until_exit() {
+    // GNU: with the coproc child's stdout redirected to a file, the
+    // child still holds a writer on the coproc read pipe for its whole
+    // life, so the parent's `read -t` times out (142) instead of
+    // seeing instant EOF, and bytes written to the coproc reach the
+    // file through the child.
+    let dir = std::env::temp_dir().join(format!("rubash-cli-issue1632-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let output = rubash_command()
+        .current_dir(&dir)
+        .arg("-c")
+        .arg(
+            "coproc RC { cat; } >redir_out.txt; \
+             echo abc >&${RC[1]}; \
+             read -t 1 -u ${RC[0]} line; echo \"read rc=$?\"; \
+             exec {RC[1]}>&-; \
+             wait $RC_PID 2>/dev/null; \
+             echo \"file=[$(cat redir_out.txt)]\"",
+        )
+        .output()
+        .expect("run rubash");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "read rc=142\nfile=[abc]\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
 fn issue1638_append_procsub_redirect_drains_before_next_command() {
     // GNU forks the `>(...)` consumer at expansion time, so a fast
     // consumer's output is on disk when the next command runs. The

@@ -155,6 +155,40 @@ enum CoprocStderrForwardTarget {
     CoprocStdin(std::fs::File),
 }
 
+/// Duplicate handles prepared for `apply_coproc_redirects`' fd-dup arms
+/// (rubash#1644): GNU applies a command's redirections inside the
+/// forked coproc child with dup2, so `>&2` makes the child's stdout
+/// share stderr's current destination and `2>&1` makes its stderr
+/// share stdout's — the coproc pipe at that point. The caller owns
+/// both destinations before spawn (the forwarder pipe writer for
+/// stderr, the coproc pipe writer for stdout), so it hands over one
+/// duplicate of each; an arm that does not fire drops its duplicate
+/// when this value goes out of scope, before the spawn.
+struct CoprocRedirectDups {
+    /// Duplicate of the child's stderr destination (the forwarder
+    /// pipe's writer, or the process stderr handle when fd 2 is
+    /// inherited natively).
+    stderr_writer: Option<std::fs::File>,
+    /// Duplicate of the coproc pipe writer (the child's stdout
+    /// destination before its own redirections).
+    stdout_writer: Option<std::fs::File>,
+}
+
+/// What `apply_coproc_redirects` did to the coproc child's stdio, so
+/// the caller can finish the wiring (writer retention, forwarder
+/// suppression) after the spawn.
+#[derive(Default)]
+struct CoprocRedirectOutcome {
+    /// The child's stdout no longer points at the coproc pipe (file,
+    /// null, or a `>&2` dup): the parent retains its writer duplicate
+    /// for the coproc's lifetime (rubash#1632).
+    stdout_displaced: bool,
+    /// The child's stderr no longer points at the forwarder pipe (file,
+    /// null, or a `2>&1` dup onto the coproc pipe): no forwarder thread
+    /// is needed for this child.
+    stderr_displaced: bool,
+}
+
 /// Resolved stdio disposition for one of a background child's fds 0-2,
 /// tracking what GNU's do_redirections would leave the descriptor
 /// pointing at inside the forked subshell.
@@ -261,7 +295,7 @@ fn strip_consumed_redirects(command: &mut CommandNode, consumed: &[bool]) {
 }
 
 fn forward_coproc_stderr(
-    mut stderr: std::process::ChildStderr,
+    mut stderr: impl std::io::Read,
     mut target: CoprocStderrForwardTarget,
 ) -> Result<(), std::io::Error> {
     // Forwarding into a closed stdout/stderr pipe must end this thread
@@ -376,6 +410,11 @@ impl Executor {
     /// Close every fd slot carrying this coprocess's pipe ends. Dropping the
     /// last Rc<FileFd> closes the underlying HANDLE.
     pub(crate) fn close_coproc_endpoints(&mut self, pid: u32) {
+        // rubash#1632: the retained writer duplicate (kept while the
+        // child's own redirections displaced its stdout from the pipe)
+        // dies with the coproc's endpoints, so a blocked reader sees
+        // EOF once the coproc is retired or its fds are closed.
+        self.coproc_retained_stdout_writers.remove(&pid);
         let fds: Vec<u32> = self
             .fd_table
             .entries
@@ -3319,6 +3358,53 @@ impl Executor {
         }
     }
 
+    /// rubash#1651: the expanded content of a coproc command's
+    /// here-string, newline-terminated like GNU's. The coproc dispatch
+    /// path does not pass through preexpand_command_stdin, so the word
+    /// arrives raw (quotes and all) and stdin_string_for_command's
+    /// fallback would deliver the quote characters as data; expand it
+    /// with the same walker the simple-command path uses, honoring an
+    /// already-prepared carrier when one exists.
+    fn coproc_herestring_content(&mut self, cmd: &CommandNode) -> Option<String> {
+        fn finish(text: String) -> Option<String> {
+            let mut text = text;
+            text.push('\n');
+            Some(text)
+        }
+        if let Some(carrier) = &cmd.here_string_carrier {
+            return match carrier {
+                crate::parser::StdinBody::Preexpanded(text) => finish(text.clone()),
+                crate::parser::StdinBody::NeedsExpansion(body) => {
+                    let body = body.clone();
+                    finish(self.expand_here_string_mut(&body))
+                }
+            };
+        }
+        if let Some(word) = &cmd.here_string {
+            return finish(self.expand_here_string_mut(word));
+        }
+        if let Some(redirect) = cmd
+            .heredoc_redirects
+            .iter()
+            .rev()
+            .find(|redirect| redirect.here_string && redirect.fd == Some(0))
+        {
+            if let Some(carrier) = &redirect.body_carrier {
+                return match carrier {
+                    crate::parser::StdinBody::Preexpanded(text) => finish(text.clone()),
+                    crate::parser::StdinBody::NeedsExpansion(body) => {
+                        let body = body.clone();
+                        finish(self.expand_here_string_mut(&body))
+                    }
+                };
+            }
+            if let Some(body) = &redirect.body {
+                return finish(self.expand_here_string_mut(body));
+            }
+        }
+        self.stdin_string_for_command(cmd)
+    }
+
     pub(in crate::executor) fn execute_coproc_command(
         &mut self,
         cmd: &CommandNode,
@@ -3456,24 +3542,119 @@ impl Executor {
         if let (Ok((stdin_reader, stdin_writer)), Ok((stdout_reader, stdout_writer))) =
             (stdin_result, stdout_result)
         {
-            child.stdin(stdin_reader);
-            child.stdout(stdout_writer);
+            // rubash#1651: a heredoc/herestring on fd 0 replaces the
+            // coproc pipe as the child's stdin (GNU redir.c applies the
+            // command's own redirections after the coproc pipe wiring,
+            // and the here-document is a temp file — subst.c
+            // make_here_document); the child consumes it and exits
+            // instead of blocking on a pipe nobody feeds. The coproc
+            // pipe itself is still created and bound in the parent,
+            // exactly as in GNU.
+            let heredoc_stdin = match super::shell_options::fd0_stdin_redirect_winner(cmd) {
+                Some(crate::parser::RedirectKind::HereDoc) => self
+                    .stdin_string_for_command(cmd)
+                    .map(|content| {
+                        // The stored heredoc body drops the final line's
+                        // terminator; GNU delivers every heredoc line
+                        // newline-terminated (the delimiter must begin a
+                        // line), so restore it — a body missing it made
+                        // the child's last record arrive unterminated
+                        // and the coproc read report EOF (rubash#1651).
+                        if content.is_empty() || content.ends_with('\n') {
+                            content
+                        } else {
+                            format!("{content}\n")
+                        }
+                    })
+                    .and_then(|content| {
+                        self.write_process_substitution_temp_bytes(content.as_bytes())
+                            .ok()
+                    })
+                    .and_then(|path| std::fs::File::open(path).ok()),
+                Some(crate::parser::RedirectKind::HereString) => self
+                    .coproc_herestring_content(cmd)
+                    .and_then(|content| {
+                        self.write_process_substitution_temp_bytes(content.as_bytes())
+                            .ok()
+                    })
+                    .and_then(|path| std::fs::File::open(path).ok()),
+                _ => None,
+            };
+            if let Some(file) = heredoc_stdin {
+                child.stdin(Stdio::from(file));
+                drop(stdin_reader);
+            } else {
+                child.stdin(stdin_reader);
+            }
+            // The child's stdout starts as the coproc pipe writer; the
+            // command's own redirections may move it (GNU applies them
+            // after the pipe wiring, in the child). Two duplicates of
+            // the writer are prepared before the original is consumed:
+            // one the parent retains when the writer ends up displaced
+            // (rubash#1632 — GNU's child keeps a writer on the read
+            // pipe for its whole life, so the parent's reads see EOF
+            // only when the coproc exits), and one
+            // apply_coproc_redirects can hand to the child's stderr for
+            // a `2>&1` dup (rubash#1644).
+            let stdout_handle = crate::fd::into_handle(stdout_writer);
+            let retained_stdout_writer = crate::fd::duplicate_handle(stdout_handle)
+                .ok()
+                .map(crate::fd::handle_to_file);
+            let stdout_dup_for_stderr = crate::fd::duplicate_handle(stdout_handle)
+                .ok()
+                .map(crate::fd::handle_to_file);
+            child.stdout(Stdio::from(crate::fd::handle_to_file(stdout_handle)));
             let coproc_stderr_target = self.coproc_stderr_forward_target();
+            // The child's stderr pipe is created here rather than via
+            // Stdio::piped() so a duplicate of its writer can serve a
+            // `>&2` dup on stdout: the forwarder pipe IS stderr's
+            // destination whenever the shell's fd 2 is virtual.
+            let mut stderr_pipe_reader: Option<std::fs::File> = None;
+            let mut stderr_dup_for_stdout: Option<std::fs::File> = None;
+            let mut legacy_piped_stderr = false;
             if coproc_stderr_target.is_some() {
-                child.stderr(Stdio::piped());
+                match std::io::pipe() {
+                    Ok((reader, writer)) => {
+                        let writer_handle = crate::fd::into_handle(writer);
+                        stderr_dup_for_stdout = crate::fd::duplicate_handle(writer_handle)
+                            .ok()
+                            .map(crate::fd::handle_to_file);
+                        child.stderr(Stdio::from(crate::fd::handle_to_file(writer_handle)));
+                        stderr_pipe_reader =
+                            Some(crate::fd::handle_to_file(crate::fd::into_handle(reader)));
+                    }
+                    Err(_) => {
+                        child.stderr(Stdio::piped());
+                        legacy_piped_stderr = true;
+                    }
+                }
             } else {
                 child.stderr(Stdio::inherit());
+                stderr_dup_for_stdout =
+                    crate::fd::duplicate_handle(crate::fd::process_std_handle(2))
+                        .ok()
+                        .map(crate::fd::handle_to_file);
             }
             // rubash#846 (GNU execute_cmd.c:1759-1762 + :2583): the
             // coproc child's own redirect failure exits inverted and the
             // parent flips it back — net status 1, no flip. Mark it so an
             // enclosing `!` suppresses its flip.
-            if let Err(error) = self.apply_coproc_redirects(cmd, &mut child) {
-                if matches!(error, ExecuteError::IoError(_)) {
-                    self.note_compound_redirect_failure();
+            let redirect_outcome = match self.apply_coproc_redirects(
+                cmd,
+                &mut child,
+                CoprocRedirectDups {
+                    stderr_writer: stderr_dup_for_stdout,
+                    stdout_writer: stdout_dup_for_stderr,
+                },
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    if matches!(error, ExecuteError::IoError(_)) {
+                        self.note_compound_redirect_failure();
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
+            };
 
             suppress_orphan_console(&mut child);
             match child.spawn() {
@@ -3483,11 +3664,25 @@ impl Executor {
                     // the correct pipe direction on all hosts.
                     let pid = child_proc.id();
                     adopt_orphan_console(pid);
+                    if redirect_outcome.stdout_displaced {
+                        if let Some(writer) = retained_stdout_writer {
+                            self.coproc_retained_stdout_writers.insert(pid, writer);
+                        }
+                    }
                     if let Some(target) = coproc_stderr_target {
-                        if let Some(stderr) = child_proc.stderr.take() {
-                            let forwarder =
-                                std::thread::spawn(|| forward_coproc_stderr(stderr, target));
-                            self.coproc_stderr_forwarders.insert(pid, forwarder);
+                        if !redirect_outcome.stderr_displaced {
+                            if let Some(reader) = stderr_pipe_reader {
+                                let forwarder =
+                                    std::thread::spawn(|| forward_coproc_stderr(reader, target));
+                                self.coproc_stderr_forwarders.insert(pid, forwarder);
+                            } else if legacy_piped_stderr {
+                                if let Some(stderr) = child_proc.stderr.take() {
+                                    let forwarder = std::thread::spawn(|| {
+                                        forward_coproc_stderr(stderr, target)
+                                    });
+                                    self.coproc_stderr_forwarders.insert(pid, forwarder);
+                                }
+                            }
                         }
                     }
                     self.background_children
@@ -3760,7 +3955,9 @@ impl Executor {
         &self,
         cmd: &CommandNode,
         child: &mut Command,
-    ) -> Result<(), ExecuteError> {
+        mut dups: CoprocRedirectDups,
+    ) -> Result<CoprocRedirectOutcome, ExecuteError> {
+        let mut outcome = CoprocRedirectOutcome::default();
         if let Some(redirect) = &cmd.redirect_in {
             if redirect.fd.unwrap_or(0) == 0 {
                 let target = self.expand_redirect_target(redirect);
@@ -3776,20 +3973,38 @@ impl Executor {
             let target = self.expand_redirect_target(redirect);
             if is_closed_redirect_target(&target) {
                 child.stdout(Stdio::null());
-            } else if redirect_target_fd(&target).is_none() {
+                outcome.stdout_displaced = true;
+            } else if let Some(fd) = redirect_target_fd(&target) {
+                // rubash#1644: `>&2` dup2s stderr's current destination
+                // onto the child's stdout (GNU redir.c, applied after
+                // the coproc pipe wiring); the forwarder-pipe duplicate
+                // the caller prepared is that destination. A self-dup
+                // (`>&1`) changes nothing. Other fd targets keep the
+                // historical skip: their destinations are shell-virtual
+                // fds with no child-side handle to dup.
+                if fd == 2 {
+                    if let Some(writer) = dups.stderr_writer.take() {
+                        child.stdout(Stdio::from(writer));
+                        outcome.stdout_displaced = true;
+                    }
+                }
+            } else {
                 child.stdout(Stdio::from(
                     self.create_redirect_output(&target, redirect.clobber)?,
                 ));
+                outcome.stdout_displaced = true;
             }
         } else if let Some(redirect) = &cmd.append {
             let target = self.expand_redirect_target(redirect);
             if is_closed_redirect_target(&target) {
                 child.stdout(Stdio::null());
+                outcome.stdout_displaced = true;
             } else if redirect_target_fd(&target).is_none() {
                 child.stdout(Stdio::from(open_redirect_append(&shell_path_to_windows(
                     &target,
                     &self.shell_state.env_vars,
                 ))?));
+                outcome.stdout_displaced = true;
             }
         }
 
@@ -3797,24 +4012,40 @@ impl Executor {
             let target = self.expand_redirect_target(redirect);
             if is_closed_redirect_target(&target) {
                 child.stderr(Stdio::null());
-            } else if redirect_target_fd(&target).is_none() {
+                outcome.stderr_displaced = true;
+            } else if let Some(fd) = redirect_target_fd(&target) {
+                // rubash#1644: `2>&1` dup2s stdout's current destination
+                // — the coproc pipe — onto the child's stderr, so the
+                // child's diagnostics become readable on the coproc's
+                // parent-side read fd like GNU. A self-dup (`2>&2`)
+                // changes nothing; other fd targets keep the skip.
+                if fd == 1 {
+                    if let Some(writer) = dups.stdout_writer.take() {
+                        child.stderr(Stdio::from(writer));
+                        outcome.stderr_displaced = true;
+                    }
+                }
+            } else {
                 child.stderr(Stdio::from(
                     self.create_redirect_output(&target, redirect.clobber)?,
                 ));
+                outcome.stderr_displaced = true;
             }
         } else if let Some(redirect) = &cmd.redirect_err_append {
             let target = self.expand_redirect_target(redirect);
             if is_closed_redirect_target(&target) {
                 child.stderr(Stdio::null());
+                outcome.stderr_displaced = true;
             } else if redirect_target_fd(&target).is_none() {
                 child.stderr(Stdio::from(open_redirect_append(&shell_path_to_windows(
                     &target,
                     &self.shell_state.env_vars,
                 ))?));
+                outcome.stderr_displaced = true;
             }
         }
 
-        Ok(())
+        Ok(outcome)
     }
 
     pub(in crate::executor) fn execute_case_command(

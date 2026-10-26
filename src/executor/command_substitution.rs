@@ -1695,6 +1695,7 @@ impl Executor {
             execute_generation: Cell::new(0),
             foreground_wait_count: Cell::new(0),
             coproc_stderr_forwarders: HashMap::new(),
+            coproc_retained_stdout_writers: HashMap::new(),
             assignment_output_process_substitutions: Vec::new(),
             external_dispatch_ran: Cell::new(false),
             pipestatus_write_absorbed: Cell::new(false),
