@@ -3206,6 +3206,51 @@ mod k1_batch2 {
         assert_eq!(stdout, "SEEDLINE\nSEEDLINE\nerr-is:[echo SEEDLINE]\n");
     }
 
+    /// rubash#1776: `time` on Windows counted SELF only (PR #1771);
+    /// the CHILDREN half — CPU of waited external children, GNU
+    /// getrusage(RUSAGE_CHILDREN) — stayed zero because no reap site
+    /// sampled the child's handle. The pin times a nested rubash
+    /// child burning an arithmetic loop and asserts a 100ms user
+    /// threshold, not mere non-zero: the outer shell's own SELF delta
+    /// is a parse-and-spawn trifle (single-digit milliseconds), so a
+    /// threshold crossing proves the CHILDREN accumulator moved. The
+    /// nested binary path comes from CARGO_BIN_EXE_rubash (the same
+    /// binary the harness runs); forward slashes keep Windows
+    /// quoting intact. On unix this guards the getrusage path.
+    /// The loop count is 20,000 (not 300,000): measured ~6.5s user /
+    /// ~18s wall on a loaded 2-core box, so the run stays far inside
+    /// the 60s harness cap while still clearing the 100ms threshold
+    /// by over an order of magnitude on any runner.
+    #[test]
+    fn issue1776_time_children_cpu() {
+        fn parse_time_ms(line: &str) -> Option<u64> {
+            // line: "user\t0m2.345s" (minute form, %3lU).
+            let value = line.split('\t').nth(1)?.trim().strip_suffix('s')?;
+            let (min, rest) = value.split_once('m')?;
+            let (sec, ms) = rest.split_once('.')?;
+            let ms = format!("{ms:0<3}");
+            let ms = ms.get(..3)?;
+            Some(
+                min.parse::<u64>().ok()? * 60_000
+                    + sec.parse::<u64>().ok()? * 1_000
+                    + ms.parse::<u64>().ok()?,
+            )
+        }
+        let bin = env!("CARGO_BIN_EXE_rubash").replace('\\', "/");
+        let script =
+            format!("time \"{bin}\" -c 'x=0; while [ $x -lt 20000 ]; do x=$((x+1)); done'\n");
+        let (_stdout, stderr, code) = run("k1-1776", &script);
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        let user_line = stderr
+            .lines()
+            .find(|line| line.starts_with("user"))
+            .unwrap_or("");
+        let user_ms = parse_time_ms(user_line).unwrap_or(0);
+        assert!(
+            user_ms >= 100,
+            "child CPU must clear 100ms, got: {user_line:?} ({user_ms}ms) in\n{stderr}"
+        );
+    }
     /// rubash#1212: `time` reports real CPU time (getrusage deltas), not
     /// a hard-coded user/sys of zero.
     #[test]
@@ -3224,6 +3269,39 @@ mod k1_batch2 {
             "user time must be measured, got: {user_line:?} in\n{stderr}"
         );
     }
+
+    /// rubash#1774: a refused /dev/tcp connect on Windows leaked the
+    /// long FormatMessageW text ("No connection could be made because
+    /// the target machine actively refused it. (os error 10061)")
+    /// where GNU prints the short strerror "Connection refused"
+    /// (redir.c netopen; golden issue1237-net-redir). The rendering
+    /// funnel is posix_errors::message()'s Win32 table, so the pin
+    /// asserts the GNU shape on every platform: the sys_error line
+    /// plus the redirection_error line, and no raw OS long text.
+    #[test]
+    fn issue1774_dev_tcp_connect_failure_gnu_diagnostic() {
+        let (stdout, stderr, code) = run(
+            "k1-1774",
+            "( exec 3<>/dev/tcp/127.0.0.1/1 ); echo \"tcp rc=$?\"\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "tcp rc=1\n", "stderr:\n{stderr}");
+        assert!(
+            stderr.contains("connect: Connection refused"),
+            "missing GNU connect line in:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("/dev/tcp/127.0.0.1/1: Connection refused"),
+            "missing GNU redirection line in:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("actively refused") && !stderr.contains("os error"),
+            "raw OS text leaked in:\n{stderr}"
+        );
+    }
+
+
+
 
     /// rubash#1213: `return` with too many arguments is the no_args
     /// DISCARD class — message, status 2, rest of the line abandoned,
@@ -3244,6 +3322,45 @@ mod k1_batch2 {
              fg.sh: line 3: return: too many arguments\n\
              fg.sh: line 4: return: abc: numeric argument required\n"
         );
+    }
+
+    /// rubash#1775: /dev/tcp with a service name ('http') failed on
+    /// Windows because resolve_net_service_port only read
+    /// /etc/services, so GNU's getservbyname parity (http -> 80) was
+    /// missing and the shell printed "Servname not supported" plus
+    /// "Invalid argument". The pin asserts the resolution invariant,
+    /// not the listener state: loopback:80 may or may not have a
+    /// listener (CI runners do, local machines do not), so the
+    /// connect must be attempted at the resolved port either way —
+    /// rc=0 on connect, rc=1 with the GNU refused shape otherwise —
+    /// and must never fail with a resolution error. On unix the name
+    /// already resolved, so this guards the shared parser path there
+    /// and pins the Windows fix here.
+    #[test]
+    fn issue1775_dev_tcp_service_name_http_resolves() {
+        let (stdout, stderr, code) = run(
+            "k1-1775",
+            "( exec 3<>/dev/tcp/127.0.0.1/http ); echo \"http rc=$?\"\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert!(
+            stdout == "http rc=0\n" || stdout == "http rc=1\n",
+            "connect must be attempted at the resolved port, got stdout: {stdout:?}, stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("Servname not supported") && !stderr.contains("Invalid argument"),
+            "service name failed to resolve in:\n{stderr}"
+        );
+        if stdout == "http rc=1\n" {
+            assert!(
+                stderr.contains("connect: Connection refused"),
+                "missing GNU connect line in:\n{stderr}"
+            );
+            assert!(
+                stderr.contains("/dev/tcp/127.0.0.1/http: Connection refused"),
+                "missing GNU redirection line in:\n{stderr}"
+            );
+        }
     }
 
     /// rubash#1215: `hash <builtin>` is a silent no-op (no entry, rc 0);

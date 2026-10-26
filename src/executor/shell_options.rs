@@ -8,6 +8,27 @@ use crate::executor::glob::{pathname_expand_word, PathnameExpansion};
 /// somewhere for `99999` instead of failing), and a non-numeric word is
 /// a service name looked up in /etc/services (getservbyname). Returns
 /// None when the service name is unknown (EAI_SERVICE).
+/// The system services database getservbyname walks: /etc/services on
+/// unix; the resolver file the Windows TCP/IP stack reads on Windows
+/// (rubash#1775 — resolve_net_service_port used to read /etc/services
+/// unconditionally, so every service name failed on Windows with
+/// "Servname not supported" even though the Windows file lists http).
+/// Same file src/builtins/complete.rs consults for service-name
+/// completion (rubash#1044), same fallback chain.
+#[cfg(unix)]
+fn services_db_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/etc/services")
+}
+
+#[cfg(windows)]
+fn services_db_path() -> std::path::PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("windir"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    root.join(r"System32\drivers\etc\services")
+}
+
 fn resolve_net_service_port(port_text: &str, udp: bool) -> Option<u16> {
     if let Ok(port) = port_text.parse::<u16>() {
         return Some(port);
@@ -19,7 +40,7 @@ fn resolve_net_service_port(port_text: &str, udp: bool) -> Option<u16> {
             .map(|value| (value % 65536) as u16);
     }
     let proto = if udp { "udp" } else { "tcp" };
-    let services = std::fs::read_to_string("/etc/services").ok()?;
+    let services = std::fs::read_to_string(services_db_path()).ok()?;
     for line in services.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {

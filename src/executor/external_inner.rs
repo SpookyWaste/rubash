@@ -990,6 +990,9 @@ impl Executor {
                 if let Some(status) =
                     crate::fd::wait_child_slice(child, SLICE).map_err(ExecuteError::IoError)?
                 {
+                    // rubash#1776: sample the reaped child's CPU for the
+                    // Windows CHILDREN half while its handle is live.
+                    super::read_helpers::note_reaped_child_cpu(child);
                     return Ok(status);
                 }
                 if let Err(error) = self.observe_signals_while_blocked() {
@@ -998,6 +1001,7 @@ impl Executor {
                     // it does not linger when the console event did not kill it.
                     let _ = child.kill();
                     let _ = child.wait();
+                    super::read_helpers::note_reaped_child_cpu(child);
                     return Err(error);
                 }
             }

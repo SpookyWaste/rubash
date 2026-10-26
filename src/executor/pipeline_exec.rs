@@ -303,6 +303,9 @@ fn wait_for_windows_pipeline_member(
     let mut kill_deadline: Option<std::time::Instant> = None;
     loop {
         if let Some(status) = process.try_wait().map_err(ExecuteError::IoError)? {
+            // rubash#1776: sample the reaped member's CPU for the
+            // Windows CHILDREN half while its handle is live.
+            super::read_helpers::note_reaped_child_cpu(process);
             return Ok(status);
         }
         let downstream_gone = match downstream.as_deref_mut() {
@@ -323,6 +326,7 @@ fn wait_for_windows_pipeline_member(
             // observes for a producer whose consumer closed the pipe
             // (rubash#382; see lingerer_sigpipe_status).
             let _ = process.wait().map_err(ExecuteError::IoError)?;
+            super::read_helpers::note_reaped_child_cpu(process);
             return Ok(lingerer_sigpipe_status());
         }
         std::thread::sleep(POLL_INTERVAL);
@@ -3648,7 +3652,15 @@ impl Executor {
         ));
         for mut process in processes.into_iter().rev() {
             let status = match process.try_wait()? {
-                Some(status) => status,
+                Some(status) => {
+                    // rubash#1776: sample the reaped member's CPU for
+                    // the Windows CHILDREN half while its handle is
+                    // live. (The last member above is consumed by
+                    // wait_with_output, which closes its handle before
+                    // any sample point — its CPU stays uncounted.)
+                    super::read_helpers::note_reaped_child_cpu(&process);
+                    status
+                }
                 None => {
                     // The sequential tail consumed this member's output and
                     // the downstream already exited, so a member still alive
@@ -3658,6 +3670,7 @@ impl Executor {
                     // otherwise outlive this Child and pin niu's exit drain.
                     kill_lingerer(&mut process);
                     process.wait().map_err(ExecuteError::IoError)?;
+                    super::read_helpers::note_reaped_child_cpu(&process);
                     lingerer_sigpipe_status()
                 }
             };
