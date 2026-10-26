@@ -878,13 +878,34 @@ impl Executor {
         self.apply_child_environment(&mut process);
         let raws_aligned = command.assignment_raws.len() == command.assignments.len();
         for (index, (var_name, var_value)) in command.assignments.iter().enumerate() {
-            let (base_name, _) = assignment_name_and_append(var_name);
+            let (base_name, append) = assignment_name_and_append(var_name);
             let raw = raws_aligned
                 .then(|| command.assignment_raws.get(index))
                 .flatten()
                 .map(String::as_str);
             let expanded_value = self.expand_assignment_value_with_raw(var_name, var_value, raw);
-            if is_valid_process_env(base_name, &expanded_value) {
+            // Marker hygiene (rubash#1620): a compound `name=(...)`
+            // tempenv word binds as the literal list text; the internal
+            // COMPOUND_ASSIGNMENT_MARKER must not reach the child.
+            let expanded_value = expanded_value
+                .strip_prefix(crate::executor::types::COMPOUND_ASSIGNMENT_MARKER)
+                .unwrap_or(&expanded_value);
+            if append {
+                // A pipeline stage's assignments are NOT pre-applied to
+                // the variable table (the direct external path's child
+                // inherits the window binding via apply_child_environment;
+                // a stage's table still holds the outer value), so the
+                // spawner composes the window value itself, mirroring
+                // assign_in_env with ASS_APPEND: the target's scalar view
+                // plus the literal RHS text (rubash#1620 — re-applying the
+                // raw RHS lost the base and leaked the marker).
+                let window = format!("{}{}", self.tempenv_scalar_view(base_name), expanded_value);
+                if is_valid_process_env(base_name, &window) {
+                    process.env(base_name, window);
+                }
+                continue;
+            }
+            if is_valid_process_env(base_name, expanded_value) {
                 process.env(base_name, expanded_value);
             }
         }
