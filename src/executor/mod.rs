@@ -1345,6 +1345,22 @@ pub struct Executor {
     /// entry; keyed by node address, valid only within that command's
     /// execution span.
     redirect_target_memo: RefCell<HashMap<String, String>>,
+    /// The field-count fact the ambiguity gate cannot recover from the
+    /// carrier String: keys (same key as redirect_target_memo) whose
+    /// expansion resolved through pathname expansion to EXACTLY ONE
+    /// match. GNU subst.c:12645-12676 (glob_expand_word_list) returns
+    /// one field per match, and glob matches are never word-split, so a
+    /// single match is one field even when its name contains whitespace
+    /// (rubash#1769: `> only*.txt` with one file `only one.txt` opens
+    /// it, it is not AMBIGUOUS_REDIRECT). The carrier String joins
+    /// multi-field results with ' ', which the textual gate cannot
+    /// distinguish from one space-containing field — this set carries
+    /// the count the gate needs. Cleared at each execute_command entry
+    /// like redirect_target_memo; only the single-match arm sets it,
+    /// every other arm (multi-match join, no-match literal, brace
+    /// branches, failglob pattern) leaves the gate's existing behavior
+    /// untouched, so an unquoted `$var` that word-splits stays ambiguous.
+    redirect_target_single_glob_match: RefCell<HashSet<String>>,
     /// GNU subst.c:3565 do_assignment_internal expands an assignment RHS
     /// exactly once and subst.c:3576 hands the COMPUTED value to
     /// xtrace_print_assignment — the trace never re-runs the expansion.

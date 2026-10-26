@@ -1295,7 +1295,8 @@ impl Executor {
                             &self.shell_state.env_vars,
                             "extglob",
                         ),
-                    ) {
+                    ) && !self.redirect_target_resolved_single_glob_match(redirect)
+                    {
                         self.write_ambiguous_redirect_diagnostic(
                             state,
                             &redirect.target_metadata.raw,
