@@ -312,8 +312,36 @@ impl<'a> Lexer<'a> {
     /// Track the GNU reader state that affects `{` handling:
     /// reserved-word acceptability (last two tokens) and PST_CASEPAT.
     fn record_token(&mut self, token: &mut Token) {
+        // rubash#1721: stamp the reserved-word verdict for word-path
+        // keyword tokens from the reader state in which the token was
+        // READ (before this token updates it below) — the same state
+        // the history demotion at the bottom of this function uses.
+        // GNU CHECK_FOR_RESERVED_WORD (parse.y:3168) recognizes a
+        // reserved word only when reserved_word_acceptable (parse.y:
+        // 5899) holds for the previous token, and under PST_CASEPAT
+        // (parse.y:3177-3186) only `esac' is recognized, and not after
+        // `|' (Posix grammar rule 4). Completeness scans fold the
+        // token's `reserved_position` stamp instead of its bare kind,
+        // so an argument-position `if' (`command -vkb if' in a case
+        // clause) no longer opens a phantom compound frame there.
+        if token.kind == TokenKind::Keyword && is_keyword(&token.value) {
+            token.reserved_position = if self.parse_state.case_pattern {
+                token.value == "esac"
+                    && !matches!(self.parse_state.last_token, Some((TokenKind::Pipe, _)))
+            } else {
+                self.reserved_word_position()
+            };
+        }
         let keyword_is = |v: &str| token.kind == TokenKind::Keyword && token.value == v;
         let word_is = |v: &str| token.kind == TokenKind::Word && token.value == v;
+        // rubash#1721: a keyword-spelled case word (`case if in',
+        // `case in in', `case esac in') IS the operand — GNU's grammar
+        // takes a WORD there and recognizes no reserved word in that
+        // slot, and the parser's collect_case_word likewise accepts a
+        // Keyword token as the subject. Excluding Keyword here left
+        // case_expect_in unarmed, the `in' unrecognized, and the first
+        // clause's PST_CASEPAT state (case_pattern / case_pattern_close
+        // / the reserved_position CASEPAT branch) lost with it.
         let is_case_operand = matches!(
             token.kind,
             TokenKind::Word
@@ -321,6 +349,7 @@ impl<'a> Lexer<'a> {
                 | TokenKind::CommandSubst
                 | TokenKind::Assignment
                 | TokenKind::BraceExpand
+                | TokenKind::Keyword
         ) && !word_is(";;")
             && !word_is(";&")
             && !word_is(";;&");

@@ -1475,7 +1475,10 @@ fn unclosed_compound_open_line(text: &str) -> Option<usize> {
     let tokens = tokenize(text);
     let mut stack: Vec<(&str, usize)> = Vec::new();
     for token in &tokens {
-        if token.kind != TokenKind::Keyword {
+        // rubash#1721: structural keywords only (see
+        // Token::structural_keyword) — an argument-position keyword
+        // word is not an open compound.
+        if !token.structural_keyword() {
             continue;
         }
         match token.value.as_str() {
@@ -1586,7 +1589,14 @@ pub fn stdin_source_needs_more_posix(source: &str, posix: bool) -> bool {
             }
             continue;
         }
-        if token.kind != TokenKind::Keyword {
+        // rubash#1721: only structural keywords fold — a keyword-spelled
+        // argument word (`echo if', `command -vkb if' in a case clause)
+        // is not a reserved word to GNU's reader (parse.y:3168
+        // CHECK_FOR_RESERVED_WORD via parse.y:5899
+        // reserved_word_acceptable; PST_CASEPAT parse.y:3177-3186), so
+        // it pushes no phantom frame here either. Mirror of
+        // GroupScanFeeder::fold_token.
+        if !token.structural_keyword() {
             continue;
         }
         match token.value.as_str() {
