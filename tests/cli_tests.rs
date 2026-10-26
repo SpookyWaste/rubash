@@ -525,6 +525,57 @@ fn issue1632_coproc_redirected_stdout_read_end_blocks_until_exit() {
 }
 
 #[test]
+fn issue1632_displaced_stdout_read_end_sees_eof_at_child_exit() {
+    // The other edge of the same GNU rule: once the child exits, the
+    // read end sees EOF immediately — an untimed drain returns
+    // instead of waiting for a reap that could only run after it.
+    // The writer duplicate therefore lives in the child (fd 10),
+    // not in the parent.
+    let dir = std::env::temp_dir().join(format!("rubash-cli-issue1632e-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let output = rubash_command()
+        .current_dir(&dir)
+        .arg("-c")
+        .arg(
+            "coproc { echo hi; } > out.txt; \
+             cat <&${COPROC[0]}; echo \"cat_rc=$? file=[$(cat out.txt)]\"",
+        )
+        .output()
+        .expect("run rubash");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "cat_rc=0 file=[hi]\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
+fn issue1632_dup_stderr_to_pipe_then_redirect_out_drains_and_ends() {
+    // `2>&1 >file`: stderr joins the coproc pipe, stdout goes to
+    // the file (GNU's left-to-right order). The reader drains the
+    // stderr line and then sees EOF at child exit.
+    let dir = std::env::temp_dir().join(format!("rubash-cli-issue1632o-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let output = rubash_command()
+        .current_dir(&dir)
+        .arg("-c")
+        .arg(
+            "coproc { echo O; echo E >&2; } 2>&1 > out.txt; \
+             cat <&${COPROC[0]}; echo \"file=[$(cat out.txt)]\"",
+        )
+        .output()
+        .expect("run rubash");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "E\nfile=[O]\n");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
 fn issue1644_coproc_dup_stdout_to_stderr_reaches_shell_stderr() {
     // GNU redir.c: `coproc CMD >&2` dup2s the shell's fd 2 onto the
     // coproc child's stdout — the text lands on the shell's stderr,

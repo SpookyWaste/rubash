@@ -572,10 +572,12 @@ pub struct Executor {
     /// child's stdout off the coproc pipe (a file, `>&2`, `>&-`), GNU's
     /// child still holds a writer on the read pipe for its whole life
     /// (its inherited fd from the coproc pipe pair), so the parent's
-    /// reads block until the coproc exits. The parent mirrors that by
-    /// retaining a duplicate of the pipe writer here, keyed by coproc
+    /// reads block until the coproc exits. On Unix the duplicate is
+    /// pinned into the child at fd 10 (pin_coproc_writer_in_child),
+    /// so this map stays empty there; where pre_exec is unavailable
+    /// the parent retains the duplicate here instead, keyed by coproc
     /// pid and dropped when the coproc is retired (reaped) or its
-    /// endpoints are closed.
+    /// endpoints are closed — EOF then tracks the reap, not the exit.
     coproc_retained_stdout_writers: HashMap<u32, std::fs::File>,
     /// Assignment-RHS output process substitutions awaiting their
     /// finish, in materialization order (GNU forks left-to-right
