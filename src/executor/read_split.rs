@@ -118,7 +118,15 @@ pub(in crate::executor) fn split_read_field_ranges(
     let n = units.len();
     let line_len = line.len();
     if ifs.is_empty() {
-        return vec![(0, line_len)];
+        // Empty IFS: the whole line is one field — except an empty
+        // line, which has no field at all (GNU subst.c:3119
+        // list_string returns NULL for an empty string, so
+        // `IFS='' read -a A` on an empty line assigns an empty array).
+        return if line.is_empty() {
+            Vec::new()
+        } else {
+            vec![(0, line_len)]
+        };
     }
 
     let mut ranges: Vec<(usize, usize)> = Vec::new();
