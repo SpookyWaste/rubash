@@ -157,12 +157,17 @@ impl Executor {
     /// reads HISTFILE into the list (only when no lines have been recorded
     /// yet and the file has not already been loaded).
     pub(in crate::executor) fn load_history_file_if_needed(&mut self) {
-        let Some(session) = self.shell_state.session_history.clone() else {
-            return;
-        };
         if !crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "history") {
             return;
         }
+        // builtins/set.def bash_set_history reaches load_history with
+        // whatever list the shell has; a shell that has not touched
+        // history yet (the non-interactive stdin driver installs no
+        // session up front) still loads, so create the list on demand
+        // under the history builtin's rule (rubash#1668).
+        let Some(session) = self.ensure_session_history() else {
+            return;
+        };
         let needs_load = {
             let shell = session.borrow_mut();
             !shell.histfile_loaded && shell.lines_this_session == 0
@@ -174,9 +179,12 @@ impl Executor {
             return;
         };
         let histsize = crate::history::SessionHistory::size_limit(self.get_env("HISTSIZE"));
+        // The load reads with the caller's current comment-char arming
+        // (rubash#1669), like any other history file read.
+        let timestamps_armed = self.get_env("HISTTIMEFORMAT").is_some();
         let mut shell = session.borrow_mut();
         shell.histfile_loaded = true;
-        let _ = shell.load_file(&path, histsize);
+        let _ = shell.load_file_with_arming(&path, histsize, timestamps_armed);
     }
 
     pub(in crate::executor) fn execute_set_command(

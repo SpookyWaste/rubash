@@ -239,10 +239,7 @@ impl Executor {
         result
     }
 
-    fn execute_wait_inner(
-        &mut self,
-        cmd: &CommandNode,
-    ) -> Result<i32, ExecuteError> {
+    fn execute_wait_inner(&mut self, cmd: &CommandNode) -> Result<i32, ExecuteError> {
         self.refresh_background_jobs_observed()?;
         // GNU wait.def wait_builtin() internal_getopt "fnp:": a dangling
         // `-p` (no joined text, no next word) is a getopt error, reported
@@ -1163,10 +1160,7 @@ impl Executor {
             .set(self.foreground_wait_count.get() + 1);
     }
 
-    fn refresh_background_jobs_impl(
-        &mut self,
-        force_observe: bool,
-    ) -> Result<(), ExecuteError> {
+    fn refresh_background_jobs_impl(&mut self, force_observe: bool) -> Result<(), ExecuteError> {
         // rubash#1494: job-state transitions the shell's own kill sent
         // become visible only after a full intervening reader command
         // (GNU waitchld notification lag) — apply the ripe ones here, at
@@ -1233,7 +1227,8 @@ impl Executor {
             if observe || self.shell_state.coproc_names.contains_key(&pid) {
                 self.apply_job_completion(pid, status, term_signal)?;
             } else {
-                self.pending_job_completions.push((pid, status, term_signal));
+                self.pending_job_completions
+                    .push((pid, status, term_signal));
             }
         }
         Ok(())
@@ -2581,13 +2576,9 @@ impl Executor {
         // a session history on demand so the builtin can read/list —
         // but only when no host provider is installed: an installed
         // provider IS the history list (the host owns interactive
-        // history), so an auto-created empty session must not shadow it.
-        if self.shell_state.session_history.is_none() && self.history_provider.is_none() {
-            let session = std::rc::Rc::new(std::cell::RefCell::new(
-                crate::history::SessionHistory::new(),
-            ));
-            self.set_session_history(Some(session));
-        }
+        // history), so an auto-created empty session must not shadow
+        // it (Executor::ensure_session_history owns the rule).
+        self.ensure_session_history();
         if let Some(session) = self.shell_state.session_history.clone() {
             // The shell's own session history (scripts that ran
             // "set -o history") takes precedence over the host provider.
