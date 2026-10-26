@@ -280,6 +280,34 @@ impl Executor {
 
     pub(in crate::executor) fn apply_child_environment(&self, process: &mut Command) {
         process.env_clear();
+        // G-03: project the process-env mirror into the child env FIRST,
+        // so the session overlays below override it name-by-name. The
+        // mirror set (local_helpers::shell_assignment_needs_process_env:
+        // the PATH/HOME family, the locale family, and every __RUBASH_*
+        // protocol name) is written through to the process env on
+        // assignment precisely so child processes can read it back —
+        // every other spawn surface honors that transport (the
+        // respawn/comsub env_map bases start from std::env::vars()).
+        // This builder env_clear()s, so without the projection the
+        // mirror was a write-only sink for plain external commands: a
+        // session's own mirrored writes never reached its children
+        // (the multi-session harness caught a mirrored __RUBASH_* probe
+        // invisible to the assigning session's /usr/bin/env). TMPDIR
+        // stays out (set_process_env never mirrors it); __RUBASH_TRAP*
+        // keys stay out except the merged ignore set, which the
+        // transport_inherited_ignores arm below re-adds in child form —
+        // the same strip the respawn env_map applies.
+        for (name, value) in std::env::vars() {
+            if name == "TMPDIR"
+                || !crate::executor::local_helpers::shell_assignment_needs_process_env(&name)
+                || (name.starts_with("__RUBASH_TRAP")
+                    && name != crate::builtins::trap::TRAP_ORIG_IGNORES)
+                || !is_valid_process_env(&name, &value)
+            {
+                continue;
+            }
+            process.env(&name, self.child_env_value(&name, &value));
+        }
         for name in marked_env_names(&self.shell_state.env_vars, EXPORTED_VARS) {
             // GNU variables.c make_env_array_from_var_list: array and
             // associative variables never cross the child env boundary
