@@ -540,6 +540,52 @@ fn issue1638_append_procsub_redirect_drains_before_next_command() {
 }
 
 #[test]
+fn issue1651_coproc_herestring_feeds_child_stdin() {
+    // GNU: the herestring replaces the coproc pipe as the child's
+    // stdin; the child consumes it and exits (it does not block on
+    // the pipe).
+    let output = rubash_command()
+        .arg("-c")
+        .arg(
+            "coproc cat <<< \"hello\"; \
+             read -t 2 -u ${COPROC[0]} l; echo \"l=[$l] rc=$?\"; \
+             wait $COPROC_PID 2>/dev/null; \
+             if kill -0 $COPROC_PID 2>/dev/null; then echo ALIVE; else echo DEAD; fi",
+        )
+        .output()
+        .expect("run rubash");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "l=[hello] rc=0\nDEAD\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
+fn issue1651_coproc_heredoc_feeds_child_stdin() {
+    // The heredoc form of rubash#1651.
+    let output = rubash_command()
+        .arg("-c")
+        .arg(
+            "coproc cat <<EOF1651\nhello\nEOF1651\n\
+             read -t 2 -u ${COPROC[0]} l; echo \"l=[$l] rc=$?\"; \
+             wait $COPROC_PID 2>/dev/null; \
+             if kill -0 $COPROC_PID 2>/dev/null; then echo ALIVE; else echo DEAD; fi",
+        )
+        .output()
+        .expect("run rubash");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "l=[hello] rc=0\nDEAD\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
 fn typed_cell_stays_consistent_across_builtin_writes() {
     // Typed-cell reads must agree with the mirror after every kind of
     // write: plain/compound/append element writes, declare/typeset/local,
