@@ -3372,10 +3372,29 @@ impl Executor {
                     child.arg(word);
                 }
             } else {
-                child.arg("-c").arg(command_words_source_text(
-                    &coproc_cmd.words,
-                    &coproc_cmd.word_metadata,
-                ));
+                // rubash#1653: the child re-parses this text, so a bare
+                // head word `time` would regain keyword status in the
+                // child even though the coproc parser never granted it
+                // (GNU parse.y:1125-1175: after `coproc`, `time` is a
+                // plain word — GNU forks the same parse tree, rubash
+                // respawns through `-c`). Quote the bare head word so
+                // the re-parse keeps it an ordinary command name: the
+                // child's lookup then matches GNU's forked child
+                // (function, builtin, PATH, else 127 `time: command
+                // not found`). A head word already quoted in source
+                // keeps its own raw spelling; only the bare `time`
+                // spelling needs the quote.
+                let mut metadata = coproc_cmd.word_metadata.clone();
+                if coproc_cmd.words.first().map(String::as_str) == Some("time")
+                    && metadata
+                        .first()
+                        .is_some_and(|meta| meta.value == "time" && meta.raw == "time")
+                {
+                    metadata[0].raw = "'time'".to_string();
+                }
+                child
+                    .arg("-c")
+                    .arg(command_words_source_text(&coproc_cmd.words, &metadata));
             }
             child
         } else {

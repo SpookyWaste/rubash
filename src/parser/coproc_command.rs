@@ -1,7 +1,3 @@
-use super::parse_loop::{
-    parse_time_prefixed_compound_command, parse_time_prefixed_shell_command,
-    scan_time_prefix_tokens, time_prefixed_shell_command_allows_simple_pipeline,
-};
 use super::*;
 use crate::lexer::{Token, TokenKind};
 
@@ -254,30 +250,7 @@ fn is_coproc_shell_command_start(tokens: &[Token], index: usize) -> bool {
             "for" | "case" | "select" | "coproc" | "if" | "while" | "until" | "[["
         ) || token.value.starts_with("((")
             || parse_function_command(tokens, index).is_some()
-            || time_prefixed_shell_command_allows_simple_pipeline(tokens, index)
-            || time_prefixed_compound_command_start(tokens, index)
     })
-}
-
-fn time_prefixed_compound_command_start(tokens: &[Token], start: usize) -> bool {
-    if !is_keyword(tokens, start, "time") {
-        return false;
-    }
-
-    // rubash#1548: same operand window as the other time-prefix
-    // scanners (parse.y special_case_tokens).
-    let index = scan_time_prefix_tokens(tokens, start).next;
-
-    tokens.get(index).is_some_and(|token| {
-        is_brace_group_token(token)
-            || matches!(
-                token.value.as_str(),
-                "for" | "case" | "select" | "coproc" | "if" | "while" | "until" | "[["
-            )
-            || token.value.starts_with("((")
-            || parse_function_command(tokens, index).is_some()
-    }) || is_keyword(tokens, index, "{")
-        || is_keyword(tokens, index, "(")
 }
 
 fn parse_coproc_command_sequence_body(
@@ -342,9 +315,20 @@ fn parse_coproc_compound_body(tokens: &[Token], start: usize) -> Option<(Command
         return Some(parsed);
     }
 
+    // rubash#1653: there is deliberately NO "time" arm here. GNU
+    // parse.y:1125-1175 gives coproc only `COPROC shell_command`,
+    // `COPROC WORD shell_command` and `COPROC simple_command`
+    // (plus redirection variants); `time` is a timespec prefix on
+    // `pipeline_command` (parse.y:1416), not a shell_command starter,
+    // so after `coproc` it is never the time keyword: it is the
+    // coproc NAME when a compound command follows (handled by the
+    // caller's next-token check), and otherwise the first word of
+    // the simple-command body below (`coproc time echo hi` runs a
+    // child that reports `time: command not found`, and
+    // `coproc time echo hi | cat` leaves the `| cat` outside the
+    // coproc, so the coproc lives in the pipeline subshell and the
+    // parent never sees COPROC_PID).
     match tokens.get(start)?.value.as_str() {
-        "time" => parse_time_prefixed_shell_command(tokens, start)
-            .or_else(|| parse_time_prefixed_compound_command(tokens, start)),
         "for" => parse_for_command(tokens, start, None, 0),
         "if" => parse_if_command_standalone(tokens, start, None, 0),
         "while" | "until" => parse_loop_command(tokens, start, None, 0),
