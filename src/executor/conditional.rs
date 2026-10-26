@@ -2206,9 +2206,9 @@ fn regexp_error_reason(pattern: &str) -> &'static str {
                             .map(|pos| j + 2 + pos);
                         if let Some(end) = name_end {
                             let name: String = chars[j + 2..end].iter().collect();
-                            const CLASSES: [&str; 14] = [
-                                "alnum", "alpha", "ascii", "blank", "cntrl", "digit", "graph",
-                                "lower", "print", "punct", "space", "upper", "word", "xdigit",
+                            const CLASSES: [&str; 12] = [
+                                "alnum", "alpha", "blank", "cntrl", "digit", "graph", "lower",
+                                "print", "punct", "space", "upper", "xdigit",
                             ];
                             if !CLASSES.contains(&name.as_str()) {
                                 return "Invalid character class name";
@@ -2293,9 +2293,14 @@ fn append_literal_glob_text(output: &mut String, text: &str) {
 /// no such validation (an unknown name degrades to a nested class), so
 /// scan the post-translation pattern the same way regcomp does.
 fn posix_bracket_class_names_valid(pattern: &str) -> bool {
-    const CLASSES: [&str; 14] = [
-        "alnum", "alpha", "ascii", "blank", "cntrl", "digit", "graph", "lower", "print", "punct",
-        "space", "upper", "word", "xdigit",
+    // The twelve wctype property names (glibc and bionic alike);
+    // `word`/`ascii` are regex-crate Perl classes, not regcomp
+    // classes, and GNU rejects them with REG_ECTYPE (rubash#1717).
+    // The glob matcher has its own 14-name table on purpose
+    // (lib/glob/smatch.c cclass_name[]) — that side is not this gate.
+    const CLASSES: [&str; 12] = [
+        "alnum", "alpha", "blank", "cntrl", "digit", "graph", "lower", "print", "punct", "space",
+        "upper", "xdigit",
     ];
     let chars: Vec<char> = pattern.chars().collect();
     let mut i = 0usize;
@@ -2501,8 +2506,12 @@ fn translate_bracket_prefix(
 /// matcher's predicate form of the same glibc tables (rubash#1621).
 /// `print`/`graph`/`punct` come out as single negated classes by De
 /// Morgan: graph = print minus blank, punct = graph minus alnum.
-/// `digit`, `xdigit` and `ascii` return None: the crate's own
-/// [:name:] classes already are glibc's ASCII-only tables there.
+/// `digit` and `xdigit` return None: the crate's own [:name:]
+/// classes already are glibc's ASCII-only tables there. `word` and
+/// `ascii` have no expansion either — they are not regcomp classes
+/// at all, so the verbatim span reaches the class-name gate in
+/// [`posix_bracket_class_names_valid`] and fails with REG_ECTYPE
+/// (rubash#1717).
 fn posix_class_unicode_expansion(class: &str) -> Option<String> {
     const BLANK_ITEMS: &str = "\\t \\u{1680}\\u{2000}-\\u{200A}\\u{205F}\\u{3000}";
     const CNTRL_ITEMS: &str = "\\p{Cc}\\u{2028}\\u{2029}";
@@ -2514,7 +2523,6 @@ fn posix_class_unicode_expansion(class: &str) -> Option<String> {
             crate::locale::non_ascii_nd_class_items()
         ),
         "alnum" => "\\p{Alphabetic}\\p{Nd}".to_string(),
-        "word" => "\\p{Alphabetic}\\p{Nd}_".to_string(),
         "cntrl" => CNTRL_ITEMS.to_string(),
         "print" => format!("[^{}]", CNTRL_ITEMS),
         "graph" => format!("[^{}{}]", CNTRL_ITEMS, BLANK_ITEMS),
