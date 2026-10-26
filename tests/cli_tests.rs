@@ -876,6 +876,26 @@ fn issue1652_named_coproc_bang_is_a_syntax_error() {
 }
 
 #[test]
+fn issue1652_coproc_bang_before_brace_body_is_a_syntax_error() {
+    // `coproc ! { ...; }`: the `!` sits at the operand position
+    // even though a compound body follows — it must not be consumed
+    // as the coproc NAME (the named-coproc path used to steal it,
+    // reporting `!': not a valid identifier). GNU: syntax error.
+    let output = rubash_command()
+        .arg("-c")
+        .arg("coproc ! { echo hi; }; echo after")
+        .output()
+        .expect("run rubash");
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("syntax error near unexpected token `!'"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn issue1653_coproc_time_word_binds_in_pipeline_stage_only() {
     // GNU parse.y: after `coproc`, `time` is the first word of a
     // simple command, never a prefix — so in a pipeline the coproc
