@@ -805,6 +805,7 @@ fn expand_multi_globstar(
         nocaseglob,
         dotglob,
         globskipdots,
+        absolute,
         env_vars,
     );
     crate::locale::sort_collated(&mut matches);
@@ -874,6 +875,7 @@ fn collect_multi_globstar_paths(
     nocaseglob: bool,
     dotglob: bool,
     globskipdots: bool,
+    absolute: bool,
     env_vars: &std::collections::HashMap<String, String>,
 ) {
     if index == segments.len() {
@@ -898,6 +900,7 @@ fn collect_multi_globstar_paths(
             nocaseglob,
             dotglob,
             globskipdots,
+            absolute,
             env_vars,
         );
         let entries = match shell_directory_entries(logical, env_vars) {
@@ -921,16 +924,44 @@ fn collect_multi_globstar_paths(
                 .map(|meta| meta.file_type().is_symlink())
                 .unwrap_or(false);
             if is_symlink {
-                // glob.c: `**` never descends through a symlinked directory,
-                // but the link itself is still emitted as a match
-                // (globstar3.sub: `c` for `**`, `c/` for `**/`).
-                if !dirs_only || is_dir {
-                    matches.push(if dirs_only {
-                        format!("{child_logical}/")
-                    } else {
-                        child_logical.clone()
-                    });
+                // glob.c glob_filename (the all_starstar symlink special
+                // case): what a symlinked directory enumerated by `**`
+                // contributes depends on the rest of the pattern.
+                if index + 1 == segments.len() {
+                    // `**` is the final segment: the link itself is a
+                    // match (globstar3.sub: `c` for `**`, `c/` for `**/`).
+                    if !dirs_only || is_dir {
+                        matches.push(if dirs_only {
+                            format!("{child_logical}/")
+                        } else {
+                            child_logical.clone()
+                        });
+                    }
+                } else if absolute || segments[..index].iter().any(|s| *s != "**") {
+                    // The directory part is not all-`**` (a literal or
+                    // absolute prefix precedes this `**`): the remaining
+                    // segments are applied inside the linked directory.
+                    // The recursive call consumes the next segment, so
+                    // the `**` enumeration itself still never descends
+                    // into the link (rubash#1672, multi-segment forms).
+                    collect_multi_globstar_paths(
+                        segments,
+                        index + 1,
+                        &child_logical,
+                        &child_physical,
+                        dirs_only,
+                        matches,
+                        nocaseglob,
+                        dotglob,
+                        globskipdots,
+                        absolute,
+                        env_vars,
+                    );
                 }
+                // All-`**` prefix with segments remaining: the link
+                // contributes nothing — it is skipped, never emitted as
+                // a bare final match (rubash#1671: `**/deep/*` used to
+                // append every cwd symlink name, dangling included).
                 continue;
             }
             if index + 1 < segments.len() && !is_dir {
@@ -946,6 +977,7 @@ fn collect_multi_globstar_paths(
                 nocaseglob,
                 dotglob,
                 globskipdots,
+                absolute,
                 env_vars,
             );
         }
@@ -993,6 +1025,7 @@ fn collect_multi_globstar_paths(
             nocaseglob,
             dotglob,
             globskipdots,
+            absolute,
             env_vars,
         );
     }
