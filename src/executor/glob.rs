@@ -2,7 +2,35 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::executor::path::{shell_directory_entries, shell_path_to_windows};
+use crate::executor::path::{shell_directory_entries_in, shell_path_to_windows};
+
+/// G-02: resolve a logical glob directory to its physical backing path,
+/// anchoring relative forms at the session cwd. Before G-02 the relative
+/// forms fell through to the process cwd, which the session owned.
+fn anchored_physical(
+    dir: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    cwd: &Path,
+) -> PathBuf {
+    let physical = shell_path_to_windows(dir, env_vars);
+    if physical.is_absolute() {
+        physical
+    } else {
+        cwd.join(physical)
+    }
+}
+
+/// The session cwd for call sites that hold no Executor (completion,
+/// declare storage): $PWD is the session cwd's logical display form.
+pub(crate) fn env_cwd_path(env_vars: &std::collections::HashMap<String, String>) -> PathBuf {
+    if let Some(pwd) = env_vars.get("PWD") {
+        let physical = shell_path_to_windows(pwd, env_vars);
+        if physical.is_absolute() {
+            return physical;
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+}
 
 pub(crate) enum PathnameExpansion {
     Matches(Vec<String>),
@@ -146,6 +174,7 @@ fn contains_glob_or_extglob(word: &str) -> bool {
 pub(crate) fn pathname_expand_word(
     word: &str,
     env_vars: &std::collections::HashMap<String, String>,
+    cwd: &Path,
 ) -> PathnameExpansion {
     if word.is_empty() {
         return PathnameExpansion::NoMatch;
@@ -202,6 +231,7 @@ pub(crate) fn pathname_expand_word(
             dotglob,
             globskipdots,
             env_vars,
+            cwd,
         );
     }
 
@@ -215,6 +245,7 @@ pub(crate) fn pathname_expand_word(
             globskipdots,
             extglob,
             env_vars,
+            cwd,
         );
     }
 
@@ -235,6 +266,7 @@ pub(crate) fn pathname_expand_word(
         dot_mode,
         globskipdots,
         env_vars,
+        cwd,
     );
     let matches = apply_globignore(matches, env_vars);
     if matches.is_empty() {
@@ -252,6 +284,7 @@ fn pathname_expand_segments(
     globskipdots: bool,
     extglob: bool,
     env_vars: &std::collections::HashMap<String, String>,
+    cwd: &Path,
 ) -> PathnameExpansion {
     // Assigning GLOBIGNORE also makes dotfiles matchable (bash variables.c
     // setup_glob_ignore clears noglob_dot_filenames).
@@ -260,7 +293,15 @@ fn pathname_expand_segments(
     } else {
         DotMode::Period
     };
-    let matches = glob_filename_expand(word, nocaseglob, extglob, dot_mode, globskipdots, env_vars);
+    let matches = glob_filename_expand(
+        word,
+        nocaseglob,
+        extglob,
+        dot_mode,
+        globskipdots,
+        env_vars,
+        cwd,
+    );
     let matches = apply_globignore(matches, env_vars);
     if matches.is_empty() {
         return unmatched_expansion(word, nullglob, failglob);
@@ -279,6 +320,7 @@ fn glob_filename_expand(
     dot_mode: DotMode,
     globskipdots: bool,
     env_vars: &std::collections::HashMap<String, String>,
+    cwd: &Path,
 ) -> Vec<String> {
     let (directory, filename) = split_last_unquoted_slash(pattern);
 
@@ -290,14 +332,22 @@ fn glob_filename_expand(
             Some(stripped) => stripped,
             None => directory,
         };
-        let dirs = glob_filename_expand(d, nocaseglob, extglob, dot_mode, globskipdots, env_vars);
+        let dirs = glob_filename_expand(
+            d,
+            nocaseglob,
+            extglob,
+            dot_mode,
+            globskipdots,
+            env_vars,
+            cwd,
+        );
         let mut out = Vec::new();
         for dname in dirs {
             if filename.is_empty() {
                 // glob.c:1287-1289: scan even on a NULL filename, so `b*/`
                 // yields only directories, with the `/` re-added by
                 // glob_dir_to_array.
-                if shell_path_to_windows(&dname, env_vars).is_dir() {
+                if anchored_physical(&dname, env_vars, cwd).is_dir() {
                     out.push(format!("{dname}/"));
                 }
             } else {
@@ -309,6 +359,7 @@ fn glob_filename_expand(
                     dot_mode,
                     globskipdots,
                     env_vars,
+                    cwd,
                 ) {
                     out.push(join_dir_to_name(&dname, &name));
                 }
@@ -340,6 +391,7 @@ fn glob_filename_expand(
         dot_mode,
         globskipdots,
         env_vars,
+        cwd,
     );
     if directory.is_empty() {
         return names;
@@ -361,8 +413,11 @@ fn glob_vector_expand(
     dot_mode: DotMode,
     globskipdots: bool,
     env_vars: &std::collections::HashMap<String, String>,
+    cwd: &Path,
 ) -> Vec<String> {
-    let dir_physical = shell_path_to_windows(dir, env_vars);
+    // G-02: every physical access anchors at the session cwd; `dir` keeps
+    // its logical form for result construction only.
+    let dir_physical = anchored_physical(dir, env_vars, cwd);
     // glob.c:669-691: an empty pattern just requires DIR to be a directory
     // and yields one empty name (glob_dir_to_array re-attaches the slash).
     if pattern.is_empty() {
@@ -377,20 +432,15 @@ fn glob_vector_expand(
     // returning the dequoted name on success.
     if !glob_pattern_p_component(pattern) {
         let npat = dequote_pathname(pattern);
-        // glob.c:703-712: the stat path joins DIR and the dequoted tail with
-        // a `/` unless DIR is empty or already ends with one.
-        let full = if dir.is_empty() || dir.ends_with('/') {
-            format!("{dir}{npat}")
-        } else {
-            format!("{dir}/{npat}")
-        };
-        return if shell_path_to_windows(&full, env_vars).exists() {
+        // glob.c:703-712: the stat path joins DIR and the dequoted tail
+        // (the physical join is the anchored equivalent).
+        return if dir_physical.join(&npat).exists() {
             vec![npat]
         } else {
             Vec::new()
         };
     }
-    let entries = match shell_directory_entries(dir, env_vars) {
+    let entries = match shell_directory_entries_in(&dir_physical) {
         Ok(entries) => entries,
         Err(_) => return Vec::new(),
     };
@@ -581,6 +631,7 @@ fn globstar_expand(
     dotglob: bool,
     globskipdots: bool,
     env_vars: &std::collections::HashMap<String, String>,
+    cwd: &Path,
 ) -> PathnameExpansion {
     let parts: Vec<&str> = word.split("**").collect();
     // GNU collapses adjacent ** segments (**/** == **, a/**/** == a/**):
@@ -599,6 +650,7 @@ fn globstar_expand(
             dotglob,
             globskipdots,
             env_vars,
+            cwd,
         );
     }
     let prefix = parts[0];
@@ -619,6 +671,7 @@ fn globstar_expand(
             dotglob,
             globskipdots,
             env_vars,
+            cwd,
         );
     }
     // GNU globstar forms (parse.y/glob.c GLOBSTAR): a bare `**` matches every
@@ -637,6 +690,7 @@ fn globstar_expand(
             dotglob,
             globskipdots,
             env_vars,
+            cwd,
         );
     }
     // GNU `**/foo*/` matches directories named foo* with the trailing slash
@@ -654,7 +708,8 @@ fn globstar_expand(
     } else {
         prefix.trim_end_matches('/').to_string()
     };
-    let physical_base_dir = shell_path_to_windows(&logical_base_dir, env_vars);
+    // G-02: the walk's physical root anchors at the session cwd.
+    let physical_base_dir = anchored_physical(&logical_base_dir, env_vars, cwd);
 
     let mut matches = Vec::new();
     // GNU `lib/**` includes the zero-depth match: the base directory itself
@@ -734,6 +789,7 @@ fn expand_multi_globstar(
     dotglob: bool,
     globskipdots: bool,
     env_vars: &std::collections::HashMap<String, String>,
+    cwd: &Path,
 ) -> PathnameExpansion {
     let absolute = word.starts_with('/');
     let dirs_only = word.len() > 1 && word.ends_with('/');
@@ -766,6 +822,7 @@ fn expand_multi_globstar(
             dotglob,
             globskipdots,
             env_vars,
+            cwd,
         );
         if !dirs_only {
             if let PathnameExpansion::Matches(values) = expanded {
@@ -793,7 +850,12 @@ fn expand_multi_globstar(
         return expanded;
     }
     let base = if absolute { "/" } else { "." };
-    let physical_base = shell_path_to_windows(base, env_vars);
+    // G-02: a relative multi-globstar walk roots at the session cwd.
+    let physical_base = if absolute {
+        shell_path_to_windows(base, env_vars)
+    } else {
+        cwd.to_path_buf()
+    };
     let mut matches = Vec::new();
     collect_multi_globstar_paths(
         &segments,
@@ -827,7 +889,8 @@ fn star_descend(
     dotglob: bool,
     env_vars: &std::collections::HashMap<String, String>,
 ) {
-    let entries = match shell_directory_entries(logical, env_vars) {
+    // G-02: the walk carries the physical directory explicitly.
+    let entries = match shell_directory_entries_in(physical) {
         Ok(entries) => entries,
         Err(_) => return,
     };
@@ -903,7 +966,7 @@ fn collect_multi_globstar_paths(
             absolute,
             env_vars,
         );
-        let entries = match shell_directory_entries(logical, env_vars) {
+        let entries = match shell_directory_entries_in(physical) {
             Ok(entries) => entries,
             Err(_) => return,
         };
@@ -983,7 +1046,7 @@ fn collect_multi_globstar_paths(
         }
         return;
     }
-    let entries = match shell_directory_entries(logical, env_vars) {
+    let entries = match shell_directory_entries_in(physical) {
         Ok(entries) => entries,
         Err(_) => return,
     };
@@ -1076,7 +1139,7 @@ fn collect_multi_globstar(
         } else {
             let mut next: Vec<(String, PathBuf)> = Vec::new();
             for (logical, physical) in &work {
-                let entries = match shell_directory_entries(logical, env_vars) {
+                let entries = match shell_directory_entries_in(physical) {
                     Ok(entries) => entries,
                     Err(_) => continue,
                 };
@@ -1159,7 +1222,8 @@ fn collect_globstar_matches(
     follow_symlink_suffix: bool,
     env_vars: &std::collections::HashMap<String, String>,
 ) {
-    let entries = match shell_directory_entries(logical_dir, env_vars) {
+    // G-02: list the carried physical directory, not the logical form.
+    let entries = match shell_directory_entries_in(physical_dir) {
         Ok(entries) => entries,
         Err(_) => return,
     };
@@ -1253,7 +1317,7 @@ fn collect_globstar_matches(
             && name != "."
             && name != ".."
         {
-            if let Ok(sub_entries) = shell_directory_entries(&logical_path, env_vars) {
+            if let Ok(sub_entries) = shell_directory_entries_in(&physical_path) {
                 for sub in &sub_entries {
                     let sub_name = &sub.name;
                     if sub_name == "." || sub_name == ".." {
@@ -2546,11 +2610,29 @@ mod tests {
         let dir = root.to_string_lossy().to_string();
         let env = std::collections::HashMap::new();
         // `*` hides dotfiles under Period mode (dotglob off).
-        let mut got = glob_vector_expand("*.txt", &dir, false, false, DotMode::Period, true, &env);
+        let mut got = glob_vector_expand(
+            "*.txt",
+            &dir,
+            false,
+            false,
+            DotMode::Period,
+            true,
+            &env,
+            Path::new("/"),
+        );
         got.sort();
         assert_eq!(got, vec!["a.txt".to_string(), "b.txt".to_string()]);
         // nocaseglob folds AB.TXT in.
-        let mut got = glob_vector_expand("*.txt", &dir, true, false, DotMode::Period, true, &env);
+        let mut got = glob_vector_expand(
+            "*.txt",
+            &dir,
+            true,
+            false,
+            DotMode::Period,
+            true,
+            &env,
+            Path::new("/"),
+        );
         got.sort();
         assert_eq!(
             got,
@@ -2561,8 +2643,16 @@ mod tests {
             ]
         );
         // Extglob exercises the zero-copy alt subslice path.
-        let mut got =
-            glob_vector_expand("+(a|b).txt", &dir, false, true, DotMode::Period, true, &env);
+        let mut got = glob_vector_expand(
+            "+(a|b).txt",
+            &dir,
+            false,
+            true,
+            DotMode::Period,
+            true,
+            &env,
+            Path::new("/"),
+        );
         got.sort();
         assert_eq!(got, vec!["a.txt".to_string(), "b.txt".to_string()]);
         let _ = std::fs::remove_dir_all(&root);
@@ -2621,7 +2711,9 @@ mod tests {
             root.to_string_lossy().to_string(),
         );
 
-        let PathnameExpansion::Matches(matches) = pathname_expand_word("/etc/*", &env_vars) else {
+        let PathnameExpansion::Matches(matches) =
+            pathname_expand_word("/etc/*", &env_vars, Path::new("/"))
+        else {
             panic!("logical root glob did not produce matches");
         };
         assert_eq!(matches, vec!["/etc/config".to_string()]);

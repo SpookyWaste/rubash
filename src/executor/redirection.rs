@@ -433,8 +433,7 @@ impl Executor {
             // closed fd and fails with EBADF (GNU redir.c:798-803).
             if matches!(
                 redirect.kind,
-                crate::parser::RedirectKind::CloseOutput
-                    | crate::parser::RedirectKind::CloseInput
+                crate::parser::RedirectKind::CloseOutput | crate::parser::RedirectKind::CloseInput
             ) {
                 opened.insert(redirector, false);
                 continue;
@@ -744,10 +743,10 @@ impl Executor {
                 && !target.starts_with("<(")
                 && redirect_target_fd(&target).is_none()
             {
-                let path = crate::executor::path::windows_operand_file_path(
+                let path = self.session_path(crate::executor::path::windows_operand_file_path(
                     shell_path_to_windows(&target, &self.shell_state.env_vars),
                     &self.shell_state.env_vars,
-                );
+                ));
                 if let Err(error) = std::fs::File::open(&path) {
                     // posix_errors::path_error already renders the
                     // `{target}: {errno text}` shape (same convention the
@@ -1295,7 +1294,8 @@ impl Executor {
                             &self.shell_state.env_vars,
                             "extglob",
                         ),
-                    ) {
+                    ) && !self.redirect_target_resolved_single_glob_match(redirect)
+                    {
                         self.write_ambiguous_redirect_diagnostic(
                             state,
                             &redirect.target_metadata.raw,
@@ -1531,17 +1531,11 @@ impl Executor {
     /// Pipeline staging (deferred writes) and virtual bindings (pipes,
     /// captures) keep the dup semantics GNU gets from opening a pipe's
     /// /proc/self/fd entry.
-    fn dev_stdio_target_reopens_disk(
-        &self,
-        target: &str,
-        state: &OutputFdState,
-    ) -> bool {
+    fn dev_stdio_target_reopens_disk(&self, target: &str, state: &OutputFdState) -> bool {
         if state.defer_stdout_writes {
             return false;
         }
-        let Some(source_fd) =
-            crate::executor::execution_misc::dev_stdio_redirect_fd(target)
-        else {
+        let Some(source_fd) = crate::executor::execution_misc::dev_stdio_redirect_fd(target) else {
             return false;
         };
         match self.fd_table.output_endpoint(source_fd) {
@@ -1549,12 +1543,10 @@ impl Executor {
                 .map(|meta| meta.is_file())
                 .unwrap_or(false),
             Some(FdWriteEndpoint::Stdout) => {
-                crate::fd::disk_file_path(crate::fd::process_std_handle(1))
-                    .is_some()
+                crate::fd::disk_file_path(crate::fd::process_std_handle(1)).is_some()
             }
             Some(FdWriteEndpoint::Stderr) => {
-                crate::fd::disk_file_path(crate::fd::process_std_handle(2))
-                    .is_some()
+                crate::fd::disk_file_path(crate::fd::process_std_handle(2)).is_some()
             }
             _ => false,
         }
@@ -1638,8 +1630,10 @@ impl Executor {
                 // failed open's target word (`$FIX/b: No such file or
                 // directory`, issue #518); a bare OS error renders
                 // message-only and drops the word.
-                open_redirect_append(&shell_path_to_windows(&target, &self.shell_state.env_vars))
-                    .map_err(|e| crate::posix_errors::path_error(&target, e))?;
+                open_redirect_append(
+                    &self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars)),
+                )
+                .map_err(|e| crate::posix_errors::path_error(&target, e))?;
             } else {
                 self.create_redirect_output(&target, redirect.clobber)?;
             }
@@ -1848,8 +1842,9 @@ impl Executor {
                 }
             }
             OutputTarget::Path(path) => {
-                let mut file =
-                    open_redirect_append(&shell_path_to_windows(path, &self.shell_state.env_vars))?;
+                let mut file = open_redirect_append(
+                    &self.session_path(shell_path_to_windows(path, &self.shell_state.env_vars)),
+                )?;
                 // GNU builtins/common.c:320-334 sh_chkwrite: a builtin's
                 // failed flush is reported by the BUILTIN as
                 // `<name>: write error: <strerror>` (builtin_error via
@@ -2073,10 +2068,15 @@ impl OutputFdState {
                 Ok(())
             }
             OutputTarget::Path(path) => {
-                let mut file = open_redirect_append(&shell_path_to_windows(
-                    &path,
-                    &executor.shell_state.env_vars,
-                ))?;
+                // G-02: the recorded target is the raw redirect word —
+                // anchor it at the session cwd, never the process cwd
+                // (this append-open is where buffered builtin output
+                // actually lands; the setup open in
+                // open_command_output_target only creates/truncates).
+                let mut file = open_redirect_append(
+                    &executor
+                        .session_path(shell_path_to_windows(&path, &executor.shell_state.env_vars)),
+                )?;
                 file.write_all(output)?;
                 Ok(())
             }

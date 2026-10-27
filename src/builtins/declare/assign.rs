@@ -4,9 +4,10 @@ use super::diagnostic::diagnostic_prefix;
 use super::marks::{mark_typed, marked_vars, unmark_typed};
 use super::names::valid_nameref_value;
 use super::storage::{
-    append_array_value, append_assoc_value, append_baseline_mirror, eval_integer_value,
-    format_assoc_storage, format_indexed_array_storage, indexed_array_entries,
-    is_noassign_bash_array, parse_array_tokens, parse_assoc_words, quote_assoc_storage_value,
+    append_array_value, append_assoc_scalar_append_value, append_assoc_value,
+    append_baseline_mirror, eval_integer_value, format_assoc_storage, format_indexed_array_storage,
+    indexed_array_entries, is_noassign_bash_array, parse_array_tokens, parse_assoc_words,
+    quote_assoc_storage_value,
 };
 use super::{
     ARRAY_VARS, ASSOC_128_VARS, ASSOC_VARS, CAPCASE_VARS, COMPOUND_ASSIGNMENT_MARKER,
@@ -478,6 +479,17 @@ where
                 // gated names (locale family) must reach the process-env
                 // mirror on a declare bind too.
                 sync_shell_assignment_process_env(variables, var_name, value);
+                // rubash#1692: a declare bind is bind_variable — GNU's
+                // sv_locale watcher fires on it (variables.c:6272).
+                if let Some(warning) = crate::locale::locale_assignment_warning(var_name, variables)
+                {
+                    writeln!(
+                        stderr,
+                        "{}warning: {}",
+                        diagnostic_prefix(variables),
+                        warning
+                    )?;
+                }
                 unmark_typed(variables, DECLARED_UNSET_VARS, var_name);
                 continue;
             }
@@ -515,6 +527,14 @@ where
                 (value, false)
             };
         let value = if append {
+            // GNU variables.c: the integer attribute lives on the
+            // VARIABLE (att_integer), not on this command's flags — a
+            // flagless re-declare of an integer variable still appends
+            // arithmetically (make_variable_value, variables.c:2905).
+            // The declare option parse only reports -i spelled on THIS
+            // command, so fold the existing mark in, the same fold the
+            // subscript-element path applies below (rubash#1677).
+            let integer = integer || variables.is_marked(INTEGER_VARS, var_name);
             let current = variables.get(var_name).cloned().unwrap_or_default();
             if assoc || variables.is_marked(ASSOC_VARS, var_name) {
                 if value.starts_with('(') && value.ends_with(')') {
@@ -542,7 +562,14 @@ where
                         word
                     )?;
                 }
-                append_assoc_value(&current, value, integer, variables)
+                if value.starts_with('(') && value.ends_with(')') {
+                    append_assoc_value(&current, value, integer, variables)
+                } else {
+                    // A bare scalar word under += is NOT a kvlist
+                    // operand: GNU variables.c:3138-3142 combines it
+                    // with the old value at key "0" (rubash#1677).
+                    append_assoc_scalar_append_value(&current, value, integer, variables)
+                }
             } else if compound_marked
                 || array
                 || variables.is_marked(ARRAY_VARS, var_name)
@@ -736,6 +763,16 @@ where
         // once. The sync is gated (#916), so ordinary names pay only
         // the name check.
         sync_shell_assignment_process_env(variables, var_name, &value);
+        // rubash#1692: same sv_locale bind hook as the nameref path
+        // above (variables.c:6272).
+        if let Some(warning) = crate::locale::locale_assignment_warning(var_name, variables) {
+            writeln!(
+                stderr,
+                "{}warning: {}",
+                diagnostic_prefix(variables),
+                warning
+            )?;
+        }
         unmark_typed(variables, DECLARED_UNSET_VARS, var_name);
         if compound_operand && !assoc && !variables.is_marked(ASSOC_VARS, var_name) {
             mark_typed(variables, ARRAY_VARS, var_name);

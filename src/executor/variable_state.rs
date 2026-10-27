@@ -855,6 +855,13 @@ impl Executor {
                 crate::builtins::hash::flush_command_hash_table(&mut self.shell_state.env_vars);
             }
             self.restore_typed_temporary_value(&name, typed_value);
+            // rubash#1692: reinstalling the saved binding re-runs the
+            // variable's watcher in GNU (the BASH_COMPAT precedent at
+            // the head of this function) — for the locale family that
+            // is sv_locale, and a restored invalid value re-warns
+            // (`LC_ALL=bad` followed by `LC_ALL=C true` warns again
+            // when the tempenv pops; verified oracle).
+            self.note_locale_assignment(&name);
             // GNU variables.c pop_scope: the saved variable object — value
             // AND attributes — is reinstalled when the tempenv pops, so an
             // attribute gained mid-command (`a=7 f` where f runs

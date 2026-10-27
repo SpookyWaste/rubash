@@ -3,9 +3,79 @@ use std::env;
 
 const ARRAY_VARS: &str = "__RUBASH_ARRAY_VARS";
 const ASSOC_VARS: &str = "__RUBASH_ASSOC_VARS";
+const NAMEREF_VARS: &str = "__RUBASH_NAMEREF_VARS";
 const UNSET_DYNAMIC_VARS: &str = "__RUBASH_UNSET_DYNAMIC_VARS";
 
+/// GNU test.c:650 (unary `-v`): the operand goes through find_variable,
+/// which follows nameref chains (variables.c:2011-2047
+/// find_variable_nameref), so the verdict is the resolved TARGET's
+/// set-ness, never the nameref cell's own existence (rubash#1707).
+/// Returns Some(verdict) when the operand's base name is a nameref;
+/// None when it is not (the caller's ordinary logic then applies —
+/// including to the resolved name, which this helper substitutes by
+/// recursing on the rewritten operand). Chain accounting mirrors the
+/// executor's nameref_resolution: an empty/invalid/missing cell is
+/// Unresolved, a chain that returns to its start or repeats a hop is
+/// Circular, more than 8 hops is MaxDepth — all three read as unset.
+/// A resolved target whose cell text itself carries a subscript
+/// (`declare -n r='a[1]'`) is always unset here: -v tests the variable
+/// find_variable returns for the target NAME and never decomposes the
+/// target text into an element reference (oracle: `a=(x y);
+/// declare -n r='a[1]'; [[ -v r ]]` is false even though a[1] is set),
+/// while an operand subscript re-attaches to the resolved plain name
+/// (`[[ -v r[1] ]]` with r->a tests a[1]).
+fn dash_v_nameref_verdict(
+    operand: &str,
+    env_vars: &crate::shell::var_table::VarTable,
+) -> Option<bool> {
+    let (base, suffix) = match operand.find('[') {
+        Some(index) => (&operand[..index], &operand[index..]),
+        None => (operand, ""),
+    };
+    let namerefs = marked_vars(env_vars, NAMEREF_VARS);
+    if !namerefs.iter().any(|marked| marked == base) {
+        return None;
+    }
+    let mut current = base.to_string();
+    for level in 1..=9 {
+        if !namerefs.iter().any(|marked| marked == &current) {
+            if current.contains('[') {
+                return Some(false);
+            }
+            return Some(variable_is_set(&format!("{current}{suffix}"), env_vars));
+        }
+        if level > 8 {
+            return Some(false);
+        }
+        let Some(cell) = env_vars.get(&current) else {
+            return Some(false);
+        };
+        if cell.is_empty()
+            || (!is_valid_variable_name(cell) && parse_array_subscript(cell).is_none())
+        {
+            return Some(false);
+        }
+        if cell == base || cell == &current {
+            return Some(false);
+        }
+        current = cell.clone();
+    }
+    Some(false)
+}
+
+fn is_valid_variable_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first == '_' || first.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
 pub(crate) fn variable_is_set(operand: &str, env_vars: &crate::shell::var_table::VarTable) -> bool {
+    if let Some(verdict) = dash_v_nameref_verdict(operand, env_vars) {
+        return verdict;
+    }
     if let Some(name) = operand
         .strip_suffix("[@]")
         .or_else(|| operand.strip_suffix("[*]"))
@@ -123,6 +193,7 @@ fn dynamic_parameter_is_set(name: &str, env_vars: &crate::shell::var_table::VarT
         name,
         "EPOCHSECONDS"
             | "EPOCHREALTIME"
+            | "BASH_MONOSECONDS"
             | "SECONDS"
             | "RANDOM"
             | "SRANDOM"

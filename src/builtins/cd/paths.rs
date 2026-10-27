@@ -12,7 +12,7 @@ pub(super) fn starts_with_dot_component(path: &Path) -> bool {
     )
 }
 
-pub(super) fn current_logical_pwd(env_vars: &HashMap<String, String>) -> PathBuf {
+pub(super) fn current_logical_pwd(env_vars: &HashMap<String, String>, cwd: &Path) -> PathBuf {
     if let Some(pwd) = shell_var(env_vars, "PWD") {
         if cfg!(windows) && pwd.starts_with('/') {
             return PathBuf::from(pwd);
@@ -24,7 +24,9 @@ pub(super) fn current_logical_pwd(env_vars: &HashMap<String, String>) -> PathBuf
         }
     }
 
-    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    // G-02: the no-$PWD fallback is the session's physical cwd, not the
+    // process cwd.
+    cwd.to_path_buf()
 }
 
 pub(super) fn logical_destination(old_pwd: &Path, target: &Path) -> PathBuf {

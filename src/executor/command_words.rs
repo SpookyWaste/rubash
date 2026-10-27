@@ -459,7 +459,11 @@ impl Executor {
     fn glob_for_list_fields(&self, fields: Vec<String>) -> Result<Vec<String>, String> {
         let mut globbed = Vec::with_capacity(fields.len());
         for field in fields {
-            match glob::pathname_expand_word(&field, &self.shell_state.env_vars) {
+            match glob::pathname_expand_word(
+                &field,
+                &self.shell_state.env_vars,
+                &self.shell_state.cwd,
+            ) {
                 glob::PathnameExpansion::Matches(matches) => globbed.extend(matches),
                 glob::PathnameExpansion::NoMatch => globbed.push(finalize_for_list_value(field)),
                 glob::PathnameExpansion::Fail(pattern) => return Err(pattern),
@@ -502,7 +506,11 @@ impl Executor {
             }
             let mut values = Vec::with_capacity(fields.len());
             for field in fields {
-                match glob::pathname_expand_word(&field, &self.shell_state.env_vars) {
+                match glob::pathname_expand_word(
+                    &field,
+                    &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
+                ) {
                     glob::PathnameExpansion::Matches(matches) => values.extend(matches),
                     glob::PathnameExpansion::NoMatch => values.push(finalize_for_list_value(field)),
                     glob::PathnameExpansion::Fail(pattern) => return Err(pattern),
@@ -527,7 +535,11 @@ impl Executor {
             return Ok(vec![finalize_for_list_value(expanded)]);
         }
         // Apply glob expansion for for-loop words
-        match glob::pathname_expand_word(&expanded, &self.shell_state.env_vars) {
+        match glob::pathname_expand_word(
+            &expanded,
+            &self.shell_state.env_vars,
+            &self.shell_state.cwd,
+        ) {
             glob::PathnameExpansion::Matches(matches) => Ok(matches),
             glob::PathnameExpansion::NoMatch => Ok(vec![finalize_for_list_value(expanded)]),
             glob::PathnameExpansion::Fail(pattern) => Err(pattern),

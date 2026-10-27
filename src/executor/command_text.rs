@@ -296,18 +296,39 @@ fn command_word_needs_process_line_env(word: &str) -> bool {
 
 pub(in crate::executor) fn bash_command_text(cmd: &CommandNode) -> String {
     let mut parts = Vec::new();
-    for (name, value) in &cmd.assignments {
-        // Assignment values may carry the lexer's private quoted-RHS marker.
-        // BASH_COMMAND exposes shell source, never that expansion sentinel.
-        let value = value
-            .strip_prefix(crate::executor::markers::IFS_GLUE)
-            .unwrap_or(value);
+    let raws_aligned = cmd.assignment_raws.len() == cmd.assignments.len();
+    for (index, (name, value)) in cmd.assignments.iter().enumerate() {
+        // GNU print_cmd.c print_simple_command prints each assignment
+        // word's TEXT as lexed (rubash#202, ast_print.rs): the raw RHS
+        // carries the source quotes, so `x="$(a) ($(b | cat))"` re-parses
+        // as one assignment. The cooked value drops those quotes, which
+        // corrupted respawned background children (rubash#1664: the
+        // payload became `x=$(a) ($(b cat))`, a syntax error; rubash#1704:
+        // a multi-line quoted value re-parsed as separate commands and a
+        // quoted comsub lost its quotes in BASH_COMMAND and every other
+        // text exposure). Prefer the raw RHS when the parser recorded
+        // it; fall back to the cooked value (with the lexer's private
+        // quoted-RHS marker stripped, so BASH_COMMAND never exposes
+        // that sentinel). The raws are only trusted when they align with
+        // the assignments; synthesized assignments carry no raw.
+        let raw = raws_aligned
+            .then(|| cmd.assignment_raws.get(index))
+            .flatten()
+            .filter(|raw| !raw.is_empty());
+        let text = match raw {
+            Some(raw) => format!("{name}={raw}"),
+            None => {
+                let value = value
+                    .strip_prefix(crate::executor::markers::IFS_GLUE)
+                    .unwrap_or(value);
+                format!("{name}={value}")
+            }
+        };
         // GNU parse.y:4451/4632 (parse_comsub -> print_comsub) replaces every
         // `$()` body with the canonical print_cmd.c serialization at parse
         // time, so the enclosing command's BASH_COMMAND carries that form:
         // `v=$(echo    a   b)` exposes `v=$(echo a b)` and multi-clause
         // bodies expose the re-indented canonical text (rubash#274).
-        let text = format!("{name}={value}");
         parts.push(super::print_comsub::canonicalize_comsub_spans(&text));
     }
     let words = command_words_source_text_for_command(cmd);
@@ -863,10 +884,46 @@ pub(in crate::executor) fn case_command_head_source_text(case_command: &CaseComm
 }
 
 fn case_command_source_text(case_command: &CaseCommand) -> String {
-    let mut text = format!("case {} in", case_command.word);
+    // GNU print_cmd.c:750 (print_case_command) prints the subject word
+    // and every clause pattern from their raw token text — quotes
+    // intact — with patterns joined by command_print_word_list's
+    // " | " (print_cmd.c:782). Rendering the cooked forms instead
+    // dropped the quoting: an empty-string pattern `''` rendered as
+    // nothing (an unparseable ` )` clause head) and a quoted subject
+    // lost its quotes, corrupting every respawned background child
+    // whose prelude carried such a case (rubash#1704:
+    // nvm_download_artifact). Same raw contract ComsubPrinter's case
+    // arm already keeps.
+    let word = if case_command.word_metadata.value == case_command.word
+        && !case_command.word_metadata.raw.is_empty()
+    {
+        case_command.word_metadata.raw.clone()
+    } else {
+        case_command.word.clone()
+    };
+    let mut text = format!("case {} in", word);
     for clause in &case_command.clauses {
         text.push(' ');
-        text.push_str(&clause.patterns.join("|"));
+        let patterns = clause
+            .patterns
+            .iter()
+            .enumerate()
+            .map(|(index, pattern)| {
+                clause
+                    .pattern_nodes
+                    .get(index)
+                    .map(|node| node.raw_text.trim().to_string())
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or_else(|| pattern.clone())
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        // An `esac` pattern only parses behind an opening paren
+        // (print_cmd.c:782-787).
+        if clause.patterns.first().is_some_and(|p| p == "esac") {
+            text.push('(');
+        }
+        text.push_str(&patterns);
         text.push_str(") ");
         text.push_str(&bash_command_sequence_text(&clause.body));
         text.push(' ');
@@ -882,11 +939,18 @@ fn case_command_source_text(case_command: &CaseCommand) -> String {
 
 fn coproc_command_source_text(coproc_command: &crate::parser::CoprocCommand) -> String {
     let mut text = String::from("coproc");
-    // GNU always renders the coprocess name in command displays (jobs,
-    // BASH_COMMAND): an unnamed coproc runs under the default name COPROC
-    // (execute_cmd.c coproc_setup; print_cmd.c prints the name verbatim).
-    text.push(' ');
-    text.push_str(coproc_command.name.as_deref().unwrap_or("COPROC"));
+    // GNU print_cmd.c `cm_coproc` (5.3.20) prints the name ONLY when
+    // the body is not a simple command: `coproc sleep 5` for a
+    // simple body (named or not — there is no `COPROC WORD
+    // simple_command` production, so a simple body never carries a
+    // real name), but `coproc COPROC { sleep 5; }` / `coproc C1
+    // { sleep 5; }` for compound bodies. The old comment here
+    // claimed GNU always prints the name; that matches bash 5.2's
+    // print code, not 5.3.20's (rubash#1645).
+    if coproc_command.body_kind != crate::parser::CoprocBodyKind::SimpleCommand {
+        text.push(' ');
+        text.push_str(coproc_command.name.as_deref().unwrap_or("COPROC"));
+    }
     text.push(' ');
     if let Some(body) = &coproc_command.body {
         text.push_str("{ ");

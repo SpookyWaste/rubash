@@ -45,6 +45,95 @@ fn rusage_counters() -> RusageCounters {
     }
 }
 
+/// Accumulated CPU of reaped external children (rubash#1776): GNU
+/// getrusage(RUSAGE_CHILDREN) sums every waited child, but Windows has
+/// no such counter — each child's times must be sampled from its
+/// process handle before the executor closes it, so every reap site
+/// calls note_reaped_child_cpu while the handle is still live and
+/// rusage_counters adds the sum to the SELF half. The dedup key is
+/// (pid, process creation time): a child observed at two reap points
+/// (poll + formal wait) must count once, and a recycled pid must not
+/// be mistaken for the earlier child. Process-wide by necessity — a
+/// Windows process has one handle table, so sessions sharing a
+/// process share this sum (same caveat class as the executor's other
+/// process-global state; a per-Session split rides the 1.5.0
+/// state-view work, not this fix). Lock poisoning is tolerated: the
+/// accumulator is a sum, not guarded data.
+#[cfg(windows)]
+static REAPED_CHILDREN_CPU: std::sync::LazyLock<
+    std::sync::Mutex<(std::collections::HashSet<(u32, u64)>, RusageCounters)>,
+> = std::sync::LazyLock::new(|| {
+    std::sync::Mutex::new((std::collections::HashSet::new(), RusageCounters::default()))
+});
+
+/// A reaped child that can still yield its live process handle to the
+/// CHILDREN sampler below. std::process::Child and fd::SpawnedChild
+/// differ only in how the handle is reached: SpawnedChild's Whitelisted
+/// form holds a raw OwnedHandle, not a std Child, so demanding a Child
+/// here made the two job_builtins reap sites uncompilable (E0308).
+pub(in crate::executor) trait ReapedChildCpu {
+    fn reaped_pid(&self) -> u32;
+    #[cfg(windows)]
+    fn reaped_handle(&self) -> windows_sys::Win32::Foundation::HANDLE;
+}
+
+impl ReapedChildCpu for std::process::Child {
+    fn reaped_pid(&self) -> u32 {
+        self.id()
+    }
+    #[cfg(windows)]
+    fn reaped_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        use std::os::windows::io::AsRawHandle;
+        self.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE
+    }
+}
+
+impl ReapedChildCpu for crate::fd::SpawnedChild {
+    fn reaped_pid(&self) -> u32 {
+        self.id()
+    }
+    #[cfg(windows)]
+    fn reaped_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.process_handle() as windows_sys::Win32::Foundation::HANDLE
+    }
+}
+
+/// Sample one reaped child's CPU into the CHILDREN accumulator. Call
+/// only at a reap point, while the child's handle is still live (after
+/// try_wait/wait returns a status, before the child is dropped). On
+/// non-Windows this is a no-op: getrusage(RUSAGE_CHILDREN) already
+/// covers waited children there.
+pub(in crate::executor) fn note_reaped_child_cpu<C: ReapedChildCpu>(child: &C) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::GetProcessTimes;
+        let handle = child.reaped_handle();
+        let mut creation: FILETIME = unsafe { std::mem::zeroed() };
+        let mut exit: FILETIME = unsafe { std::mem::zeroed() };
+        let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+        let mut user: FILETIME = unsafe { std::mem::zeroed() };
+        let ok =
+            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+        if ok == 0 {
+            return;
+        }
+        let ticks = |ft: FILETIME| ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64;
+        let key = (child.reaped_pid(), ticks(creation));
+        let mut guard = REAPED_CHILDREN_CPU
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.0.insert(key) {
+            guard.1.user += std::time::Duration::from_nanos(ticks(user).saturating_mul(100));
+            guard.1.sys += std::time::Duration::from_nanos(ticks(kernel).saturating_mul(100));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = child;
+    }
+}
+
 #[cfg(windows)]
 fn rusage_counters() -> RusageCounters {
     // Windows has no getrusage. The SELF half of GNU's SELF+CHILDREN
@@ -52,10 +141,11 @@ fn rusage_counters() -> RusageCounters {
     // also where rubash's no-fork subshell and builtin work lands, so
     // it is the half that moves for in-process timed commands (a pure
     // builtin loop under `time` used to report user 0m0.000s here).
-    // The CHILDREN half has no accumulation point yet: a waited
-    // child's times would have to be sampled from its process handle
-    // before the executor closes it, so external commands still
-    // contribute zero on this platform.
+    // The CHILDREN half is the reap-site accumulator above
+    // (rubash#1776): external children sampled at wait time. One
+    // known gap remains: a capture pipeline's last member is consumed
+    // by wait_with_output, which closes its handle before any sample
+    // point, so that member's CPU is still missing.
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 
@@ -81,10 +171,16 @@ fn rusage_counters() -> RusageCounters {
     if ok == 0 {
         return RusageCounters::default();
     }
-    RusageCounters {
+    let mut counters = RusageCounters {
         user: ticks(user),
         sys: ticks(kernel),
-    }
+    };
+    let reaped = REAPED_CHILDREN_CPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    counters.user += reaped.1.user;
+    counters.sys += reaped.1.sys;
+    counters
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -961,8 +1057,14 @@ pub(in crate::executor) fn trim_read_input(
     // Trimming and limit math below run on the literal-char form (the
     // delimiter needle handles both transports); the storage-domain tagging
     // is the last step so every served record leaves this fn normalized.
-    let trimmed =
-        trim_read_input_literal(input, delimiter, char_limit, exact_char_limit, escape_aware, raw);
+    let trimmed = trim_read_input_literal(
+        input,
+        delimiter,
+        char_limit,
+        exact_char_limit,
+        escape_aware,
+        raw,
+    );
     tag_read_carrier_text(&trimmed)
 }
 
@@ -994,8 +1096,7 @@ fn trim_read_input_literal(
                 .or_else(|| input.split_once(delimiter))
                 .map(|(before, _)| before.len())
         } else {
-            find_unescaped_read_delimiter(&input, &needle, delimiter)
-                .map(|before| before.len())
+            find_unescaped_read_delimiter(&input, &needle, delimiter).map(|before| before.len())
         };
         if let Some(at) = split_at {
             input = if cfg!(windows) {
@@ -1150,12 +1251,17 @@ pub(in crate::executor) fn split_read_array_words(line: &str, ifs: Option<&str>)
         // GNU read.def assigns -a words through the same field-splitting
         // rules as scalar names: interior empty fields bounded by
         // non-whitespace IFS delimiters are kept (`IFS=: read -a A` on
-        // `:::` yields three empty elements).
-        Some(ifs) if !ifs.is_empty() => split_read_field_ranges(line, ifs, false)
+        // `:::` yields three empty elements). A set-but-empty IFS is not
+        // the default: read.def:969 hands the line to list_string
+        // (subst.c:3119) with the ambient IFS, and an empty IFS disables
+        // splitting entirely — the whole line is one field, which
+        // split_read_field_ranges already encodes for "" (rubash#1713).
+        // Only an UNSET IFS takes the default whitespace split.
+        Some(ifs) => split_read_field_ranges(line, ifs, false)
             .into_iter()
             .map(|(start, end)| line[start..end].to_string())
             .collect(),
-        _ => line.split_whitespace().map(str::to_string).collect(),
+        None => line.split_whitespace().map(str::to_string).collect(),
     }
 }
 
@@ -1170,10 +1276,11 @@ pub(in crate::executor) fn split_read_array_words_with_backslashes(
         // characters stay inside the element and the backslash is dropped.
         // The raw slice here kept the backslash (rubash#397); the scalar
         // field_value helper performs the same escape-aware split + unescape.
-        Some(ifs) if !ifs.is_empty() => {
-            crate::executor::read_split::read_array_field_values(line, ifs)
-        }
-        _ => split_escaped_words_on_whitespace(line),
+        // A set-but-empty IFS disables splitting (one field, escapes still
+        // processed) exactly as in the raw path above (rubash#1713); only
+        // an unset IFS falls back to whitespace splitting.
+        Some(ifs) => crate::executor::read_split::read_array_field_values(line, ifs),
+        None => split_escaped_words_on_whitespace(line),
     }
 }
 

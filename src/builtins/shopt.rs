@@ -532,10 +532,12 @@ fn set_option_inner(
         "sourcepath" => SOURCEPATH.store(enabled, Ordering::Relaxed),
         "checkhash" => {
             CHECKHASH.store(enabled, Ordering::Relaxed);
+            // G-03: route through the mirror funnel so the write is
+            // journaled to the running executor's lineage.
             if enabled {
-                std::env::set_var("__RUBASH_SHOPT_CHECKHASH", "1");
+                crate::executor::local_helpers::set_process_env("__RUBASH_SHOPT_CHECKHASH", "1");
             } else {
-                std::env::remove_var("__RUBASH_SHOPT_CHECKHASH");
+                crate::executor::local_helpers::unset_process_env("__RUBASH_SHOPT_CHECKHASH");
             }
         }
         // GNU builtins/shopt.def:617-627 (shopt_set_debug_mode):
