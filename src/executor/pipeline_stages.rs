@@ -170,7 +170,24 @@ impl Executor {
                 .insert(base_name.to_string(), expanded_value);
         }
 
-        subshell.stdout_capture = Some(Vec::new());
+        // rubash#1605 (residual of #1454): when this stage is the
+        // pipeline's final member and its fd 1 IS the shell's own stdout
+        // (the final_member_stdout_streams_to_host predicate: no output
+        // redirect on the element, fd 1 open on the Stdout endpoint, no
+        // enclosing capture), GNU execute_cmd.c execute_pipeline runs the
+        // element with the inherited stdout — `echo hi | { readlink
+        // /proc/self/fd/1; }` names the shell's stdout target. An fd-1
+        // capture here would resolve the body's external children to the
+        // capture pipe instead (a fresh pipe), so skip both capture
+        // layers and let the body write straight to the live endpoint;
+        // the stage's returned stdout stays empty. The stderr capture is
+        // unaffected.
+        let stream_final_stdout = self.pipeline_final_stage.get()
+            && self.pipeline_stdout_stream.is_none()
+            && self.final_member_stdout_streams_to_host(command);
+        if !stream_final_stdout {
+            subshell.stdout_capture = Some(Vec::new());
+        }
         subshell.stderr_capture = Some(Vec::new());
 
         // GNU execute_cmd.c execute_pipeline + redir.c do_redirection_internal:
@@ -185,11 +202,16 @@ impl Executor {
         // downstream pipe element. Wrap the stage in the same thread-local
         // stdout capture execute_builtin_pipeline_stage uses and merge both
         // capture sources.
-        let saved_capture = crate::executor::shell_options::begin_stdout_capture();
-        // niubash#345: this element is the shell-side producer when the
-        // driver armed `pipeline_stdout_stream`; give its capture frame the
-        // pipe target so the body streams (nested frames still capture).
-        crate::executor::shell_options::set_capture_stream(self.pipeline_stdout_stream);
+        let saved_capture = if stream_final_stdout {
+            None
+        } else {
+            let saved = crate::executor::shell_options::begin_stdout_capture();
+            // niubash#345: this element is the shell-side producer when the
+            // driver armed `pipeline_stdout_stream`; give its capture frame the
+            // pipe target so the body streams (nested frames still capture).
+            crate::executor::shell_options::set_capture_stream(self.pipeline_stdout_stream);
+            Some(saved)
+        };
 
         let result = if command.brace_group.is_some() {
             subshell.execute_brace_group_pipeline(command).map(|_| ())
@@ -208,7 +230,9 @@ impl Executor {
                 // active — restore it before propagating so later stdout
                 // writes in the script are not swallowed into the
                 // orphaned buffer.
-                crate::executor::shell_options::restore_stdout_capture(saved_capture);
+                if let Some(saved) = saved_capture {
+                    crate::executor::shell_options::restore_stdout_capture(saved);
+                }
                 return Err(error);
             }
         }
@@ -223,11 +247,20 @@ impl Executor {
         // leaves nothing for this second run.
         let body_status = subshell.last_exit_code();
         let trap_result = subshell.run_exit_trap_for_status(body_status);
-        let mut thread_output = crate::executor::shell_options::take_stdout_capture();
+        // rubash#1605: a streamed final stage installed no thread capture
+        // (saved_capture is None); its bytes already went to the live
+        // stdout, so there is nothing to take or restore.
+        let mut thread_output = if saved_capture.is_some() {
+            crate::executor::shell_options::take_stdout_capture()
+        } else {
+            Vec::new()
+        };
         let mut output = subshell.stdout_capture.take().unwrap_or_default();
         let stderr = subshell.stderr_capture.take().unwrap_or_default();
 
-        crate::executor::shell_options::restore_stdout_capture(saved_capture);
+        if let Some(saved) = saved_capture {
+            crate::executor::shell_options::restore_stdout_capture(saved);
+        }
         // rubash#1141: the stage's output assembles field-sink bytes
         // first, thread-sink bytes after — snapshot the prefix totals so
         // the timing recorder can place thread arrivals behind them.
@@ -335,15 +368,31 @@ impl Executor {
             .env_vars
             .insert(FUNCTION_STDIN_OFFSET.to_string(), "0".to_string());
 
-        subshell.stdout_capture = Some(Vec::new());
+        // rubash#1605: same final-member rule as the compound stage
+        // above — a final function element whose fd 1 IS the shell's own
+        // stdout runs uncaptured, so external children in the body
+        // inherit the real fd 1 instead of a fresh capture pipe.
+        let stream_final_stdout = self.pipeline_final_stage.get()
+            && self.pipeline_stdout_stream.is_none()
+            && self.final_member_stdout_streams_to_host(command);
+        if !stream_final_stdout {
+            subshell.stdout_capture = Some(Vec::new());
+        }
         subshell.stderr_capture = Some(Vec::new());
         // Direct-stdout builtins in the function consult the thread-local
         // capture, which belongs to an enclosing capture when this stage
         // runs inside one; give the call its own capture.
-        let (thread_captured, result) = crate::executor::shell_options::capture_stdout_streamed(
-            self.pipeline_stdout_stream,
-            || subshell.execute_function(&function_name, &args, &call),
-        );
+        let (thread_captured, result) = if stream_final_stdout {
+            (
+                Vec::new(),
+                subshell.execute_function(&function_name, &args, &call),
+            )
+        } else {
+            crate::executor::shell_options::capture_stdout_streamed(
+                self.pipeline_stdout_stream,
+                || subshell.execute_function(&function_name, &args, &call),
+            )
+        };
         // GNU execute_cmd.c:1761-1763 (execute_in_subshell): a pipeline
         // element is a forked subshell whose exit — implicit after the body
         // as much as via `exit` — runs the subshell's EXIT trap. The trap
@@ -358,11 +407,14 @@ impl Executor {
         // f | cat` reports PIPESTATUS 2. Only a builtin that IS the
         // element folds to 1.)
         let body_status = subshell.last_exit_code();
-        let (trap_thread_captured, trap_result) =
+        let (trap_thread_captured, trap_result) = if stream_final_stdout {
+            (Vec::new(), subshell.run_exit_trap_for_status(body_status))
+        } else {
             crate::executor::shell_options::capture_stdout_streamed(
                 self.pipeline_stdout_stream,
                 || subshell.run_exit_trap_for_status(body_status),
-            );
+            )
+        };
         let mut output = subshell.stdout_capture.take().unwrap_or_default();
         // rubash#1141: field-sink bytes precede the thread-sink bytes in
         // the assembled output — snapshot the prefix for the recorder.
