@@ -3810,16 +3810,26 @@ impl Executor {
         self.set_env("COMP_CWORD", &cword.to_string());
     }
 
-    /// pcomplete.c:863 gen_wordlist_matches: split the -W wordlist at shell
-    /// delimiters (quotes group and are removed — the splitter's
-    /// GNU-parse.y-compatible pass in alias_helpers), then expand each word
-    /// with the shellexp rules: a quoted word keeps one field per array
-    /// element and never glob-splits; an unquoted word goes through the
+    /// pcomplete.c:863 gen_wordlist_matches: split the -W wordlist with
+    /// split_at_delims (subst.c:2616) at the CURRENT $IFS (quotes group
+    /// and are retained in the pieces), then expand each word with the
+    /// shellexp rules: a quoted word keeps one field per array element
+    /// and never glob-splits; an unquoted word goes through the
     /// for-list expander (parameter expansion, field splitting, pathname
     /// expansion).
     fn expand_compgen_wordlist(&mut self, wordlist: &str) -> Vec<String> {
+        // subst.c:2630: with delims == NULL the splitter reads
+        // ifs_value — the shell's current IFS (this command's tempenv
+        // frame included), or the default " \t\n" while IFS is unset.
+        // An empty IFS splits nowhere.
+        let ifs = self
+            .shell_state
+            .env_vars
+            .get("IFS")
+            .cloned()
+            .unwrap_or_else(|| " \t\n".to_string());
         let mut values = Vec::new();
-        for (word, quoted) in split_shell_words_with_quote_info(wordlist) {
+        for (word, quoted) in split_compgen_wordlist(wordlist, &ifs) {
             if quoted {
                 // expand_words_shellexp keeps W_QUOTED words whole; a word
                 // that IS an array reference yields one field per element
@@ -4113,4 +4123,268 @@ where
         "{diagnostic_prefix}wait: `{operand}': not a pid or valid job spec"
     )?;
     Ok(1)
+}
+
+/// subst.c:2616 split_at_delims with delims == NULL, as driven by
+/// pcomplete.c:863 gen_wordlist_matches for the -W wordlist: the
+/// delimiter set is the current $IFS; a maximal run of delimiter
+/// characters separates two fields and leading/trailing runs vanish,
+/// so no empty fields are ever produced (with delims == NULL the d2
+/// empty-field branch of split_at_delims never fires). Grouping
+/// follows subst.c:2199 skip_to_delim: a backslash quotes the next
+/// character before any delimiter test, and single/double quotes,
+/// backquotes, $'...', $(...) and ${...} spans group — delimiter
+/// characters inside a span are field content. Pieces keep their
+/// quote characters for the shellexp expansion arms; a piece is
+/// reported quoted when it carries top-level quoting (a quote, an
+/// escape, or a $'...' span), which is what keeps its expansion
+/// unsplit (rubash#1797).
+fn split_compgen_wordlist(wordlist: &str, ifs: &str) -> Vec<(String, bool)> {
+    CompgenWordlistScanner {
+        chars: wordlist.chars().collect(),
+        ifs,
+        pos: 0,
+    }
+    .split()
+}
+
+struct CompgenWordlistScanner<'a> {
+    chars: Vec<char>,
+    ifs: &'a str,
+    pos: usize,
+}
+
+impl CompgenWordlistScanner<'_> {
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+
+    fn peek_next(&self) -> Option<char> {
+        self.chars.get(self.pos + 1).copied()
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let c = self.peek()?;
+        self.pos += 1;
+        Some(c)
+    }
+
+    fn is_delim(&self, c: char) -> bool {
+        self.ifs.contains(c)
+    }
+
+    fn split(mut self) -> Vec<(String, bool)> {
+        let mut words = Vec::new();
+        loop {
+            // A delimiter run is one separator; leading runs vanish.
+            while matches!(self.peek(), Some(c) if self.is_delim(c)) {
+                self.pos += 1;
+            }
+            if self.peek().is_none() {
+                break;
+            }
+            let (piece, quoted) = self.field();
+            if !piece.is_empty() {
+                words.push((piece, quoted));
+            }
+        }
+        words
+    }
+
+    /// One field: consume until an unquoted delimiter or end of input.
+    /// The test order mirrors skip_to_delim: backslash and backquote
+    /// are recognized before the delimiter test; quotes and dollar
+    /// spans after it.
+    fn field(&mut self) -> (String, bool) {
+        let mut piece = String::new();
+        let mut quoted = false;
+        while let Some(c) = self.peek() {
+            match c {
+                '\\' => {
+                    // A top-level escape quotes the field. The escaped
+                    // character is decoded with the same carrier
+                    // encoding the alias_helpers splitter produces, so
+                    // the shellexp arms see the piece in the form they
+                    // already handle (a raw backslash would survive
+                    // expand_word verbatim: `a\ b` must yield `a b`).
+                    quoted = true;
+                    self.bump();
+                    match self.bump() {
+                        None => piece.push('\\'),
+                        Some('\n') => {}
+                        Some('\\') => piece.push(crate::executor::markers::DATA_BACKSLASH),
+                        Some('$') => piece.push(crate::executor::markers::DATA_DOLLAR),
+                        Some('`') => piece.push(crate::executor::markers::DATA_BACKTICK),
+                        Some('\'') => piece.push(crate::executor::markers::DATA_SQUOTE),
+                        Some('"') => piece.push(crate::executor::markers::DATA_DQUOTE),
+                        Some(other) => piece.push(other),
+                    }
+                }
+                '`' => self.backquote_span(&mut piece),
+                _ if self.is_delim(c) => break,
+                '\'' => {
+                    quoted = true;
+                    self.squote_span(&mut piece);
+                }
+                '"' => {
+                    quoted = true;
+                    self.dquote_span(&mut piece);
+                }
+                '$' if self.peek_next() == Some('\'') => {
+                    quoted = true;
+                    self.ansi_c_span(&mut piece);
+                }
+                '$' if self.peek_next() == Some('"') => {
+                    quoted = true;
+                    piece.push(self.bump().unwrap());
+                    self.dquote_span(&mut piece);
+                }
+                '$' if self.peek_next() == Some('(') => self.dollar_paren_span(&mut piece),
+                '$' if self.peek_next() == Some('{') => self.dollar_brace_span(&mut piece),
+                _ => piece.push(self.bump().unwrap()),
+            }
+        }
+        (piece, quoted)
+    }
+
+    fn squote_span(&mut self, piece: &mut String) {
+        piece.push(self.bump().unwrap_or('\''));
+        while let Some(c) = self.peek() {
+            piece.push(self.bump().unwrap());
+            if c == '\'' {
+                break;
+            }
+        }
+    }
+
+    fn ansi_c_span(&mut self, piece: &mut String) {
+        piece.push(self.bump().unwrap_or('$'));
+        piece.push(self.bump().unwrap_or('\''));
+        while let Some(c) = self.peek() {
+            if c == '\\' {
+                piece.push(self.bump().unwrap());
+                if let Some(escaped) = self.bump() {
+                    piece.push(escaped);
+                }
+                continue;
+            }
+            piece.push(self.bump().unwrap());
+            if c == '\'' {
+                break;
+            }
+        }
+    }
+
+    fn dquote_span(&mut self, piece: &mut String) {
+        piece.push(self.bump().unwrap_or('"'));
+        while let Some(c) = self.peek() {
+            match c {
+                '"' => {
+                    piece.push(self.bump().unwrap());
+                    break;
+                }
+                '\\' => {
+                    piece.push(self.bump().unwrap());
+                    // Inside double quotes a backslash quotes only
+                    // $, `, ", \ and newline (skip_double_quoted).
+                    if matches!(self.peek(), Some('$' | '`' | '"' | '\\' | '\n')) {
+                        piece.push(self.bump().unwrap());
+                    }
+                }
+                '`' => self.backquote_span(piece),
+                '$' if self.peek_next() == Some('(') => self.dollar_paren_span(piece),
+                '$' if self.peek_next() == Some('{') => self.dollar_brace_span(piece),
+                _ => piece.push(self.bump().unwrap()),
+            }
+        }
+    }
+
+    fn backquote_span(&mut self, piece: &mut String) {
+        piece.push(self.bump().unwrap_or('`'));
+        while let Some(c) = self.peek() {
+            if c == '\\' {
+                piece.push(self.bump().unwrap());
+                if let Some(escaped) = self.bump() {
+                    piece.push(escaped);
+                }
+                continue;
+            }
+            piece.push(self.bump().unwrap());
+            if c == '`' {
+                break;
+            }
+        }
+    }
+
+    fn dollar_paren_span(&mut self, piece: &mut String) {
+        piece.push(self.bump().unwrap_or('$'));
+        piece.push(self.bump().unwrap_or('('));
+        let mut depth = 1usize;
+        while depth > 0 {
+            let Some(c) = self.peek() else { break };
+            match c {
+                '\\' => {
+                    piece.push(self.bump().unwrap());
+                    if let Some(escaped) = self.bump() {
+                        piece.push(escaped);
+                    }
+                }
+                '\'' => self.squote_span(piece),
+                '"' => self.dquote_span(piece),
+                '`' => self.backquote_span(piece),
+                '$' if self.peek_next() == Some('\'') => self.ansi_c_span(piece),
+                '$' if self.peek_next() == Some('(') => {
+                    piece.push(self.bump().unwrap());
+                    piece.push(self.bump().unwrap());
+                    depth += 1;
+                }
+                '$' if self.peek_next() == Some('{') => self.dollar_brace_span(piece),
+                '(' => {
+                    piece.push(self.bump().unwrap());
+                    depth += 1;
+                }
+                ')' => {
+                    piece.push(self.bump().unwrap());
+                    depth -= 1;
+                }
+                _ => piece.push(self.bump().unwrap()),
+            }
+        }
+    }
+
+    fn dollar_brace_span(&mut self, piece: &mut String) {
+        piece.push(self.bump().unwrap_or('$'));
+        piece.push(self.bump().unwrap_or('{'));
+        let mut depth = 1usize;
+        while depth > 0 {
+            let Some(c) = self.peek() else { break };
+            match c {
+                '\\' => {
+                    piece.push(self.bump().unwrap());
+                    if let Some(escaped) = self.bump() {
+                        piece.push(escaped);
+                    }
+                }
+                '\'' => self.squote_span(piece),
+                '"' => self.dquote_span(piece),
+                '`' => self.backquote_span(piece),
+                '$' if self.peek_next() == Some('\'') => self.ansi_c_span(piece),
+                '$' if self.peek_next() == Some('(') => self.dollar_paren_span(piece),
+                '$' if self.peek_next() == Some('{') => {
+                    piece.push(self.bump().unwrap());
+                    piece.push(self.bump().unwrap());
+                    depth += 1;
+                }
+                '{' => {
+                    piece.push(self.bump().unwrap());
+                    depth += 1;
+                }
+                '}' => {
+                    piece.push(self.bump().unwrap());
+                    depth -= 1;
+                }
+                _ => piece.push(self.bump().unwrap()),
+            }
+        }
+    }
 }
