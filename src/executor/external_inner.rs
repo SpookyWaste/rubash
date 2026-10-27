@@ -1460,7 +1460,11 @@ impl Executor {
                         // The input is shell text: raw-byte marker pairs
                         // (heredoc bodies, expanded bytes) must decode to
                         // real bytes for the child (GNU writes fd bytes).
-                        stdin.write_all(
+                        // The feed itself must never fail the command or
+                        // kill the shell when the child exits without
+                        // reading (rubash#1822) — see feed_child_stdin.
+                        crate::executor::shell_options::feed_child_stdin(
+                            &mut stdin,
                             &crate::executor::substitution_metadata::shell_text_to_raw_bytes(
                                 &input,
                             ),

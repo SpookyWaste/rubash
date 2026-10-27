@@ -2072,6 +2072,40 @@ pub(in crate::executor) fn write_pipeline_stream(
     }
 }
 
+/// Feed a spawned child's stdin pipe with the shell's virtual-stdin
+/// payload (heredoc / here-string / FUNCTION_STDIN text materialized by
+/// the in-process model). GNU has no such post-spawn feed: the element's
+/// fd 0 IS the pipe or file (execute_cmd.c:2620 execute_pipeline binds
+/// the fildes; redirections are applied inside the child by
+/// do_redirection_internal), so a consumer that exits without reading
+/// simply leaves the bytes in the pipe and its own exit status governs.
+/// The feed is therefore a transport detail of this port, and its two
+/// failure faces must not leak into the command's result:
+///
+/// - a broken pipe means the child closed stdin (in practice it already
+///   exited) — the feed just ends, exactly like the writer-thread feed
+///   sites swallow it (pipeline member spawn, background spawn);
+/// - SIGPIPE is SIG_DFL process-wide (rubash#1333), so an unguarded
+///   feed on a non-pipeline executor thread would kill the SHELL when
+///   the child wins the exit race (`cmd <<< x` with a fast-exiting
+///   `cmd`) — hold the scoped block across the write so the race can
+///   only ever surface as the swallowed EPIPE above.
+///
+/// Any other io error is a genuine environment failure and propagates
+/// (rubash#1822).
+pub(in crate::executor) fn feed_child_stdin(
+    stdin: &mut impl std::io::Write,
+    payload: &[u8],
+) -> Result<(), ExecuteError> {
+    #[cfg(unix)]
+    let _sigpipe_block = crate::builtins::kill::sigpipe_block_guard();
+    match stdin.write_all(payload) {
+        Ok(()) => Ok(()),
+        Err(error) if is_broken_pipe_error(&error) => Ok(()),
+        Err(error) => Err(ExecuteError::IoError(error)),
+    }
+}
+
 /// True when a write failed because the read end of the pipe is gone —
 /// Windows ERROR_BROKEN_PIPE (109) or a POSIX EPIPE.
 pub(in crate::executor) fn is_broken_pipe_error(error: &std::io::Error) -> bool {

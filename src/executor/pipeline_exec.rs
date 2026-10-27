@@ -2964,7 +2964,10 @@ impl Executor {
                 );
             }
             if !stage0_input.is_empty() {
-                stdin.write_all(
+                // Same feed contract as the host path: a member that
+                // already exited must not fail the pipeline (rubash#1822).
+                crate::executor::shell_options::feed_child_stdin(
+                    &mut stdin,
                     &crate::executor::substitution_metadata::shell_text_to_raw_bytes(&stage0_input),
                 )?;
             }
@@ -3688,7 +3691,10 @@ impl Executor {
                     (base + stage0_input.len()).to_string(),
                 );
             }
-            stdin.write_all(
+            // Same feed contract as the host path: a member that
+            // already exited must not fail the pipeline (rubash#1822).
+            crate::executor::shell_options::feed_child_stdin(
+                &mut stdin,
                 &crate::executor::substitution_metadata::shell_text_to_raw_bytes(&stage0_input),
             )?;
         }
