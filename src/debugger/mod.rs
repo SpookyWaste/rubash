@@ -25,7 +25,9 @@ pub mod driver;
 pub mod event;
 pub mod gate;
 pub mod inspect;
+pub mod resolution;
 pub mod session;
+pub mod stepping;
 
 // The re-exports below are the module's deliberate facade: the names are
 // the debugger vocabulary for consumers in later work packages, so most
@@ -55,6 +57,8 @@ pub use inspect::{
 };
 #[allow(unused_imports)]
 pub use session::{DebugSession, SessionError, SessionState, StepArming, Termination};
+#[allow(unused_imports)]
+pub use stepping::{arming_stops_at_frame_return, arming_stops_at_seam};
 
 #[cfg(test)]
 mod wiring_tests;

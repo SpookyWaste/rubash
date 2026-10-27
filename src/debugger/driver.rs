@@ -25,6 +25,15 @@ use super::session::{DebugSession, StepArming};
 pub enum StopLoopOutcome {
     /// Resume the debuggee under this arming.
     Resume(StepArming),
+    /// Force the frame the debuggee is stopped in to return now
+    /// (design 6.1, the `return [status]` command): the frame
+    /// unwinds exactly as if it had executed `return`, carrying
+    /// this status — or the frame's current `$?` when `None` —
+    /// and the session stops in the caller at the return point
+    /// under a finish-style arming. The consult applies this only
+    /// inside a function or sourced-file frame; anywhere else it
+    /// is rejected and the debuggee resumes under `Continue`.
+    ForceReturn(Option<i32>),
     /// End the session's attachment: the gate is disarmed and the
     /// driver is dropped; the debuggee runs on unattached.
     Detach,

@@ -1730,6 +1730,9 @@ impl Executor {
             // debug session (DE-12: its frames are synthesized in a
             // later work package; stops stay on the owning executor).
             debug_driver: None,
+            // WP-8: nor a pending syntax-unit identity — a child's
+            // units are its own text, never the parent's file.
+            debug_syntax_unit_file: None,
             line_env_os_value: std::cell::RefCell::new(None),
             expansion_probe_active: std::cell::Cell::new(false),
             return_trap_running: false,

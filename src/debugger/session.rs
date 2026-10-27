@@ -143,6 +143,15 @@ pub struct DebugSession {
     termination: Option<Termination>,
     pending_events: VecDeque<DebugEvent>,
     inspection: Option<InspectionSnapshot>,
+    /// Breakpoint resolution knowledge (design 5.1/5.2; WP-8):
+    /// the syntax view of every file the engine has parsed a unit
+    /// of, keyed by the engine's own file identity. The
+    /// adjudication logic lives in `super::resolution`; the fields
+    /// live here because the session is the knowledge's owner.
+    pub(crate) syntax_views: std::collections::HashMap<String, crate::api::syntax::SyntaxView>,
+    /// Function names a runtime definition note has proven defined
+    /// (names no syntax view covers — `eval`-defined functions).
+    pub(crate) defined_functions: std::collections::HashSet<String>,
 }
 
 impl DebugSession {
@@ -165,6 +174,8 @@ impl DebugSession {
             termination: None,
             pending_events: VecDeque::new(),
             inspection: None,
+            syntax_views: std::collections::HashMap::new(),
+            defined_functions: std::collections::HashSet::new(),
         };
         session.emit(DebugEvent::SessionStarted);
         session.emit(DebugEvent::Stopped(entry_stop));
