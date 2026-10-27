@@ -23,6 +23,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[cfg(unix)]
 fn shell_bin() -> PathBuf {
     if let Some(path) = option_env!("CARGO_BIN_EXE_rubash") {
         return PathBuf::from(path);
@@ -42,12 +43,14 @@ fn shell_bin() -> PathBuf {
         })
 }
 
+#[cfg(unix)]
 struct Output {
     status: i32,
     stdout: String,
     stderr: String,
 }
 
+#[cfg(unix)]
 fn run_in_dir(dir: &Path, script: &str, path_env: &str) -> Output {
     let mut child = Command::new(shell_bin())
         .args(["-c", script])
@@ -67,6 +70,7 @@ fn run_in_dir(dir: &Path, script: &str, path_env: &str) -> Output {
     }
 }
 
+#[cfg(unix)]
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("rubash-sim-decline-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -92,6 +96,7 @@ fn fakebin_path(dir: &Path, names: &[&str]) -> String {
     format!("{}:/usr/bin:/bin", fakebin.display())
 }
 
+#[cfg(unix)]
 const SYSTEM_PATH: &str = "/usr/bin:/bin";
 
 // --------------------------------------------------------------------
