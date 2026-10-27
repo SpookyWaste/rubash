@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::breakpoints::BreakpointTable;
 use super::event::{DebugEvent, StopInfo};
 use super::gate::SESSION_ACTIVE;
+use crate::api::views::InspectionSnapshot;
 
 /// The three states of the design's session model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +142,7 @@ pub struct DebugSession {
     async_stop: AtomicBool,
     termination: Option<Termination>,
     pending_events: VecDeque<DebugEvent>,
+    inspection: Option<InspectionSnapshot>,
 }
 
 impl DebugSession {
@@ -162,6 +164,7 @@ impl DebugSession {
             async_stop: AtomicBool::new(false),
             termination: None,
             pending_events: VecDeque::new(),
+            inspection: None,
         };
         session.emit(DebugEvent::SessionStarted);
         session.emit(DebugEvent::Stopped(entry_stop));
@@ -210,6 +213,23 @@ impl DebugSession {
     /// The most recent stop, if any (the entry stop counts).
     pub fn last_stop(&self) -> Option<&StopInfo> {
         self.last_stop.as_ref()
+    }
+
+    /// The inspection snapshot captured for the current stop
+    /// (PLAN row 6 / WP-6). The executor captures it from the live
+    /// engine state at the moment of the stop and installs it here
+    /// before the stop loop runs; frontends only render it. It is a
+    /// point-in-time capture, not a live view: after a resume it is
+    /// stale by definition until the next stop replaces it.
+    pub fn inspection(&self) -> Option<&InspectionSnapshot> {
+        self.inspection.as_ref()
+    }
+
+    /// Install the inspection snapshot for the stop being served.
+    /// Consult-side only: frontends read through
+    /// [`DebugSession::inspection`].
+    pub fn set_inspection(&mut self, inspection: InspectionSnapshot) {
+        self.inspection = Some(inspection);
     }
 
     /// The arming installed by the most recent resume.

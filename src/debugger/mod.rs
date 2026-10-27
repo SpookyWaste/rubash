@@ -24,6 +24,7 @@ pub mod breakpoints;
 pub mod driver;
 pub mod event;
 pub mod gate;
+pub mod inspect;
 pub mod session;
 
 // The re-exports below are the module's deliberate facade: the names are
@@ -47,6 +48,11 @@ pub use event::{
 };
 #[allow(unused_imports)]
 pub use gate::{GateFlag, SESSION_ACTIVE};
+#[allow(unused_imports)]
+pub use inspect::{
+    render_caller, render_caller_bare, render_dynamic_state, render_info_args, render_pipestatus,
+    render_variables, render_where, VariablePartition,
+};
 #[allow(unused_imports)]
 pub use session::{DebugSession, SessionError, SessionState, StepArming, Termination};
 
