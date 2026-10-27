@@ -29,17 +29,36 @@ thread_local! {
     static ANSI_LEX_LOCALE_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
+/// RAII guard for [`ANSI_LEX_LOCALE_OVERRIDE`]: on drop it restores the
+/// value the override held on entry (an outer pin, or none) instead of
+/// clearing the slot, so nested pins compose — an inner re-derivation
+/// must not erase the outer line's read-time locale.
+struct AnsiLexLocaleGuard {
+    previous: Option<String>,
+}
+
+impl AnsiLexLocaleGuard {
+    fn new(locale: &str) -> Self {
+        let previous =
+            ANSI_LEX_LOCALE_OVERRIDE.with(|cell| cell.borrow_mut().replace(locale.to_string()));
+        AnsiLexLocaleGuard { previous }
+    }
+}
+
+impl Drop for AnsiLexLocaleGuard {
+    fn drop(&mut self) {
+        let previous = std::mem::replace(&mut self.previous, None);
+        ANSI_LEX_LOCALE_OVERRIDE.with(|cell| {
+            *cell.borrow_mut() = previous;
+        });
+    }
+}
+
 /// Run `f` with the ANSI-C decoder locale pinned to `locale` (the
 /// read-time locale recorded for the word's source line).
 pub fn with_ansi_lex_locale<T>(locale: &str, f: impl FnOnce() -> T) -> T {
-    ANSI_LEX_LOCALE_OVERRIDE.with(|cell| {
-        *cell.borrow_mut() = Some(locale.to_string());
-    });
-    let result = f();
-    ANSI_LEX_LOCALE_OVERRIDE.with(|cell| {
-        *cell.borrow_mut() = None;
-    });
-    result
+    let _guard = AnsiLexLocaleGuard::new(locale);
+    f()
 }
 
 /// The locale name the ANSI-C decoder must use: the re-derivation override
@@ -70,21 +89,28 @@ thread_local! {
 }
 
 /// RAII guard installing [`SHELL_LOCALE_OVERRIDE`] from a variable table.
-pub struct ShellLocaleGuard;
+///
+/// On drop the guard restores the override it found on entry (an outer
+/// guard's value, or none) instead of clearing the slot, so nested
+/// builtin dispatch keeps the outer builtin's variable-table locale
+/// when the inner builtin returns.
+pub struct ShellLocaleGuard {
+    previous: Option<String>,
+}
 
 impl ShellLocaleGuard {
     pub fn new(env_vars: &std::collections::HashMap<String, String>) -> Self {
-        SHELL_LOCALE_OVERRIDE.with(|cell| {
-            *cell.borrow_mut() = Some(locale_name_from_vars(env_vars));
-        });
-        ShellLocaleGuard
+        let previous = SHELL_LOCALE_OVERRIDE
+            .with(|cell| cell.borrow_mut().replace(locale_name_from_vars(env_vars)));
+        ShellLocaleGuard { previous }
     }
 }
 
 impl Drop for ShellLocaleGuard {
     fn drop(&mut self) {
+        let previous = std::mem::replace(&mut self.previous, None);
         SHELL_LOCALE_OVERRIDE.with(|cell| {
-            *cell.borrow_mut() = None;
+            *cell.borrow_mut() = previous;
         });
     }
 }
@@ -1299,7 +1325,10 @@ fn platform_collate(_a: &str, _b: &str, _locale: &str) -> Option<std::cmp::Order
 
 #[cfg(test)]
 mod tests {
-    use super::{is_utf8_locale_name, strcoll, strcoll_posixcmp};
+    use super::{
+        active_locale_name, ansi_lex_locale_name, is_utf8_locale_name, locale_name, strcoll,
+        strcoll_posixcmp, with_ansi_lex_locale, ShellLocaleGuard,
+    };
     use std::cmp::Ordering;
 
     #[test]
@@ -1314,6 +1343,41 @@ mod tests {
         if let Some(v) = saved {
             std::env::set_var("LC_ALL", v);
         }
+    }
+
+    #[test]
+    fn ansi_lex_locale_override_restores_outer_pin() {
+        // Unpinned: the decoder locale is the live environment's.
+        assert_eq!(ansi_lex_locale_name(), locale_name());
+        with_ansi_lex_locale("C", || {
+            assert_eq!(ansi_lex_locale_name(), "C");
+            with_ansi_lex_locale("en_US.UTF-8", || {
+                assert_eq!(ansi_lex_locale_name(), "en_US.UTF-8");
+            });
+            // The inner pin's exit restores the outer pin, not a clear.
+            assert_eq!(ansi_lex_locale_name(), "C");
+        });
+        assert_eq!(ansi_lex_locale_name(), locale_name());
+    }
+
+    #[test]
+    fn shell_locale_guard_restores_outer_guard() {
+        let mut outer_vars = std::collections::HashMap::new();
+        outer_vars.insert("LC_ALL".to_string(), "C".to_string());
+        let mut inner_vars = std::collections::HashMap::new();
+        inner_vars.insert("LC_ALL".to_string(), "en_US.UTF-8".to_string());
+        assert_eq!(active_locale_name(), locale_name());
+        {
+            let _outer = ShellLocaleGuard::new(&outer_vars);
+            assert_eq!(active_locale_name(), "C");
+            {
+                let _inner = ShellLocaleGuard::new(&inner_vars);
+                assert_eq!(active_locale_name(), "en_US.UTF-8");
+            }
+            // The inner guard's exit restores the outer guard's locale.
+            assert_eq!(active_locale_name(), "C");
+        }
+        assert_eq!(active_locale_name(), locale_name());
     }
 
     /// rubash#681 slice b: the hoisted sort must match the per-comparison
