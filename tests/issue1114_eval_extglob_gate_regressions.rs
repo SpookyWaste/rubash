@@ -28,7 +28,6 @@ fn rubash(script: &str) -> (String, String, Option<i32>) {
 }
 
 #[test]
-#[ignore = "issue#1114 drift on master ec279df1: the eval parse diagnostic bypasses the caller's 2>&1 redirection (lands on stderr; GNU routes it through the redirect to stdout) — reported in bf-w3-a REPORT.md as a suspected live bug"]
 fn eval_parse_honors_extglob_gate() {
     let (stdout, _, code) = rubash(
         "v=\"abc123\"\n\
@@ -43,6 +42,12 @@ fn eval_parse_honors_extglob_gate() {
     );
     assert!(stdout.contains("pre-extglob-rc=2\n"), "stdout: {stdout}");
     assert!(stdout.ends_with("m2\n"), "stdout: {stdout}");
-    assert!(!stdout.contains("m1"), "stdout: {stdout}");
+    // `m1` may appear inside the offending-line echo of the eval parse
+    // diagnostic (the echoed line literally contains `echo m1`), so a
+    // plain substring check is unsatisfiable against the GNU-shaped
+    // output; it must never appear as an executed output line. Same
+    // construction as the #1609 companion pin in
+    // `issue1609_eval_parse_diag_routing_regressions.rs`.
+    assert!(!stdout.lines().any(|line| line == "m1"), "stdout: {stdout}");
     assert_eq!(code, Some(0));
 }
