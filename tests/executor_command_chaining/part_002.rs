@@ -208,6 +208,78 @@ fn test_case_body_keeps_arithmetic_for_semicolons_inside_nested_if() {
 }
 
 #[test]
+fn test_issue_1801_deep_nesting_runs_on_the_default_test_thread_stack() {
+    // rubash#1801: the parser and executor are recursive tree walkers whose
+    // debug call chains burn ~150KB of stack per nesting level (the figure
+    // src/main.rs cites for the binary driver's 512MiB stack thread). A host
+    // that drives the library on an ordinary thread — libtest's 2MiB test
+    // threads included — must not need a driver-sized stack: the walkers
+    // grow the stack on demand (src/stack_growth.rs), the same unbounded
+    // recursion contract GNU has (variables.c FUNCNEST: recursion bounded
+    // only by the real stack). GNU bash 5.3.20 runs all three shapes below
+    // with no special stack; expected outputs are its outputs.
+    let _cwd_guard = CwdGuard::take();
+
+    // 12 nested `if` compounds, parsed and executed.
+    let output_path = "target/rubash-issue-1801-nested-if-output.txt";
+    let _ = fs::remove_file(output_path);
+    let mut input = String::new();
+    for _ in 0..12 {
+        input.push_str("if true; then ");
+    }
+    input.push_str(&format!("echo bottom > {output_path}"));
+    for _ in 0..12 {
+        input.push_str("; fi");
+    }
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+    let result = executor.execute_ast(&ast);
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "bottom\n");
+    let _ = fs::remove_file(output_path);
+
+    // 40 nested `if` compounds: the parse recursion alone overflowed a
+    // default 2MiB thread before the fix (SIGABRT in the test harness).
+    let output_path = "target/rubash-issue-1801-nested-if40-output.txt";
+    let _ = fs::remove_file(output_path);
+    let mut input = String::new();
+    for _ in 0..40 {
+        input.push_str("if true; then ");
+    }
+    input.push_str(&format!("echo bottom > {output_path}"));
+    for _ in 0..40 {
+        input.push_str("; fi");
+    }
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+    let result = executor.execute_ast(&ast);
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "bottom\n");
+    let _ = fs::remove_file(output_path);
+
+    // A 30-deep function call chain: f30 -> f29 -> ... -> f0.
+    let output_path = "target/rubash-issue-1801-func-chain-output.txt";
+    let _ = fs::remove_file(output_path);
+    let mut input = String::from("f0() { echo fnbottom; }; ");
+    for i in 1..=30 {
+        input.push_str(&format!("f{i}() {{ f{}; }}; ", i - 1));
+    }
+    input.push_str(&format!("f30 > {output_path}"));
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+    let result = executor.execute_ast(&ast);
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "fnbottom\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
 fn test_unquoted_parameter_array_assignment_preserves_quote_characters() {
     let _cwd_guard = CwdGuard::take();
     let output_path = "target/rubash-array-assignment-quoted-fields-output.txt";

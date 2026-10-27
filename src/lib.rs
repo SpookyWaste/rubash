@@ -31,6 +31,7 @@ pub mod posix_errors;
 pub mod proc_vfs;
 pub mod script_driver;
 pub mod shell;
+pub(crate) mod stack_growth;
 pub mod token_str;
 pub mod usage;
 

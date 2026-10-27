@@ -123,6 +123,14 @@ impl Executor {
         &mut self,
         commands: &[CommandNode],
     ) -> Result<(), ExecuteError> {
+        // rubash#1801: every nested command list (compound bodies, function
+        // bodies, loop bodies, pipeline stages) funnels through here, so
+        // this is the executor's recursion hub — grow the host thread's
+        // stack on demand instead of overflowing it (src/stack_growth.rs).
+        crate::stack_growth::ensure_stack(|| self.execute_ast_inner_walk(commands))
+    }
+
+    fn execute_ast_inner_walk(&mut self, commands: &[CommandNode]) -> Result<(), ExecuteError> {
         self.evalerror_exec_depth
             .set(self.evalerror_exec_depth.get() + 1);
         // rubash#1164: a nested list (function body, compound body) samples
