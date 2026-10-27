@@ -290,6 +290,15 @@ fn run_source_groups(
             Err(error) => return Err(error),
         }
     }
+    // WP-8 (debugger design 5.1): the reader reached the end of
+    // the file — lines no group attributed a command to are now
+    // soundly dead rather than pending. (The early returns above —
+    // parse aborts — skip this on purpose: that text was not read
+    // to its end.) The stack top is still this file here; the
+    // caller pops it after this returns.
+    if let Some(file) = executor.shell_state.bash_source_stack.first().cloned() {
+        executor.debugger_note_syntax_complete(&file);
+    }
     // GNU builtins/source.def: the return status of `.` is the exit status
     // of the last command executed in the file, or **zero** when no commands
     // run (builtins.tests sources a zero-length file and expects $? == 0).

@@ -5308,6 +5308,19 @@ impl Executor {
         }
     }
 
+    /// WP-8 (design 5.1): note that a file's reader reached its
+    /// end, so the session may soundly convict lines no parsed
+    /// unit covered. Called by the same two group drivers that
+    /// register views, on their normal-completion path only.
+    pub(crate) fn debugger_note_syntax_complete(&mut self, file: &str) {
+        if !self.debugger_session_here() {
+            return;
+        }
+        if let Some(driver) = self.debug_driver.as_mut() {
+            driver.session_mut().note_syntax_file_complete(file);
+        }
+    }
+
     /// Install a debug session on this executor. Gate pairing is
     /// the driver layer's job (150-c REPORT section 5, note 7):
     /// installation activates the session; termination

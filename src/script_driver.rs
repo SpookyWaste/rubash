@@ -416,6 +416,16 @@ fn run_script_grouped_at_line_offset(
             );
         }
     }
+    // WP-8 (debugger design 5.1): the reader reached the end of
+    // this input — the same completion note the source builtin
+    // gives, under the same identity rule as the per-group
+    // registration above. The early returns in the loop (parse
+    // aborts, exit jumps) skip it on purpose.
+    if !executor.command_string_mode() {
+        if let Some(file) = executor.shell_state.bash_source_stack.first().cloned() {
+            executor.debugger_note_syntax_complete(&file);
+        }
+    }
     (executor.last_exit_code(), false)
 }
 

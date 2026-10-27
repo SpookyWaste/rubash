@@ -83,6 +83,13 @@ pub(crate) enum LineClass {
 /// The syntax view of one parsed file: line sets plus function
 /// sites, accumulated across every reader unit of the file the
 /// engine has parsed so far.
+///
+/// Files are parsed incrementally, one reader unit at a time, so a
+/// view is *partial* while its file is still being read: it knows
+/// the units it has seen (their line spans are in `spans`) and
+/// nothing sound about lines beyond them. `complete` records that
+/// the file's reader reached the end — only then is "no command
+/// on this line" a sound verdict for a line no unit covered.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SyntaxView {
     /// The file identity, exactly as the engine's source stack
@@ -95,6 +102,12 @@ pub(crate) struct SyntaxView {
     /// Function definitions, in first-seen order, deduplicated by
     /// (name, definition line).
     pub functions: Vec<FunctionSite>,
+    /// The (first, last) command-line span of each parsed unit:
+    /// the line ranges this view's knowledge actually covers.
+    pub spans: Vec<(u32, u32)>,
+    /// The file's reader reached its end: every line has been
+    /// attributed to some unit or to none.
+    pub complete: bool,
 }
 
 impl SyntaxView {
@@ -104,13 +117,22 @@ impl SyntaxView {
             file: file.to_string(),
             ..SyntaxView::default()
         };
-        let mut walker = Walker { view: &mut view };
-        walker.walk_list(&ast.commands, false);
+        {
+            let mut walker = Walker { view: &mut view };
+            walker.walk_list(&ast.commands, false);
+        }
+        if let (Some(first), Some(last)) = (
+            view.command_lines.iter().next(),
+            view.command_lines.iter().next_back(),
+        ) {
+            view.spans.push((*first, *last));
+        }
         view
     }
 
     /// Fold another unit's view of the same file into this one:
-    /// line sets union, function sites append when new.
+    /// line sets union, function sites append when new, spans
+    /// accumulate, completeness is sticky.
     pub(crate) fn merge(&mut self, other: SyntaxView) {
         debug_assert_eq!(self.file, other.file);
         self.command_lines.extend(other.command_lines);
@@ -124,6 +146,21 @@ impl SyntaxView {
                 self.functions.push(site);
             }
         }
+        self.spans.extend(other.spans);
+        self.complete = self.complete || other.complete;
+    }
+
+    /// Does this view's knowledge cover `line` — does it fall
+    /// inside some parsed unit's span?
+    pub(crate) fn covers_line(&self, line: u32) -> bool {
+        self.spans
+            .iter()
+            .any(|(first, last)| *first <= line && line <= *last)
+    }
+
+    /// Record that the file's reader reached its end.
+    pub(crate) fn mark_complete(&mut self) {
+        self.complete = true;
     }
 
     /// The dead-line judgment for one line of this file.
@@ -472,5 +509,32 @@ mod tests {
         assert!(first.function_site("f").is_some());
         assert_eq!(first.classify_line(1), LineClass::Stoppable);
         assert_eq!(first.classify_line(2), LineClass::Stoppable);
+    }
+
+    #[test]
+    fn coverage_spans_track_parsed_units_and_completion_is_sticky() {
+        let mut view = view_of("echo one\n# mid\necho three\n");
+        assert!(view.covers_line(1));
+        assert!(
+            view.covers_line(2),
+            "a line between two commands of one unit is covered"
+        );
+        assert!(view.covers_line(3));
+        assert!(
+            !view.covers_line(9),
+            "a line past every parsed unit is not covered"
+        );
+        assert!(!view.complete);
+        let other = view_of("echo late\n");
+        view.merge(other);
+        assert!(!view.complete, "merging units does not complete a file");
+        view.mark_complete();
+        assert!(view.complete);
+        let mut fresh = SyntaxView {
+            file: "fixture.sh".to_string(),
+            ..SyntaxView::default()
+        };
+        fresh.merge(view);
+        assert!(fresh.complete, "completeness survives a merge");
     }
 }

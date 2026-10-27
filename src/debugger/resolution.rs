@@ -19,6 +19,14 @@
 //!   definition shows up, in a parsed unit's syntax view or at the
 //!   function's entry seam.
 //!
+//! Files parse incrementally, so a line verdict is only as strong
+//! as the view behind it: "no command on this line" is pronounced
+//! only for a line inside a parsed unit's span, or once the
+//! file's reader has reached its end
+//! ([`DebugSession::note_syntax_file_complete`]). A line beyond
+//! every parsed unit is pending, not dead — its unit may not have
+//! been read yet.
+//!
 //! Timing rules, chosen so a frontend always learns the truth
 //! exactly once:
 //!
@@ -96,13 +104,48 @@ impl DebugSession {
                 self.syntax_views.insert(file.clone(), view);
             }
         }
+        self.readjudicate_lines_for_file(&file);
+        let function_ids: Vec<BreakpointId> = self
+            .breakpoints()
+            .iter()
+            .filter(|entry| matches!(entry.target, BreakpointTarget::Function { .. }))
+            .map(|entry| entry.id)
+            .collect();
+        for id in function_ids {
+            self.readjudicate_function(id);
+        }
+    }
+
+    /// Note that a file's reader reached its end (called by the
+    /// group drivers when their read loop finishes normally): from
+    /// here on, a line no parsed unit covered is soundly "no
+    /// command on this line" rather than pending. Line entries for
+    /// the file re-adjudicate, with DE-11 on any change.
+    pub fn note_syntax_file_complete(&mut self, file: &str) {
+        let view = self
+            .syntax_views
+            .entry(file.to_string())
+            .or_insert_with(|| SyntaxView {
+                file: file.to_string(),
+                ..SyntaxView::default()
+            });
+        if view.complete {
+            return;
+        }
+        view.mark_complete();
+        self.readjudicate_lines_for_file(file);
+    }
+
+    /// Recompute the verdict of every line entry bound to `file`
+    /// and apply the results (DE-11 on change).
+    fn readjudicate_lines_for_file(&mut self, file: &str) {
         let line_ids: Vec<BreakpointId> = self
             .breakpoints()
             .iter()
             .filter(|entry| {
                 matches!(
                     &entry.target,
-                    BreakpointTarget::Line { file: f, .. } if f == &file
+                    BreakpointTarget::Line { file: f, .. } if f == file
                 )
             })
             .map(|entry| entry.id)
@@ -114,15 +157,6 @@ impl DebugSession {
                     self.apply_resolution(id, verdict);
                 }
             }
-        }
-        let function_ids: Vec<BreakpointId> = self
-            .breakpoints()
-            .iter()
-            .filter(|entry| matches!(entry.target, BreakpointTarget::Function { .. }))
-            .map(|entry| entry.id)
-            .collect();
-        for id in function_ids {
-            self.readjudicate_function(id);
         }
     }
 
@@ -171,9 +205,19 @@ impl DebugSession {
             LineClass::CommandOnly => BreakpointResolution::Unverified {
                 reason: REASON_NEVER_FIRES.to_string(),
             },
-            LineClass::NoCommand => BreakpointResolution::Unverified {
-                reason: REASON_NO_COMMAND.to_string(),
-            },
+            LineClass::NoCommand => {
+                // Sound only where the view's knowledge reaches:
+                // inside a parsed unit's span, or anywhere once
+                // the file has been read to its end. Beyond that
+                // the line's unit may simply not be parsed yet.
+                if view.complete || view.covers_line(line) {
+                    BreakpointResolution::Unverified {
+                        reason: REASON_NO_COMMAND.to_string(),
+                    }
+                } else {
+                    BreakpointResolution::Pending
+                }
+            }
         }
     }
 
@@ -274,6 +318,9 @@ mod tests {
             "a.sh",
             "# comment\nif\n  test -f x\nthen\n  echo yes\nfi\n",
         ));
+        // The comment on line 1 precedes the unit's first command
+        // line, so only the completed read convicts it.
+        session.note_syntax_file_complete("a.sh");
         let comment = session.set_line_breakpoint("a.sh", 1);
         assert_eq!(
             resolution(&session, comment),
@@ -368,6 +415,46 @@ mod tests {
         assert!(
             session.drain_events().is_empty(),
             "a repeated note changes nothing and reports nothing"
+        );
+    }
+
+    #[test]
+    fn a_line_in_an_unparsed_unit_stays_pending_until_its_unit_registers() {
+        let mut session = DebugSession::new();
+        session.register_syntax_view(view_of("a.sh", "echo first\n"));
+        let id = session.set_line_breakpoint("a.sh", 5);
+        assert_eq!(
+            resolution(&session, id),
+            BreakpointResolution::Pending,
+            "line 5 is beyond the only parsed unit: not dead, just unread"
+        );
+        session.drain_events();
+        session.register_syntax_view(view_of("a.sh", "\n\n\n\necho fifth\n"));
+        assert_eq!(resolution(&session, id), BreakpointResolution::Verified);
+        assert_eq!(session.drain_events().len(), 1, "one DE-11 for the flip");
+    }
+
+    #[test]
+    fn a_line_past_the_end_is_pending_until_the_read_completes() {
+        let mut session = DebugSession::new();
+        session.register_syntax_view(view_of("a.sh", "echo only\n"));
+        let id = session.set_line_breakpoint("a.sh", 40);
+        assert_eq!(resolution(&session, id), BreakpointResolution::Pending);
+        session.drain_events();
+        session.note_syntax_file_complete("a.sh");
+        assert_eq!(
+            resolution(&session, id),
+            BreakpointResolution::Unverified {
+                reason: REASON_NO_COMMAND.to_string()
+            },
+            "the read is complete: line 40 has no command because the file has no line 40"
+        );
+        let events = session.drain_events();
+        assert_eq!(events.len(), 1, "the completion flip emits DE-11");
+        session.note_syntax_file_complete("a.sh");
+        assert!(
+            session.drain_events().is_empty(),
+            "completion is idempotent"
         );
     }
 
