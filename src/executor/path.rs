@@ -1342,9 +1342,10 @@ pub fn external_command_for_named_program(
         // from the typed word; the resolved Windows PathBuf would leak a
         // backslash path as $0 instead.
         let zero_word = script_zero_word(program, command_name);
-        if let Some((command, used_shell)) =
+        if let Some((mut command, used_shell)) =
             shell_wrapped_command(program, &zero_word, &native_args, env_vars)
         {
+            arm_child_signal_reset(&mut command);
             return (command, used_shell);
         }
     }
@@ -1402,7 +1403,34 @@ pub fn external_command_for_named_program(
             command.arg(name);
         }
     }
+    arm_child_signal_reset(&mut command);
     (command, false)
+}
+
+/// rubash#1580: every external child is born with GNU's signal
+/// environment — execute_cmd.c:4224 runs trap.c:1489
+/// restore_original_signals between fork and exec, which returns each
+/// signal's disposition to its shell-entry value AND leaves the signal
+/// mask unblocked. The spawn sites that remembered to install
+/// `child_pre_exec_reset` themselves (external_inner's spawn, the exec
+/// builtin) got both halves; the pipeline spawners, which build their
+/// members through this funnel, never installed it, so their children
+/// inherited the SIGPIPE block the executor holds around pipeline
+/// execution (rubash#1333's guard) — members then survived writes to a
+/// closed pipe, exited 1 on EPIPE with their diagnostics leaked, and
+/// PIPESTATUS recorded 1 where GNU's kernel-killed member reports 141.
+/// Installing the reset here, at the single birth funnel, gives every
+/// funnel-born child the same environment; sites that also install it
+/// run the same idempotent reset twice (unblock + disposition store
+/// from the same entry statics), which is a no-op the second time.
+fn arm_child_signal_reset(command: &mut Command) {
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(crate::builtins::kill::child_pre_exec_reset);
+    }
+    #[cfg(not(unix))]
+    let _ = command;
 }
 
 /// niubash#379, grandchild level: a console-less rubash (agent/CI/git-hook
