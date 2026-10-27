@@ -128,10 +128,11 @@ impl Executor {
                 } else if redirect_target_fd(&target) == Some(1) {
                     super::write_stdout_bytes(&stdout)?;
                 } else {
-                    let mut file = open_redirect_append(&shell_path_to_windows(
-                        &target,
-                        &self.shell_state.env_vars,
-                    ))?;
+                    let mut file =
+                        open_redirect_append(&self.session_path(shell_path_to_windows(
+                            &target,
+                            &self.shell_state.env_vars,
+                        )))?;
                     file.write_all(&stdout)?;
                 }
             }
@@ -177,10 +178,11 @@ impl Executor {
                         super::write_stdout_bytes(&stderr)?;
                     }
                 } else {
-                    let mut file = open_redirect_append(&shell_path_to_windows(
-                        &target,
-                        &self.shell_state.env_vars,
-                    ))?;
+                    let mut file =
+                        open_redirect_append(&self.session_path(shell_path_to_windows(
+                            &target,
+                            &self.shell_state.env_vars,
+                        )))?;
                     file.write_all(&stderr)?;
                 }
             }
@@ -257,6 +259,7 @@ impl Executor {
             builtin,
             cmd.words[1..].iter().map(String::as_str),
             &mut self.shell_state.env_vars,
+            &mut self.shell_state.cwd,
             &diagnostic_prefix,
             &mut stdout,
             &mut stderr,

@@ -36,12 +36,15 @@ where
     E: Write,
 {
     let env_vars = env::vars().collect::<HashMap<_, _>>();
-    execute_with_env_and_io(args, &env_vars, stdout, stderr)
+    // Standalone entry (no session): the process cwd is the only cwd.
+    let cwd = env::current_dir().unwrap_or_default();
+    execute_with_env_and_io(args, &env_vars, &cwd, stdout, stderr)
 }
 
 pub(crate) fn execute_with_env_and_io<'a, I, W, E>(
     args: I,
     env_vars: &HashMap<String, String>,
+    cwd: &Path,
     stdout: &mut W,
     stderr: &mut E,
 ) -> io::Result<i32>
@@ -92,7 +95,7 @@ where
         }
     }
 
-    let Some(directory) = current_directory(mode, env_vars)? else {
+    let Some(directory) = current_directory(mode, env_vars, cwd)? else {
         return Ok(EXECUTION_FAILURE);
     };
 
@@ -100,13 +103,19 @@ where
     Ok(EXECUTION_SUCCESS)
 }
 
-fn current_directory(mode: Mode, env_vars: &HashMap<String, String>) -> io::Result<Option<String>> {
+fn current_directory(
+    mode: Mode,
+    env_vars: &HashMap<String, String>,
+    cwd: &Path,
+) -> io::Result<Option<String>> {
     if mode == Mode::Physical {
         if let Some(physical) = env_vars.get("__RUBASH_PHYSICAL_PWD") {
             return Ok(Some(physical.clone()));
         }
     }
-    let physical = env::current_dir()?;
+    // G-02: the physical truth is the session cwd field, not the
+    // process cwd.
+    let physical = cwd.to_path_buf();
 
     if mode == Mode::Logical {
         if let Some(logical) = logical_pwd_if_current(&physical, env_vars) {

@@ -54,14 +54,19 @@ fn fd_is_anonymous_pipe(fd: std::os::unix::io::RawFd) -> bool {
     if unsafe { libc::fstat(fd, &mut stat) } != 0 {
         return false;
     }
-    (stat.st_mode & libc::S_IFMT) == libc::S_IFIFO
+    // Widened through u32 like the sibling checks in src/fd/unix.rs:
+    // bionic (Android) types the S_IF* constants as u16 while st_mode
+    // is u32, so the raw comparison does not compile there.
+    (u32::from(stat.st_mode) & u32::from(libc::S_IFMT)) == u32::from(libc::S_IFIFO)
 }
 
 impl Executor {
     /// The simple-command execution lookup. Under a `command -p`
     /// re-dispatch (standard_path_scope set) the lookup walks the
     /// standard path — by substituting PATH in a throwaway copy of the
-    /// env map, never in the shell's own variables (rubash#1047).
+    /// env map, never in the shell's own variables (rubash#1047) —
+    /// and skips the hash table entirely (rubash#1648; GNU
+    /// findcmd.c:364: CMDSRCH_STDPATH never consults hashed_filenames).
     pub(in crate::executor) fn find_scoped_user_command(
         &self,
         name: &str,
@@ -70,7 +75,7 @@ impl Executor {
             Some(standard) => {
                 let mut env_vars = self.shell_state.env_vars.clone();
                 env_vars.insert("PATH".to_string(), standard.clone());
-                find_user_command(name, &env_vars)
+                find_user_command_without_hash(name, &env_vars)
             }
             None => find_user_command(name, &self.shell_state.env_vars),
         }
@@ -163,6 +168,9 @@ impl Executor {
             use std::os::unix::process::CommandExt;
             process.arg0(&config.command[0]);
         }
+        // G-02: children are born in the session cwd; the `env -C`
+        // override below replaces it for its own child.
+        process.current_dir(&self.shell_state.cwd);
         apply_env_command_environment(&mut process, &env_vars, !config.ignore_environment);
         if let Some(chdir) = &config.chdir {
             let directory = shell_path_to_windows(chdir, &env_vars);
@@ -637,11 +645,21 @@ impl Executor {
             let display = super::execution_misc::shell_display_path(
                 &program.to_string_lossy().replace('\\', "/"),
             );
-            crate::builtins::hash::record_command_resolution(
-                &mut self.shell_state.env_vars,
-                &cmd.words[0],
-                &display,
-            );
+            if self.standard_path_scope.is_some() {
+                // rubash#1648: a `command -p` resolution inserts
+                // unconditionally (see record_standard_path_resolution).
+                crate::builtins::hash::record_standard_path_resolution(
+                    &mut self.shell_state.env_vars,
+                    &cmd.words[0],
+                    &display,
+                );
+            } else {
+                crate::builtins::hash::record_command_resolution(
+                    &mut self.shell_state.env_vars,
+                    &cmd.words[0],
+                    &display,
+                );
+            }
         }
 
         // GNU execute_cmd.c:6139-6233 (shell_execve): the OS-level exec is
@@ -695,13 +713,17 @@ impl Executor {
             &self.shell_state.env_vars,
             self.bash_argv0_env_supplied(&cmd.assignments),
         );
+        // G-02: children are born in the session cwd, not the process cwd.
+        process.current_dir(&self.shell_state.cwd);
         self.apply_external_environment(cmd, &mut process);
         self.apply_external_redirects(cmd, &mut process)?;
         self.spawn_external_process(cmd, &program, process, used_shell, dev_ops)
     }
 
     fn handle_host_external_command(&mut self, cmd: &CommandNode) -> Result<bool, ExecuteError> {
-        let Some(output) = self.invoke_host_external_command(cmd) else {
+        // Top-level dispatch: the dispatch seam applied this command's
+        // prefix assignments to the table before reaching here.
+        let Some(output) = self.invoke_host_external_command(cmd, true) else {
             return Ok(false);
         };
         self.write_buffered_builtin_output(cmd, &output.stdout, &output.stderr)?;
@@ -709,19 +731,24 @@ impl Executor {
         Ok(true)
     }
 
+    /// Build the env map for the embedded-host channel. `assignments_applied`
+    /// records whether the command's prefix assignments were already applied
+    /// to the shell variable table: true on the top-level dispatch path
+    /// (the dispatch seam runs apply_temporary_assignments first), false on
+    /// the pipeline-stage path (a stage's assignments live only on the
+    /// cloned command node, never on the table — the same split the stage
+    /// spawner faces). The handler contract itself
+    /// (`FnMut(&[String], &HashMap<String, String>)`) is untouched; only
+    /// the values composed into the map change (rubash#1766).
     pub(in crate::executor) fn invoke_host_external_command(
         &mut self,
         cmd: &CommandNode,
+        assignments_applied: bool,
     ) -> Option<HostExternalCommandOutput> {
         let mut env_vars = self.shell_state.env_vars.clone();
         let raws_aligned = cmd.assignment_raws.len() == cmd.assignments.len();
         for (index, (var_name, var_value)) in cmd.assignments.iter().enumerate() {
-            let (base_name, _) = assignment_name_and_append(var_name);
-            let raw = raws_aligned
-                .then(|| cmd.assignment_raws.get(index))
-                .flatten()
-                .map(String::as_str);
-            let expanded_value = self.expand_assignment_value_with_raw(var_name, var_value, raw);
+            let (base_name, append) = assignment_name_and_append(var_name);
             // GNU variables.c:3564-3578 assign_in_env -> bind_variable: a
             // prefix assignment to a nameref binds the referenced variable,
             // so the child env carries the TARGET name and the nameref's
@@ -729,6 +756,39 @@ impl Executor {
             // `ref=$ref$str printenv ref` still prints "var").
             let Some(env_name) = self.tempenv_export_name(base_name) else {
                 continue;
+            };
+            if append && assignments_applied {
+                // Top-level path: the dispatch seam already composed the
+                // append into the table, so the env clone above inherits
+                // the composed value. Re-applying the raw RHS here would
+                // overwrite it (a+=5 must see 145, not 5) — the skip the
+                // direct path (apply_external_environment) performs, and
+                // the rubash#1620 root-cause-2 shape on this channel.
+                continue;
+            }
+            let raw = raws_aligned
+                .then(|| cmd.assignment_raws.get(index))
+                .flatten()
+                .map(String::as_str);
+            let expanded_value = self.expand_assignment_value_with_raw(var_name, var_value, raw);
+            // GNU variables.c assign_in_env binds a compound `name=(...)`
+            // tempenv word as the literal list text; the internal
+            // COMPOUND_ASSIGNMENT_MARKER must not leak into the host env
+            // map (mirror of apply_external_environment, niubash#121).
+            let expanded_value = expanded_value
+                .strip_prefix(crate::executor::types::COMPOUND_ASSIGNMENT_MARKER)
+                .unwrap_or(&expanded_value);
+            let expanded_value = if append {
+                // Pipeline-stage path: the stage's assignments were never
+                // applied to the table, so the clone still holds the window
+                // value; compose it the way the stage spawner does —
+                // tempenv_scalar_view of the export target (scalar itself,
+                // indexed element 0, assoc empty) plus the stripped RHS —
+                // which reproduces the GNU oracle values (1(9), 10(30),
+                // ([j]=w)) instead of the raw RHS.
+                format!("{}{}", self.tempenv_scalar_view(&env_name), expanded_value)
+            } else {
+                expanded_value.to_string()
             };
             if is_valid_process_env(&env_name, &expanded_value) {
                 env_vars.insert(env_name, expanded_value);
@@ -935,6 +995,9 @@ impl Executor {
                 if let Some(status) =
                     crate::fd::wait_child_slice(child, SLICE).map_err(ExecuteError::IoError)?
                 {
+                    // rubash#1776: sample the reaped child's CPU for the
+                    // Windows CHILDREN half while its handle is live.
+                    super::read_helpers::note_reaped_child_cpu(child);
                     return Ok(status);
                 }
                 if let Err(error) = self.observe_signals_while_blocked() {
@@ -943,6 +1006,7 @@ impl Executor {
                     // it does not linger when the console event did not kill it.
                     let _ = child.kill();
                     let _ = child.wait();
+                    super::read_helpers::note_reaped_child_cpu(child);
                     return Err(error);
                 }
             }
@@ -957,9 +1021,28 @@ impl Executor {
             // kills an interactive shell inside waitpid on Ctrl-C
             // (rubash#1250; GNU survives with rc=130). Non-interactive
             // shells keep SIG_DFL and die like GNU scripts do.
-            let _sigint_guard = ForegroundWaitSigintGuard::hold_if_interactive_untrapped(self);
+            let sigint_guard = ForegroundWaitSigintGuard::hold_if_interactive_untrapped(self);
             self.note_foreground_wait();
-            child.wait().map_err(ExecuteError::IoError)
+            let status = child.wait().map_err(ExecuteError::IoError)?;
+            // rubash#1639: the foreground job died by SIGINT in an
+            // interactive reader session with SIGINT untrapped — GNU
+            // jobs.c's waitchld tail (the job_control/IS_FOREGROUND/
+            // WTERMSIG==SIGINT block) does ADDINTERRUPT there, and
+            // the executing list throws to the top-level reader,
+            // discarding the rest of the line instead of continuing
+            // it with the 130 status. No shell-side receipt is
+            // required under job control: the job's own SIGINT death
+            // is the verdict. (Without job control the shell shares
+            // the child's process group, the same ^C is what the
+            // guard recorded, and the verdict is identical.) Mark the
+            // event; the list boundary converts it (the callers still
+            // record the 130 status from this ExitStatus first).
+            if sigint_guard.is_armed()
+                && crate::executor::wait_status::exit_status_signal(&status) == Some(libc::SIGINT)
+            {
+                self.fg_sigint_unwind = true;
+            }
+            Ok(status)
         }
     }
 
@@ -1281,19 +1364,20 @@ impl Executor {
                 // local one and must win the slot.
                 continue;
             }
-            let opened = if write {
-                if redirect.append {
-                    open_redirect_append(&shell_path_to_windows(
-                        &target,
-                        &self.shell_state.env_vars,
-                    ))
+            let opened =
+                if write {
+                    if redirect.append {
+                        open_redirect_append(&self.session_path(shell_path_to_windows(
+                            &target,
+                            &self.shell_state.env_vars,
+                        )))
+                    } else {
+                        self.create_redirect_output(&target, redirect.clobber)
+                            .map_err(|error| crate::posix_errors::path_error(&target, error))
+                    }
                 } else {
-                    self.create_redirect_output(&target, redirect.clobber)
-                        .map_err(|error| crate::posix_errors::path_error(&target, error))
-                }
-            } else {
-                self.open_input_redirect(&target)
-            };
+                    self.open_input_redirect(&target)
+                };
             let Ok(file) = opened else {
                 continue;
             };
@@ -1620,6 +1704,8 @@ impl Executor {
                         let mut shell_process = Command::new(shell);
                         shell_process.arg(program);
                         shell_process.args(&cmd.words[1..]);
+                        // G-02: children are born in the session cwd.
+                        shell_process.current_dir(&self.shell_state.cwd);
                         self.apply_external_environment(cmd, &mut shell_process);
                         self.apply_external_redirects(cmd, &mut shell_process)?;
                         return self.spawn_external_process(
@@ -1772,14 +1858,22 @@ impl Executor {
 }
 
 #[cfg(unix)]
-/// Holds SIGINT at SIG_IGN across one foreground blocking wait when the
-/// shell is interactive and SIGINT has no trap installed (kernel
-/// disposition is SIG_DFL). GNU jobs.c:3086-3102 wait_for swaps in
-/// wait_sigint_handler for the wait so an interactive shell never dies
-/// mid-wait; rubash#1250 is that missing swap (Ctrl-C killed niu -i
-/// inside waitpid). Restores SIG_DFL on drop; no child is spawned while
-/// the guard lives, so nothing inherits the ignore. Trapped SIGINT keeps
-/// its handler (disposition != DFL) so trap recording is untouched, and
+/// Holds untrapped SIGINT at the recording handler across one
+/// foreground blocking wait when the shell is an interactive reader
+/// session (kernel disposition is SIG_DFL). GNU jobs.c:3086-3102
+/// wait_for swaps in wait_sigint_handler for the wait: the handler
+/// only RECORDS the delivery (trap.c trap_handler ->
+/// set_trap_state), so an interactive shell never dies mid-wait —
+/// including when it shares the child's process group (no job
+/// control) and its own copy of ^C arrives during waitpid
+/// (rubash#1250). This used to install SIG_IGN:
+/// the shell survived, but its own copy of the delivery vanished
+/// unrecorded, leaving the line-discard verdict nothing to consult.
+/// The hold is the same one the builtin-sleep guard uses
+/// (kill::hold_fg_sigint): arrivals queue in the kernel backend while
+/// FG_INT_HOLD keeps reconcile from flipping SIGINT back to Default
+/// mid-wait; Drop releases the hold. Trapped SIGINT keeps its handler
+/// (disposition != DFL) so trap recording is untouched, and
 /// entry-ignored SIGINT stays ignored.
 struct ForegroundWaitSigintGuard {
     armed: bool,
@@ -1791,31 +1885,29 @@ impl ForegroundWaitSigintGuard {
         if !foreground_sigint_needs_protection(executor) {
             return Self { armed: false };
         }
-        unsafe {
-            let mut ignore: libc::sigaction = std::mem::zeroed();
-            ignore.sa_sigaction = libc::SIG_IGN;
-            ignore.sa_flags = 0;
-            ignore.sa_mask = std::mem::zeroed();
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            {
-                ignore.sa_restorer = None;
-            }
-            if libc::sigaction(libc::SIGINT, &ignore, std::ptr::null_mut()) == 0 {
-                return Self { armed: true };
-            }
-        }
-        Self { armed: false }
+        crate::builtins::kill::hold_fg_sigint();
+        Self { armed: true }
+    }
+
+    pub(in crate::executor) fn is_armed(&self) -> bool {
+        self.armed
     }
 }
 
-/// Shared predicate for both foreground SIGINT guards (rubash#1250): the
-/// shell is interactive (same definition as the interactive-discard rule,
-/// so the two can never drift) and SIGINT sits at SIG_DFL — i.e. no trap
-/// installed (a handler means the trap path owns the delivery) and not
-/// entry-ignored.
+/// Shared predicate for both foreground SIGINT guards (rubash#1250):
+/// an interactive reader session and SIGINT sits at SIG_DFL — i.e. no
+/// trap installed (a handler means the trap path owns the delivery)
+/// and not entry-ignored. rubash#1639: the session test is
+/// interactive_reader_session, not the full expansion-discard rule —
+/// the discard rule's frame conditions (depth 0, no comsub body)
+/// govern where an expansion error is FATAL, while a foreground wait
+/// needs protection at any depth: in the flat model the subshell
+/// frame's wait is the process's foreground wait, and GNU protects
+/// the corresponding wait_for (the parent's, for the subshell job)
+/// identically.
 #[cfg(unix)]
 pub(in crate::executor) fn foreground_sigint_needs_protection(executor: &Executor) -> bool {
-    executor.expansion_error_is_interactive_discard() && sigint_disposition_is_default()
+    executor.interactive_reader_session() && sigint_disposition_is_default()
 }
 
 #[cfg(unix)]
@@ -1837,17 +1929,7 @@ impl Drop for ForegroundWaitSigintGuard {
         if !self.armed {
             return;
         }
-        unsafe {
-            let mut dfl: libc::sigaction = std::mem::zeroed();
-            dfl.sa_sigaction = libc::SIG_DFL;
-            dfl.sa_flags = 0;
-            dfl.sa_mask = std::mem::zeroed();
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            {
-                dfl.sa_restorer = None;
-            }
-            libc::sigaction(libc::SIGINT, &dfl, std::ptr::null_mut());
-        }
+        crate::builtins::kill::release_fg_sigint();
     }
 }
 
@@ -1904,7 +1986,20 @@ impl ForegroundBuiltinSigintGuard {
         let mut rest = Vec::new();
         let mut interrupted = false;
         for signal in pending {
-            if signal == libc::SIGINT && crate::builtins::kill::kernel_handler_installed(signal) {
+            // rubash#1640: only a KERNEL-caused SIGINT (the terminal
+            // driver's group delivery, ^C) kills the virtual child —
+            // that is the delivery GNU's real foreground child dies
+            // from. A kill(2) addressed to the shell alone leaves the
+            // real child running, so it is not an abort: put it back
+            // for observe_signals_while_blocked, which consumes it
+            // without ending the wait (the recorded interrupt is
+            // forgotten when the child completes normally, exactly
+            // like the trapped path's origin check in
+            // sleep_interruptibly).
+            if signal == libc::SIGINT
+                && crate::builtins::kill::kernel_handler_installed(signal)
+                && crate::builtins::kill::last_delivery_kernel_caused(signal)
+            {
                 interrupted = true;
             } else {
                 rest.push(signal);

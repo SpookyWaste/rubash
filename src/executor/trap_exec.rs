@@ -610,7 +610,10 @@ impl Executor {
     /// expands there: the definition was read in the eval string's stream,
     /// earlier than the caller's token). The generation drops when the
     /// string's execution returns, on every path.
-    fn execute_eval_source(
+    // pub(in crate::executor): the mapfile -C callback path
+    // (mapfile_helpers.rs) runs its command string through this same
+    // parse_and_execute unit (rubash#1586).
+    pub(in crate::executor) fn execute_eval_source(
         &mut self,
         source: &str,
         caller_line: usize,
@@ -1292,13 +1295,31 @@ impl Executor {
         #[cfg(unix)]
         crate::builtins::kill::reconcile_kernel_trap_dispositions(&self.shell_state.env_vars);
 
+        // rubash#1654: deliveries a flat subshell addressed to the
+        // shell's own pid were queued for THIS layer's adjudication
+        // (kill.rs ANCESTOR_SIGNALS). They go first — in GNU the
+        // addressed (parent) process acts on them while the subshell
+        // is still its foreground job, ahead of anything that arrived
+        // later — and the stale-handler check does not apply: they
+        // were never routed through this layer's kernel dispositions,
+        // so the CURRENT (restored top-level) trap table below is
+        // their only judge (trapped -> run, ignored -> drop,
+        // untrapped -> the 128+sig death).
         let signals = crate::builtins::kill::take_pending_signals(std::process::id())?;
-        for signal in signals {
+        let mut queue: Vec<(i32, bool)> = Vec::with_capacity(signals.len() + 4);
+        #[cfg(unix)]
+        queue.extend(
+            crate::builtins::kill::take_ancestor_signals()
+                .into_iter()
+                .map(|signal| (signal, false)),
+        );
+        queue.extend(signals.into_iter().map(|signal| (signal, true)));
+        for (signal, stale_check) in queue {
             // Stale registry flag from a disposition flip (trap cleared while
             // a delivery raced): a signal the kernel no longer routes here
             // cannot be a legitimate pending trap.
             #[cfg(unix)]
-            if !crate::builtins::kill::kernel_handler_installed(signal) {
+            if stale_check && !crate::builtins::kill::kernel_handler_installed(signal) {
                 continue;
             }
             let Some(signal_name) = signal_trap_name(signal) else {
@@ -1327,6 +1348,22 @@ impl Executor {
                     continue;
                 }
                 self.exit_code = 128 + signal;
+                // rubash#1662: in an interactive shell this abort is a
+                // DISCARD-class unwind (GNU: the interrupted command
+                // ends with 128+sig and the reader prompts again), not
+                // an exit — mark it so run_source_impl does not record
+                // an exit jump for the unit. Non-interactive shells keep
+                // the exit classification (the delivery is how a script
+                // shell dies at 128+sig, running any EXIT trap).
+                if self
+                    .shell_state
+                    .env_vars
+                    .get("__RUBASH_INTERACTIVE")
+                    .map(String::as_str)
+                    == Some("1")
+                {
+                    self.signal_discard_pending = true;
+                }
                 return Err(ExecuteError::ExitCode(128 + signal));
             };
             if action.is_empty() {
@@ -1601,11 +1638,17 @@ impl Executor {
             }
             // The µs race (delivery lands between the take above and
             // observe's own take) surfaces as the untrapped error; fold it
-            // into the same abort instead of an exit jump.
+            // into the same abort instead of an exit jump — but only for
+            // a kernel-caused delivery (rubash#1640): a shell-only
+            // kill(2) SIGINT leaves GNU's real child running, and the
+            // interrupt observe just consumed is forgotten, so the
+            // virtual child sleeps on to completion (rc=0).
             #[cfg(unix)]
             match self.observe_signals_while_blocked() {
                 Err(ExecuteError::ExitCode(code)) if code == 128 + libc::SIGINT => {
-                    return Ok(Some(libc::SIGINT));
+                    if crate::builtins::kill::last_delivery_kernel_caused(libc::SIGINT) {
+                        return Ok(Some(libc::SIGINT));
+                    }
                 }
                 other => other?,
             }
@@ -1970,10 +2013,9 @@ impl Executor {
         if path.is_absolute() {
             return target.to_string();
         }
-        match env::current_dir() {
-            Ok(cwd) => shell_display_path(&cwd.join(&path).to_string_lossy()),
-            Err(_) => target.to_string(),
-        }
+        // G-02: relative redirect targets display-resolve against the
+        // session cwd, not the process cwd.
+        shell_display_path(&self.shell_state.cwd.join(&path).to_string_lossy())
     }
 
     fn apply_command_output_redirects_inner(
@@ -2232,6 +2274,7 @@ impl Executor {
             let status = crate::builtins::exec::execute_with_io(
                 &cmd.words[1..],
                 &self.shell_state.env_vars,
+                &self.shell_state.cwd,
                 &mut stdout,
                 &mut stderr,
                 // No spawn happens on this path (a bare `exec` with
@@ -2423,6 +2466,7 @@ impl Executor {
         let status = crate::builtins::exec::replace_process_image(
             &cmd.words[1..],
             &self.shell_state.env_vars,
+            &self.shell_state.cwd,
             Some((stdin, stdout, stderr)),
         )?;
         Some(match status {
@@ -2461,6 +2505,7 @@ impl Executor {
                 let status = crate::builtins::exec::execute_with_child_stdio(
                     &exec_args,
                     &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
                     &mut file,
                     &mut child_diag,
                     child_stdout,
@@ -2493,6 +2538,7 @@ impl Executor {
             let status = crate::builtins::exec::execute_with_child_stdio(
                 &exec_args,
                 &self.shell_state.env_vars,
+                &self.shell_state.cwd,
                 &mut file,
                 &mut std::io::stderr().lock(),
                 child_stdout,
@@ -2505,8 +2551,9 @@ impl Executor {
 
         if let Some(redirect) = &cmd.append {
             let target = self.expand_redirect_target(redirect);
-            let mut file =
-                open_redirect_append(&shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+            let mut file = open_redirect_append(
+                &self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars)),
+            )?;
             let child_stdout = Stdio::from(file.try_clone()?);
             // rubash#1175: `exec cmd >>file` — same replacement attempt
             // as the `>file` arm above.
@@ -2529,6 +2576,7 @@ impl Executor {
             let status = crate::builtins::exec::execute_with_child_stdio(
                 &exec_args,
                 &self.shell_state.env_vars,
+                &self.shell_state.cwd,
                 &mut file,
                 &mut std::io::stderr().lock(),
                 child_stdout,
@@ -2562,6 +2610,7 @@ impl Executor {
                     "-" => crate::builtins::exec::execute_with_child_stdio(
                         &exec_args,
                         &self.shell_state.env_vars,
+                        &self.shell_state.cwd,
                         &mut crate::executor::GlobalStdout,
                         &mut std::io::sink(),
                         Stdio::inherit(),
@@ -2571,6 +2620,7 @@ impl Executor {
                     "1" => crate::builtins::exec::execute_with_io(
                         &exec_args,
                         &self.shell_state.env_vars,
+                        &self.shell_state.cwd,
                         &mut crate::executor::GlobalStdout,
                         &mut crate::executor::GlobalStdout,
                         self.exec_inherited_stdin()?,
@@ -2578,6 +2628,7 @@ impl Executor {
                     _ => crate::builtins::exec::execute_with_child_stdio(
                         &exec_args,
                         &self.shell_state.env_vars,
+                        &self.shell_state.cwd,
                         &mut crate::executor::GlobalStdout,
                         &mut std::io::stderr().lock(),
                         self.exec_inherited_stdio(1)?,
@@ -2626,6 +2677,7 @@ impl Executor {
                 crate::builtins::exec::execute_with_io(
                     &exec_args,
                     &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
                     &mut crate::executor::GlobalStdout,
                     &mut file,
                     self.exec_inherited_stdin()?,
@@ -2634,6 +2686,7 @@ impl Executor {
                 crate::builtins::exec::execute_with_child_stdio(
                     &exec_args,
                     &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
                     &mut crate::executor::GlobalStdout,
                     &mut file,
                     Stdio::inherit(),
@@ -2647,8 +2700,9 @@ impl Executor {
 
         if let Some(redirect) = &cmd.redirect_err_append {
             let target = self.expand_redirect_target(redirect);
-            let mut file =
-                open_redirect_append(&shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+            let mut file = open_redirect_append(
+                &self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars)),
+            )?;
             let child_stderr = Stdio::from(file.try_clone()?);
             // rubash#1175: `exec cmd 2>>file` — same replacement attempt
             // as the `2>file` arm above.
@@ -2675,6 +2729,7 @@ impl Executor {
                 crate::builtins::exec::execute_with_io(
                     &exec_args,
                     &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
                     &mut crate::executor::GlobalStdout,
                     &mut file,
                     self.exec_inherited_stdin()?,
@@ -2683,6 +2738,7 @@ impl Executor {
                 crate::builtins::exec::execute_with_child_stdio(
                     &exec_args,
                     &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
                     &mut crate::executor::GlobalStdout,
                     &mut file,
                     Stdio::inherit(),
@@ -2721,6 +2777,7 @@ impl Executor {
                 if let Some(status) = crate::builtins::exec::replace_process_image(
                     &cmd.words[1..],
                     &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
                     Some(stdio),
                 ) {
                     return Ok(status?);
@@ -2754,6 +2811,7 @@ impl Executor {
                 crate::builtins::exec::execute_with_io(
                     &exec_args,
                     &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
                     &mut crate::executor::GlobalStdout,
                     &mut crate::executor::GlobalStdout,
                     self.exec_inherited_stdin()?,
@@ -2762,6 +2820,7 @@ impl Executor {
                 crate::builtins::exec::execute_with_io(
                     &exec_args,
                     &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
                     &mut crate::executor::GlobalStdout,
                     &mut std::io::stderr().lock(),
                     self.exec_inherited_stdin()?,
@@ -2780,6 +2839,7 @@ impl Executor {
             crate::builtins::exec::execute_with_child_stdio(
                 &exec_args,
                 &self.shell_state.env_vars,
+                &self.shell_state.cwd,
                 &mut crate::executor::GlobalStdout,
                 &mut std::io::stderr().lock(),
                 child_stdout,
@@ -2960,6 +3020,7 @@ impl Executor {
         child.stdin(Stdio::inherit());
         child.stdout(writer);
         child.stderr(Stdio::inherit());
+        child.current_dir(&self.shell_state.cwd);
         match child.spawn() {
             Ok(child_proc) => {
                 let pid = child_proc.id();
@@ -3124,7 +3185,11 @@ impl Executor {
                         if let Some(name) = redirect.fd_var.as_deref() {
                             self.close_dynamic_fd(name)?;
                         } else {
-                            self.close_persistent_output_fd(fd)?;
+                            // GNU redir.c r_close_this: close(redirector)
+                            // closes the descriptor wholesale — both
+                            // directions die, whichever spelling (`>&-` or
+                            // `<&-`) named it (rubash#1590).
+                            self.close_persistent_fd(fd)?;
                             self.shell_state
                                 .env_vars
                                 .insert(fd_closed_key(fd), "1".to_string());
@@ -3144,7 +3209,9 @@ impl Executor {
                         self.flush_persistent_output_process_substitution(fd)?;
                         self.copy_exec_output_fd_resolving_ambient(fd, source_fd, &ambient);
                         if move_source {
-                            self.close_persistent_output_fd(source_fd)?;
+                            // GNU redir.c dup/move case: a move closes the
+                            // source descriptor wholesale (close(redir_fd)).
+                            self.close_persistent_fd(source_fd)?;
                         }
                         continue;
                     }
@@ -3200,7 +3267,7 @@ impl Executor {
                 crate::parser::RedirectKind::DuplicateOutput => {
                     let fd = redirect.fd.unwrap_or(1);
                     if is_closed_redirect_target(&target) {
-                        self.close_persistent_output_fd(fd)?;
+                        self.close_persistent_fd(fd)?;
                         self.shell_state
                             .env_vars
                             .insert(fd_closed_key(fd), "1".to_string());
@@ -3215,7 +3282,7 @@ impl Executor {
                         self.flush_persistent_output_process_substitution(fd)?;
                         self.copy_exec_output_fd_resolving_ambient(fd, source_fd, &ambient);
                         if move_source {
-                            self.close_persistent_output_fd(source_fd)?;
+                            self.close_persistent_fd(source_fd)?;
                         }
                         continue;
                     }
@@ -3241,7 +3308,7 @@ impl Executor {
                 }
                 crate::parser::RedirectKind::CloseOutput => {
                     let fd = redirect.fd.unwrap_or(1);
-                    self.close_persistent_output_fd(fd)?;
+                    self.close_persistent_fd(fd)?;
                     self.shell_state
                         .env_vars
                         .insert(fd_closed_key(fd), "1".to_string());
@@ -3249,7 +3316,7 @@ impl Executor {
                 crate::parser::RedirectKind::Input | crate::parser::RedirectKind::ReadWrite => {
                     let fd = redirect.fd.unwrap_or(0);
                     if is_closed_redirect_target(&target) {
-                        self.close_persistent_input_fd(fd);
+                        self.close_persistent_fd(fd)?;
                         self.shell_state
                             .env_vars
                             .insert(fd_closed_key(fd), "1".to_string());
@@ -3262,7 +3329,7 @@ impl Executor {
                         }
                         self.copy_persistent_input_fd(fd, source_fd);
                         if move_source {
-                            self.close_persistent_input_fd(source_fd);
+                            self.close_persistent_fd(source_fd)?;
                         }
                         continue;
                     }
@@ -3333,7 +3400,7 @@ impl Executor {
                 }
                 crate::parser::RedirectKind::CloseInput => {
                     let fd = redirect.fd.unwrap_or(0);
-                    self.close_persistent_input_fd(fd);
+                    self.close_persistent_fd(fd)?;
                     self.shell_state
                         .env_vars
                         .insert(fd_closed_key(fd), "1".to_string());
@@ -3516,7 +3583,7 @@ impl Executor {
                 break;
             }
             if is_closed_redirect_target(target) {
-                let _ = self.close_persistent_output_fd(target_fd);
+                let _ = self.close_persistent_fd(target_fd);
                 self.shell_state
                     .env_vars
                     .insert(fd_closed_key(target_fd), "1".to_string());
@@ -4343,10 +4410,12 @@ impl Executor {
                     self.create_redirect_output(&target, redirect.clobber)?;
                 }
                 crate::parser::RedirectKind::Append => {
-                    open_redirect_append(&shell_path_to_windows(
-                        &target,
-                        &self.shell_state.env_vars,
-                    ))?;
+                    open_redirect_append(
+                        &self.session_path(shell_path_to_windows(
+                            &target,
+                            &self.shell_state.env_vars,
+                        )),
+                    )?;
                 }
                 crate::parser::RedirectKind::ReadWrite => {
                     OpenOptions::new()
@@ -4407,7 +4476,11 @@ impl Executor {
             }
             crate::parser::RedirectKind::DuplicateInput => {
                 if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
-                    if !self.fd_table.is_open_for_read(source_fd) {
+                    // GNU redir.c do_redirection_internal dup/move case:
+                    // the descriptor is copied wholesale — the </> letter
+                    // never gates on the source's direction, only on it
+                    // being open at all (rubash#1591).
+                    if !self.fd_table.is_open(source_fd) {
                         return Ok(true);
                     }
                     let Some(fd) = self.allocate_dynamic_fd() else {
@@ -4427,7 +4500,7 @@ impl Executor {
                         )));
                     }
                     if move_source {
-                        self.close_persistent_input_fd(source_fd);
+                        self.close_persistent_fd(source_fd)?;
                     }
                     close_after_success(self, fd)?;
                     return Ok(true);
@@ -4435,7 +4508,7 @@ impl Executor {
             }
             crate::parser::RedirectKind::DuplicateOutput => {
                 if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
-                    if !self.fd_table.is_open_for_write(source_fd) {
+                    if !self.fd_table.is_open(source_fd) {
                         return Ok(true);
                     }
                     let Some(fd) = self.allocate_dynamic_fd() else {
@@ -4453,7 +4526,7 @@ impl Executor {
                         )));
                     }
                     if move_source {
-                        self.close_persistent_output_fd(source_fd)?;
+                        self.close_persistent_fd(source_fd)?;
                     }
                     close_after_success(self, fd)?;
                     return Ok(true);

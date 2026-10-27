@@ -22,6 +22,7 @@ mod word;
 mod tests;
 
 use brace_scan::{opens_function_body_after_previous_signature, tokens_open_unclosed_brace_group};
+pub(crate) use classification::is_assignment;
 use continuation::{compound_residuals_advance, ends_with_unquoted_backslash, has_unclosed_quotes};
 pub(crate) use continuation::{
     comsub_residuals_advance, quotes_residuals_advance, CompoundResidualState, ComsubResidualState,
@@ -193,6 +194,21 @@ pub struct TokenizeOptions {
 
 pub fn tokenize(input: &str) -> Vec<Token> {
     tokenize_with_options(input, TokenizeOptions::default())
+}
+
+/// Whether a fresh tokenize pass over `input` ends inside a `[[ ... ]]`
+/// conditional (PST_CONDCMD still armed — the COND_END `]]` was never
+/// read, including the rubash#1553 shape where a `]]` glued to a `=~`
+/// RHS group is word text). The fresh-scan mirror of the group
+/// completeness test (`stdin_source_needs_more_posix`) asks this of the
+/// scanner's own state machine rather than re-deriving it from the
+/// token list, so the feeder and fresh-scan answers cannot drift
+/// (rubash#1573).
+pub(crate) fn source_ends_in_cond_command(input: &str, posix: bool) -> bool {
+    let mut parse_state = LexerParseState::default();
+    let mut brace_cache = BraceScanCache::default();
+    let _ = tokenize_plain(input, posix, &mut parse_state, &mut brace_cache);
+    LexerParseState::cond_command_open(&parse_state)
 }
 
 pub fn tokenize_with_options(input: &str, options: TokenizeOptions) -> Vec<Token> {
@@ -697,6 +713,18 @@ impl GroupScanFeeder {
         if self.stray_close {
             return false;
         }
+        // rubash#1573: a `[[` whose COND_END has not been read holds the
+        // group open — the conditional is one command in GNU's reader
+        // (parse.y:3654 PST_CONDCMD), so a newline inside it is a token
+        // separator, not a command boundary. The scanner's own state
+        // machine is the authority (it already implements the #1524/#1553
+        // rule that a `]]' absorbed into a still-open `=~' RHS word is
+        // word text, never COND_END): without this arm the stdin group
+        // was submitted after the `[[` line and reported the EOF shape
+        // instead of reading on into the conditional's next line.
+        if LexerParseState::cond_command_open(&self.lexer_parse_state) {
+            return true;
+        }
         // rubash#463: an open word-attached procsub body holds the logical
         // line open (the keyword stack cannot see it — the body's tokens are
         // consumed by the word scanner of the still-unfinished word).
@@ -772,7 +800,12 @@ impl GroupScanFeeder {
 
     /// Fold one token into the keyword-stack / last-significant summary,
     /// exactly the loop `stdin_source_needs_more_posix` runs over the fresh
-    /// token list.
+    /// token list. Only STRUCTURAL keywords fold (Token::structural_keyword):
+    /// a keyword-spelled word in argument position (`echo if', the `if' in
+    /// `command -vkb if && set -o posix' inside a case clause) is a plain
+    /// word to GNU's reader (parse.y:3168 CHECK_FOR_RESERVED_WORD), so it
+    /// must neither push a phantom frame nor make the clause's `;;' read
+    /// as stray against that frame (rubash#1721, modernish bin/modernish).
     fn fold_token(&mut self, token: &Token) {
         // `=~` RHS fragments are word data (token.rs field doc), never
         // grammar tokens — a `)` inside `[[ x =~ (a|b) ]]` is pattern text.
@@ -783,7 +816,7 @@ impl GroupScanFeeder {
             if !matches!(self.keyword_stack.last(), Some(&"esac") | Some(&")")) {
                 self.stray_close = true;
             }
-        } else if token.kind == TokenKind::Keyword && !token.regexp_rhs_fragment {
+        } else if token.structural_keyword() && !token.regexp_rhs_fragment {
             match token.value.as_str() {
                 "case" => self.keyword_stack.push("esac"),
                 "if" => self.keyword_stack.push("fi"),

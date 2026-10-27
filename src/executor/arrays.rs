@@ -31,11 +31,12 @@ use std::collections::{BTreeMap, HashMap};
 
 use super::assignment_expansion::decode_compound_expansion_carriers;
 use super::{
-    apply_parameter_case_mod, assoc_value_at, eval_arith_value, eval_conditional_arith_value,
-    is_marked_var, is_shell_name, parse_indirect_pattern_removal, parse_parameter_case_mod,
+    apply_parameter_case_mod, assoc_value_at, eval_conditional_arith_value, is_marked_var,
+    is_shell_name, parse_indirect_pattern_removal, parse_parameter_case_mod,
     parse_parameter_replacement, parse_parameter_transform, remove_parameter_pattern,
     split_indexed_tagged_token, split_storage_words, unquote_storage_value, Executor,
-    ParameterTransform, ARRAY_FIELD_SPLIT_MARKER, ASSOC_VARS,
+    ParameterTransform, ARRAY_FIELD_SPLIT_MARKER, ASSOC_VARS, CAPCASE_VARS, LOWERCASE_VARS,
+    UPPERCASE_VARS,
 };
 use crate::executor::markers::{DATA_DOLLAR, STORAGE_WORD_PREFIX};
 use crate::lexer::remove_shell_quotes;
@@ -445,6 +446,17 @@ fn bytes_to_shell_text(
 }
 
 pub(super) fn field_split_values_with_ifs(value: &str, ifs: Option<&str>) -> Vec<String> {
+    // GNU word splitting (subst.c:12377 word_split) of an empty expansion
+    // result yields NO field, whatever IFS holds: the trailing-field
+    // emission below is driven by consumed delimiters, and an empty
+    // string contains none (rubash#1715: `IFS=:; v=''; for x in $v`
+    // must iterate zero times). The whitespace and empty-IFS branches
+    // already encode this; the non-whitespace and raw-byte-marker
+    // branches manufactured one empty field from the unconditional
+    // final push.
+    if value.is_empty() {
+        return Vec::new();
+    }
     let Some(ifs) = ifs else {
         return split_ifs_whitespace(value, " \t\n");
     };
@@ -525,10 +537,29 @@ pub(super) fn field_split_array_values_with_ifs(
     values: Vec<String>,
     ifs: Option<&str>,
 ) -> Vec<String> {
-    values
-        .into_iter()
-        .flat_map(|value| field_split_values_with_ifs(&value, ifs))
-        .collect()
+    // GNU hands the element list to the standard field splitter as ONE
+    // string joined with the first IFS character (the model
+    // string_list_dollar_at documents at subst.c:2957 and that
+    // field_split_positional_values_with_ifs already implements for
+    // $@): junction empties then fall out of the single-string rules.
+    // Splitting each element independently and concatenating miscounts
+    // exactly at the junctions (rubash#1714): a delimiter-only element
+    // `:` under IFS=: must contribute TWO empty fields (it is two
+    // adjacent separators in the joined string), an empty element
+    // between neighbors contributes one, and a leading empty element
+    // survives while a trailing one drops.
+    if ifs.is_some_and(|ifs| ifs.is_empty()) {
+        // Null IFS: no field splitting — one word per element, but an
+        // entirely empty element contributes no field at all (measured
+        // GNU 5.3.20: `IFS=''; arr=('' x); set -- ${arr[@]}` -> 1 word).
+        return values
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect();
+    }
+    let separator = ifs.and_then(|ifs| ifs.chars().next()).unwrap_or(' ');
+    let joined = values.join(&separator.to_string());
+    field_split_values_with_ifs(&joined, ifs)
 }
 
 pub(super) fn field_split_positional_values_with_ifs(
@@ -548,8 +579,13 @@ pub(super) fn field_split_positional_values_with_ifs(
     if ifs.is_some_and(|ifs| ifs.is_empty()) {
         // Posix interp 888 (IFS null): no field splitting — one word per
         // parameter (callers already special-case the plain `$*`/`${*}`
-        // spellings the same way).
-        return values;
+        // spellings the same way), but an entirely empty parameter
+        // contributes no word (rubash#1714; measured GNU 5.3.20:
+        // `IFS=''; set -- '' x ' y '; set -- $@` -> 2 words [x][ y ]).
+        return values
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect();
     }
     let separator = ifs.and_then(|ifs| ifs.chars().next()).unwrap_or(' ');
     let joined = values.join(&separator.to_string());
@@ -655,8 +691,9 @@ pub(super) fn word_is_unquoted_array_list_expansion(word: &str) -> bool {
 pub(super) fn pathname_expand_array_token(
     token: &str,
     env_vars: &HashMap<String, String>,
+    cwd: &std::path::Path,
 ) -> crate::executor::glob::PathnameExpansion {
-    crate::executor::glob::pathname_expand_word(token, env_vars)
+    crate::executor::glob::pathname_expand_word(token, env_vars, cwd)
 }
 
 /// GNU arrayfunc.c quote_array_assignment_chars (arrayfunc.c:1107+) marks
@@ -816,6 +853,45 @@ pub(super) struct IndexedAppendOutcome {
     pub bad_subscript: Option<String>,
 }
 
+/// The case attribute a compound element bind must apply to each element
+/// value it writes (GNU make_array_variable_value, arrayfunc.c:166 ->
+/// make_variable_value, variables.c:2970-2986). Elements already stored
+/// were converted when THEY were bound and are never rewritten by an
+/// append, so the conversion hangs off `IndexedDecodeBase::insert` — the
+/// one choke point every element written by a compound call passes
+/// through (rubash#1618: `a+=(...)` skipped the conversion entirely;
+/// rubash#1619: capcase was missing from the same paths).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ElementCase {
+    None,
+    Upper,
+    Lower,
+    Capitalize,
+}
+
+impl ElementCase {
+    fn of(env_vars: &crate::shell::var_table::VarTable, name: &str) -> Self {
+        if is_marked_var(env_vars, UPPERCASE_VARS, name) {
+            ElementCase::Upper
+        } else if is_marked_var(env_vars, LOWERCASE_VARS, name) {
+            ElementCase::Lower
+        } else if is_marked_var(env_vars, CAPCASE_VARS, name) {
+            ElementCase::Capitalize
+        } else {
+            ElementCase::None
+        }
+    }
+
+    fn apply(&self, value: String) -> String {
+        match self {
+            ElementCase::Upper => value.to_uppercase(),
+            ElementCase::Lower => value.to_lowercase(),
+            ElementCase::Capitalize => super::variable_state::capitalize_value(&value),
+            ElementCase::None => value,
+        }
+    }
+}
+
 /// rubash#616 (plan Phase 1c): the array contents the compound scan decodes
 /// against. GNU edits the ARRAY object in place — assign_compound_array_list
 /// (arrayfunc.c:700) inserts each element and `array_max_index` + 1 is the
@@ -834,6 +910,8 @@ struct IndexedDecodeBase<'a> {
     parsed: BTreeMap<usize, String>,
     /// Writes made by THIS call; the last write to an index wins.
     mutations: BTreeMap<usize, String>,
+    /// Case conversion for THIS call's writes (see `ElementCase`).
+    case: ElementCase,
 }
 
 impl IndexedDecodeBase<'_> {
@@ -869,6 +947,7 @@ impl IndexedDecodeBase<'_> {
     }
 
     fn insert(&mut self, index: usize, value: String) {
+        let value = self.case.apply(value);
         self.mutations.insert(index, value);
     }
 
@@ -913,9 +992,11 @@ pub(super) fn append_array_value(
     current: &str,
     cell: Option<&BTreeMap<i64, String>>,
     value: &str,
+    name: &str,
     integer: bool,
     ifs: Option<&str>,
     env_vars: &crate::shell::var_table::VarTable,
+    cwd: &std::path::Path,
 ) -> Result<IndexedAppendOutcome, String> {
     let mut entries = IndexedDecodeBase {
         cell,
@@ -925,6 +1006,14 @@ pub(super) fn append_array_value(
             indexed_array_entries(current)
         },
         mutations: BTreeMap::new(),
+        // GNU make_variable_value (variables.c:2920-2986): the integer
+        // branch preempts the case branch, so a variable carrying both
+        // evaluates and never case-converts.
+        case: if integer {
+            ElementCase::None
+        } else {
+            ElementCase::of(env_vars, name)
+        },
     };
     let old_max = entries.max();
     // An integer array rewrites EVERY element in the post-pass below, so even
@@ -974,7 +1063,7 @@ pub(super) fn append_array_value(
             } else {
                 crate::executor::glob::compound_element_glob_pattern(&token)
             };
-            match crate::executor::glob::pathname_expand_word(&glob_word, env_vars) {
+            match crate::executor::glob::pathname_expand_word(&glob_word, env_vars, cwd) {
                 crate::executor::glob::PathnameExpansion::Matches(matches) => {
                     for value in matches {
                         entries.insert(next_index, value);
@@ -1054,7 +1143,7 @@ pub(super) fn append_array_value(
         let quoted_token = token_is_fully_quoted(&token) && !command_subst_token;
         if let Some(token) = token.strip_prefix(ARRAY_FIELD_SPLIT_MARKER) {
             let token = unquote_storage_value(token);
-            match pathname_expand_array_token(&token, env_vars) {
+            match pathname_expand_array_token(&token, env_vars, cwd) {
                 crate::executor::glob::PathnameExpansion::Matches(matches) => {
                     for value in matches {
                         entries.insert(next_index, value);
@@ -1130,7 +1219,7 @@ pub(super) fn append_array_value(
         let token = crate::executor::markers::dequote_ctlesc_pairs(&token);
         if let Some(expanded_array) = token.strip_prefix(STORAGE_WORD_PREFIX) {
             for value in field_split_values_with_ifs(expanded_array, ifs) {
-                match pathname_expand_array_token(&value, env_vars) {
+                match pathname_expand_array_token(&value, env_vars, cwd) {
                     crate::executor::glob::PathnameExpansion::Matches(matches) => {
                         for value in matches {
                             entries.insert(next_index, value);
@@ -1171,7 +1260,13 @@ pub(super) fn append_array_value(
         if scalar_append && !entries.is_empty() {
             let current = entries.get(0).cloned().unwrap_or_default();
             let appended = if integer {
-                (eval_arith_value(&current) + eval_arith_value(&token)).to_string()
+                // GNU make_variable_value ASS_APPEND (variables.c:2922):
+                // both sides go through evalexp — the same full evaluator
+                // the `[sub]+=` arm above uses (rubash#1617: the split('+')
+                // evaluator stored 1 for `ia=(1); ia+='2*3'`).
+                (eval_conditional_arith_value(&current, env_vars).unwrap_or(0)
+                    + eval_conditional_arith_value(&token, env_vars).unwrap_or(0))
+                .to_string()
             } else {
                 append_scalar_value(&current, &finalize_comsub_element(&token))
             };

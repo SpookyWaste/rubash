@@ -164,7 +164,53 @@ impl Executor {
                         // status is the signal death 128+sig, like GNU
                         // reaping a real sleep killed the same way.
                         match self.sleep_interruptibly(seconds)? {
-                            Some(signal) => self.exit_code = 128 + signal,
+                            Some(signal) => {
+                                self.exit_code = 128 + signal;
+                                // rubash#1639: an UNTRAPPED SIGINT abort
+                                // of the virtual child is GNU's foreground
+                                // job dying by SIGINT with the shell
+                                // receiving the same terminal delivery —
+                                // wait_for throws and the rest of the line
+                                // is discarded. A trapped SIGINT already
+                                // ran its action inside sleep_interruptibly
+                                // and the list continues, so only the
+                                // no-trap case marks the discard.
+                                //
+                                // rubash#1811: the trap-table lookup must
+                                // use the canonical key form. The table is
+                                // keyed verbatim by trap_key() over the
+                                // names normalize_signal returns — the
+                                // SIG-prefixed SIGNALS entries for real
+                                // signals ("SIGINT"), bare names only for
+                                // the EXIT/ERR/DEBUG/RETURN pseudo-signals
+                                // — and every other lookup site honors
+                                // that (signal_trap_name(), the "SIGCHLD"
+                                // literal). This site's bare "INT" could
+                                // never hit a stored trap, so EVERY abort
+                                // read as untrapped and a trapped SIGINT
+                                // discarded the line exactly like an
+                                // untrapped one. GNU's adjudication is
+                                // by signal number against the trap table
+                                // (jobs.c:3315 waitchld: ADDINTERRUPT only
+                                // when signal_is_trapped(SIGINT) == 0;
+                                // a trapped delivery is only recorded,
+                                // trap.c:553 trap_handler -> trap.c:545
+                                // set_trap_state, and its action runs at
+                                // the next boundary, execute_cmd.c:643
+                                // run_pending_traps, after which the
+                                // list continues with the wait's 130).
+                                #[cfg(unix)]
+                                if signal == libc::SIGINT
+                                    && self.interactive_reader_session()
+                                    && crate::builtins::trap::get_trap_action(
+                                        &self.shell_state.env_vars,
+                                        "SIGINT",
+                                    )
+                                    .is_none()
+                                {
+                                    self.fg_sigint_unwind = true;
+                                }
+                            }
                             None => self.exit_code = 0,
                         }
                     } else {

@@ -65,7 +65,7 @@ impl Executor {
         &self,
         word: &str,
     ) -> Vec<String> {
-        match glob::pathname_expand_word(word, &self.shell_state.env_vars) {
+        match glob::pathname_expand_word(word, &self.shell_state.env_vars, &self.shell_state.cwd) {
             glob::PathnameExpansion::Matches(matches) => matches,
             glob::PathnameExpansion::NoMatch => vec![word.to_string()],
             glob::PathnameExpansion::Fail(_) => vec![word.to_string()],
@@ -583,11 +583,7 @@ impl Executor {
         if let Some(base) = var_name.strip_suffix("[@]") {
             if is_shell_name(base) {
                 return self
-                    .array_subscript_range_values(
-                        base,
-                        offset,
-                        length.and_then(|length| usize::try_from(length).ok()),
-                    )
+                    .array_subscript_range_values(base, offset, length)
                     .unwrap_or_default();
             }
         }
@@ -887,6 +883,7 @@ impl Executor {
         // substitution pipe read ends at their numbers in the child.
         #[cfg(unix)]
         crate::executor::dev_fd_operands::attach_unix_dev_fd_operands(&mut process, &dev_ops);
+        process.current_dir(&self.shell_state.cwd);
         suppress_orphan_console(&mut process);
         let mut spawned = process.spawn().ok()?;
         adopt_orphan_console(spawned.id());
@@ -982,7 +979,8 @@ impl Executor {
 
     fn command_substitution_redirect_path(&self, target: &str) -> Option<PathBuf> {
         let expanded = strip_matching_quotes(&self.expand_word(target)).to_string();
-        Some(shell_path_to_windows(&expanded, &self.shell_state.env_vars))
+        // G-02: comsub redirect opens anchor at the session cwd.
+        Some(self.session_path(shell_path_to_windows(&expanded, &self.shell_state.env_vars)))
     }
 
     pub(in crate::executor) fn expand_backtick_substitution_typed(
@@ -1985,6 +1983,31 @@ where
                     for value in &mut values {
                         *value = protect_ifs_field_chars(value, ifs);
                     }
+                } else if !ifs.is_some_and(|ifs| ifs.is_empty()) {
+                    // GNU string_list_dollar_at (subst.c:2957): an UNQUOTED
+                    // $@/${arr[@]} does not splice one word per element —
+                    // the elements join with the first IFS character (a
+                    // space when IFS is unset) into the word's single
+                    // expansion string, and word_split runs over the whole
+                    // string, so junction empties count exactly like a
+                    // scalar split (rubash#1714: a delimiter-only element
+                    // contributes two empty fields, an empty element one).
+                    // Splicing per element and splitting each produced
+                    // word separately loses precisely those junction
+                    // fields (`x${arr[@]}y`, `for x in ${arr[@]}`). A null
+                    // IFS keeps the per-element splice below: no joining
+                    // and no splitting happen there.
+                    let separator = match ifs {
+                        Some(ifs) => ifs
+                            .chars()
+                            .next()
+                            .map(|ch| ch.to_string())
+                            .unwrap_or_default(),
+                        None => " ".to_string(),
+                    };
+                    current.push_str(&values.join(&separator));
+                    current_present = true;
+                    continue;
                 }
 
                 current.push_str(&values[0]);

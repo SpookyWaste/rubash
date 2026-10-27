@@ -9,6 +9,17 @@
 //! the child runs in its own session, we poll /proc for state T,
 //! check the partial output, then continue it.
 //! Expectations verified against GNU bash 5.3.20 (same harness).
+//!
+//! rubash#1637 — the original carrier could hang the whole suite in
+//! a sandbox: it sent SIGCONT exactly once and then blocked in an
+//! unbounded `wait()`. Under load that one SIGCONT did not wake the
+//! stopped child (an externally-sent SIGCONT later did), the test
+//! hung for 815s, and the stopped process leaked for manual cleanup.
+//! The carrier is now bounded end to end: every wait has a deadline,
+//! SIGCONT is re-sent while the child remains stopped, and a Drop
+//! guard SIGKILLs + reaps the child session on every exit path, so
+//! a failure here can never wedge the suite or leak a stopped
+//! process. The assertions and expectations are unchanged.
 
 #![cfg(target_os = "linux")]
 
@@ -38,6 +49,50 @@ fn read_file(path: &PathBuf) -> String {
     s
 }
 
+/// Supervised child (rubash#1637): owns the spawned session leader
+/// and guarantees the session is killed and reaped on every path —
+/// success, assertion panic, or timeout — so no stopped rubash can
+/// outlive the test.
+struct SupervisedChild {
+    child: std::process::Child,
+    pid: u32,
+}
+
+impl SupervisedChild {
+    /// Poll for exit until `timeout`; returns the status if the
+    /// child finished in time, `None` on deadline.
+    fn wait_for_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn send_sigcont(&self) {
+        unsafe {
+            libc::kill(-(self.pid as i32), libc::SIGCONT);
+            libc::kill(self.pid as i32, libc::SIGCONT);
+        }
+    }
+}
+
+impl Drop for SupervisedChild {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(-(self.pid as i32), libc::SIGKILL);
+            libc::kill(self.pid as i32, libc::SIGKILL);
+        }
+        // Reap, itself bounded so Drop can never hang.
+        let _ = self.wait_for_exit(Duration::from_secs(5));
+    }
+}
+
 #[test]
 fn suspend_f_stops_before_following_commands() {
     let dir = tempdir("suspend");
@@ -65,8 +120,9 @@ fn suspend_f_stops_before_following_commands() {
             Ok(())
         });
     }
-    let mut child = cmd.spawn().expect("spawn rubash");
+    let child = cmd.spawn().expect("spawn rubash");
     let pid = child.id();
+    let mut sup = SupervisedChild { child, pid };
 
     // Poll up to 15s for the stopped state.
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -76,7 +132,7 @@ fn suspend_f_stops_before_following_commands() {
             stopped = true;
             break;
         }
-        if let Ok(Some(_)) = child.try_wait() {
+        if let Ok(Some(_)) = sup.child.try_wait() {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -92,12 +148,30 @@ fn suspend_f_stops_before_following_commands() {
         "commands after suspend -f ran before SIGCONT"
     );
 
-    // Continue the whole session and let it finish.
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGCONT);
-        libc::kill(pid as i32, libc::SIGCONT);
-    }
-    let status = child.wait().expect("wait child");
+    // Continue the session and let it finish. SIGCONT is re-sent for
+    // as long as the child remains stopped (rubash#1637: a single
+    // send proved losable under sandbox load), and the wait is
+    // bounded: on deadline the guard kills the session and this
+    // assertion fails with diagnostics instead of hanging the suite.
+    let resume_deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Ok(Some(status)) = sup.child.try_wait() {
+            break Some(status);
+        }
+        if Instant::now() >= resume_deadline {
+            break None;
+        }
+        sup.send_sigcont();
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "child did not exit within 30s of SIGCONT (state: {:?}); out: {:?}; err: {:?}",
+            proc_state(pid),
+            read_file(&out_path),
+            read_file(&err_path)
+        )
+    });
     assert!(status.success(), "final status: {status}");
     let full = read_file(&out_path);
     assert_eq!(

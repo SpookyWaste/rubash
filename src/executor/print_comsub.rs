@@ -253,7 +253,18 @@ impl ComsubPrinter {
         if let Some(pipeline) = &command.pipeline_command {
             for (index, stage) in pipeline.stages.iter().enumerate() {
                 if index > 0 {
-                    self.cprintf(" ");
+                    // print_cmd.c:249-272 (cm_connection, connector '|'):
+                    // the stages print joined by " | " — the deferred-
+                    // heredoc string carries " |" and a following
+                    // cprintf(" ") separates it from the next stage.
+                    // Joining with a bare space instead flattened the
+                    // pipeline into one simple command's word list in
+                    // every canonical re-print (rubash#1704: a comsub
+                    // `$(echo abc | awk '...')` inside a respawned
+                    // background function body ran as `echo abc awk
+                    // '...'`; rubash#1664: a respawned background child
+                    // re-parsed `$(echo hi | cat)` as `$(echo hi cat)`).
+                    self.cprintf(" | ");
                     self.skip_this_indent += 1;
                 }
                 self.print_command(stage);

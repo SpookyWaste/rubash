@@ -118,7 +118,8 @@ impl Executor {
         input: &str,
         streaming_stdin: bool,
     ) -> Result<(String, String, i32), ExecuteError> {
-        let saved_dir = env::current_dir().ok();
+        // G-02: no process-cwd save/restore — the stage subshell is a clone
+        // with its own session cwd field.
         let mut subshell = self.command_substitution_executor();
         // A compound pipeline element passes execute_in_subshell, which
         // resets loop_level to 0 (execute_cmd.c:1642, Posix interp 842):
@@ -170,7 +171,24 @@ impl Executor {
                 .insert(base_name.to_string(), expanded_value);
         }
 
-        subshell.stdout_capture = Some(Vec::new());
+        // rubash#1605 (residual of #1454): when this stage is the
+        // pipeline's final member and its fd 1 IS the shell's own stdout
+        // (the final_member_stdout_streams_to_host predicate: no output
+        // redirect on the element, fd 1 open on the Stdout endpoint, no
+        // enclosing capture), GNU execute_cmd.c execute_pipeline runs the
+        // element with the inherited stdout — `echo hi | { readlink
+        // /proc/self/fd/1; }` names the shell's stdout target. An fd-1
+        // capture here would resolve the body's external children to the
+        // capture pipe instead (a fresh pipe), so skip both capture
+        // layers and let the body write straight to the live endpoint;
+        // the stage's returned stdout stays empty. The stderr capture is
+        // unaffected.
+        let stream_final_stdout = self.pipeline_final_stage.get()
+            && self.pipeline_stdout_stream.is_none()
+            && self.final_member_stdout_streams_to_host(command);
+        if !stream_final_stdout {
+            subshell.stdout_capture = Some(Vec::new());
+        }
         subshell.stderr_capture = Some(Vec::new());
 
         // GNU execute_cmd.c execute_pipeline + redir.c do_redirection_internal:
@@ -185,11 +203,16 @@ impl Executor {
         // downstream pipe element. Wrap the stage in the same thread-local
         // stdout capture execute_builtin_pipeline_stage uses and merge both
         // capture sources.
-        let saved_capture = crate::executor::shell_options::begin_stdout_capture();
-        // niubash#345: this element is the shell-side producer when the
-        // driver armed `pipeline_stdout_stream`; give its capture frame the
-        // pipe target so the body streams (nested frames still capture).
-        crate::executor::shell_options::set_capture_stream(self.pipeline_stdout_stream);
+        let saved_capture = if stream_final_stdout {
+            None
+        } else {
+            let saved = crate::executor::shell_options::begin_stdout_capture();
+            // niubash#345: this element is the shell-side producer when the
+            // driver armed `pipeline_stdout_stream`; give its capture frame the
+            // pipe target so the body streams (nested frames still capture).
+            crate::executor::shell_options::set_capture_stream(self.pipeline_stdout_stream);
+            Some(saved)
+        };
 
         let result = if command.brace_group.is_some() {
             subshell.execute_brace_group_pipeline(command).map(|_| ())
@@ -208,7 +231,9 @@ impl Executor {
                 // active — restore it before propagating so later stdout
                 // writes in the script are not swallowed into the
                 // orphaned buffer.
-                crate::executor::shell_options::restore_stdout_capture(saved_capture);
+                if let Some(saved) = saved_capture {
+                    crate::executor::shell_options::restore_stdout_capture(saved);
+                }
                 return Err(error);
             }
         }
@@ -223,20 +248,26 @@ impl Executor {
         // leaves nothing for this second run.
         let body_status = subshell.last_exit_code();
         let trap_result = subshell.run_exit_trap_for_status(body_status);
-        let mut thread_output = crate::executor::shell_options::take_stdout_capture();
+        // rubash#1605: a streamed final stage installed no thread capture
+        // (saved_capture is None); its bytes already went to the live
+        // stdout, so there is nothing to take or restore.
+        let mut thread_output = if saved_capture.is_some() {
+            crate::executor::shell_options::take_stdout_capture()
+        } else {
+            Vec::new()
+        };
         let mut output = subshell.stdout_capture.take().unwrap_or_default();
         let stderr = subshell.stderr_capture.take().unwrap_or_default();
 
-        crate::executor::shell_options::restore_stdout_capture(saved_capture);
+        if let Some(saved) = saved_capture {
+            crate::executor::shell_options::restore_stdout_capture(saved);
+        }
         // rubash#1141: the stage's output assembles field-sink bytes
         // first, thread-sink bytes after — snapshot the prefix totals so
         // the timing recorder can place thread arrivals behind them.
         crate::executor::shell_options::capture_timing_set_prefix(&output);
         output.append(&mut thread_output);
 
-        if let Some(saved_dir) = saved_dir {
-            let _ = env::set_current_dir(saved_dir);
-        }
         let status = match (result, trap_result) {
             (Ok(()), Ok(trap_status)) => trap_status,
             (Err(ExecuteError::ExitCode(code)), Ok(_)) => code,
@@ -316,7 +347,7 @@ impl Executor {
         call.redirect_out = None;
         call.append = None;
 
-        let saved_dir = env::current_dir().ok();
+        // G-02: no process-cwd save/restore (stage subshell clone, as above).
         let mut subshell = self.command_substitution_executor();
         // A pipeline member runs in a subshell: caught signal traps reset to
         // the inherited disposition (execute_cmd.c subshell trap reset), so
@@ -335,15 +366,80 @@ impl Executor {
             .env_vars
             .insert(FUNCTION_STDIN_OFFSET.to_string(), "0".to_string());
 
-        subshell.stdout_capture = Some(Vec::new());
+        // rubash#1605: same final-member rule as the compound stage
+        // above — a final function element whose fd 1 IS the shell's own
+        // stdout runs uncaptured, so external children in the body
+        // inherit the real fd 1 instead of a fresh capture pipe.
+        let stream_final_stdout = self.pipeline_final_stage.get()
+            && self.pipeline_stdout_stream.is_none()
+            && self.final_member_stdout_streams_to_host(command);
+        if !stream_final_stdout {
+            subshell.stdout_capture = Some(Vec::new());
+        }
         subshell.stderr_capture = Some(Vec::new());
+        // GNU: a pipeline element's forked child runs the element's simple
+        // command itself, so the command's assignment words are processed
+        // in the child — subst.c:13153 expand_word_list_internal picks
+        // assign_in_env (variables.c:3536) to build the temporary_env, and
+        // execute_function (execute_cmd.c:5181) receives it as the
+        // function's variable context via push_context
+        // (execute_cmd.c:5233/5252). The non-pipeline invocation path
+        // (execute_function_command_invocation) performs exactly this
+        // apply on the executing executor; the stage clone IS the forked
+        // child, so the apply belongs on the clone, before the body runs
+        // (rubash#1765: the stage used to drop the prefix assignments
+        // entirely and the body saw the outer values).
+        let assignment_raws = (materialized_command.assignment_raws.len()
+            == materialized_command.assignments.len())
+        .then(|| materialized_command.assignment_raws.as_slice());
+        let (temporary_assignments, assignments_failed) = subshell
+            .apply_temporary_assignments(&materialized_command.assignments, assignment_raws);
+        // GNU variables.c push_context: the call tempenv becomes the
+        // function's variable context — recorded so a posix special
+        // builtin's merged tempenv inside the body can tell a context
+        // binding from an ordinary command tempenv binding (mirrors
+        // execute_function_command_invocation).
+        subshell.function_tempenv_names.push(
+            materialized_command
+                .assignments
+                .iter()
+                .map(|(name, _)| assignment_name_and_append(name).0.to_string())
+                .collect(),
+        );
         // Direct-stdout builtins in the function consult the thread-local
         // capture, which belongs to an enclosing capture when this stage
         // runs inside one; give the call its own capture.
-        let (thread_captured, result) = crate::executor::shell_options::capture_stdout_streamed(
-            self.pipeline_stdout_stream,
-            || subshell.execute_function(&function_name, &args, &call),
-        );
+        // The failure classes mirror execute_function_command_invocation:
+        // a posix-fatal tempenv failure or a DISCARD-class expansion error
+        // skips the body with status 1 (in the child both end the element);
+        // any other failure (default-mode readonly) only diagnosed — the
+        // window stays partially applied and the body still runs.
+        // rubash#1605: short of that fatal skip, a final stage whose fd 1
+        // IS the shell's own stdout runs the body uncaptured (no
+        // thread-local capture frame), exactly as in the compound stage.
+        let (thread_captured, result) = if assignments_failed
+            && (subshell.posix_assignment_failure_is_fatal() || subshell.evalerror_pending.get())
+        {
+            subshell.exit_code = 1;
+            (Vec::new(), Err(ExecuteError::ExpansionFailure(1)))
+        } else if stream_final_stdout {
+            (
+                Vec::new(),
+                subshell.execute_function(&function_name, &args, &call),
+            )
+        } else {
+            crate::executor::shell_options::capture_stdout_streamed(
+                self.pipeline_stdout_stream,
+                || subshell.execute_function(&function_name, &args, &call),
+            )
+        };
+        // The window dies with the command, before the element's EXIT
+        // trap runs (the trap is subshell teardown, after the command
+        // completed and its temp vars were popped). The clone is dropped
+        // after the stage, so this restore only keeps the clone's own
+        // bookkeeping balanced for the trap run below.
+        subshell.restore_temporary_assignments(temporary_assignments);
+        subshell.function_tempenv_names.pop();
         // GNU execute_cmd.c:1761-1763 (execute_in_subshell): a pipeline
         // element is a forked subshell whose exit — implicit after the body
         // as much as via `exit` — runs the subshell's EXIT trap. The trap
@@ -358,11 +454,14 @@ impl Executor {
         // f | cat` reports PIPESTATUS 2. Only a builtin that IS the
         // element folds to 1.)
         let body_status = subshell.last_exit_code();
-        let (trap_thread_captured, trap_result) =
+        let (trap_thread_captured, trap_result) = if stream_final_stdout {
+            (Vec::new(), subshell.run_exit_trap_for_status(body_status))
+        } else {
             crate::executor::shell_options::capture_stdout_streamed(
                 self.pipeline_stdout_stream,
                 || subshell.run_exit_trap_for_status(body_status),
-            );
+            )
+        };
         let mut output = subshell.stdout_capture.take().unwrap_or_default();
         // rubash#1141: field-sink bytes precede the thread-sink bytes in
         // the assembled output — snapshot the prefix for the recorder.
@@ -386,9 +485,6 @@ impl Executor {
         }
         let stderr = subshell.stderr_capture.take().unwrap_or_default();
 
-        if let Some(saved_dir) = saved_dir {
-            let _ = env::set_current_dir(saved_dir);
-        }
         let status = match (result, trap_result) {
             (Ok(()), Ok(trap_status)) => trap_status,
             (Err(ExecuteError::ExitCode(code)), Ok(_)) => code,
@@ -713,7 +809,11 @@ impl Executor {
                     args.push(value);
                     continue;
                 }
-                match glob::pathname_expand_word(&value, &self.shell_state.env_vars) {
+                match glob::pathname_expand_word(
+                    &value,
+                    &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
+                ) {
                     glob::PathnameExpansion::Matches(matches) => args.extend(matches),
                     glob::PathnameExpansion::NoMatch => args.push(value),
                     // rubash#1540: same failglob funnel as the stage
@@ -758,7 +858,10 @@ impl Executor {
             // visible argv text, so decode the carriers here.
             .map(|word| super::execution_misc::restore_command_substitution_output(&word))
             .collect();
-        if let Some(output) = self.invoke_host_external_command(&host_cmd) {
+        // Pipeline-stage path: the stage's assignments were never applied
+        // to the table (they live only on the cloned command node), so the
+        // host channel must compose appends itself (rubash#1766).
+        if let Some(output) = self.invoke_host_external_command(&host_cmd, false) {
             return Ok(Some((
                 crate::executor::substitution_metadata::bytes_to_shell_text(&output.stdout),
                 crate::executor::substitution_metadata::bytes_to_shell_text(&output.stderr),
@@ -813,17 +916,33 @@ impl Executor {
                     if let Ok(mut file) = self.create_redirect_output(&target, redirect.clobber) {
                         let _ = file.write_all(diagnostic.as_bytes());
                     }
+                    // rubash#1571: the diagnostic was just delivered
+                    // through the element's own open of the target. The
+                    // driver's routing walk would re-run the ordered
+                    // redirects for this stage and its probe-open
+                    // (open_command_output_target) truncates the file
+                    // again before writing the stage's (empty) captured
+                    // stderr — the delivered diagnostic died for every
+                    // non-first stage. The stage owns its stream
+                    // placement exactly like the shared-file wiring
+                    // below and the function stage's rubash#412 case:
+                    // mark it pre-wired so the driver skips routing.
+                    self.pipeline_stage_fds_pre_wired.set(true);
                     return Ok(Some((String::new(), String::new(), 127)));
                 }
             } else if let Some(redirect) = &command.redirect_err_append {
                 let target = self.expand_redirect_target(redirect);
                 if !is_closed_redirect_target(&target) && redirect_target_fd(&target).is_none() {
-                    if let Ok(mut file) = open_redirect_append(&shell_path_to_windows(
-                        &target,
-                        &self.shell_state.env_vars,
-                    )) {
+                    if let Ok(mut file) =
+                        open_redirect_append(&self.session_path(shell_path_to_windows(
+                            &target,
+                            &self.shell_state.env_vars,
+                        )))
+                    {
                         let _ = file.write_all(diagnostic.as_bytes());
                     }
+                    // rubash#1571: same direct delivery as above.
+                    self.pipeline_stage_fds_pre_wired.set(true);
                     return Ok(Some((String::new(), String::new(), 127)));
                 }
             }
@@ -878,13 +997,34 @@ impl Executor {
         self.apply_child_environment(&mut process);
         let raws_aligned = command.assignment_raws.len() == command.assignments.len();
         for (index, (var_name, var_value)) in command.assignments.iter().enumerate() {
-            let (base_name, _) = assignment_name_and_append(var_name);
+            let (base_name, append) = assignment_name_and_append(var_name);
             let raw = raws_aligned
                 .then(|| command.assignment_raws.get(index))
                 .flatten()
                 .map(String::as_str);
             let expanded_value = self.expand_assignment_value_with_raw(var_name, var_value, raw);
-            if is_valid_process_env(base_name, &expanded_value) {
+            // Marker hygiene (rubash#1620): a compound `name=(...)`
+            // tempenv word binds as the literal list text; the internal
+            // COMPOUND_ASSIGNMENT_MARKER must not reach the child.
+            let expanded_value = expanded_value
+                .strip_prefix(crate::executor::types::COMPOUND_ASSIGNMENT_MARKER)
+                .unwrap_or(&expanded_value);
+            if append {
+                // A pipeline stage's assignments are NOT pre-applied to
+                // the variable table (the direct external path's child
+                // inherits the window binding via apply_child_environment;
+                // a stage's table still holds the outer value), so the
+                // spawner composes the window value itself, mirroring
+                // assign_in_env with ASS_APPEND: the target's scalar view
+                // plus the literal RHS text (rubash#1620 — re-applying the
+                // raw RHS lost the base and leaked the marker).
+                let window = format!("{}{}", self.tempenv_scalar_view(base_name), expanded_value);
+                if is_valid_process_env(base_name, &window) {
+                    process.env(base_name, window);
+                }
+                continue;
+            }
+            if is_valid_process_env(base_name, expanded_value) {
                 process.env(base_name, expanded_value);
             }
         }
@@ -1058,9 +1198,8 @@ impl Executor {
                         if !is_closed_redirect_target(&target)
                             && redirect_target_fd(&target).is_none()
                         {
-                            if let Ok(file) = open_redirect_append(&shell_path_to_windows(
-                                &target,
-                                &self.shell_state.env_vars,
+                            if let Ok(file) = open_redirect_append(&self.session_path(
+                                shell_path_to_windows(&target, &self.shell_state.env_vars),
                             )) {
                                 process.stderr(Stdio::from(file));
                             }
@@ -1080,6 +1219,7 @@ impl Executor {
         // literal argv word resolves through the OS /dev/fd layer.
         #[cfg(unix)]
         crate::executor::dev_fd_operands::attach_unix_dev_fd_operands(&mut process, &dev_ops);
+        process.current_dir(&self.shell_state.cwd);
         suppress_orphan_console(&mut process);
         let mut child = process.spawn()?;
         adopt_orphan_console(child.id());
@@ -1146,9 +1286,8 @@ impl Executor {
                 // an empty pipe (GNU's next element reads nothing).
                 match target {
                     MergedSharedFile::Path(path) => {
-                        let mut file = open_redirect_append(&shell_path_to_windows(
-                            &path,
-                            &self.shell_state.env_vars,
+                        let mut file = open_redirect_append(&self.session_path(
+                            shell_path_to_windows(&path, &self.shell_state.env_vars),
                         ))
                         .map_err(ExecuteError::IoError)?;
                         file.write_all(&merged)?;

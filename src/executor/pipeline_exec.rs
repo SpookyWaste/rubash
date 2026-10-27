@@ -65,6 +65,39 @@ fn timed_read_value(
     (value, 142)
 }
 
+/// rubash#1581: may the timed consumer model execute this followup
+/// command itself? Followups run with an empty stdin, so only commands
+/// that provably never read the pipeline stream qualify: the stream is
+/// untouched by `echo`/`printf` (they only write), by the no-op
+/// builtins, and by `sleep`; an assignment-only command runs no
+/// program at all; and a followup that rebinds its own fd 0 (input
+/// redirect, heredoc, here-string) reads that binding, not the stream.
+/// Everything else — a second `read`, `mapfile`, an external command,
+/// a name reached through expansion to one of those — declines.
+fn timed_followup_keeps_stream(command: &CommandNode, name: &str) -> bool {
+    if command.redirect_in.is_some()
+        || command.heredoc.is_some()
+        || command.here_string.is_some()
+        || command.redirects.iter().any(|redirect| {
+            (redirect.fd.is_none() || redirect.fd == Some(0))
+                && matches!(
+                    redirect.kind,
+                    crate::parser::RedirectKind::Input
+                        | crate::parser::RedirectKind::DuplicateInput
+                        | crate::parser::RedirectKind::CloseInput
+                        | crate::parser::RedirectKind::ReadWrite
+                        | crate::parser::RedirectKind::HereString
+                )
+        })
+    {
+        return true;
+    }
+    if command.words.is_empty() {
+        return true;
+    }
+    matches!(name, "echo" | "printf" | "true" | ":" | "false" | "sleep")
+}
+
 #[cfg(windows)]
 fn stdio_from_transferred_handle<T>(handle: T) -> Stdio
 where
@@ -303,6 +336,9 @@ fn wait_for_windows_pipeline_member(
     let mut kill_deadline: Option<std::time::Instant> = None;
     loop {
         if let Some(status) = process.try_wait().map_err(ExecuteError::IoError)? {
+            // rubash#1776: sample the reaped member's CPU for the
+            // Windows CHILDREN half while its handle is live.
+            super::read_helpers::note_reaped_child_cpu(process);
             return Ok(status);
         }
         let downstream_gone = match downstream.as_deref_mut() {
@@ -323,6 +359,7 @@ fn wait_for_windows_pipeline_member(
             // observes for a producer whose consumer closed the pipe
             // (rubash#382; see lingerer_sigpipe_status).
             let _ = process.wait().map_err(ExecuteError::IoError)?;
+            super::read_helpers::note_reaped_child_cpu(process);
             return Ok(lingerer_sigpipe_status());
         }
         std::thread::sleep(POLL_INTERVAL);
@@ -1769,6 +1806,21 @@ impl Executor {
                     last_status = status;
                 }
                 _ if saw_read => {
+                    // rubash#1581: followups run with an empty stdin
+                    // (timed_read_followup_output passes "" as the stage
+                    // input): the modeled producer bytes beyond the first
+                    // read's record exist only as timing chunks and are
+                    // never materialized for the body. A followup that
+                    // reads fd 0 — a second `read`, `mapfile`, `cat`, any
+                    // external command — would see EOF where GNU serves
+                    // the not-yet-arrived data, so the model may only keep
+                    // followups that provably never consume the stream;
+                    // anything else declines to the sequential stage
+                    // path, whose TimedInput judge serves the same body
+                    // correctly (and still reports the timeout as 142).
+                    if !timed_followup_keeps_stream(command, &name) {
+                        return None;
+                    }
                     output.push_str(&self.timed_read_followup_output(
                         command,
                         &read_name,
@@ -2253,6 +2305,7 @@ impl Executor {
             // rubash#1688: a pipeline member is a fork of the shell
             // like any external child — pin the ambient descriptors.
             self.attach_ambient_fd_pins(consumers[index], &mut process);
+            process.current_dir(&self.shell_state.cwd);
             suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
                 ExecuteError::IoError(io::Error::new(
@@ -2871,6 +2924,7 @@ impl Executor {
             // CreateProcess failed (and with which binary).
             // rubash#1688: pin the ambient descriptors for the stage.
             self.attach_ambient_fd_pins(&commands[index], &mut process);
+            process.current_dir(&self.shell_state.cwd);
             suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
                 ExecuteError::IoError(io::Error::new(
@@ -3118,6 +3172,7 @@ impl Executor {
             ));
             // rubash#1688: pin the ambient descriptors for the stage.
             self.attach_ambient_fd_pins(commands[index], &mut process);
+            process.current_dir(&self.shell_state.cwd);
             suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
                 ExecuteError::IoError(io::Error::new(
@@ -3597,6 +3652,7 @@ impl Executor {
 
             // rubash#1688: pin the ambient descriptors for the stage.
             self.attach_ambient_fd_pins(&commands[index], &mut process);
+            process.current_dir(&self.shell_state.cwd);
             suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
                 ExecuteError::IoError(io::Error::new(
@@ -3657,7 +3713,15 @@ impl Executor {
         ));
         for mut process in processes.into_iter().rev() {
             let status = match process.try_wait()? {
-                Some(status) => status,
+                Some(status) => {
+                    // rubash#1776: sample the reaped member's CPU for
+                    // the Windows CHILDREN half while its handle is
+                    // live. (The last member above is consumed by
+                    // wait_with_output, which closes its handle before
+                    // any sample point — its CPU stays uncounted.)
+                    super::read_helpers::note_reaped_child_cpu(&process);
+                    status
+                }
                 None => {
                     // The sequential tail consumed this member's output and
                     // the downstream already exited, so a member still alive
@@ -3667,6 +3731,7 @@ impl Executor {
                     // otherwise outlive this Child and pin niu's exit drain.
                     kill_lingerer(&mut process);
                     process.wait().map_err(ExecuteError::IoError)?;
+                    super::read_helpers::note_reaped_child_cpu(&process);
                     lingerer_sigpipe_status()
                 }
             };
@@ -3820,7 +3885,11 @@ impl Executor {
                     out.push(expanded.replace(crate::executor::markers::CTLESC, ""));
                     continue;
                 }
-                match glob::pathname_expand_word(&expanded, &self.shell_state.env_vars) {
+                match glob::pathname_expand_word(
+                    &expanded,
+                    &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
+                ) {
                     glob::PathnameExpansion::Matches(matches) => out.extend(matches),
                     glob::PathnameExpansion::NoMatch => {
                         out.push(expanded.replace(crate::executor::markers::CTLESC, ""))
@@ -4381,7 +4450,11 @@ impl Executor {
         // authority for the readonly/special classes: report it here,
         // exactly once, and kill the element the same way.
         if let Some((name, message)) = self.parameter_assignment_error(command) {
-            let class = if message == "readonly variable" { 2 } else { 1 };
+            let class = if matches!(message, "readonly variable" | "bad array subscript") {
+                2
+            } else {
+                1
+            };
             let line = format!("{}{}: {}\n", self.error_prefix(), name, message);
             self.write_diagnostic_fd2(line.as_bytes());
             return Ok(Some((
@@ -4416,7 +4489,7 @@ impl Executor {
                 continue;
             }
             if let glob::PathnameExpansion::Fail(pattern) =
-                glob::pathname_expand_word(word, &self.shell_state.env_vars)
+                glob::pathname_expand_word(word, &self.shell_state.env_vars, &self.shell_state.cwd)
             {
                 if !self.evalerror_failglob_pending.replace(true) {
                     self.report_failglob(&pattern);
@@ -4693,7 +4766,11 @@ impl Executor {
                         file_operands.push(value.replace(crate::executor::markers::CTLESC, ""));
                         continue;
                     }
-                    match glob::pathname_expand_word(&value, &self.shell_state.env_vars) {
+                    match glob::pathname_expand_word(
+                        &value,
+                        &self.shell_state.env_vars,
+                        &self.shell_state.cwd,
+                    ) {
                         glob::PathnameExpansion::Matches(matches) => file_operands.extend(matches),
                         glob::PathnameExpansion::NoMatch | glob::PathnameExpansion::Fail(_) => {
                             file_operands.push(value.replace(crate::executor::markers::CTLESC, ""))
@@ -4779,9 +4856,11 @@ impl Executor {
                         // its `.exe` spelling (`/usr/bin/seq`) opens like the
                         // spawned cat.exe sees it (same exists-first rule as
                         // the argv funnel).
-                        match fs::read(crate::executor::path::windows_operand_file_path(
-                            shell_path_to_windows(&path, &self.shell_state.env_vars),
-                            &self.shell_state.env_vars,
+                        match fs::read(self.session_path(
+                            crate::executor::path::windows_operand_file_path(
+                                shell_path_to_windows(&path, &self.shell_state.env_vars),
+                                &self.shell_state.env_vars,
+                            ),
                         )) {
                             Ok(bytes) => stream.extend(bytes),
                             Err(_) => {
@@ -5724,6 +5803,10 @@ fn time_pipeline_prefix(command: &CommandNode) -> Option<TimePipelinePrefix> {
     if command.word_metadata.len() == command.words.len() {
         stripped.word_metadata = command.word_metadata[index..].to_vec();
     }
+    // rubash#1661: same displaced classification as the parser fold —
+    // restore the stage's leading assignment words (see
+    // parser::reclassify_leading_assignment_words).
+    crate::parser::reclassify_leading_assignment_words(&mut stripped);
     Some(TimePipelinePrefix {
         command: stripped,
         inverted,

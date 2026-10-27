@@ -1460,6 +1460,49 @@ pub fn stdin_source_needs_more(source: &str) -> bool {
     stdin_source_needs_more_posix(source, false)
 }
 
+/// The 1-based line (within `text`) on which the OUTERMOST keyword
+/// compound that is still open at the end of `text` began, if any. The
+/// keyword stack mirrors `stdin_source_needs_more_posix`'s discipline
+/// (same push/pop pairs); token positions carry physical lines. Used by
+/// the unclosed-diagnostics route in `run_source_impl` to find where
+/// the FAILED command starts: a matched-pair construct (quote, `$(`,
+/// ...) that dies at EOF inside an unclosed `if`/`while`/`{`/... makes
+/// the whole compound the failed command in GNU's reader (parse.y
+/// read_token fails inside the compound's own token read), so none of
+/// the compound — and nothing else on its opening line — ever runs,
+/// and the compound-EOF diagnostic is never printed (rubash#1589).
+fn unclosed_compound_open_line(text: &str) -> Option<usize> {
+    let tokens = tokenize(text);
+    let mut stack: Vec<(&str, usize)> = Vec::new();
+    for token in &tokens {
+        // rubash#1721: structural keywords only (see
+        // Token::structural_keyword) — an argument-position keyword
+        // word is not an open compound.
+        if !token.structural_keyword() {
+            continue;
+        }
+        match token.value.as_str() {
+            "case" => stack.push(("esac", token.position)),
+            "if" => stack.push(("fi", token.position)),
+            "for" | "select" | "while" | "until" => stack.push(("done", token.position)),
+            "{" => stack.push(("}", token.position)),
+            "(" => stack.push((")", token.position)),
+            ")" => {
+                if stack.last().map(|(closer, _)| *closer) == Some(")") {
+                    stack.pop();
+                }
+            }
+            "esac" | "fi" | "done" | "}" => {
+                if stack.last().map(|(closer, _)| *closer) == Some(token.value.as_str()) {
+                    stack.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    stack.first().map(|(_, line)| *line)
+}
+
 /// Advance an open `=~` parse_matched_pair scan depth over one token
 /// (see the scan tracking in `stdin_source_needs_more_posix`). Keyword
 /// `(`/`)` are the lexer's split points; an unquoted word's unescaped
@@ -1501,6 +1544,14 @@ pub fn stdin_source_needs_more_posix(source: &str, posix: bool) -> bool {
     if stdin_source_text_needs_more(source, posix) {
         return true;
     }
+    // rubash#1573: an unterminated `[[` holds the group open (the
+    // conditional is one command; see GroupScanFeeder::
+    // token_level_needs_more for the parked-feeder arm of this rule —
+    // both halves of the completeness test ask the scanner's PST_CONDCMD
+    // state so their answers agree).
+    if crate::lexer::source_ends_in_cond_command(source, posix) {
+        return true;
+    }
 
     let tokens = tokenize(source);
     let mut stack = Vec::new();
@@ -1538,7 +1589,14 @@ pub fn stdin_source_needs_more_posix(source: &str, posix: bool) -> bool {
             }
             continue;
         }
-        if token.kind != TokenKind::Keyword {
+        // rubash#1721: only structural keywords fold — a keyword-spelled
+        // argument word (`echo if', `command -vkb if' in a case clause)
+        // is not a reserved word to GNU's reader (parse.y:3168
+        // CHECK_FOR_RESERVED_WORD via parse.y:5899
+        // reserved_word_acceptable; PST_CASEPAT parse.y:3177-3186), so
+        // it pushes no phantom frame here either. Mirror of
+        // GroupScanFeeder::fold_token.
+        if !token.structural_keyword() {
             continue;
         }
         match token.value.as_str() {
@@ -2989,6 +3047,21 @@ fn run_source_impl(
                 .map(|(prefix, _)| prefix.to_string())
                 .unwrap_or_default(),
         };
+        // rubash#1589: the matched-pair cut above stops at the pair's
+        // own line, but when that line sits inside a keyword compound
+        // that is itself unclosed at EOF (`if true; then` on the line
+        // above an unclosed quote), the prefix still ends mid-compound
+        // — running it standalone makes the prefix's own parse report
+        // the compound's EOF diagnostic ahead of the pair's, while GNU
+        // prints only the pair's (its reader died inside the compound,
+        // so the compound is the failed command and none of it — nor
+        // anything else on its opening line — ever ran). Retreat the
+        // cut to the outermost still-open compound's opening line.
+        let prefix = match unclosed_compound_open_line(&prefix) {
+            Some(open) if open > 1 => prefix.lines().take(open - 1).collect::<Vec<_>>().join("\n"),
+            Some(_) => String::new(),
+            None => prefix,
+        };
         if !prefix.trim().is_empty() {
             let _ = run_source_prefix_diagnostic_owned(
                 executor,
@@ -3237,7 +3310,14 @@ fn run_source_impl(
         // The grouped drivers must stop reading — record it before the
         // status conversion loses the distinction.
         Err(ExecuteError::ExitCode(code)) => {
-            executor.exit_jump_pending.set(true);
+            // rubash#1662: a signal-discard abort (untrapped SIGINT in
+            // an interactive shell) reaches the top as ExitCode too,
+            // but it is not a jump_to_top_level exit — the dispatch
+            // marked it DISCARD, so the reader keeps the session and
+            // prompts again with $? = code.
+            if !executor.take_signal_discard_pending() {
+                executor.exit_jump_pending.set(true);
+            }
             code
         }
         Err(ExecuteError::FatalFunctionError(code)) => {
@@ -3247,6 +3327,11 @@ fn run_source_impl(
         // ExpansionFailure is GNU's DISCARD: the command list aborted but
         // the reader continues with the next complete command.
         Err(ExecuteError::ExpansionFailure(code)) => code,
+        // SigintUnwind is the same DISCARD shape with a fixed verdict
+        // (rubash#1639): GNU threw to the top-level reader on the
+        // foreground job's SIGINT death — no diagnostic, the reader
+        // continues, and $? is the 130 the wait recorded.
+        Err(ExecuteError::SigintUnwind) => 130,
         // A `return` that unwinds to this unit's top ends the unit with
         // its status as an ordinary value (builtins/evalfile.c
         // source_file returns it; no jump_to_top_level). It can only
@@ -3389,12 +3474,15 @@ fn bind_lines_columns(executor: &mut Executor, lines: i32, columns: i32) {
         .shell_state
         .env_vars
         .insert("COLUMNS".to_string(), columns.to_string());
-    if std::env::var_os("LINES").is_some() {
-        std::env::set_var("LINES", lines.to_string());
-    }
-    if std::env::var_os("COLUMNS").is_some() {
-        std::env::set_var("COLUMNS", columns.to_string());
-    }
+    // G-01: winsize sync writes the process env — serialize it.
+    crate::executor::local_helpers::with_process_state_lock(|| {
+        if std::env::var_os("LINES").is_some() {
+            std::env::set_var("LINES", lines.to_string());
+        }
+        if std::env::var_os("COLUMNS").is_some() {
+            std::env::set_var("COLUMNS", columns.to_string());
+        }
+    });
 }
 
 /// jobs.c:2618 get_tty_state -> jobs.c:2647-2648 `if (check_window_size)
@@ -3588,6 +3676,13 @@ pub const READ_STDIN_MARKER: &str = "__RUBASH_READ_STDIN";
 /// readline/misc.c rl_operate_and_get_next) executes the current line and
 /// replaces the buffer with the next history entry.
 pub fn run_interactive_stdin(executor: &mut Executor) -> i32 {
+    // rubash#1662: GNU installs the interactive signal dispositions
+    // before the first prompt is read (sig.c:315-316); the command-
+    // boundary reconcile only runs after a command completes, so
+    // without this call the first prompt would still sit at the SIGINT
+    // kernel default.
+    #[cfg(unix)]
+    crate::builtins::kill::reconcile_kernel_trap_dispositions(&executor.shell_state.env_vars);
     // parse.y:1710: the SAME reader serves tty and non-tty stdin; the two
     // cases differ only in who echoes the accepted line (readline echoes
     // itself on a tty — the Windows cooked console echoes each typed key —
@@ -3887,6 +3982,29 @@ pub fn run_interactive_stdin(executor: &mut Executor) -> i32 {
                 preload_operate_and_get_next(executor, &mut st, src_abs);
             }
             continue;
+        }
+
+        // rubash#1662: dispatch pending signals before blocking on the
+        // next line, and while waiting for one at a fresh prompt (see
+        // prompt_wait_for_input). A delivery that aborts here discards
+        // the line being edited — GNU's reader leaves the read with
+        // the partial line dropped and $? = 128+sig — instead of the
+        // stale delivery ambushing the next completed line at its
+        // first command boundary. An exit jump recorded by a trap
+        // action is honored by the loop-top check after the cleanup.
+        #[cfg(unix)]
+        if console.is_none() {
+            let aborted = if pending.is_empty() && st.buffer.is_empty() {
+                matches!(prompt_wait_for_input(executor), PromptWait::Aborted)
+            } else {
+                executor.run_pending_signal_traps().is_err()
+            };
+            if aborted {
+                pending.clear();
+                group.clear();
+                st = EditState::default();
+                continue;
+            }
         }
 
         let mut raw = String::new();
@@ -4428,6 +4546,43 @@ fn normalize_bridge_line(raw: &str) -> String {
     output
 }
 
+/// Outcome of [`prompt_wait_for_input`].
+#[cfg(unix)]
+enum PromptWait {
+    /// fd 0 is readable (or at EOF): proceed with the line read.
+    Ready,
+    /// The pending-signal dispatch unwound: the current line is
+    /// discarded and the reader re-prompts.
+    Aborted,
+}
+
+/// rubash#1662: wait at a fresh interactive prompt until fd 0 is
+/// readable, dispatching pending signals between poll slices. fd
+/// reads retry on EINTR by design (fd::read_some: "let the
+/// pending-signal queue dispatch at the next command boundary"), but
+/// at a prompt there is no next command yet — an undispatched SIGINT
+/// would sit in the mailbox and abort the next typed line instead of
+/// the empty current one. GNU's reader instead leaves the read at
+/// once: partial line dropped, $? = 128+sig, fresh prompt.
+#[cfg(unix)]
+fn prompt_wait_for_input(executor: &mut Executor) -> PromptWait {
+    loop {
+        if executor.run_pending_signal_traps().is_err() {
+            return PromptWait::Aborted;
+        }
+        let mut pfd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, 50) };
+        if rc > 0 || pfd.revents != 0 {
+            return PromptWait::Ready;
+        }
+        // Slice expired or EINTR: loop and re-check the signal queue.
+    }
+}
+
 pub fn read_unbuffered_line(output: &mut String) -> io::Result<usize> {
     // TODO(input.c): This intentionally avoids BufRead prefetching so a child
     // shell script can inherit unread bytes from the same redirected stdin.
@@ -4560,19 +4715,13 @@ pub fn run_stdin_script(executor: &mut Executor) -> i32 {
             continue;
         }
 
-        // bashhist.c:869 bash_add_history: in interactive mode, each
-        // complete command is recorded to the session history.
-        if let Some(session) = executor.get_session_history() {
-            let trimmed = pending.trim_end();
-            if !trimmed.is_empty() {
-                let control = executor.get_env("HISTCONTROL").unwrap_or_default();
-                let ignore = executor.get_env("HISTIGNORE").unwrap_or_default();
-                let histsize = SessionHistory::size_limit(executor.get_env("HISTSIZE"));
-                session
-                    .borrow_mut()
-                    .record(trimmed, &control, &ignore, histsize);
-            }
-        }
+        // bashhist.c maybe_add_history gates recording on
+        // remember_on_history — the `history' set option, which defaults
+        // OFF for a non-interactive shell. This driver is the
+        // non-interactive stdin path, so input lines enter the history
+        // list only after `set -o history' (or `-o history' at startup)
+        // turns the option on (rubash#1629).
+        record_stdin_group_if_armed(executor, &pending);
 
         // eval.c:178: one current_command_number increment per command
         // list read happens in the execute_ast walk; no driver increment
@@ -4612,6 +4761,9 @@ pub fn run_stdin_script(executor: &mut Executor) -> i32 {
     if !pending.trim().is_empty() {
         // Final list gathered at EOF (e.g. no trailing newline) — still
         // one reader_loop iteration (eval.c:178); the walk increments it.
+        // The final group is read too, so the same read-time recording
+        // applies before it executes (rubash#1668).
+        record_stdin_group_if_armed(executor, &pending);
         let status = run_source_with_line_offset(
             executor,
             &pending,
@@ -4636,6 +4788,34 @@ pub fn run_stdin_script(executor: &mut Executor) -> i32 {
     let status = executor.last_exit_code();
     let interactive = executor.get_env("__RUBASH_INTERACTIVE").as_deref() == Some("1");
     finish_shell(executor, status, interactive)
+}
+
+/// bashhist.c maybe_add_history gates recording on remember_on_history
+/// — the `history' set option, which defaults OFF for a non-interactive
+/// shell. This driver is the non-interactive stdin path, so an input
+/// group enters the history list only when the option is on at read
+/// time (after `set -o history', or `-o history' at startup). The list
+/// is created on demand under the history builtin's rule: this driver
+/// installs no session up front, so without the on-demand step every
+/// line between `set -o history' and the first `history' builtin was
+/// silently dropped (rubash#1629, #1668).
+fn record_stdin_group_if_armed(executor: &mut Executor, pending: &str) {
+    if executor.get_env("__RUBASH_SETOPT_history").as_deref() != Some("1") {
+        return;
+    }
+    let Some(session) = executor.ensure_session_history() else {
+        return;
+    };
+    let trimmed = pending.trim_end();
+    if trimmed.is_empty() {
+        return;
+    }
+    let control = executor.get_env("HISTCONTROL").unwrap_or_default();
+    let ignore = executor.get_env("HISTIGNORE").unwrap_or_default();
+    let histsize = SessionHistory::size_limit(executor.get_env("HISTSIZE"));
+    session
+        .borrow_mut()
+        .record(trimmed, &control, &ignore, histsize);
 }
 
 pub fn finish_shell(executor: &mut Executor, status: i32, interactive: bool) -> i32 {

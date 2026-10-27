@@ -256,7 +256,8 @@ impl Executor {
                 return Ok(());
             }
             let file = if redirect.append {
-                let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
+                let path =
+                    self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars));
                 // niubash#519: CON has no read+write handle; a child's fd 0
                 // only needs the console input half (FileFd::
                 // open_readwrite_pair splits the fd-table binds).
@@ -782,7 +783,12 @@ impl Executor {
                 else {
                     continue;
                 };
-                self.write_process_substitution_temp_bytes(&output)?;
+                // rubash#1691: keep the carrier path — the per-command
+                // finish removes it (see the field docs); discarding it
+                // here leaked the file in $TMPDIR for good.
+                let carrier = self.write_process_substitution_temp_bytes(&output)?;
+                self.assignment_input_process_substitution_files
+                    .push(carrier);
                 let word_form = self.process_substitution_fd_word(&output);
                 word.replace_range(start..end, &word_form);
                 cursor = start + word_form.len();
@@ -836,7 +842,11 @@ impl Executor {
                 else {
                     continue;
                 };
-                self.write_process_substitution_temp_bytes(&output)?;
+                // rubash#1691: same carrier bookkeeping as the raw
+                // channel above.
+                let carrier = self.write_process_substitution_temp_bytes(&output)?;
+                self.assignment_input_process_substitution_files
+                    .push(carrier);
                 let word_form = self.process_substitution_fd_word(&output);
                 if let Some((start, end)) = range {
                     word.replace_range(start..end, &word_form);
@@ -904,6 +914,16 @@ impl Executor {
             }
         }
         self.cleanup_process_substitution_files(files);
+        // rubash#1691: ad-hoc carriers written while this command's
+        // redirects and fd endpoints were served (see
+        // ShellState::procsub_adhoc_carriers) die at the same finish —
+        // their consumers (a spawned child, an in-shell read) are done
+        // by now. The opened File handles stay valid on unix even
+        // after the unlink.
+        let adhoc = std::mem::take(&mut *self.shell_state.procsub_adhoc_carriers.borrow_mut());
+        for path in adhoc {
+            let _ = fs::remove_file(path);
+        }
         if let Some(error) = error {
             return Err(error);
         }
@@ -948,6 +968,20 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        // rubash#1691: assignment-RHS INPUT procsub carriers die with
+        // this command — GNU's substitution fd is closed when the
+        // command finishes, so the stored /dev/fd/N word is dead from
+        // the next command on (verified oracle); the payload bytes
+        // stay readable through the in-memory stream registry for
+        // in-shell consumers. This drain must run even when the
+        // output queue below is empty (the common input-only case).
+        if !self.assignment_input_process_substitution_files.is_empty() {
+            let carriers = std::mem::take(&mut self.assignment_input_process_substitution_files);
+            self.cleanup_process_substitution_files(ProcessSubstitutionFiles {
+                inputs: carriers,
+                outputs: Vec::new(),
+            });
+        }
         if self.assignment_output_process_substitutions.is_empty() {
             return Ok(());
         }
@@ -1169,6 +1203,7 @@ impl Executor {
             .stdin(Stdio::piped())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
+        process.current_dir(&self.shell_state.cwd);
         suppress_orphan_console(&mut process);
         let mut child = process.spawn()?;
         let pid = child.id();
@@ -1376,10 +1411,10 @@ impl Executor {
             let fallback = std::env::temp_dir();
             if Self::dir_usable_for_scratch(&fallback) {
                 dir = fallback;
-            } else if let Ok(cwd) = std::env::current_dir() {
-                dir = cwd;
             } else {
-                fs::create_dir_all(&dir)?;
+                // G-02: "the shell cwd" (the pre-G-02 code's last-resort
+                // process cwd) is the session cwd field.
+                dir = self.shell_state.cwd.clone();
             }
         }
         let nanos = SystemTime::now()

@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::{
-    eval_arith_value, parse_array_tokens, parse_array_words, split_indexed_tagged_token,
-    split_storage_words, unquote_storage_value,
+    eval_arith_value, eval_integer_value, parse_array_tokens, parse_array_words,
+    split_indexed_tagged_token, split_storage_words, unquote_storage_value,
 };
 use crate::executor::glob::{pathname_expand_word, PathnameExpansion};
 use crate::executor::markers::STORAGE_WORD_PREFIX;
@@ -104,7 +104,11 @@ pub(in crate::builtins) fn append_array_value(
             } else {
                 crate::executor::glob::compound_element_glob_pattern(token)
             };
-            match pathname_expand_word(&glob_word, env_vars) {
+            match pathname_expand_word(
+                &glob_word,
+                env_vars,
+                &crate::executor::glob::env_cwd_path(env_vars),
+            ) {
                 PathnameExpansion::Matches(matches) => {
                     for value in matches {
                         entries.insert(next_index, value);
@@ -143,7 +147,9 @@ pub(in crate::builtins) fn append_array_value(
                         // remains.
                         let rhs = crate::executor::markers::dequote_ctlesc_pairs(rhs);
                         let value = if integer {
-                            (eval_arith_value(&current) + eval_arith_value(&rhs)).to_string()
+                            (eval_integer_value(&current, env_vars)
+                                + eval_integer_value(&rhs, env_vars))
+                            .to_string()
                         } else {
                             format!("{current}{rhs}")
                         };
@@ -223,7 +229,8 @@ pub(in crate::builtins) fn append_array_value(
         if scalar_append && !entries.is_empty() {
             let current = entries.get(&0).cloned().unwrap_or_default();
             let appended = if integer {
-                (eval_arith_value(&current) + eval_arith_value(&token)).to_string()
+                (eval_integer_value(&current, env_vars) + eval_integer_value(&token, env_vars))
+                    .to_string()
             } else {
                 format!("{current}{token}")
             };
@@ -236,7 +243,7 @@ pub(in crate::builtins) fn append_array_value(
 
     if integer {
         for element in entries.values_mut() {
-            *element = eval_arith_value(element).to_string();
+            *element = eval_integer_value(element, env_vars).to_string();
         }
     }
 
