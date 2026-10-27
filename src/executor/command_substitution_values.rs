@@ -859,13 +859,44 @@ impl Executor {
         // fd 0: feed the child the unread tail of FUNCTION_STDIN and, after
         // it runs, drain the caller's cursor to EOF.
         let mut piped_stdin: Option<Vec<u8>> = None;
+        let mut fd_table_text_stdin = false;
         if let Some(stdin_path) = stdio.stdin_path {
             let file = File::open(stdin_path).ok()?;
             process.stdin(Stdio::from(file));
+        } else if self.fd_table.is_closed(0)
+            || (self.fd_table.has_entry(0) && !self.fd_table.is_open_for_read(0))
+        {
+            // rubash#1877: mirror apply_external_stdin_redirect's tail —
+            // an exec-installed closed/write-only fd 0 gives the forked
+            // child no readable descriptor (rubash#1102), never the
+            // process's ambient stdin.
+            process.stdin(crate::executor::external_setup::closed_stdin());
+        } else if let Some(
+            FdReadEndpoint::File(file_fd) | FdReadEndpoint::CoprocStdout { fd: file_fd, .. },
+        ) = self.fd_table.read_endpoint(0)
+        {
+            // rubash#1877: GNU subst.c:7143 command_substitute forks, so
+            // the child shares fd 0's open file description — after
+            // `exec < file` an external command inside $( ) reads from
+            // the shell's current offset and advances it for the next
+            // reader. duplicate_handle shares the file pointer exactly
+            // like the generic spawn path (apply_external_stdin_redirect,
+            // rubash#1102/#1103); this arm must win over the
+            // FUNCTION_STDIN buffer below for the same reason.
+            let dup = crate::fd::duplicate_handle(file_fd.handle).ok()?;
+            process.stdin(Stdio::from(crate::fd::handle_to_file(dup)));
         } else if let Some(input) = self.function_stdin_remaining() {
             process.stdin(Stdio::piped());
             piped_stdin =
                 Some(crate::executor::substitution_metadata::shell_text_to_raw_bytes(&input));
+        } else if let Some(bytes) = self.virtual_fd_stdin_remaining_bytes(0) {
+            // Buffered fd-0 endpoint (heredoc/herestring text or a
+            // process-substitution stream staged by `exec`): the forked
+            // child drains the stream, so feed the unread remainder and
+            // consume the parent's cursor once it has run.
+            process.stdin(Stdio::piped());
+            piped_stdin = Some(bytes);
+            fd_table_text_stdin = true;
         }
         if let Some(redirect) = &stdio.stdout_redirect {
             let file = open_command_substitution_redirect(redirect).ok()?;
@@ -895,11 +926,16 @@ impl Executor {
         }
         let mut output = spawned.wait_with_output().ok()?;
         output.stdout.extend(self.collect_dev_fd_capture(&dev_ops));
-        if piped_stdin.is_some() {
+        if piped_stdin.is_some() && !fd_table_text_stdin {
             if let Some(text) = self.shell_state.env_vars.get(FUNCTION_STDIN) {
                 self.comsub_stdin_writeback
                     .set(Some((text.len(), Self::function_stdin_fingerprint(text))));
             }
+        }
+        if fd_table_text_stdin {
+            // The child drained the buffered fd-0 stream (shared-offset
+            // semantics, redir.c): the parent's cursor moves to EOF.
+            self.fd_table.drain_input_to_eof(0);
         }
         let status = crate::executor::wait_status::process_exit_status(&output.status);
         if stdio.expanded_words.first().map(String::as_str) == Some("mktemp")

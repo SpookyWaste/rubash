@@ -1666,7 +1666,7 @@ impl Executor {
 /// A write-only /dev/null reproduces that observable contract on Unix —
 /// read(2) on a write-only descriptor fails EBADF. Elsewhere fall back to
 /// the plain null device (EOF).
-fn closed_stdin() -> Stdio {
+pub(in crate::executor) fn closed_stdin() -> Stdio {
     #[cfg(unix)]
     {
         if let Ok(file) = OpenOptions::new().write(true).open("/dev/null") {
