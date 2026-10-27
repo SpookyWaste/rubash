@@ -1652,12 +1652,14 @@ impl Executor {
 
     /// GNU wait.def:193-206 + :328-331: drain this process's pending-signal
     /// mailbox while waiting. An untrapped non-SIGCHLD signal aborts the
-    /// shell with 128+sig (ExecuteError::ExitCode); a trapped signal makes
-    /// `wait` return 128+sig immediately — SIGCHLD is exempt outside posix
-    /// mode (wait.def:195-199). Everything drained is re-queued so the
-    /// command boundary's run_pending_signal_traps still runs the trap
-    /// actions after wait returns ("the trap associated with that signal
-    /// shall be taken").
+    /// wait with 128+sig (ExecuteError::ExitCode, classified discard vs
+    /// exit exactly like the boundary dispatch's untrapped branch —
+    /// rubash#1825); a trapped signal makes `wait` return 128+sig
+    /// immediately — SIGCHLD is exempt outside posix mode
+    /// (wait.def:195-199). Everything drained on the non-aborting paths
+    /// is re-queued so the command boundary's run_pending_signal_traps
+    /// still runs the trap actions after wait returns ("the trap
+    /// associated with that signal shall be taken").
     fn wait_pending_signal_status(&mut self) -> Result<Option<i32>, ExecuteError> {
         let signals =
             crate::builtins::kill::take_pending_signals_now(std::process::id()).unwrap_or_default();
@@ -1686,9 +1688,34 @@ impl Executor {
                 // Explicitly ignored (trap '' USR1) or SIGCHLD under posix:
                 // not fatal, not interrupting.
                 Some(_) => continue,
-                None => return Err(ExecuteError::ExitCode(128 + signal)),
-                // signals delivered but never named (signal_trap_name
-                // gives None for out-of-range) are dropped with the rest.
+                None => {
+                    // rubash#1825: the same classification the boundary
+                    // dispatch's untrapped branch makes
+                    // (run_pending_signal_traps): record the status and,
+                    // in an interactive shell, mark the unit for
+                    // DISCARD — GNU jobs.c:3315-3316 (ADDINTERRUPT)
+                    // throws the interrupted wait to the top level as a
+                    // discard, so the session survives with $?=128+sig
+                    // instead of ending. A bare ExitCode here was read
+                    // by the source driver as an exit jump and killed
+                    // the whole interactive session at the wait.
+                    // Non-interactive shells keep the exit
+                    // classification, and the drained signals are not
+                    // re-queued on this path: this delivery IS the
+                    // wait's verdict.
+                    self.exit_code = 128 + signal;
+                    if self
+                        .shell_state
+                        .env_vars
+                        .get("__RUBASH_INTERACTIVE")
+                        .map(String::as_str)
+                        == Some("1")
+                    {
+                        self.signal_discard_pending = true;
+                    }
+                    return Err(ExecuteError::ExitCode(128 + signal));
+                } // signals delivered but never named (signal_trap_name
+                  // gives None for out-of-range) are dropped with the rest.
             }
         }
         crate::builtins::kill::requeue_pending_signals(signals);
