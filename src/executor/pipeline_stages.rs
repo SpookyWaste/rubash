@@ -865,6 +865,18 @@ impl Executor {
                     if let Ok(mut file) = self.create_redirect_output(&target, redirect.clobber) {
                         let _ = file.write_all(diagnostic.as_bytes());
                     }
+                    // rubash#1571: the diagnostic was just delivered
+                    // through the element's own open of the target. The
+                    // driver's routing walk would re-run the ordered
+                    // redirects for this stage and its probe-open
+                    // (open_command_output_target) truncates the file
+                    // again before writing the stage's (empty) captured
+                    // stderr — the delivered diagnostic died for every
+                    // non-first stage. The stage owns its stream
+                    // placement exactly like the shared-file wiring
+                    // below and the function stage's rubash#412 case:
+                    // mark it pre-wired so the driver skips routing.
+                    self.pipeline_stage_fds_pre_wired.set(true);
                     return Ok(Some((String::new(), String::new(), 127)));
                 }
             } else if let Some(redirect) = &command.redirect_err_append {
@@ -876,6 +888,8 @@ impl Executor {
                     )) {
                         let _ = file.write_all(diagnostic.as_bytes());
                     }
+                    // rubash#1571: same direct delivery as above.
+                    self.pipeline_stage_fds_pre_wired.set(true);
                     return Ok(Some((String::new(), String::new(), 127)));
                 }
             }
