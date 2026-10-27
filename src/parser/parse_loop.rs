@@ -1000,36 +1000,57 @@ fn fold_time_pipeline_commands(commands: Vec<CommandNode>) -> Vec<CommandNode> {
     commands
         .into_iter()
         .map(|mut command| {
-            let Some(pipeline) = command.pipeline_command.as_mut() else {
+            // parse.y: the timespec production is recursive
+            // (pipeline_command: timespec pipeline_command), so strip
+            // EVERY recorded timespec head off the pipeline's first
+            // stage — innermost head first — and wrap one TimeCommand
+            // frame per head (rubash#1805: `time time cmd | …`).
+            let mut prefixes = Vec::new();
+            loop {
+                let Some(pipeline) = command.pipeline_command.as_mut() else {
+                    break;
+                };
+                let Some(prefix) = time_prefix_from_pipeline(pipeline) else {
+                    break;
+                };
+                prefixes.push(prefix);
+            }
+            if prefixes.is_empty() {
                 return command;
-            };
-            let Some(prefix) = time_prefix_from_pipeline(pipeline) else {
-                return command;
-            };
+            }
 
             let line = command.line;
             let inverted = command.inverted;
             let and_or = command.and_or.take();
             let background = command.background;
+            let logical_line = command.logical_line;
             command.inverted = false;
             command.background = false;
             command.and_or = None;
-            let mut timed = CommandNode::new();
-            timed.line = line;
-            timed.logical_line = command.logical_line;
+            // The pipeline node's own modifiers belong to the whole
+            // unit, so they land on the OUTERMOST frame (built last);
+            // each frame's TimeCommand.inverted is its own head's
+            // window verdict.
+            let mut timed = command;
+            for prefix in prefixes.into_iter().rev() {
+                let mut frame = CommandNode::new();
+                frame.line = line;
+                frame.logical_line = logical_line;
+                frame.time_command = Some(TimeCommand {
+                    keyword: prefix.keyword,
+                    keyword_metadata: prefix.keyword_metadata,
+                    prefix_words: prefix.prefix_words,
+                    prefix_word_metadata: prefix.prefix_word_metadata,
+                    command: Box::new(timed),
+                    posix_format: prefix.posix_format,
+                    inverted: prefix.inverted,
+                    keyword_was_plain_word: false,
+                });
+                timed = frame;
+            }
             timed.inverted = inverted;
             timed.and_or = and_or;
             timed.background = background;
-            timed.time_command = Some(TimeCommand {
-                keyword: prefix.keyword,
-                keyword_metadata: prefix.keyword_metadata,
-                prefix_words: prefix.prefix_words,
-                prefix_word_metadata: prefix.prefix_word_metadata,
-                command: Box::new(command),
-                posix_format: prefix.posix_format,
-                inverted: prefix.inverted,
-                keyword_was_plain_word: false,
-            });
             timed
         })
         .collect()
@@ -1187,32 +1208,50 @@ fn fold_time_simple_commands(commands: Vec<CommandNode>) -> Vec<CommandNode> {
             if !command_is_time_simple_candidate(&command) {
                 return command;
             }
-            let Some(prefix) = time_prefix_from_command(&mut command) else {
+            // parse.y: the timespec production is recursive
+            // (pipeline_command: timespec pipeline_command), so strip
+            // EVERY recorded timespec head — innermost head first —
+            // and wrap one TimeCommand frame per head (rubash#1805:
+            // `time time x=1` applies the assignment, as GNU does).
+            let mut prefixes = Vec::new();
+            while let Some(prefix) = time_prefix_from_command(&mut command) {
+                prefixes.push(prefix);
+            }
+            if prefixes.is_empty() {
                 return command;
-            };
+            }
 
             let line = command.line;
             let inverted = command.inverted;
             let and_or = command.and_or.take();
             let background = command.background;
+            let logical_line = command.logical_line;
             command.inverted = false;
             command.background = false;
-            let mut timed = CommandNode::new();
-            timed.line = line;
-            timed.logical_line = command.logical_line;
+            // The command's own modifiers belong to the whole unit,
+            // so they land on the OUTERMOST frame (built last); each
+            // frame's TimeCommand.inverted is its own head's window
+            // verdict.
+            let mut timed = command;
+            for prefix in prefixes.into_iter().rev() {
+                let mut frame = CommandNode::new();
+                frame.line = line;
+                frame.logical_line = logical_line;
+                frame.time_command = Some(TimeCommand {
+                    keyword: prefix.keyword,
+                    keyword_metadata: prefix.keyword_metadata,
+                    prefix_words: prefix.prefix_words,
+                    prefix_word_metadata: prefix.prefix_word_metadata,
+                    command: Box::new(timed),
+                    posix_format: prefix.posix_format,
+                    inverted: prefix.inverted,
+                    keyword_was_plain_word: false,
+                });
+                timed = frame;
+            }
             timed.inverted = inverted;
             timed.and_or = and_or;
             timed.background = background;
-            timed.time_command = Some(TimeCommand {
-                keyword: prefix.keyword,
-                keyword_metadata: prefix.keyword_metadata,
-                prefix_words: prefix.prefix_words,
-                prefix_word_metadata: prefix.prefix_word_metadata,
-                command: Box::new(command),
-                posix_format: prefix.posix_format,
-                inverted: prefix.inverted,
-                keyword_was_plain_word: false,
-            });
             timed
         })
         .collect()
@@ -3014,7 +3053,15 @@ pub(super) fn parse_time_prefixed_compound_command(
         i += 1;
     }
 
-    let (mut command, next_i) = if is_keyword(tokens, i, "for") {
+    let (mut command, next_i) = if is_keyword(tokens, i, "time") {
+        // parse.y: the timespec production is recursive
+        // (pipeline_command: timespec pipeline_command), so a second
+        // recorded `time` head after the first head's operand window
+        // introduces the inner timed command — compound or simple —
+        // exactly as the first did (rubash#1805: `time time if …`,
+        // `time time ((…))`, … all parse in GNU).
+        parse_time_prefixed_compound_command(tokens, i)?
+    } else if is_keyword(tokens, i, "for") {
         parse_for_command(tokens, i, None, 0)?
     } else if is_keyword(tokens, i, "if") {
         parse_if_command_standalone(tokens, i, None, 0)?
