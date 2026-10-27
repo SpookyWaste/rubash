@@ -476,6 +476,19 @@ impl BreakpointTable {
         self.entries.values().filter(|entry| entry.kind.is_watch())
     }
 
+    /// Whether any entry could stop the debuggee at a seam: an
+    /// enabled line or function entry. Watch entries never stop
+    /// at a seam (their stop-and-diff is serviced at stops the
+    /// other kinds cause), and disabled entries are skipped by
+    /// the consult entirely — neither keeps the consult awake.
+    /// The funnel's inert fast exit (design 4.4) asks this
+    /// before its stop-decision machinery.
+    pub fn has_enabled_seam_entries(&self) -> bool {
+        self.entries.values().any(|entry| {
+            entry.enabled && matches!(entry.kind, BreakpointKind::Line | BreakpointKind::Function)
+        })
+    }
+
     /// Enable or disable an entry; false when the id is unknown.
     pub fn set_enabled(&mut self, id: BreakpointId, enabled: bool) -> bool {
         let Some(entry) = self.entries.get_mut(&id) else {
@@ -571,6 +584,31 @@ mod tests {
         Breakpoint, BreakpointId, BreakpointKind, BreakpointResolution, BreakpointTable,
         BreakpointTarget, HitOutcome,
     };
+
+    #[test]
+    fn has_enabled_seam_entries_counts_only_enabled_line_and_function() {
+        let mut table = BreakpointTable::new();
+        assert!(!table.has_enabled_seam_entries(), "empty table");
+        let watch = table.insert_watch("x");
+        assert!(
+            !table.has_enabled_seam_entries(),
+            "watch is not a seam stop"
+        );
+        let line = table.insert_line("a.sh", 10);
+        assert!(table.has_enabled_seam_entries(), "enabled line entry");
+        table.set_enabled(line, false);
+        assert!(
+            !table.has_enabled_seam_entries(),
+            "a disabled line entry is inert"
+        );
+        table.set_enabled(line, true);
+        let _ = table.remove(line);
+        let func = table.insert_function("main");
+        assert!(table.has_enabled_seam_entries(), "enabled function entry");
+        table.set_enabled(func, false);
+        assert!(!table.has_enabled_seam_entries());
+        let _ = watch;
+    }
 
     #[test]
     fn ids_start_at_one_and_advance_in_creation_order() {

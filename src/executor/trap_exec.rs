@@ -5289,6 +5289,20 @@ impl Executor {
         crate::debugger::SESSION_ACTIVE.is_armed() && self.debug_driver.is_some()
     }
 
+    /// Could the consult on THIS executor stop the debuggee at
+    /// the next seam? The session's own predicate
+    /// ([`crate::debugger::DebugSession::can_stop_at_seam`]),
+    /// plus the no-driver case: an executor that carries no
+    /// session has nothing to consult, whatever the process
+    /// gate says. The funnel consult asks this before its
+    /// stop-decision machinery (S4; design 4.4).
+    fn debugger_consult_can_stop(&self) -> bool {
+        match self.debug_driver.as_ref() {
+            Some(driver) => driver.session().can_stop_at_seam(),
+            None => false,
+        }
+    }
+
     /// WP-8 (design 5.1): register one parsed reader unit's syntax
     /// view with the attached session, under the file identity the
     /// engine itself reports for the unit. Called by the two
@@ -5406,7 +5420,33 @@ impl Executor {
                             .inspection()
                             .map(|snapshot| snapshot.frames.len())
                     });
-                    let evaluation = self.debugger_evaluate(&request, frame_count)?;
+                    let evaluation = match self.debugger_evaluate(&request, frame_count) {
+                        Ok(evaluation) => evaluation,
+                        Err(unwind) => {
+                            // A control unwind the user typed at
+                            // the stop (`exit` / `return` / `break`
+                            // / `continue` in an explicit
+                            // evaluation; design 7.4) propagates as
+                            // the debuggee's own flow — which makes
+                            // it a resume: the debuggee is running
+                            // again the moment the unwind leaves
+                            // this serve. Mirror the ForceReturn
+                            // route's discipline (resume first,
+                            // then raise): a session left Stopped
+                            // here would wedge — the consult serves
+                            // only a running session, so no later
+                            // breakpoint, step, or frame-return
+                            // note could ever land again. The
+                            // arming is Continue: the typed unwind
+                            // installed no rule.
+                            if let Some(driver) = self.debug_driver.as_mut() {
+                                let _ = driver
+                                    .session_mut()
+                                    .resume(crate::debugger::StepArming::Continue);
+                            }
+                            return Err(unwind);
+                        }
+                    };
                     if let Some(driver) = self.debug_driver.as_mut() {
                         driver.session_mut().set_last_evaluation(evaluation);
                     }
@@ -5545,6 +5585,39 @@ impl Executor {
         seam: crate::debugger::SeamKind,
         command_text: &str,
     ) -> Result<(), ExecuteError> {
+        // WP-8 (design 5.2): a function-entry seam proves the
+        // entered function is defined. The note is resolution
+        // bookkeeping, not a stop decision — later breakpoint
+        // adjudication reads the record it leaves — so it is
+        // taken on every entry arrival while the session runs,
+        // ahead of the inert fast exit below, exactly as it was
+        // taken inside the consult body before.
+        if seam == crate::debugger::SeamKind::FunctionEntry {
+            if let Some(name) = self.shell_state.function_name_stack.first().cloned() {
+                if let Some(driver) = self.debug_driver.as_mut() {
+                    let session = driver.session_mut();
+                    if session.is_running() {
+                        session.note_function_defined(&name);
+                    }
+                }
+            }
+        }
+        // S4 inert fast exit (design 4.4): when nothing on this
+        // executor can stop the debuggee at this seam — no
+        // driver installed here at all (child executors share
+        // the process gate but never carry a session), or a
+        // session that is attached but inert (running under a
+        // Continue arming with no enabled seam entry) — the
+        // consult does not run. Nothing the consult body does
+        // is observable in that shape: there is no condition to
+        // evaluate, no stop to serve, and the $BASH_COMMAND
+        // refresh below exists only for a stop's own reads.
+        // The inert path therefore costs the gate load the
+        // funnel already paid plus this one predicate — the
+        // zero-cost shape the design budgets for the off path.
+        if !self.debugger_consult_can_stop() {
+            return Ok(());
+        }
         // $BASH_COMMAND at a stop is the about-to-run command
         // (design 7.3; the section 4.2 ordering sets it before
         // the consult): for the duration of the consult — the
@@ -5590,15 +5663,11 @@ impl Executor {
         if let Some(driver) = self.debug_driver.as_mut() {
             let session = driver.session_mut();
             if session.is_running() {
-                // WP-8 (design 5.2): a function-entry seam proves
-                // the entered function is defined. For a name no
-                // syntax view covers — an eval-defined function —
-                // this note is what resolves its pending entries,
-                // and it lands before hit accounting so a
-                // just-resolved entry can stop at this very entry.
-                if let Some(name) = &function_name {
-                    session.note_function_defined(name);
-                }
+                // The WP-8 function-definition note for this
+                // arrival was taken by the consult wrapper, ahead
+                // of its inert fast exit — it lands before this
+                // hit accounting, so a just-resolved entry can
+                // stop at this very entry.
                 // Breakpoint accounting (design 5.1/5.2/5.5):
                 // register_hit counts the hit and spends ignore
                 // credit before any condition is evaluated.
