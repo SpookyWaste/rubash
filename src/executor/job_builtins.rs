@@ -3462,6 +3462,13 @@ impl Executor {
                     }
                     let word = parsed.word().to_string();
                     let mut resolved = crate::builtins::complete::CompgenDynamic::default();
+                    // rubash#1799: -A variable lists PIPESTATUS only
+                    // while its cell exists as a visible variable —
+                    // materialized by a completed pipeline (LiveArray)
+                    // or created by a scalar bind (Scalar); the
+                    // valueless declare shapes stay att_invisible in
+                    // GNU and an absent cell is no variable at all.
+                    resolved.pipestatus = self.pipestatus_listing();
                     if let Some(funcname) = parsed.funcname.as_deref() {
                         // GNU pcomplete.c:1058-1066 gen_shell_function_matches:
                         // a missing -F function is internal_error
@@ -3701,6 +3708,8 @@ impl Executor {
                 )
             };
         let mut dynamic = crate::builtins::complete::CompgenDynamic::default();
+        // rubash#1799: same PIPESTATUS cell rule as the compgen arm.
+        dynamic.pipestatus = self.pipestatus_listing();
         if let Some(funcname) = spec.funcname.as_deref() {
             dynamic.function_candidates = self.run_completion_function_live(
                 funcname,
@@ -3847,6 +3856,23 @@ impl Executor {
             }
         }
         values
+    }
+
+    /// rubash#1799: the PIPESTATUS cell facts for the -A variable /
+    /// -A arrayvar listings, read from the cell shape the status writer
+    /// maintains: a completed pipeline (or array bind) leaves a
+    /// LiveArray cell, a scalar bind a Scalar cell — both visible
+    /// variables in GNU's table; the valueless declare shapes are
+    /// att_invisible and an Absent shape is no cell at all.
+    fn pipestatus_listing(&self) -> crate::builtins::complete::PipestatusListing {
+        use crate::shell::state::PipestatusShape;
+        crate::builtins::complete::PipestatusListing {
+            cell_visible: matches!(
+                self.shell_state.pipestatus_shape,
+                PipestatusShape::LiveArray | PipestatusShape::Scalar
+            ),
+            live_array: self.shell_state.pipestatus_shape == PipestatusShape::LiveArray,
+        }
     }
 
     /// pcomplete.c:929 bind_compfunc_variables with the compgen shape: an

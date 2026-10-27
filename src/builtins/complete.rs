@@ -751,6 +751,25 @@ pub(crate) struct CompgenDynamic {
     pub(crate) command_candidates: Vec<String>,
     /// The expanded -W wordlist, when -W was given.
     pub(crate) expanded_wordlist: Option<Vec<String>>,
+    /// The PIPESTATUS cell facts the variable listings need
+    /// (rubash#1799): GNU registers no PIPESTATUS cell at startup —
+    /// set_pipestatus_array (variables.c:6291) materializes it when
+    /// the first pipeline completes, and a bind creates a visible cell
+    /// too — so the listings offer the name only while such a cell
+    /// lives. The executor reads the cell shape from its shell state;
+    /// the builtin-side listings cannot see it.
+    pub(crate) pipestatus: PipestatusListing,
+}
+
+/// PIPESTATUS cell shapes as the -A variable / -A arrayvar listings
+/// see them (rubash#1799): `cell_visible` (a live array cell or a
+/// scalar cell — both are visible variables in GNU's table) drives
+/// -A variable; `live_array` (only the materialized array cell)
+/// drives -A arrayvar.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PipestatusListing {
+    pub(crate) cell_visible: bool,
+    pub(crate) live_array: bool,
 }
 
 /// pcomplete.c:285-297 filter_matches: with extglob disabled a leading `!`
@@ -808,6 +827,7 @@ pub(crate) fn apply_completion_actions(
     function_names: &[String],
     job_names: &[String],
     underlay: &crate::shell::var_table::TempenvListingUnderlay,
+    pipestatus: PipestatusListing,
 ) -> Vec<String> {
     let mut candidates: Vec<String> = Vec::new();
     for &(actname, actbit, _) in COMPACTS {
@@ -816,9 +836,11 @@ pub(crate) fn apply_completion_actions(
         }
         match actname {
             "alias" => candidates.extend(alias_completion_candidates(aliases)),
-            "arrayvar" => {
-                candidates.extend(array_variable_completion_candidates(env_vars, underlay))
-            }
+            "arrayvar" => candidates.extend(array_variable_completion_candidates(
+                env_vars,
+                underlay,
+                pipestatus.live_array,
+            )),
             "binding" => candidates.extend(READLINE_BINDINGS.iter().map(|s| s.to_string())),
             "builtin" => candidates.extend(SHELL_BUILTINS.iter().map(|s| s.to_string())),
             "command" => candidates.extend(command_completion_candidates(
@@ -857,7 +879,11 @@ pub(crate) fn apply_completion_actions(
             "signal" => candidates.extend(signal_completion_candidates()),
             "stopped" => {}
             "user" => candidates.extend(user_completion_candidates(env_vars)),
-            "variable" => candidates.extend(variable_completion_candidates(env_vars, underlay)),
+            "variable" => candidates.extend(variable_completion_candidates(
+                env_vars,
+                underlay,
+                pipestatus.cell_visible,
+            )),
             _ => {}
         }
     }
@@ -977,6 +1003,10 @@ pub(crate) fn complete_line_candidates_with_dynamic(
                 function_names,
                 job_names,
                 &crate::shell::var_table::TempenvListingUnderlay::new(),
+                dynamic
+                    .as_ref()
+                    .map(|dynamic| dynamic.pipestatus)
+                    .unwrap_or_default(),
             ));
         }
         if let Some(globpat) = cs.globpat.as_deref() {
@@ -1130,6 +1160,10 @@ where
         function_names,
         job_names,
         underlay,
+        dynamic
+            .as_ref()
+            .map(|dynamic| dynamic.pipestatus)
+            .unwrap_or_default(),
     );
 
     if let Some(glob_pattern) = parsed.globpat.as_deref() {
@@ -1584,6 +1618,7 @@ fn services_db_path() -> std::path::PathBuf {
 fn variable_completion_candidates(
     env_vars: &HashMap<String, String>,
     underlay: &crate::shell::var_table::TempenvListingUnderlay,
+    pipestatus_cell_visible: bool,
 ) -> Vec<String> {
     // GNU variables.c:511-526 (initialize_shell_variables): invalid-name
     // environment entries live in the invisible invalid_env table and are
@@ -1594,13 +1629,27 @@ fn variable_completion_candidates(
     // GNU registers as hash-table cells (variables.c initialize_dynamic_
     // variables) list even though rubash computes them at read time
     // instead of storing them in the env map. FUNCNAME carries
-    // att_invisible outside a function (variables.c:1812) and HISTCMD is
-    // not implemented by this engine, so neither is added here.
+    // att_invisible outside a function (variables.c:1812), so it is not
+    // added here. HISTCMD is such a registered dynamic cell
+    // (variables.c:1873 INIT_DYNAMIC_VAR) and lists unconditionally
+    // (rubash#1799). PIPESTATUS has no cell until set_pipestatus_array
+    // (variables.c:6291) materializes one — see the CompgenDynamic field
+    // of the same name. THIS_SH is not a GNU variable at all: the engine
+    // injects it into the env map at startup (executor init), so the
+    // injected spelling (the running executable's own path) is hidden;
+    // a value the caller supplied that survived init (an sh/bash-named
+    // wrapper) is a real environment variable and lists, exactly as an
+    // imported THIS_SH lists under GNU (rubash#1799).
+    let this_sh_injected = auto_this_sh_spelling();
     let mut candidates: Vec<String> = env_vars
         .keys()
         .filter(|name| valid_identifier(name))
         .filter(|name| !name.starts_with("__RUBASH_"))
         .filter(|name| name.as_str() != "FUNCNAME")
+        .filter(|name| {
+            name.as_str() != "THIS_SH"
+                || env_vars.get("THIS_SH").map(String::as_str) != Some(this_sh_injected.as_str())
+        })
         // rubash#1569: a name created by the current command's own
         // tempenv frame is not a context variable, so it is not a
         // candidate; a shadowed name stays (its underlying binding is
@@ -1618,8 +1667,8 @@ fn variable_completion_candidates(
             "EPOCHREALTIME",
             "EPOCHSECONDS",
             "GROUPS",
+            "HISTCMD",
             "LINENO",
-            "PIPESTATUS",
             "RANDOM",
             "SECONDS",
             "SRANDOM",
@@ -1627,27 +1676,45 @@ fn variable_completion_candidates(
         .iter()
         .map(|name| name.to_string()),
     );
+    if pipestatus_cell_visible {
+        candidates.push("PIPESTATUS".to_string());
+    }
     candidates.sort();
     candidates.dedup();
     candidates
 }
 
+/// The THIS_SH spelling the engine injects at startup (executor init):
+/// the running executable's path with backslashes normalized to `/`.
+/// A THIS_SH in the env map with any other value was supplied by the
+/// caller and kept by init (the sh/bash wrapper exception), so it is a
+/// genuine environment variable for listing purposes (rubash#1799).
+fn auto_this_sh_spelling() -> String {
+    std::env::current_exe()
+        .map(|path| path.to_string_lossy().replace('\\', "/").to_string())
+        .unwrap_or_else(|_| "rubash".to_string())
+}
+
 fn array_variable_completion_candidates(
     env_vars: &crate::shell::var_table::VarTable,
     underlay: &crate::shell::var_table::TempenvListingUnderlay,
+    pipestatus_live_array: bool,
 ) -> Vec<String> {
     // GNU pcomplete.c it_init_arrayvariables lists visible array/assoc
     // variables. GROUPS is a dynamic array cell (variables.c get_
     // groupset) that rubash computes at read time, so it is never in
     // the ARRAY_VARS marks — add it explicitly (rubash#1046). FUNCNAME
-    // is att_invisible at the top level and PIPESTATUS's cell is only
-    // materialized by a completed pipeline; the marks carry both from
-    // engine init, so drop them to match the top-level listing.
+    // is att_invisible at the top level, so drop it. PIPESTATUS's cell
+    // is only materialized by a completed pipeline (or a bind); the
+    // marks carry it from engine init, so drop it exactly while no
+    // visible cell lives (rubash#1799).
     let mut candidates = BTreeSet::new();
     candidates.extend(env_vars.marked_names(ARRAY_VARS));
     candidates.extend(env_vars.marked_names(ASSOC_VARS));
     candidates.remove("FUNCNAME");
-    candidates.remove("PIPESTATUS");
+    if !pipestatus_live_array {
+        candidates.remove("PIPESTATUS");
+    }
     candidates.insert("GROUPS".to_string());
     // rubash#1569: same own-frame adjudication as the other listings.
     candidates.retain(|name| match underlay.get(name) {
@@ -2474,6 +2541,7 @@ mod completion_hook_tests {
             function_candidates: vec!["zzz".to_string(), "alps".to_string()],
             command_candidates: Vec::new(),
             expanded_wordlist: None,
+            pipestatus: PipestatusListing::default(),
         };
         let out = complete_line_candidates_with_dynamic(
             "dyncmd al",
