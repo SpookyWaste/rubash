@@ -45,13 +45,13 @@ fn read(dir: &PathBuf, name: &str) -> String {
 /// temp dirs these tests use always live on one.
 fn shell_spelling_to_native(text: &str) -> PathBuf {
     if cfg!(windows) {
-        let bytes = text.as_bytes();
-        if bytes.len() >= 3
-            && bytes[0] == b'/'
-            && bytes[1].is_ascii_alphabetic()
-            && bytes[2] == b'/'
-        {
-            return PathBuf::from(format!("{}:{}", bytes[1] as char, &text[2..]));
+        if let Some(rest) = text.strip_prefix('/') {
+            let mut chars = rest.chars();
+            if let (Some(drive), Some('/')) = (chars.next(), chars.next()) {
+                if drive.is_ascii_alphabetic() {
+                    return PathBuf::from(format!("{drive}:{}", chars.as_str()));
+                }
+            }
         }
     }
     PathBuf::from(text)
