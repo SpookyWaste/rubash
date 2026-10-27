@@ -128,9 +128,12 @@ fn issue1785_pipeline_middle_time_resolves_an_external_program() {
     ));
     std::fs::create_dir_all(&dir).expect("stub dir");
     let stub = dir.join("time");
+    // The script pins PATH to the stub dir alone, so the stub's own
+    // stdin relay must not resolve through PATH either: use the
+    // absolute /bin/cat (the pin is unix-gated).
     std::fs::write(
         &stub,
-        "#!/bin/sh\necho \"EXTERNAL_TIME_RAN args=$*\"\ncat\n",
+        "#!/bin/sh\necho \"EXTERNAL_TIME_RAN args=$*\"\nexec /bin/cat\n",
     )
     .expect("write stub");
     use std::os::unix::fs::PermissionsExt;
