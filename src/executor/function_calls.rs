@@ -191,6 +191,10 @@ impl Executor {
             redirects.heredoc_body = cmd.heredoc_body.clone();
             redirects.here_string = cmd.here_string.clone();
             redirects.here_string_carrier = cmd.here_string_carrier.clone();
+            // rubash#1867: the numbered heredoc/herestring bodies live
+            // in the parallel store — without them the call-time bind
+            // sees the redirect nodes but no bodies to stage.
+            redirects.heredoc_redirects = cmd.heredoc_redirects.clone();
             // GNU execute_cmd.c:5205 binds the definition's BODY command
             // (function_cell), whose `redirects' list carries the numbered
             // entries (`} 5</dev/null'); execute_command re-applies them
@@ -788,6 +792,15 @@ impl Executor {
                 })
                 .cloned()
                 .collect();
+            // rubash#1867: keep the numbered heredoc/herestring bodies
+            // that pair with the selected redirect nodes (same fd > 2
+            // cut) so with_numbered_fd_bindings can stage them.
+            selected.heredoc_redirects = definition
+                .heredoc_redirects
+                .iter()
+                .filter(|redirect| redirect.fd.is_some_and(|fd| fd > 2))
+                .cloned()
+                .collect();
             selected
         });
         // A body flagged UNSTREAMED_FUNCTION_BODIES still holds
@@ -813,15 +826,24 @@ impl Executor {
             Ok(())
         } else {
             self.with_compound_output_redirects(call_cmd, |executor| {
-                let body_run = |executor: &mut Executor| {
-                    executor.with_ambient_line(body_open_line, |executor| {
-                        executor.execute_ast_inner(&body_ast.commands)
-                    })
-                };
-                match &definition_body_redirects {
-                    Some(definition) => executor.with_numbered_fd_bindings(definition, body_run),
-                    None => body_run(executor),
-                }
+                // rubash#1867: the call's numbered input redirects and
+                // heredoc/herestring entries bind around the body,
+                // outside the definition's own bindings (GNU applies
+                // the call's do_redirections first, the definition's
+                // stored redirects inside execute_function).
+                executor.with_call_numbered_input_redirects(call_cmd, |executor| {
+                    let body_run = |executor: &mut Executor| {
+                        executor.with_ambient_line(body_open_line, |executor| {
+                            executor.execute_ast_inner(&body_ast.commands)
+                        })
+                    };
+                    match &definition_body_redirects {
+                        Some(definition) => {
+                            executor.with_numbered_fd_bindings(definition, body_run)
+                        }
+                        None => body_run(executor),
+                    }
+                })
             })
         };
         if body_unstreamed {

@@ -1,7 +1,7 @@
 use super::redirection::{dup_bad_fd_name, dup_source_fd_open};
 use super::*;
 use crate::executor::fd_table::FdEntry;
-use crate::executor::markers::DATA_DOLLAR;
+use crate::executor::markers::{DATA_DOLLAR, STORAGE_WORD_PREFIX};
 
 /// Saved descriptor state for a numbered fd opened by a compound command's
 /// input redirection (see open_compound_numbered_input_redirects).
@@ -894,6 +894,62 @@ impl Executor {
             })
     }
 
+    /// The canonical text of one heredoc/herestring redirect entry
+    /// (redir.c here_document_to_fd). The form the parser stored decides
+    /// the expansion ladder: a typed carrier expands through its
+    /// snapshot; a here-string's STORAGE_WORD_PREFIX storage word is
+    /// ANSI-C-decoded when it has that form, else word-expanded; a plain
+    /// here-string body takes the here-string expansion; a heredoc body
+    /// takes the heredoc expansion. A here-string's bytes always end
+    /// with a newline — that terminator is what lets a final `read`
+    /// still return the last line. Every staging consumer (compound fd
+    /// binds, dynamic-fd allocation, /dev/fd materialization) must use
+    /// this ladder: feeding the raw stored body to the heredoc
+    /// expansion leaks the storage prefix into the delivered stream and
+    /// drops the trailing newline (rubash#1867).
+    /// Expand one STORAGE_WORD_PREFIX here-string word (the parser's
+    /// stored token value) to its final data bytes: ANSI-C decode when
+    /// the word kept its textual `$'...'` form, else word expansion.
+    /// The result is a byte stream (redir.c here_document_to_fd), so
+    /// the field-split transport guard on lexer-decoded `$'...'` blanks
+    /// (ANSI_C_IFS_GUARD) must not survive into it — the same
+    /// value-boundary strip the redirect-filename path applies
+    /// (expand_word.rs, rubash#379); the strip is E400-aware, so a
+    /// user-typed literal U+E401 stays data (rubash#735, rubash#1867).
+    pub(in crate::executor) fn expand_stored_here_string_word(&mut self, word: &str) -> String {
+        let input = decode_ansi_c_quoted_word(word).unwrap_or_else(|| self.expand_word(word));
+        crate::executor::markers::strip_ansi_c_ifs_guard(&input)
+    }
+
+    pub(in crate::executor) fn expand_heredoc_redirect_text(
+        &mut self,
+        redirect: &crate::parser::HereDocRedirect,
+    ) -> String {
+        if redirect.body_carrier.is_some() {
+            let mut input = if redirect.here_string {
+                self.expand_here_string_mut_from_carrier(&redirect.body_carrier)
+            } else {
+                self.expand_heredoc_body_mut_from_carrier(&redirect.body_carrier)
+            };
+            if redirect.here_string {
+                input.push('\n');
+            }
+            return input;
+        }
+        let body = redirect.body.as_deref().unwrap_or("");
+        if redirect.here_string {
+            let mut input = if let Some(word) = body.strip_prefix(STORAGE_WORD_PREFIX) {
+                self.expand_stored_here_string_word(word)
+            } else {
+                self.expand_here_string_mut(body)
+            };
+            input.push('\n');
+            input
+        } else {
+            self.expand_heredoc_body_mut(body)
+        }
+    }
+
     /// Expands an unquoted heredoc body like Bash: parameter, command and
     /// arithmetic expansions run in the context of the receiving command.
     /// A dedicated quoted-heredoc marker keeps the body literal without sharing
@@ -1331,8 +1387,30 @@ impl Executor {
             return self.abandon_compound_for_dup_bad_fd(cmd, index, &name);
         }
         let saved_output = self.open_compound_output_redirects(cmd)?;
-        let result = body(self);
+        // rubash#1867: the numbered heredoc/herestring entries stage
+        // through the same wrap as every other compound — a definition
+        // carrying `3<<<word` binds the text for the body's duration.
+        let result = self.with_loop_fd_heredocs(cmd, body);
         self.restore_compound_output_redirects(saved_output);
+        self.restore_compound_numbered_input_redirects(saved_numbered);
+        result
+    }
+
+    /// rubash#1867: bind a function CALL's numbered input redirections
+    /// and heredoc/herestring entries for the body's duration (GNU
+    /// execute_cmd.c:5606 do_redirections over the call, undone at
+    /// return). The call machinery already covers fd 0
+    /// (function_call_stdin) and the outputs
+    /// (with_compound_output_redirects); the numbered inputs were
+    /// never opened at all, so `f 3<file` / `f 3<<<word` left the body
+    /// reading a bad fd.
+    pub(crate) fn with_call_numbered_input_redirects<T>(
+        &mut self,
+        cmd: &CommandNode,
+        body: impl FnOnce(&mut Executor) -> Result<T, ExecuteError>,
+    ) -> Result<T, ExecuteError> {
+        let saved_numbered = self.open_compound_numbered_input_redirects(cmd)?;
+        let result = self.with_loop_fd_heredocs(cmd, body);
         self.restore_compound_numbered_input_redirects(saved_numbered);
         result
     }

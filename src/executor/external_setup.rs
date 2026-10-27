@@ -1,5 +1,4 @@
 use super::*;
-use crate::executor::markers::STORAGE_WORD_PREFIX;
 
 #[derive(Debug, Default)]
 pub(in crate::executor) struct ProcessSubstitutionFiles {
@@ -1638,25 +1637,10 @@ impl Executor {
             .iter()
             .rev()
             .find(|redirect| redirect.fd == Some(fd))?;
-        if redirect.body_carrier.is_some() {
-            let mut input = if redirect.here_string {
-                self.expand_here_string_mut_from_carrier(&redirect.body_carrier)
-            } else {
-                self.expand_heredoc_body_mut_from_carrier(&redirect.body_carrier)
-            };
-            if redirect.here_string {
-                input.push('\n');
-            }
-            return Some(input);
+        if redirect.body_carrier.is_none() {
+            redirect.body.as_ref()?;
         }
-        let body = redirect.body.as_deref()?;
-        if let Some(word) = body.strip_prefix(STORAGE_WORD_PREFIX) {
-            let mut input =
-                decode_ansi_c_quoted_word(word).unwrap_or_else(|| self.expand_word(word));
-            input.push('\n');
-            return Some(input);
-        }
-        Some(self.expand_heredoc_body_mut(body))
+        Some(self.expand_heredoc_redirect_text(redirect))
     }
 }
 

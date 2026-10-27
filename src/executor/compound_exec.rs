@@ -1836,21 +1836,7 @@ impl Executor {
             .iter()
             .filter(|entry| entry.fd == redirect.fd && entry.here_string == want_string)
             .nth(ordinal)
-            .map(|entry| {
-                if entry.body_carrier.is_some() {
-                    if entry.here_string {
-                        self.expand_here_string_mut_from_carrier(&entry.body_carrier)
-                    } else {
-                        self.expand_heredoc_body_mut_from_carrier(&entry.body_carrier)
-                    }
-                } else {
-                    entry
-                        .body
-                        .as_deref()
-                        .map(|body| self.expand_heredoc_body_mut(body))
-                        .unwrap_or_default()
-                }
-            })
+            .map(|entry| self.expand_heredoc_redirect_text(entry))
             .or_else(|| {
                 if redirect.fd.is_some() {
                     return None;
@@ -2763,8 +2749,14 @@ impl Executor {
                 }
                 Err(error)
             }
-            Ok(()) => self.with_command_input_redirects(cmd, |executor| {
-                executor.execute_if_command(&if_command)
+            // rubash#1867: numbered heredoc/herestring staging wraps
+            // every compound executor (GNU do_redirections binds them
+            // for the compound's lifetime) — the loop wrap is the
+            // template; if/case/for/select carried no staging at all.
+            Ok(()) => self.with_loop_fd_heredocs(cmd, |executor| {
+                executor.with_command_input_redirects(cmd, |executor| {
+                    executor.execute_if_command(&if_command)
+                })
             }),
         };
         let status = self.exit_code;
@@ -3326,33 +3318,31 @@ impl Executor {
         Ok(())
     }
 
-    pub(in crate::executor) fn with_loop_fd_heredocs<F>(
+    pub(in crate::executor) fn with_loop_fd_heredocs<T, F>(
         &mut self,
         cmd: &CommandNode,
         f: F,
-    ) -> Result<(), ExecuteError>
+    ) -> Result<T, ExecuteError>
     where
-        F: FnOnce(&mut Executor) -> Result<(), ExecuteError>,
+        F: FnOnce(&mut Executor) -> Result<T, ExecuteError>,
     {
         let mut saved_fd_inputs = Vec::new();
         for redirect in &cmd.heredoc_redirects {
-            let (Some(fd), Some(body)) = (redirect.fd, redirect.body.clone()) else {
+            let Some(fd) = redirect.fd else {
                 continue;
             };
-            // A loop's numbered heredoc is still an ordinary unquoted
-            // heredoc. Keep its expansion rules identical to the command's
-            // stdin heredoc, including parameter and command substitutions.
-            // The typed carrier wins: a Preexpanded body was already expanded
-            // at the do_redirections point and must not expand again.
-            let body = if redirect.body_carrier.is_some() {
-                if redirect.here_string {
-                    self.expand_here_string_mut_from_carrier(&redirect.body_carrier)
-                } else {
-                    self.expand_heredoc_body_mut_from_carrier(&redirect.body_carrier)
-                }
-            } else {
-                self.expand_heredoc_body_mut(&body)
-            };
+            if redirect.body.is_none() && redirect.body_carrier.is_none() {
+                continue;
+            }
+            // One canonical expansion for every staged numbered
+            // heredoc/herestring (expand_heredoc_redirect_text): the
+            // typed carrier wins (a Preexpanded body was already
+            // expanded at the do_redirections point and must not expand
+            // again), a here-string's storage word decodes/expands and
+            // gains its trailing newline. Feeding the raw stored body
+            // to the heredoc expansion leaked the storage prefix into
+            // the stream and lost the last line (rubash#1867).
+            let body = self.expand_heredoc_redirect_text(redirect);
             saved_fd_inputs.push((fd, self.fd_table.entries.get(&fd).cloned()));
             self.fd_table
                 .open_input(fd, FdReadEndpoint::text(&body), true);
@@ -4478,9 +4468,11 @@ impl Executor {
         // GNU execute_cmd.c:3653 `line_number = case_command->line`: the
         // `case` keyword's line is the ambient while a clause body runs.
         let case_line = cmd.line;
-        let result = self.with_command_input_redirects(cmd, |executor| {
-            executor.with_ambient_line(case_line, |executor| {
-                executor.execute_case_command(&case_command)
+        let result = self.with_loop_fd_heredocs(cmd, |executor| {
+            executor.with_command_input_redirects(cmd, |executor| {
+                executor.with_ambient_line(case_line, |executor| {
+                    executor.execute_case_command(&case_command)
+                })
             })
         });
         let status = self.exit_code;

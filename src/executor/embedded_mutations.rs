@@ -1,5 +1,5 @@
 use super::*;
-use crate::executor::markers::DATA_DOLLAR;
+use crate::executor::markers::{DATA_DOLLAR, STORAGE_WORD_PREFIX};
 use crate::executor::parameter_core::word_contains_current_shell_command_substitution;
 
 // The quoted-null carrier (GNU subst.c CTLNUL): an empty quoted span
@@ -362,7 +362,18 @@ impl Executor {
                 crate::executor::execution_misc::decode_stdin_body_enq(text)
             }
             Some(crate::parser::StdinBody::NeedsExpansion(word)) => {
-                self.expand_here_string_mut(word)
+                // rubash#1867: preexpand_command_stdin wraps a numbered
+                // here-string's STORAGE_WORD_PREFIX body verbatim into a
+                // NeedsExpansion carrier (stdin_body_needs_expansion
+                // exempts the storage form). The prefix is a parser
+                // transport encoding, never data: a carrier still
+                // carrying it takes the storage ladder (ANSI-C decode
+                // or word expansion), exactly like the un-carried body.
+                if let Some(word) = word.strip_prefix(STORAGE_WORD_PREFIX) {
+                    self.expand_stored_here_string_word(word)
+                } else {
+                    self.expand_here_string_mut(word)
+                }
             }
             None => String::new(),
         }
