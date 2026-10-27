@@ -304,10 +304,46 @@ fn test_pipestatus_tracks_simple_and_pipeline_statuses() {
 
     assert!(result.is_ok());
     assert_eq!(executor.last_exit_code(), 0);
+    // First line is `::0`, NOT `0:0:1`: in GNU the PIPESTATUS cell is
+    // ABSENT until the first command completes — a fresh shell's first
+    // read is empty and `declare -p PIPESTATUS` reports not found
+    // (variables.c:6291 set_pipestatus_array materializes the cell from
+    // a completion: execute_cmd.c:4639/4904 simple commands, :1222
+    // compound, jobs.c pipelines). Oracle-verified on GNU bash 5.3.20
+    // (and 5.2) across -c, script-file, stdin, and interactive modes:
+    // the first echo reads `::0`; the cell then tracks each completion.
+    // The earlier `0:0:1` expectation was a wrong pin (rubash#1800).
     assert_eq!(
         fs::read_to_string(output_path).unwrap(),
-        "0:0:1\n1:1:1\n1 -- 1 -- 1 0 1 -- 1 - 0 - 1\n"
+        "::0\n1:1:1\n1 -- 1 -- 1 0 1 -- 1 - 0 - 1\n"
     );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn issue1800_pipestatus_absent_until_first_command_completes() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-issue1800-pipestatus-output.txt";
+    let _ = fs::remove_file(output_path);
+    // GNU lifecycle (oracle, bash 5.3.20): the cell does not exist in a
+    // fresh shell (`[[ -v PIPESTATUS ]]` is false, `declare -p` says
+    // not found); the FIRST command completion materializes it with
+    // that command's own exit status — here the `[[ ]]` fails (1), the
+    // intervening echo succeeds, so the final read sees (0) of length
+    // 1. Seeding the cell with (0) at Executor birth would flip the
+    // first line to v1=0 and diverge (rubash#1800).
+    let input = format!(
+        "[[ -v PIPESTATUS ]]; echo \"v1=$?\" > {output_path}; \
+         echo \"now:${{PIPESTATUS[*]}}:${{#PIPESTATUS[@]}}\" >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "v1=1\nnow:0:1\n");
     let _ = fs::remove_file(output_path);
 }
 
