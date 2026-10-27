@@ -922,7 +922,7 @@ fn fold_pipeline_commands(commands: Vec<CommandNode>) -> Vec<CommandNode> {
             continue;
         }
 
-        fold_time_pipeline_stage_commands(&mut stages);
+        demote_pipeline_middle_time_heads(&mut stages);
 
         let first = stages.first().expect("pipeline has a first stage");
         let last = stages.last().expect("pipeline has a last stage");
@@ -969,43 +969,31 @@ fn looks_like_case_pattern_alternate(stages: &[CommandNode]) -> bool {
     first.words.len() >= 4 && stages.len() >= 2
 }
 
-fn fold_time_pipeline_stage_commands(stages: &mut [CommandNode]) {
+/// rubash#1785: GNU admits the timespec production only at the head
+/// of a pipeline_command (parse.y:1416 `timespec pipeline_command`);
+/// a pipeline's later elements derive from `command` alone (the
+/// `pipeline: pipeline '|' pipeline` recursion bottoms out in
+/// `command`), and `time_command_acceptable` (parse.y:3286) has no
+/// `|' case — after a pipe connector `time` is an ordinary WORD: a
+/// command name resolved through PATH (127 when no external `time`
+/// exists, the external program when one does). Freeze that verdict
+/// onto every stage after the first, in the same recorded form the
+/// rubash#1520 POSIX freeze uses: `time_head_plain_word` is set and
+/// the head word's recorded kind becomes Word, so the time folds'
+/// admission and the executor's `time` name dispatch both honour the
+/// head as an ordinary command name with no further special cases.
+fn demote_pipeline_middle_time_heads(stages: &mut [CommandNode]) {
     for stage in stages.iter_mut().skip(1) {
-        let folded = fold_time_pipeline_stage_command(std::mem::take(stage));
-        *stage = folded;
+        if stage.words.first().map(String::as_str) != Some("time") || stage.time_head_plain_word {
+            continue;
+        }
+        stage.time_head_plain_word = true;
+        if stage.word_kinds.len() == stage.words.len()
+            && stage.word_kinds.first() == Some(&TokenKind::Keyword)
+        {
+            stage.word_kinds[0] = TokenKind::Word;
+        }
     }
-}
-
-fn fold_time_pipeline_stage_command(mut command: CommandNode) -> CommandNode {
-    if !command_is_time_simple_candidate(&command) {
-        return command;
-    }
-    let Some(prefix) = time_prefix_from_command(&mut command) else {
-        return command;
-    };
-
-    let mut timed = CommandNode::new();
-    timed.line = command.line;
-    timed.logical_line = command.logical_line;
-    timed.inverted = command.inverted;
-    timed.pipe = command.pipe.take();
-    timed.redirect_in = command.redirect_in.clone();
-    timed.redirect_out = command.redirect_out.clone();
-    timed.append = command.append.clone();
-    timed.redirect_err = command.redirect_err.clone();
-    timed.redirect_err_append = command.redirect_err_append.clone();
-    command.inverted = false;
-    timed.time_command = Some(TimeCommand {
-        keyword: prefix.keyword,
-        keyword_metadata: prefix.keyword_metadata,
-        prefix_words: prefix.prefix_words,
-        prefix_word_metadata: prefix.prefix_word_metadata,
-        command: Box::new(command),
-        posix_format: prefix.posix_format,
-        inverted: prefix.inverted,
-        keyword_was_plain_word: false,
-    });
-    timed
 }
 
 fn fold_time_pipeline_commands(commands: Vec<CommandNode>) -> Vec<CommandNode> {
