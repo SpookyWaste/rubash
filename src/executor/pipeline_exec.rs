@@ -3946,6 +3946,16 @@ impl Executor {
         // this idempotent pass covers the recursion entry points that bypass
         // the gather (the `time` prefix arm and the timed-read followup).
         let command = &normalize_pipeerr_stage(command);
+        // rubash#1843: GNU stamps every simple element's own line
+        // before it runs (execute_cmd.c:936 SET_LINE_NUMBER in
+        // execute_simple_command) — execute_pipeline forks each
+        // element into that same funnel. This stage funnel never
+        // re-entered the command_execute stamping seam, so an element
+        // inside a function body reported the body's ambient
+        // (definition) line for its diagnostics instead of its own.
+        // set_current_line's fallback keeps wrapper/compound elements
+        // on the ambient line per the command_sets_own_line table.
+        self.set_current_line(command);
         // rubash#1115: GNU forks every pipeline element
         // (execute_cmd.c:2620 execute_pipeline -> execute_simple_command
         // in the child), so the element's word expansion and body draw
@@ -4393,6 +4403,13 @@ impl Executor {
             }
         };
         if stage_output_redirect_failed {
+            // rubash#1844: the stage died at its own do_redirections,
+            // before running — its pipe bytes are final, so mark it
+            // pre-wired like the rejection arm above (issue #514): the
+            // driver's stream routing must not re-apply the same
+            // redirect list, which would open the targets a second
+            // time and print the failure diagnostic twice.
+            self.pipeline_stage_fds_pre_wired.set(true);
             let captured = crate::executor::shell_options::take_stdout_capture();
             crate::executor::shell_options::restore_stdout_capture(saved_capture);
             return Ok(Some((
