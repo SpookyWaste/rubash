@@ -747,7 +747,14 @@ impl Executor {
                     shell_path_to_windows(&target, &self.shell_state.env_vars),
                     &self.shell_state.env_vars,
                 ));
-                if let Err(error) = std::fs::File::open(&path) {
+                // rubash#1820: an O_RDONLY probe open is NOT side-effect
+                // free on a FIFO — it blocks until a writer appears and
+                // consumes the rendezvous pairing, after which the real
+                // open blocks forever (GNU opens the target exactly once,
+                // redir.c do_redirections). An existing FIFO validates
+                // through access(2) instead: ENOENT / EACCES surface with
+                // the same errno the open would have produced.
+                if let Err(error) = super::shell_options::probe_input_redirect_gate(&path) {
                     // posix_errors::path_error already renders the
                     // `{target}: {errno text}` shape (same convention the
                     // ReadWrite probe above consumes).
