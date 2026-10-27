@@ -176,7 +176,13 @@ impl Executor {
                 .insert(fd_output_key(fd), target.to_string());
             return Ok(());
         }
-        let path = shell_path_to_windows(target, &self.shell_state.env_vars);
+        // G-02 session-cwd anchor (rubash#1887): GNU redir.c:725
+        // redir_open opens in the shell process, whose only cwd is the
+        // shell's cwd; in this port's split model every session open
+        // anchors at ShellState.cwd via session_path (see its doc), or
+        // a relative operand resolves against the process cwd and the
+        // bind misses files the shell itself just created after `cd`.
+        let path = self.session_path(shell_path_to_windows(target, &self.shell_state.env_vars));
         // open_readwrite_pair splits `<>CON` into its CONIN$/CONOUT$
         // halves (niubash#519: CON rejects a read+write handle).
         let (read_file, write_file) = FileFd::open_readwrite_pair(path)?;
@@ -217,7 +223,8 @@ impl Executor {
             self.shell_state.env_vars.insert(fd_output_key(fd), target);
             return Ok(());
         }
-        let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
+        // G-02 session-cwd anchor (rubash#1887): see set_fd_readwrite_file.
+        let path = self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars));
         let file = FileFd::open_write(path, append, false)
             .map_err(|e| crate::posix_errors::path_error(&target, e))?;
         self.fd_table
@@ -3437,7 +3444,16 @@ impl Executor {
                         let file_fd = FileFd::from_file(file, target.clone().into());
                         self.set_fd_input_file(fd, file_fd, fd != 0);
                     } else {
-                        let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
+                        // G-02 session-cwd anchor (rubash#1887): see
+                        // set_fd_readwrite_file — without it `exec
+                        // 10<infile` after `cd` opens against the
+                        // process cwd and reports ENOENT for a file in
+                        // the shell's own cwd (redir8.sub's shape, once
+                        // the session and process cwds diverge).
+                        let path = self.session_path(shell_path_to_windows(
+                            &target,
+                            &self.shell_state.env_vars,
+                        ));
                         let file = FileFd::open_read(path)
                             .map_err(|e| crate::posix_errors::path_error(&target, e))?;
                         self.set_fd_input_file(fd, file, fd != 0);
@@ -4639,7 +4655,10 @@ impl Executor {
                     }
                 }
 
-                let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
+                // G-02 session-cwd anchor (rubash#1887): see
+                // set_fd_readwrite_file.
+                let path =
+                    self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars));
                 let (read_file, write_file) =
                     if redirect.kind == crate::parser::RedirectKind::ReadWrite {
                         FileFd::open_readwrite_pair(path)

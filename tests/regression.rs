@@ -3455,3 +3455,110 @@ mod k1_batch2 {
         );
     }
 }
+
+mod win_face_fd_history {
+    use super::*;
+
+    fn run(case: &str, script: &str) -> (String, String, Option<i32>) {
+        let dir = case_scratch(case);
+        std::fs::write(dir.join("fg.sh"), script).expect("write script");
+        let out = run_rubash_in(&dir, &["fg.sh"], Duration::from_secs(60));
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    /// rubash#1887: an `exec`-bound file fd must feed an external
+    /// command's stdin after being dup'd onto fd 0 (and directly),
+    /// sharing the open file description's offset with builtin reads.
+    /// GNU bash 5.3.20 oracle (script file, stdin </dev/null): every
+    /// variant prints the file body; variant D proves the shared offset
+    /// (the builtin `read -u 10` consumes line 1, `cat` sees 2..4).
+    /// On the Windows build the two snapshot groups in redir.snap
+    /// (upstream redir8.sub segments) came back empty — the external
+    /// child read EOF. Linux build matched GNU byte-for-byte.
+    #[test]
+    fn issue_1887_exec_fd_move_external_stdin() {
+        let (stdout, stderr, code) = run(
+            "wf-1887",
+            "exec 7<&0\n\
+             printf '1\\n2\\n3\\n4\\n' > infile\n\
+             echo \"--- A seed: exec 10<infile; exec 0<&10; cat <&10 ---\"\n\
+             exec 10<infile\n\
+             exec 0<&10\n\
+             cat <&10\n\
+             echo \"cat-status=$?\"\n\
+             exec 0<&7\n\
+             exec 10<&-\n\
+             echo \"--- B direct: exec 10<infile; cat <&10 ---\"\n\
+             exec 10<infile\n\
+             cat <&10\n\
+             echo \"cat-status=$?\"\n\
+             exec 10<&-\n\
+             echo \"--- C fd0: exec 0<infile; cat ---\"\n\
+             exec 0<infile\n\
+             cat\n\
+             echo \"cat-status=$?\"\n\
+             exec 0<&7\n\
+             echo \"--- D shared offset: read -u 10 then cat <&10 ---\"\n\
+             exec 10<infile\n\
+             read -u 10 line\n\
+             echo \"read line=[$line]\"\n\
+             cat <&10\n\
+             echo \"cat-status=$?\"\n\
+             exec 10<&-\n\
+             echo \"--- E plain: cat < infile ---\"\n\
+             cat < infile\n\
+             echo \"cat-status=$?\"\n\
+             echo \"--- end ---\"\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(
+            stdout,
+            "--- A seed: exec 10<infile; exec 0<&10; cat <&10 ---\n\
+             1\n2\n3\n4\ncat-status=0\n\
+             --- B direct: exec 10<infile; cat <&10 ---\n\
+             1\n2\n3\n4\ncat-status=0\n\
+             --- C fd0: exec 0<infile; cat ---\n\
+             1\n2\n3\n4\ncat-status=0\n\
+             --- D shared offset: read -u 10 then cat <&10 ---\n\
+             read line=[1]\n2\n3\n4\ncat-status=0\n\
+             --- E plain: cat < infile ---\n\
+             1\n2\n3\n4\ncat-status=0\n\
+             --- end ---\n",
+            "stderr:\n{stderr}"
+        );
+    }
+
+    /// rubash#1887 (suite form): the verbatim upstream redir8.sub, run
+    /// as a child script exactly as redir.tests:208 runs it. The
+    /// isolated matrix above passes on the Windows build; the suite
+    /// form carries the prefix state (fd 10/8 write opens and closes,
+    /// `-c` children with redirected fds, a heredoc-fed external cat)
+    /// under which the two `1 2 3 4` groups vanished on Windows.
+    /// Expected stdout is the GNU bash 5.3.20 oracle's standalone run
+    /// of the same file.
+    #[test]
+    fn issue_1887_redir8_sub_verbatim() {
+        let sub = std::fs::read_to_string(manifest_dir().join("third_party/bash/tests/redir8.sub"))
+            .expect("read redir8.sub");
+        let dir = case_scratch("wf-1887-sub");
+        std::fs::write(dir.join("redir8.sub"), sub).expect("write sub");
+        std::fs::write(
+            dir.join("fg.sh"),
+            "mkdir wtmp\nexport TMPDIR=\"$PWD/wtmp\"\n${THIS_SH} ./redir8.sub\n",
+        )
+        .expect("write wrapper");
+        let out = run_rubash_in(&dir, &["fg.sh"], Duration::from_secs(120));
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(
+            stdout, "fd 10\nfd 8\nfd 10\nnext fd\nfd 10\nfd 8\n1\n2\n3\n4\n1\n2\n3\n4\n",
+            "stderr:\n{stderr}"
+        );
+    }
+
+}
