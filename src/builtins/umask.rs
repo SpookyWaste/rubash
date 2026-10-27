@@ -40,9 +40,10 @@ where
     W: Write,
     E: Write,
 {
-    // TODO(builtins/umask.def): GNU Bash reads and mutates the process umask.
-    // This internal shell value preserves shell semantics without changing the
-    // host process mask.
+    // GNU builtins/umask.def:124-125 umask_builtin: the set path calls
+    // umask(2) on the process (rubash#1014). The env record below keeps
+    // the display/symbolic engine in sync; file creation (redirections,
+    // external touch) observes the real process mask via the OS.
     let mut symbolic = false;
     let mut reusable = false;
     let mut mode = None;
@@ -114,6 +115,17 @@ where
             }
         };
         env_vars.insert("__RUBASH_UMASK".to_string(), format!("{mask:04o}"));
+        // GNU builtins/umask.def:124-125 umask_builtin: `umask (umask_arg)`
+        // really changes the process mask (rubash#1014: `umask 022; touch f`
+        // must create 644). In-process fork children (comsub, flat `( )`,
+        // pipeline stages) save/restore around their region — mirroring the
+        // saved_dir precedent — so a child set never leaks into the parent.
+        // Unix-only (libc is a unix-only dependency): other platforms keep
+        // the env record for display only.
+        #[cfg(unix)]
+        unsafe {
+            libc::umask(mask as libc::mode_t);
+        }
         if symbolic {
             // Bash's symbolic form is already human-readable; `-p` only
             // changes the octal form into a reusable command and is ignored
@@ -140,6 +152,38 @@ where
 
     Ok(EXECUTION_SUCCESS)
 }
+
+/// Read the live process mask without changing it (the umask(0) +
+/// restore dance, same as GNU's display path in builtins/umask.def:131).
+/// Fork-like in-process regions (comsub, flat `( )`, pipeline stages) save
+/// this at entry and restore at exit — mirroring the saved_dir precedent —
+/// so a `umask <mode>` inside never leaks into the parent (GNU forks).
+/// Unix-only: other platforms have no process umask; the stubs keep the
+/// call sites branch-free.
+#[cfg(unix)]
+pub(crate) fn save_process_umask() -> u32 {
+    unsafe {
+        let mask = libc::umask(0);
+        libc::umask(mask);
+        mask as u32
+    }
+}
+
+/// Restore a mask previously read by [`save_process_umask`].
+#[cfg(unix)]
+pub(crate) fn restore_process_umask(mask: u32) {
+    unsafe {
+        libc::umask(mask as libc::mode_t);
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn save_process_umask() -> u32 {
+    0o022
+}
+
+#[cfg(not(unix))]
+pub(crate) fn restore_process_umask(_mask: u32) {}
 
 fn current_mask(env_vars: &HashMap<String, String>) -> u32 {
     if let Some(mask) = env_vars
@@ -325,6 +369,9 @@ mod tests {
         )]));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        // The set path really calls umask(2) (builtins/umask.def:124-125):
+        // shield the test process so later tests keep their own mask.
+        let saved = super::save_process_umask();
         let status = execute_with_io(
             &vec![mode.to_string(), "-S".to_string()],
             &mut env,
@@ -332,11 +379,34 @@ mod tests {
             &mut stderr,
         )
         .unwrap();
+        super::restore_process_umask(saved);
         (
             status,
             String::from_utf8(stdout).unwrap(),
             String::from_utf8(stderr).unwrap(),
         )
+    }
+
+    #[test]
+    fn set_path_changes_process_mask() {
+        // rubash#1014 functional half (builtins/umask.def:124-125
+        // umask_builtin `umask (umask_arg)`): the set path really calls
+        // umask(2), so files created afterwards observe the new mask.
+        // The mask is read back then restored BEFORE asserting, so a
+        // failure cannot pollute later tests in this process.
+        let saved = super::save_process_umask();
+        let mut env = VarTable::default();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status =
+            execute_with_io(&["022".to_string()], &mut env, &mut stdout, &mut stderr).unwrap();
+        let observed = super::save_process_umask();
+        super::restore_process_umask(saved);
+        assert_eq!(status, EXECUTION_SUCCESS);
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        assert_eq!(observed, 0o022);
+        assert_eq!(env.get("__RUBASH_UMASK").map(String::as_str), Some("0022"));
     }
 
     #[test]

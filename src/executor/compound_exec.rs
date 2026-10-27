@@ -2325,6 +2325,10 @@ impl Executor {
         // environment and must be restored like env_vars (niubash#100).
         // Same convention as command substitution's saved_dir handling.
         let saved_cwd = env::current_dir().ok();
+        // GNU's forked child owns its own process umask
+        // (builtins/umask.def:124-125): a `umask <mode>` in the body must
+        // not leak into the parent — save/restore like saved_cwd.
+        let saved_umask = crate::builtins::umask::save_process_umask();
         // rubash#439: the body's word-expansion error mark dies with the
         // forked child (GNU's DISCARD jump cannot cross the fork boundary) —
         // the parent judges the subshell only by its exit STATUS, so
@@ -2487,6 +2491,7 @@ impl Executor {
                 // leaked subshell_depth + the child trap reset into the
                 // parent.
                 self.restore_flat_subshell(saved_state, saved_cwd);
+                crate::builtins::umask::restore_process_umask(saved_umask);
                 self.fd_table = saved_fd_table;
                 self.command_expansion_failed.set(saved_expansion_failed);
                 self.exec_replaced = saved_exec_replaced;
@@ -2593,6 +2598,7 @@ impl Executor {
                     self.subshell_fork_collapse.set(saved);
                 }
                 self.restore_flat_subshell(saved_state.clone(), saved_cwd.clone());
+                crate::builtins::umask::restore_process_umask(saved_umask);
                 self.fd_table = saved_fd_table.clone();
                 self.command_expansion_failed.set(saved_expansion_failed);
                 self.exec_replaced = saved_exec_replaced;
@@ -2606,6 +2612,7 @@ impl Executor {
                     self.subshell_fork_collapse.set(saved);
                 }
                 self.restore_flat_subshell(saved_state.clone(), saved_cwd.clone());
+                crate::builtins::umask::restore_process_umask(saved_umask);
                 self.fd_table = saved_fd_table.clone();
                 self.command_expansion_failed.set(saved_expansion_failed);
                 self.exec_replaced = saved_exec_replaced;
@@ -2618,6 +2625,7 @@ impl Executor {
             self.subshell_fork_collapse.set(saved);
         }
         self.restore_flat_subshell(saved_state, saved_cwd);
+        crate::builtins::umask::restore_process_umask(saved_umask);
         self.fd_table = saved_fd_table;
         self.command_expansion_failed.set(saved_expansion_failed);
         self.exec_replaced = saved_exec_replaced;

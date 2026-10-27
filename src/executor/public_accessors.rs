@@ -144,15 +144,25 @@ impl Executor {
 
     /// GNU parse.y:6865/6886 (report_syntax_error): the offending-input-line
     /// echo (`print_offending_line', parse.y:6814) runs only `if (interactive
-    /// == 0)'. An interactive shell prints the two `parser_error' diagnostic
-    /// lines and NO `` `line' `` echo (verified: `bash -i < err.sh' prints
-    /// the syntax error pair without the third backquote line). Every
-    /// `__RUBASH_PARSE_SOURCE__' echo site must consult this gate.
+    /// == 0)' — the lowercase reader global, NOT interactive_shell.
+    /// SEVAL_NONINT/FEVAL_NONINT units (evalstring.c:284-285, evalfile.c:231)
+    /// zero it for their duration, so a sourced/rc file or PROMPT_COMMAND
+    /// echoes even in an `-i` session (verified: `bash --rcfile badrc -i
+    /// -c 'echo AFTER'` prints the `` `if then' `` line, while `bash -i -c
+    /// 'if then'` does not). `__RUBASH_INTERACTIVE_FLAG_OFF` is this
+    /// engine's stand-in for that zeroed global (set by run_init_file, the
+    /// `bash -i script` driver, and the PROMPT_COMMAND runner); the echo
+    /// runs unless an interactive session is in a live reader unit.
+    /// Every `__RUBASH_PARSE_SOURCE__' echo site must consult this gate.
     pub(in crate::executor) fn offending_line_echo_enabled(&self) -> bool {
         !self
             .shell_state
             .env_vars
             .contains_key("__RUBASH_INTERACTIVE")
+            || self
+                .shell_state
+                .env_vars
+                .contains_key("__RUBASH_INTERACTIVE_FLAG_OFF")
     }
 
     /// GNU error.c:324-327 (parser_error): when `exit_immediately_on_error`
@@ -1579,8 +1589,25 @@ impl Executor {
             {
                 return self.gnu_error_line(&format!("{script}: eval"), line);
             }
-            if is_c {
+            // rubash#1161: same sourced-file suppression as the ungated
+            // twin — a sourced rc/profile under `-c` reports
+            // `{file}: line N:`, never `{file}: -c: line N:`.
+            if is_c && !self.in_source_context() {
                 return self.gnu_error_line(&format!("{script}: -c"), line);
+            }
+            if self.in_source_context()
+                && self
+                    .shell_state
+                    .env_vars
+                    .contains_key("__RUBASH_INTERACTIVE")
+            {
+                return self.gnu_error_line(
+                    &format!(
+                        "{}: {script}",
+                        Self::interactive_shell_basename(&self.shell_state.env_vars)
+                    ),
+                    line,
+                );
             }
             return self.gnu_error_line(script, line);
         }
@@ -1749,8 +1776,28 @@ impl Executor {
             return self.gnu_error_line("bash: eval", line);
         }
         if let Some(script) = self.shell_state.env_vars.get("__RUBASH_SCRIPT_NAME") {
-            if is_c {
+            // rubash#1161: same sourced-file suppression as the ungated
+            // twin — a sourced rc/profile under `-c` reports
+            // `{file}: line N:`, never `{file}: -c: line N:`. The
+            // interactive arm renders GNU's `bash: FILE: line N:` startup
+            // shape (error.c parser_error: shell-name prolog plus the
+            // sourced file as yy_input_name).
+            if is_c && !self.in_source_context() {
                 return self.gnu_error_line(&format!("{script}: -c"), line);
+            }
+            if self.in_source_context()
+                && self
+                    .shell_state
+                    .env_vars
+                    .contains_key("__RUBASH_INTERACTIVE")
+            {
+                return self.gnu_error_line(
+                    &format!(
+                        "{}: {script}",
+                        Self::interactive_shell_basename(&self.shell_state.env_vars)
+                    ),
+                    line,
+                );
             }
             return self.gnu_error_line(script, line);
         }

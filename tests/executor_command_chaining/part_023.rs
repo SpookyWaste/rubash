@@ -141,6 +141,7 @@ fn test_cd_appends_stderr() {
 #[test]
 fn test_umask_redirects_output() {
     let _cwd_guard = CwdGuard::take();
+    let _umask_guard = UmaskGuard::take();
     let output_path = "target/rubash-umask-redirect-output.txt";
     let _ = fs::remove_file(output_path);
     let input = format!("umask 077; umask > {output_path}");
@@ -159,6 +160,7 @@ fn test_umask_redirects_output() {
 #[test]
 fn test_umask_appends_output() {
     let _cwd_guard = CwdGuard::take();
+    let _umask_guard = UmaskGuard::take();
     let output_path = "target/rubash-umask-append-output.txt";
     let _ = fs::remove_file(output_path);
     fs::write(output_path, "before\n").unwrap();
@@ -178,6 +180,7 @@ fn test_umask_appends_output() {
 #[test]
 fn test_umask_symbolic_modes_update_mask() {
     let _cwd_guard = CwdGuard::take();
+    let _umask_guard = UmaskGuard::take();
     let output_path = "target/rubash-umask-symbolic-output.txt";
     let _ = fs::remove_file(output_path);
     let input = format!(
@@ -203,6 +206,7 @@ fn test_umask_symbolic_modes_update_mask() {
 #[test]
 fn test_umask_symbolic_modes_copy_permissions() {
     let _cwd_guard = CwdGuard::take();
+    let _umask_guard = UmaskGuard::take();
     let output_path = "target/rubash-umask-symbolic-copy-output.txt";
     let _ = fs::remove_file(output_path);
     let status_path = "target/rubash-umask-symbolic-copy-status.txt";
@@ -231,6 +235,7 @@ fn test_umask_symbolic_modes_copy_permissions() {
 #[test]
 fn test_umask_combined_symbolic_reusable_options() {
     let _cwd_guard = CwdGuard::take();
+    let _umask_guard = UmaskGuard::take();
     let output_path = "target/rubash-umask-combined-options-output.txt";
     let _ = fs::remove_file(output_path);
     let input = format!("umask 022; umask -Sp > {output_path}; umask -pS >> {output_path}");

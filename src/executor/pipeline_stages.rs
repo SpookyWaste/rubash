@@ -105,6 +105,9 @@ impl Executor {
         streaming_stdin: bool,
     ) -> Result<(String, String, i32), ExecuteError> {
         let saved_dir = env::current_dir().ok();
+        // Fork-face umask isolation (execute_cmd.c:2702-2723: a pipeline
+        // element is a forked subshell) — save/restore like saved_dir.
+        let saved_umask = crate::builtins::umask::save_process_umask();
         let mut subshell = self.command_substitution_executor();
         // A compound pipeline element passes execute_in_subshell, which
         // resets loop_level to 0 (execute_cmd.c:1642, Posix interp 842):
@@ -195,6 +198,7 @@ impl Executor {
                 // writes in the script are not swallowed into the
                 // orphaned buffer.
                 crate::executor::shell_options::restore_stdout_capture(saved_capture);
+                crate::builtins::umask::restore_process_umask(saved_umask);
                 return Err(error);
             }
         }
@@ -219,6 +223,7 @@ impl Executor {
         if let Some(saved_dir) = saved_dir {
             let _ = env::set_current_dir(saved_dir);
         }
+        crate::builtins::umask::restore_process_umask(saved_umask);
         let status = match (result, trap_result) {
             (Ok(()), Ok(trap_status)) => trap_status,
             (Err(ExecuteError::ExitCode(code)), Ok(_)) => code,
@@ -294,6 +299,9 @@ impl Executor {
         call.append = None;
 
         let saved_dir = env::current_dir().ok();
+        // Fork-face umask isolation for function pipeline stages (same
+        // execute_in_subshell fork as compound stages above).
+        let saved_umask = crate::builtins::umask::save_process_umask();
         let mut subshell = self.command_substitution_executor();
         // A pipeline member runs in a subshell: caught signal traps reset to
         // the inherited disposition (execute_cmd.c subshell trap reset), so
@@ -358,6 +366,7 @@ impl Executor {
         if let Some(saved_dir) = saved_dir {
             let _ = env::set_current_dir(saved_dir);
         }
+        crate::builtins::umask::restore_process_umask(saved_umask);
         let status = match (result, trap_result) {
             (Ok(()), Ok(trap_status)) => trap_status,
             (Err(ExecuteError::ExitCode(code)), Ok(_))

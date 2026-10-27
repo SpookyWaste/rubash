@@ -34,6 +34,46 @@ impl Drop for CwdGuard {
     }
 }
 
+/// Process-umask guard for tests that run `umask <mode>` sets in-process:
+/// the builtin really calls umask(2) (builtins/umask.def:124-125,
+/// rubash#1014), so without this every later test in the binary inherits
+/// the changed mask and file-creating tests break (same class as CwdGuard,
+/// rubash#690). Restores on Drop, so even a panicking test cannot leak
+/// the mask change into its neighbors.
+pub(crate) struct UmaskGuard {
+    #[cfg(unix)]
+    saved: u32,
+}
+
+impl UmaskGuard {
+    pub(crate) fn take() -> Self {
+        #[cfg(unix)]
+        {
+            // The umask(0) + restore dance reads the live mask without
+            // changing it (same as builtins/umask.def:131 display path).
+            let saved = unsafe {
+                let mask = libc::umask(0);
+                libc::umask(mask);
+                mask as u32
+            };
+            Self { saved }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::umask(self.saved as libc::mode_t);
+        }
+    }
+}
+
 #[test]
 fn diagnostic_prefix_three_modes_match_gnu() {
     let _cwd_guard = CwdGuard::take();

@@ -98,6 +98,7 @@ fn test_builtin_mapfile_uses_here_string() {
 #[test]
 fn test_builtin_umask_redirects_output() {
     let _cwd_guard = CwdGuard::take();
+    let _umask_guard = UmaskGuard::take();
     let output_path = "target/rubash-builtin-umask-output.txt";
     let _ = fs::remove_file(output_path);
     let input = format!("builtin umask 077; builtin umask > {output_path}");

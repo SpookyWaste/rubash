@@ -1556,7 +1556,26 @@ fn run_init_file(executor: &mut Executor, init_file: &str) -> i32 {
     executor.set_env("__RUBASH_INTERACTIVE_FLAG_OFF", "1");
     // Drop any stale parse latch so the check below reflects THIS file.
     let _ = executor.take_parse_error();
+    // GNU shell.c:1147 run_startup_files -> maybe_execute_file ->
+    // evalfile_internal -> parse_and_execute(string, filename)
+    // (builtins/evalfile.c): the rc/profile runs with its FILENAME as the
+    // input-stream name (parse.y yy_input_name), so parser diagnostics cite
+    // `{file}: line N:` — never the `-c` stream tag (rubash#1161). Set the
+    // source context (the same marker execute_source_with_args uses) and
+    // the file's script name for the duration, then restore.
+    let old_source_marker = executor.get_env("__RUBASH_IN_SOURCE").map(str::to_string);
+    let old_script_name = executor.get_env("__RUBASH_SCRIPT_NAME").map(str::to_string);
+    executor.set_env("__RUBASH_IN_SOURCE", "1");
+    executor.set_env("__RUBASH_SCRIPT_NAME", init_file);
     let status = run_source(executor, &contents, false);
+    match old_script_name {
+        Some(value) => executor.set_env("__RUBASH_SCRIPT_NAME", &value),
+        None => executor.remove_env("__RUBASH_SCRIPT_NAME"),
+    }
+    match old_source_marker {
+        Some(value) => executor.set_env("__RUBASH_IN_SOURCE", &value),
+        None => executor.remove_env("__RUBASH_IN_SOURCE"),
+    }
     // GNU evalstring.c:585-606 (parse_and_execute): a syntax error in a
     // startup file aborts the rest of THAT file and returns EX_BADUSAGE as
     // an ordinary value — the shell prints the diagnostic and keeps

@@ -852,9 +852,9 @@ fn find_user_command_uncached(
     None
 }
 
-pub fn standard_path(_env_vars: &HashMap<String, String>) -> String {
+pub fn standard_path(env_vars: &HashMap<String, String>) -> String {
     if cfg!(windows) {
-        if configured_shell_root(_env_vars).is_some() {
+        if configured_shell_root(env_vars).is_some() {
             return "/usr/local/bin:/usr/bin:/bin".to_string();
         }
         let mut dirs = vec![
@@ -867,7 +867,7 @@ pub fn standard_path(_env_vars: &HashMap<String, String>) -> String {
         // host keeps its toolset (Git usr/bin, WinuxCmd links), discovered
         // from the real PATH as the first directory holding a full set.
         #[cfg(windows)]
-        if let Some(dir) = windows_posix_tools_dir(_env_vars) {
+        if let Some(dir) = windows_posix_tools_dir(env_vars) {
             dirs.push(dir);
         }
         return dirs
@@ -895,6 +895,20 @@ pub fn standard_path(_env_vars: &HashMap<String, String>) -> String {
 
     #[cfg(all(unix, target_os = "android"))]
     {
+        // GNU general.c:1435 conf_standard_path on bionic (no confstr):
+        // the Termux bash build bakes $TERMUX_PREFIX/bin as its
+        // STANDARD_UTILS_PATH (verified on-device: `command -p sh -c
+        // 'echo $PATH'` prints /data/data/com.termux/files/usr/bin
+        // regardless of the runtime $PREFIX). Read the runtime $PREFIX so
+        // the value tracks the device's prefix; fall back to the stock
+        // config-top.h default when PREFIX is unset (non-Termux Android).
+        // Using the stock "/bin:..." here instead resolves /system/bin
+        // applets (e.g. /bin/getconf -> toybox) that GNU's lookup rejects,
+        // flipping lookup failures ("command not found", 127) into spawn
+        // failures (rubash#1172).
+        if let Some(prefix) = env_vars.get("PREFIX").filter(|value| !value.is_empty()) {
+            return format!("{prefix}/bin");
+        }
         "/bin:/usr/bin:/sbin:/usr/sbin".to_string()
     }
 

@@ -620,6 +620,9 @@ impl Executor {
         }
 
         let saved_dir = env::current_dir().ok();
+        // Fork-face umask isolation (subst.c:6362 process_substitute
+        // forks) — save/restore like saved_dir.
+        let saved_umask = crate::builtins::umask::save_process_umask();
         let mut subshell = self.command_substitution_executor();
         // GNU subst.c:6618 runs the process-substitution body through
         // parse_and_execute ("process substitution") → evalstring.c:348
@@ -665,6 +668,7 @@ impl Executor {
         if let Some(saved_dir) = saved_dir {
             let _ = env::set_current_dir(saved_dir);
         }
+        crate::builtins::umask::restore_process_umask(saved_umask);
 
         match result {
             Ok(())

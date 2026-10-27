@@ -161,6 +161,12 @@ impl Executor {
         // resource (niubash#100) and is restored separately.
         let mut subshell_state: Option<crate::shell::ShellState> = None;
         let mut subshell_cwd: Option<PathBuf> = None;
+        // GNU execute_cmd.c:1576 execute_in_subshell forks: a `umask <mode>`
+        // inside `( )` changes only the child's process mask
+        // (builtins/umask.def:124-125). The flat region runs in place, so
+        // the mask is saved at entry and restored at every close below —
+        // the same boundary as subshell_cwd (niubash#100).
+        let mut subshell_umask: Option<u32> = None;
         // The fd table is executor state, outside ShellState: a forked
         // child's descriptor table is a copy, so `( exec 3<&- )` must not
         // close the parent's fd 3. Rc-shared endpoints still alias the same
@@ -201,6 +207,9 @@ impl Executor {
                     self.evalerror_line.set(None);
                     if let Some(saved_state) = subshell_state.take() {
                         self.restore_flat_subshell(saved_state, subshell_cwd.take());
+                        if let Some(mask) = subshell_umask.take() {
+                            crate::builtins::umask::restore_process_umask(mask);
+                        }
                         if let Some(saved) = subshell_fd_table.take() {
                             self.fd_table = saved;
                         }
@@ -236,6 +245,9 @@ impl Executor {
                 }
                 if let Some(saved_state) = subshell_state.take() {
                     self.restore_flat_subshell(saved_state, subshell_cwd.take());
+                    if let Some(mask) = subshell_umask.take() {
+                        crate::builtins::umask::restore_process_umask(mask);
+                    }
                     if let Some(saved) = subshell_fd_table.take() {
                         self.fd_table = saved;
                     }
@@ -378,6 +390,9 @@ impl Executor {
                     if command.subshell_end {
                         if let Some(saved_state) = subshell_state.take() {
                             self.restore_flat_subshell(saved_state, subshell_cwd.take());
+                            if let Some(mask) = subshell_umask.take() {
+                                crate::builtins::umask::restore_process_umask(mask);
+                            }
                             if let Some(saved) = subshell_fd_table.take() {
                                 self.fd_table = saved;
                             }
@@ -598,6 +613,9 @@ impl Executor {
                 if command.subshell_end {
                     if let Some(saved_state) = subshell_state.take() {
                         self.restore_flat_subshell(saved_state, subshell_cwd.take());
+                        if let Some(mask) = subshell_umask.take() {
+                            crate::builtins::umask::restore_process_umask(mask);
+                        }
                         if let Some(saved) = subshell_fd_table.take() {
                             self.fd_table = saved;
                         }
@@ -649,6 +667,7 @@ impl Executor {
                 subshell_state = Some(self.shell_state.clone_for_child_save());
                 subshell_fd_table = Some(self.fd_table.clone());
                 subshell_cwd = env::current_dir().ok();
+                subshell_umask = Some(crate::builtins::umask::save_process_umask());
                 self.shell_state.loop_depth = 0;
                 // execute_in_subshell resets loop_level (execute_cmd.c:1642):
                 // fork-inherited depth does not cross a `( )` region either.
@@ -1593,6 +1612,9 @@ impl Executor {
                     }
                     if let Some(saved_state) = subshell_state.take() {
                         self.restore_flat_subshell(saved_state, subshell_cwd.take());
+                        if let Some(mask) = subshell_umask.take() {
+                            crate::builtins::umask::restore_process_umask(mask);
+                        }
                         if let Some(saved) = subshell_fd_table.take() {
                             self.fd_table = saved;
                         }
@@ -1720,6 +1742,9 @@ impl Executor {
                 self.evalerror_line.set(None);
                 if let Some(saved_state) = subshell_state.take() {
                     self.restore_flat_subshell(saved_state, subshell_cwd.take());
+                    if let Some(mask) = subshell_umask.take() {
+                        crate::builtins::umask::restore_process_umask(mask);
+                    }
                     if let Some(saved) = subshell_fd_table.take() {
                         self.fd_table = saved;
                     }

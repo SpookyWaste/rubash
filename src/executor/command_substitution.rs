@@ -1036,7 +1036,15 @@ impl Executor {
             return output;
         }
 
-        if words.first().map(String::as_str) == Some("umask") {
+        // rubash#117 (whitelist admission): the fast path only serves the
+        // trivial display form `$(umask)` — the env octal is exactly GNU's
+        // `%04lo` bare output. Every other shape falls through to full
+        // execution on the fork-copy executor: a set form (`$(umask 077)`)
+        // prints nothing and must change only the child's process mask
+        // (builtins/umask.def:124-125; the fork region save/restores it),
+        // and flag forms (`-S`/`-p`) render through the builtin's own
+        // display logic.
+        if words.first().map(String::as_str) == Some("umask") && words.len() == 1 {
             return self
                 .shell_state
                 .env_vars
@@ -1295,6 +1303,10 @@ impl Executor {
         }
 
         let saved_dir = env::current_dir().ok();
+        // GNU subst.c:7143 command_substitute forks: a `umask <mode>` in the
+        // body changes only the child's process mask (builtins/umask.def).
+        // The fork copy shares this process — save/restore like saved_dir.
+        let saved_umask = crate::builtins::umask::save_process_umask();
         let mut subshell = self.command_substitution_executor();
         // rubash#815: the comsub frame is opened by the dispatch entries
         // (expand_command_substitution_with_context / the mut typed
@@ -1484,6 +1496,7 @@ impl Executor {
         if let Some(saved_dir) = saved_dir {
             let _ = env::set_current_dir(saved_dir);
         }
+        crate::builtins::umask::restore_process_umask(saved_umask);
 
         let readback = SubstitutionOutput::readback(output, status, context);
         self.last_command_substitution_status
@@ -1777,6 +1790,9 @@ impl Executor {
             return String::new();
         }
         let saved_dir = env::current_dir().ok();
+        // Same fork-face umask isolation as the $(...) body above
+        // (subst.c:7101 nofork comsub runs in the forked child too).
+        let saved_umask = crate::builtins::umask::save_process_umask();
         let mut subshell = self.command_substitution_executor();
         // rubash#815 profiler: the `${ ... }` funsub runs as "nofork comsub"
         // (subst.c:7101) — same independent fork-face frame as `$(...)`.
@@ -1826,6 +1842,7 @@ impl Executor {
         if let Some(saved_dir) = saved_dir {
             let _ = env::set_current_dir(saved_dir);
         }
+        crate::builtins::umask::restore_process_umask(saved_umask);
         self.last_command_substitution_status.set(Some(status));
         match captured {
             Some(bytes) => crate::executor::substitution_metadata::bytes_to_shell_text(&bytes)
