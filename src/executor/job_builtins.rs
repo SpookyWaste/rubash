@@ -3413,6 +3413,10 @@ impl Executor {
         // shell engine, so resolve them here before the builtin generates
         // candidates from the static actions.
         let mut dynamic: Option<crate::builtins::complete::CompgenDynamic> = None;
+        // rubash#1798: the fd table saved while the compgen command's
+        // own stdio redirects are bound as the resolution frame (see
+        // the will_run branch below); restored after the final output.
+        let mut framed_fd_table: Option<crate::executor::fd_table::FdTable> = None;
         if matches!(
             builtin,
             crate::builtins::complete::CompletionBuiltin::Compgen
@@ -3454,7 +3458,35 @@ impl Executor {
                                 .funcname
                                 .as_deref()
                                 .is_some_and(|funcname| self.has_function(funcname));
-                        if will_run {
+                        if will_run && compgen_stdio_redirected(cmd) {
+                            // rubash#1798: GNU installs a builtin's
+                            // redirections before it runs (execute_cmd.c
+                            // do_redirections), so everything the -F
+                            // function / -C command writes to fd 1/2 —
+                            // including a nested compopt's `not
+                            // currently executing` diagnostic — travels
+                            // through THIS command's redirect frame.
+                            // Bind the frame into the fd table for the
+                            // resolution and the final output, and write
+                            // the warning through it now (its GNU
+                            // position precedes the run). The buffered
+                            // flush cannot be used while framed: it
+                            // re-opens the targets, and the second open
+                            // truncates what the frame already wrote
+                            // (the #1090/#1041 hazard — it was already
+                            // erasing this very warning on the will_run
+                            // path).
+                            framed_fd_table = Some(self.fd_table.clone());
+                            if let Err(error) = self.bind_conditional_stdio_redirects(cmd) {
+                                self.fd_table = framed_fd_table.take().unwrap();
+                                return Err(error);
+                            }
+                            if let Err(error) = self.write_default_stderr(&stderr) {
+                                self.fd_table = framed_fd_table.take().unwrap();
+                                return Err(error);
+                            }
+                            stderr.clear();
+                        } else if will_run {
                             self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
                             stdout.clear();
                             stderr.clear();
@@ -3497,7 +3529,7 @@ impl Executor {
                 }
             }
         }
-        let status = if matches!(
+        let status = match (if matches!(
             builtin,
             crate::builtins::complete::CompletionBuiltin::Compgen
         ) {
@@ -3515,7 +3547,7 @@ impl Executor {
                 &underlay,
                 &mut stdout,
                 &mut stderr,
-            )?
+            )
         } else {
             crate::builtins::complete::execute_with_io(
                 builtin,
@@ -3527,7 +3559,17 @@ impl Executor {
                 &diagnostic_prefix,
                 &mut stdout,
                 &mut stderr,
-            )?
+            )
+        }) {
+            Ok(status) => status,
+            Err(error) => {
+                // rubash#1798: never leak a bound frame past this
+                // builtin, whatever failed inside it.
+                if let Some(saved) = framed_fd_table.take() {
+                    self.fd_table = saved;
+                }
+                return Err(error.into());
+            }
         };
         if matches!(
             builtin,
@@ -3547,7 +3589,23 @@ impl Executor {
                 stdout.clear();
             }
         }
-        self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+        if let Some(saved) = framed_fd_table.take() {
+            // rubash#1798: framed mode — the matches (and any residue)
+            // go through the bound frame in order, then the frame is
+            // restored. The buffered flush would re-open the targets
+            // and truncate the resolution's own writes.
+            let mut result: Result<(), ExecuteError> = Ok(());
+            if !stdout.is_empty() {
+                result = self.write_default_stdout(&stdout);
+            }
+            if result.is_ok() && !stderr.is_empty() {
+                result = self.write_default_stderr(&stderr);
+            }
+            self.fd_table = saved;
+            result?;
+        } else {
+            self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+        }
         Ok(status)
     }
 
@@ -4413,4 +4471,31 @@ impl CompgenWordlistScanner<'_> {
             }
         }
     }
+}
+
+/// Whether a command node carries its own fd 1 / fd 2 output
+/// redirection (an ordered `redirects` entry with an output kind
+/// naming fd 1 or 2, or defaulting to fd 1) — the trigger for running
+/// compgen's dynamic resolution under a bound fd frame
+/// (rubash#1798). fd_var entries bind a fresh descriptor, never
+/// fd 1/2, and input-side kinds name fd 0; neither installs a stdio
+/// frame in GNU either (do_redirections binds exactly the listed
+/// descriptors).
+fn compgen_stdio_redirected(cmd: &CommandNode) -> bool {
+    use crate::parser::RedirectKind;
+    cmd.redirects.iter().any(|redirect| {
+        if redirect.fd_var.is_some() {
+            return false;
+        }
+        match redirect.kind {
+            RedirectKind::Output
+            | RedirectKind::Append
+            | RedirectKind::ClobberOutput
+            | RedirectKind::CombinedOutput
+            | RedirectKind::CombinedAppend
+            | RedirectKind::DuplicateOutput
+            | RedirectKind::CloseOutput => matches!(redirect.fd, None | Some(1) | Some(2)),
+            _ => false,
+        }
+    })
 }
