@@ -3573,7 +3573,7 @@ impl Executor {
             );
             return Vec::new();
         }
-        self.bind_compfunc_variables("", 0, &[], -1);
+        self.bind_compfunc_variables("", 0, &[], -1, false);
         let args = [cmd.to_string(), word.to_string(), String::new()];
         let _ = self.call_function(funcname, args);
         let reply = self
@@ -3595,7 +3595,7 @@ impl Executor {
         cmd: &str,
         word: &str,
     ) -> Vec<String> {
-        self.bind_compfunc_variables("", 0, &[], 0);
+        self.bind_compfunc_variables("", 0, &[], 0, true);
         let result = self.run_completion_command_line(command, cmd, word, "");
         self.unbind_compfunc_variables();
         result
@@ -3844,11 +3844,29 @@ impl Executor {
     /// COMP_TYPE 0, COMP_KEY 0 — readline is not completing here), the
     /// COMP_WORDS array, and COMP_CWORD (cw - 1 for functions,
     /// pcomplete.c:1073-1074).
-    fn bind_compfunc_variables(&mut self, line: &str, point: usize, words: &[String], cword: i64) {
+    ///
+    /// The `exported` arm is the -C shape (pcomplete.c:1156
+    /// gen_command_matches passes exported=1): only the four scalar
+    /// variables are bound — COMP_WORDS and COMP_CWORD are bound solely
+    /// in the exported==0 (function) arm, so a -C command observes them
+    /// exactly as the caller left them (unset in a fresh shell,
+    /// rubash#1796). unbind_compfunc_variables removes all six either
+    /// way (pcomplete.c:976), matching GNU.
+    fn bind_compfunc_variables(
+        &mut self,
+        line: &str,
+        point: usize,
+        words: &[String],
+        cword: i64,
+        exported: bool,
+    ) {
         self.set_env("COMP_LINE", line);
         self.set_env("COMP_POINT", &point.to_string());
         self.set_env("COMP_TYPE", "0");
         self.set_env("COMP_KEY", "0");
+        if exported {
+            return;
+        }
         // GNU compgen passes the caller's COMP_WORDS through to the -F
         // function: outside a live completion there is no word list to
         // bind, so a COMP_WORDS the script already set stays visible
