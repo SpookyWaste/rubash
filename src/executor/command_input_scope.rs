@@ -668,7 +668,16 @@ impl Executor {
                         if redirect.append {
                             self.set_fd_output_file(1, path.to_string(), false, true)
                         } else {
-                            self.create_redirect_output(path, redirect.clobber)?;
+                            // rubash#1868: probe form — on a FIFO the
+                            // physical create open would consume the
+                            // rendezvous pairing set_fd_output_file's
+                            // bind open waits for (see
+                            // probe_output_redirect).
+                            crate::executor::shell_options::probe_output_redirect(
+                                self,
+                                path,
+                                redirect.clobber,
+                            )?;
                             self.set_fd_output_file(1, path.to_string(), false, false)
                         }
                         .map_err(|error| crate::posix_errors::path_error(path, error))?;
@@ -695,8 +704,15 @@ impl Executor {
                     let append = redirect.kind == crate::parser::RedirectKind::CombinedAppend;
                     // rubash#1025: same prepare/bind pair as the Output
                     // arm below — consume the prepare phase's record.
+                    // rubash#1868: probe form of the create (FIFO targets
+                    // are access-checked, not opened — the bind open in
+                    // set_fd_output_file is the single pairing open).
                     if !append && !self.take_noclobber_prepared_target(&target) {
-                        self.create_redirect_output(&target, redirect.clobber)?;
+                        crate::executor::shell_options::probe_output_redirect(
+                            self,
+                            &target,
+                            redirect.clobber,
+                        )?;
                     }
                     self.set_fd_output_file(1, target.clone(), false, append)
                         .map_err(|error| crate::posix_errors::path_error(&target, error))?;
@@ -752,9 +768,16 @@ impl Executor {
                     // O_EXCL-opened again here — the record is consumed
                     // exactly once, so pre-existing files still fail in
                     // the prepare phase and bind-only scopes keep the
-                    // plain check.
+                    // plain check. rubash#1868: probe form of the create
+                    // (FIFO targets are access-checked, not opened — the
+                    // bind open in set_fd_output_file is the single
+                    // pairing open).
                     if !redirect.append && !self.take_noclobber_prepared_target(&target) {
-                        self.create_redirect_output(&target, redirect.clobber)?;
+                        crate::executor::shell_options::probe_output_redirect(
+                            self,
+                            &target,
+                            redirect.clobber,
+                        )?;
                     }
                     // GNU redir.c do_redirection_internal: every `>file`
                     // redirection performs its OWN open() — `>f 2>f` binds

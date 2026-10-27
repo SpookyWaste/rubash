@@ -1680,20 +1680,53 @@ impl Executor {
             }
         } else {
             let target = self.redirect_output_path_target(target);
-            let open_result: Result<(), std::io::Error> = if redirect.append {
-                // GNU redir.c redirection_error (redir.c:149-176) carries the
-                // failed open's target word (`$FIX/b: No such file or
-                // directory`, issue #518); a bare OS error renders
-                // message-only and drops the word.
-                open_redirect_append(
-                    &self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars)),
-                )
-                .map(|_| ())
-                .map_err(|e| crate::posix_errors::path_error(&target, e))
-            } else {
-                self.create_redirect_output(&target, redirect.clobber)
-                    .map(|_| ())
+            // rubash#1868: this walk's open is a create/truncate
+            // VALIDATION whose File is dropped on the floor — buffered
+            // builtin output lands later through a SECOND open (the
+            // open_redirect_append flush in write_stage_stream_to_target
+            // / route_builtin_buffered_output). On a FIFO the dropped
+            // validation open consumes the rendezvous pairing and
+            // closes without writing: a reader whose first read starts
+            // in the zero-writer gap before the flush open takes a
+            // spurious EOF (its shell exits 0 with an empty line), and
+            // the flush open then blocks forever with no reader left —
+            // the intermittent #1820-pin hang under load. GNU redir.c
+            // do_redirections performs ONE open per redirection.
+            // Mirror the #1820 probe carve-out (probe_output_redirect):
+            // a FIFO target is validated by access only, so the flush
+            // open is the single pairing open.
+            #[cfg(unix)]
+            let fifo_validation: Option<Result<(), std::io::Error>> = {
+                let path =
+                    self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars));
+                crate::executor::shell_options::redirect_path_is_fifo(&path).then(|| {
+                    match crate::executor::shell_options::redirect_fifo_access_error(&path, true) {
+                        Some(error) => Err(crate::posix_errors::path_error(&target, error)),
+                        None => Ok(()),
+                    }
+                })
             };
+            #[cfg(not(unix))]
+            let fifo_validation: Option<Result<(), std::io::Error>> = None;
+            let open_result: Result<(), std::io::Error> =
+                match fifo_validation {
+                    Some(result) => result,
+                    None if redirect.append => {
+                        // GNU redir.c redirection_error (redir.c:149-176) carries the
+                        // failed open's target word (`$FIX/b: No such file or
+                        // directory`, issue #518); a bare OS error renders
+                        // message-only and drops the word.
+                        open_redirect_append(&self.session_path(shell_path_to_windows(
+                            &target,
+                            &self.shell_state.env_vars,
+                        )))
+                        .map(|_| ())
+                        .map_err(|e| crate::posix_errors::path_error(&target, e))
+                    }
+                    None => self
+                        .create_redirect_output(&target, redirect.clobber)
+                        .map(|_| ()),
+                };
             if let Err(error) = open_result {
                 // GNU redir.c:149-176 redirection_error, reached from
                 // do_redirections (redir.c:246): a failed open reports
@@ -2061,6 +2094,23 @@ impl OutputFdState {
             return Ok(());
         }
         if output.is_empty() {
+            // rubash#1868: an empty stream still owes a FIFO target its
+            // pairing open. GNU redir.c opens at redirection time,
+            // before the builtin runs, so `printf "" > fifo` blocks
+            // for a reader and hands it EOF — the open is not skipped
+            // for writing nothing. The ordered walk access-probes FIFO
+            // targets instead of opening them (the dropped validation
+            // open would consume the rendezvous and race the reader to
+            // a spurious EOF), so for an empty stream the single
+            // pairing open lives here, at the flush site; a non-empty
+            // stream reaches it through the Path arm below.
+            if let Some(OutputTarget::Path(path)) = self.fd_target(fd).cloned() {
+                let resolved = executor
+                    .session_path(shell_path_to_windows(&path, &executor.shell_state.env_vars));
+                if crate::executor::shell_options::redirect_path_is_fifo(&resolved) {
+                    let _pairing = open_redirect_append(&resolved)?;
+                }
+            }
             return Ok(());
         }
 
