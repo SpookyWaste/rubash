@@ -100,6 +100,45 @@ pub enum StepArming {
         /// The depth of the frame being finished.
         frame_depth: usize,
     },
+    /// Stop at the next seam in the same file as the stop the
+    /// resume started from (design 6.1's `step+`, rubash's
+    /// portable reading). The file is not carried here: it is the
+    /// session's step-file scope ([`DebugSession::step_file_scope`]),
+    /// recorded as a canonical identity when the arming is
+    /// installed, and the consult compares identities — never
+    /// spellings, never basenames.
+    StepInFile,
+    /// Stop at the next seam in a shallower frame than
+    /// `frame_depth` (design 6.1's `step-`, rubash's portable
+    /// reading: leaving the current function). Unlike `Finish`
+    /// this is serviced only at seams, never at a return site:
+    /// the stop is the first command back in a caller, wherever
+    /// the frame went.
+    StepOutOfFrame {
+        /// The depth of the frame being left.
+        frame_depth: usize,
+    },
+}
+
+/// The exception filter ids of design 9.3 / WP-15, in their
+/// canonical order. These are the operation-set names both
+/// frontends use: the DAP adapter accepts exactly these ids in
+/// `setExceptionBreakpoints` (and offers them as its
+/// `exceptionBreakpointFilters`), and the CLI lists and toggles
+/// the same strings. A filter being *set* only records the
+/// user's selection in the session; the engine-side sites that
+/// report against the filters (the DE-06 producers) are
+/// PLAN row 12 — until then no exception stop can occur, and
+/// neither frontend may claim one did.
+pub const EXCEPTION_FILTER_IDS: [&str; 3] = ["err-trap", "set -e", "parse-error"];
+
+/// The filter id naming one exception kind.
+pub fn exception_filter_id(kind: super::event::ExceptionKind) -> &'static str {
+    match kind {
+        super::event::ExceptionKind::ErrTrap => "err-trap",
+        super::event::ExceptionKind::Errexit => "set -e",
+        super::event::ExceptionKind::ParseError => "parse-error",
+    }
 }
 
 /// A rejected state transition. The machine is small, so a rejected
@@ -163,6 +202,18 @@ pub struct DebugSession {
     /// Function names a runtime definition note has proven defined
     /// (names no syntax view covers — `eval`-defined functions).
     pub(crate) defined_functions: std::collections::HashSet<String>,
+    /// The canonical file identity a `StepInFile` arming is
+    /// scoped to, recorded when the arming is installed (the
+    /// file of the stop being resumed from). Consult-side state:
+    /// frontends set it through
+    /// [`DebugSession::set_step_file_scope`] in the same breath
+    /// as the resume that installs the arming.
+    step_file_scope: Option<String>,
+    /// The exception filters the user has selected (WP-15;
+    /// design 9.3): a subset of [`EXCEPTION_FILTER_IDS`], stored
+    /// at the operation-set layer so both frontends read and
+    /// write the one set. Empty until a frontend sets it.
+    exception_filters: std::collections::HashSet<String>,
 }
 
 impl DebugSession {
@@ -188,6 +239,8 @@ impl DebugSession {
             last_evaluation: None,
             syntax_views: std::collections::HashMap::new(),
             defined_functions: std::collections::HashSet::new(),
+            step_file_scope: None,
+            exception_filters: std::collections::HashSet::new(),
         };
         session.emit(DebugEvent::SessionStarted);
         session.emit(DebugEvent::Stopped(entry_stop));
@@ -273,6 +326,59 @@ impl DebugSession {
     /// The arming installed by the most recent resume.
     pub fn arming(&self) -> StepArming {
         self.arming
+    }
+
+    /// Record the canonical file identity a `StepInFile` arming
+    /// is scoped to. The identity convergence is the caller's
+    /// one job (`super::resolution::file_identity`): the session
+    /// stores the string as given and the consult compares it
+    /// against the seam's own converged identity.
+    pub fn set_step_file_scope(&mut self, identity: Option<String>) {
+        self.step_file_scope = identity;
+    }
+
+    /// The recorded step-file scope, if any.
+    pub fn step_file_scope(&self) -> Option<&str> {
+        self.step_file_scope.as_deref()
+    }
+
+    /// Replace the exception filter selection (WP-15). Unknown
+    /// ids are rejected as a batch — the selection is unchanged
+    /// and the offending ids are returned — because a frontend
+    /// must never believe a filter is armed when the session
+    /// does not know it.
+    pub fn set_exception_filters(
+        &mut self,
+        ids: impl IntoIterator<Item = String>,
+    ) -> Result<(), Vec<String>> {
+        let mut selected = std::collections::HashSet::new();
+        let mut unknown = Vec::new();
+        for id in ids {
+            if EXCEPTION_FILTER_IDS.contains(&id.as_str()) {
+                selected.insert(id);
+            } else {
+                unknown.push(id);
+            }
+        }
+        if !unknown.is_empty() {
+            return Err(unknown);
+        }
+        self.exception_filters = selected;
+        Ok(())
+    }
+
+    /// The selected exception filter ids, in canonical order.
+    pub fn exception_filters(&self) -> Vec<&'static str> {
+        EXCEPTION_FILTER_IDS
+            .iter()
+            .filter(|id| self.exception_filters.contains(**id))
+            .copied()
+            .collect()
+    }
+
+    /// Whether the filter naming `kind` is selected.
+    pub fn exception_filter_covers(&self, kind: super::event::ExceptionKind) -> bool {
+        self.exception_filters.contains(exception_filter_id(kind))
     }
 
     /// Could this session stop the debuggee at the next seam?
@@ -630,6 +736,40 @@ mod tests {
         let id = session.breakpoints_mut().insert_line("a.sh", 9);
         assert_eq!(session.breakpoints().len(), 1);
         assert_eq!(session.breakpoints().get(id).expect("entry").hit_count, 0);
+    }
+
+    #[test]
+    fn exception_filters_round_trip_in_canonical_order() {
+        let mut session = DebugSession::new();
+        assert!(session.exception_filters().is_empty());
+        session
+            .set_exception_filters(vec!["parse-error".to_string(), "err-trap".to_string()])
+            .expect("known ids");
+        assert_eq!(session.exception_filters(), vec!["err-trap", "parse-error"]);
+        assert!(session.exception_filter_covers(crate::debugger::event::ExceptionKind::ErrTrap));
+        assert!(!session.exception_filter_covers(crate::debugger::event::ExceptionKind::Errexit));
+        // Replacement is wholesale, not additive.
+        session
+            .set_exception_filters(Vec::<String>::new())
+            .expect("empty selection");
+        assert!(session.exception_filters().is_empty());
+    }
+
+    #[test]
+    fn exception_filters_reject_unknown_ids_as_a_batch() {
+        let mut session = DebugSession::new();
+        session
+            .set_exception_filters(vec!["err-trap".to_string()])
+            .unwrap();
+        let rejected = session
+            .set_exception_filters(vec!["set -e".to_string(), "bogus".to_string()])
+            .expect_err("an unknown id rejects the batch");
+        assert_eq!(rejected, vec!["bogus".to_string()]);
+        assert_eq!(
+            session.exception_filters(),
+            vec!["err-trap"],
+            "a rejected batch leaves the previous selection untouched"
+        );
     }
 
     #[test]

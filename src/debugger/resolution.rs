@@ -56,6 +56,79 @@ use super::event::DebugEvent;
 use super::session::DebugSession;
 use crate::api::syntax::{LineClass, SyntaxView};
 
+/// The one canonical file identity a spelling resolves to
+/// (PLAN row 11; the row-10 DAP residual).
+///
+/// Breakpoint keys and syntax-view keys are identities, not
+/// spellings: the same file reached through a symlink, a relative
+/// path, or a Windows 8.3 short name must meet the registration
+/// made under any other spelling of it. Every registration and
+/// every query in the session core converges here — frontends
+/// never normalize (and never guess by basename); the DAP
+/// adapter's own bridge helper produces this same value for the
+/// paths it canonicalizes, so the two sides meet by construction.
+///
+/// - A spelling that names an existing file canonicalizes
+///   through the filesystem (symlinks and short names resolve;
+///   the Windows extended-length prefix is stripped).
+/// - A spelling whose file does not exist (yet) falls back to a
+///   lexical absolutization against the process cwd with `.` /
+///   `..` components collapsed, so a pending entry still has one
+///   stable key. Caveat, shared with bashdb: a relative spelling
+///   is anchored at the cwd in force when it is keyed; the
+///   session's own cwd starts at the launch cwd and the process
+///   cwd does not follow the debuggee's `cd` (G-02 model).
+/// - Pseudo-sources (spellings starting with `<`, e.g.
+///   `<debugger>`) are not files and pass through unchanged.
+///
+/// Idempotent: the identity of an identity is itself.
+pub(crate) fn file_identity(spelling: &str) -> String {
+    if spelling.starts_with('<') {
+        return spelling.to_string();
+    }
+    if let Ok(path) = std::fs::canonicalize(spelling) {
+        return identity_path_string(&path);
+    }
+    let path = std::path::Path::new(spelling);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => path.to_path_buf(),
+        }
+    };
+    let mut out = std::path::PathBuf::new();
+    for component in absolute.components() {
+        use std::path::Component;
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::RootDir => out.push(std::path::MAIN_SEPARATOR.to_string()),
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    identity_path_string(&out)
+}
+
+/// An identity string from a path: the native spelling, with the
+/// Windows extended-length prefixes the canonicalizer adds
+/// mapped back to their ordinary forms (`\\?\C:\…` → `C:\…`,
+/// `\\?\UNC\…` → `\\…`).
+fn identity_path_string(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy().into_owned();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return rest.to_string();
+    }
+    text
+}
+
 /// The design's verdict for a line that carries no command
 /// (section 5.1).
 pub(crate) const REASON_NO_COMMAND: &str = "no command on this line";
@@ -69,7 +142,7 @@ impl DebugSession {
     /// stoppable line, unverified with the design's reason for a
     /// dead one, pending when the file has not been parsed yet.
     pub fn set_line_breakpoint(&mut self, file: impl Into<String>, line: u32) -> BreakpointId {
-        let file = file.into();
+        let file = file_identity(&file.into());
         let id = self.breakpoints_mut().insert_line(&file, line);
         let verdict = self.line_verdict(&file, line);
         self.breakpoints_mut().set_resolution(id, verdict);
@@ -96,7 +169,11 @@ impl DebugSession {
     /// re-adjudicate every entry the grown knowledge touches: all
     /// line entries for the view's file, and all function entries
     /// (any file's view may prove a name). Changes emit DE-11.
-    pub fn register_syntax_view(&mut self, view: SyntaxView) {
+    pub fn register_syntax_view(&mut self, mut view: SyntaxView) {
+        // Registration keys by canonical identity (row 11): a
+        // unit parsed under one spelling serves the entries set
+        // under every spelling of the same file.
+        view.file = file_identity(&view.file);
         let file = view.file.clone();
         match self.syntax_views.get_mut(&file) {
             Some(existing) => existing.merge(view),
@@ -122,18 +199,19 @@ impl DebugSession {
     /// command on this line" rather than pending. Line entries for
     /// the file re-adjudicate, with DE-11 on any change.
     pub fn note_syntax_file_complete(&mut self, file: &str) {
+        let file = file_identity(file);
         let view = self
             .syntax_views
-            .entry(file.to_string())
+            .entry(file.clone())
             .or_insert_with(|| SyntaxView {
-                file: file.to_string(),
+                file: file.clone(),
                 ..SyntaxView::default()
             });
         if view.complete {
             return;
         }
         view.mark_complete();
-        self.readjudicate_lines_for_file(file);
+        self.readjudicate_lines_for_file(&file);
     }
 
     /// Recompute the verdict of every line entry bound to `file`
@@ -257,7 +335,7 @@ impl DebugSession {
 mod tests {
     use super::{REASON_NEVER_FIRES, REASON_NO_COMMAND};
     use crate::api::syntax::SyntaxView;
-    use crate::debugger::breakpoints::BreakpointResolution;
+    use crate::debugger::breakpoints::{BreakpointResolution, BreakpointTarget};
     use crate::debugger::event::DebugEvent;
     use crate::debugger::session::DebugSession;
 
@@ -456,6 +534,101 @@ mod tests {
             session.drain_events().is_empty(),
             "completion is idempotent"
         );
+    }
+
+    #[test]
+    fn canonical_keying_merges_spellings_of_one_file() {
+        // Row 11: registration and query converge on the canonical
+        // identity. A view registered under a relative spelling
+        // adjudicates an entry set under the absolute spelling,
+        // and the stored key is the identity itself.
+        let mut session = DebugSession::new();
+        session.register_syntax_view(view_of("a.sh", "echo one\necho two\n"));
+        let absolute = super::file_identity("a.sh");
+        assert_ne!(absolute, "a.sh", "the identity is absolute");
+        let id = session.set_line_breakpoint(&absolute, 2);
+        assert_eq!(resolution(&session, id), BreakpointResolution::Verified);
+        let entry = session.breakpoints().get(id).expect("entry");
+        match &entry.target {
+            BreakpointTarget::Line { file, .. } => {
+                assert_eq!(file, &absolute, "the stored key is the identity")
+            }
+            other => panic!("line entry expected, got {other:?}"),
+        }
+        // The table query converges too: the relative spelling
+        // finds the entry the absolute spelling set.
+        assert_eq!(session.breakpoints().line_entries_at("a.sh", 2).count(), 1);
+        assert_eq!(
+            session.breakpoints().line_entries_at(&absolute, 2).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn canonical_keying_does_not_merge_different_files() {
+        // The counter-example: two distinct files in one directory
+        // keep distinct keys — identity convergence is not
+        // basename matching.
+        let dir = std::env::temp_dir().join(format!("rubash-row11-keying-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let one = dir.join("one.sh");
+        let two = dir.join("two.sh");
+        std::fs::write(&one, "echo one\n").expect("write one");
+        std::fs::write(&two, "echo two\n").expect("write two");
+        let mut session = DebugSession::new();
+        session.register_syntax_view(view_of(one.to_str().unwrap(), "echo one\n"));
+        let in_two = session.set_line_breakpoint(two.to_str().unwrap(), 1);
+        assert_eq!(
+            resolution(&session, in_two),
+            BreakpointResolution::Pending,
+            "one.sh's view proves nothing about two.sh"
+        );
+        let in_one = session.set_line_breakpoint(one.to_str().unwrap(), 1);
+        assert_eq!(resolution(&session, in_one), BreakpointResolution::Verified);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_keying_resolves_a_symlink_spelling() {
+        // The row-10 residual in its original shape: a breakpoint
+        // set on the symlink spelling must verify against the view
+        // the engine registered under the real path (and the hit
+        // query from either spelling finds it).
+        let dir = std::env::temp_dir().join(format!("rubash-row11-symlink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let real = dir.join("real.sh");
+        let link = dir.join("link.sh");
+        std::fs::write(&real, "echo one\necho two\n").expect("write real");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let mut session = DebugSession::new();
+        session.register_syntax_view(view_of(real.to_str().unwrap(), "echo one\necho two\n"));
+        let id = session.set_line_breakpoint(link.to_str().unwrap(), 2);
+        assert_eq!(resolution(&session, id), BreakpointResolution::Verified);
+        assert_eq!(
+            session
+                .breakpoints()
+                .line_entries_at(link.to_str().unwrap(), 2)
+                .count(),
+            1
+        );
+        assert_eq!(
+            session
+                .breakpoints()
+                .line_entries_at(real.to_str().unwrap(), 2)
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn canonical_keying_passes_pseudo_sources_through() {
+        assert_eq!(super::file_identity("<debugger>"), "<debugger>");
+        assert_eq!(super::file_identity("<stdin>"), "<stdin>");
+        // Idempotence: the identity of an identity is itself.
+        let once = super::file_identity("a.sh");
+        assert_eq!(super::file_identity(&once), once);
     }
 
     #[test]

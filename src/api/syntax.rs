@@ -16,12 +16,14 @@
 //! breakpoint-condition evaluations) never register a view, so a
 //! view always describes a real file the debuggee is executing.
 //!
-//! File identity is the exact string the engine itself puts on the
-//! `BASH_SOURCE` stack for the unit. No canonicalization, no
-//! absolutizing: a breakpoint set against the path the user named
-//! and a view registered under the path the engine reports are the
-//! same string by construction, or resolution honestly reports
-//! "no view of that file yet" (pending) instead of guessing.
+//! File identity at this layer is the exact string the engine
+//! itself puts on the `BASH_SOURCE` stack for the unit: the view
+//! records what the engine reported, verbatim. The session
+//! core's registration point (PLAN row 11) converges that
+//! spelling — and every breakpoint spelling — onto one
+//! canonical identity (`debugger::resolution::file_identity`),
+//! so a view registered under one spelling serves entries set
+//! under any other spelling of the same file.
 //!
 //! Line classification (the dead-line judgment, WP-8):
 //!

@@ -25,6 +25,7 @@
 //! atomic gate and stop-request flags.
 
 pub mod breakpoints;
+pub mod cli;
 pub mod dap;
 pub mod driver;
 pub mod evaluation;
@@ -49,6 +50,8 @@ pub use breakpoints::{
     BreakpointTarget, HitFlow, HitOutcome, WatchSnapshot,
 };
 #[allow(unused_imports)]
+pub use cli::{run_debug_cli, run_debug_cli_with_stream, DebugCliPreset};
+#[allow(unused_imports)]
 pub use dap::{run_dap_server, run_dap_stdio, DapLaunchPreset};
 #[allow(unused_imports)]
 pub use driver::{SessionDriver, StopLoop, StopLoopOutcome};
@@ -70,13 +73,23 @@ pub use inspect::{
     render_caller, render_caller_bare, render_dynamic_state, render_info_args, render_pipestatus,
     render_variables, render_watch_value, render_where, VariablePartition,
 };
+pub(crate) use resolution::file_identity;
 #[allow(unused_imports)]
-pub use session::{DebugSession, SessionError, SessionState, StepArming, Termination};
+pub use session::{
+    exception_filter_id, DebugSession, SessionError, SessionState, StepArming, Termination,
+    EXCEPTION_FILTER_IDS,
+};
 #[allow(unused_imports)]
-pub use stepping::{arming_stops_at_frame_return, arming_stops_at_seam};
+pub use stepping::{
+    arming_stops_at_frame_return, arming_stops_at_seam, arming_stops_at_seam_in_file,
+};
 
 #[cfg(test)]
+mod cli_tests;
+#[cfg(test)]
 mod dap_tests;
+#[cfg(test)]
+mod driver_tests;
 #[cfg(test)]
 mod evaluation_tests;
 #[cfg(test)]

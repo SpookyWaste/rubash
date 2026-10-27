@@ -356,8 +356,14 @@ impl BreakpointTable {
     }
 
     /// Insert a line entry (5.1) and return its id.
+    ///
+    /// The stored key is the file's canonical identity
+    /// (`super::resolution::file_identity`, PLAN row 11), never
+    /// the caller's spelling: entries set through a symlink, a
+    /// relative path, or a short name are the same entry.
     pub fn insert_line(&mut self, file: impl Into<String>, line: u32) -> BreakpointId {
         let id = self.alloc_id();
+        let file = super::resolution::file_identity(&file.into());
         self.entries.insert(id, Breakpoint::line(id, file, line));
         id
     }
@@ -408,13 +414,14 @@ impl BreakpointTable {
     /// Delete the line entries at one (file, line) — the no-argument
     /// `clear` rule of design 5.5 — and return how many were removed.
     pub fn clear_at(&mut self, file: &str, line: u32) -> usize {
+        let file = super::resolution::file_identity(file);
         let doomed: Vec<BreakpointId> = self
             .entries
             .values()
             .filter(|entry| {
                 matches!(
                     &entry.target,
-                    BreakpointTarget::Line { file: f, line: l } if f == file && *l == line
+                    BreakpointTarget::Line { file: f, line: l } if f == &file && *l == line
                 )
             })
             .map(|entry| entry.id)
@@ -442,16 +449,22 @@ impl BreakpointTable {
     }
 
     /// Enabled seam-fired entries bound to one (file, line).
+    ///
+    /// The query spelling is normalized to the canonical
+    /// identity here, at the same convergence point as
+    /// registration (`insert_line`), so the engine's reported
+    /// spelling and the user's spelling meet on one key.
     pub fn line_entries_at<'a>(
         &'a self,
         file: &'a str,
         line: u32,
     ) -> impl Iterator<Item = &'a Breakpoint> + 'a {
+        let identity = super::resolution::file_identity(file);
         self.entries.values().filter(move |entry| {
             entry.enabled
                 && matches!(
                     &entry.target,
-                    BreakpointTarget::Line { file: f, line: l } if f == file && *l == line
+                    BreakpointTarget::Line { file: f, line: l } if f == &identity && *l == line
                 )
         })
     }
@@ -644,7 +657,9 @@ mod tests {
         assert_eq!(
             entry.target,
             BreakpointTarget::Line {
-                file: "lib.sh".to_string(),
+                // The stored key is the canonical identity of the
+                // spelling, per row 11's keying convergence.
+                file: crate::debugger::resolution::file_identity("lib.sh"),
                 line: 20
             }
         );

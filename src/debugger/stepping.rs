@@ -47,6 +47,40 @@ pub fn arming_stops_at_seam(arming: StepArming, depth: usize) -> bool {
         StepArming::StepInto => true,
         StepArming::StepOver { max_depth } => depth <= max_depth,
         StepArming::Finish { frame_depth } => depth < frame_depth,
+        // `step-`: the first seam back in a shallower frame. The
+        // depth rule matches Finish's backstop; the difference
+        // is service — `arming_stops_at_frame_return` never
+        // services this arming, so the stop is that seam itself.
+        StepArming::StepOutOfFrame { frame_depth } => depth < frame_depth,
+        // `step+` is a file rule, not a depth rule: without the
+        // seam's file it cannot be decided here. The consult
+        // uses `arming_stops_at_seam_in_file`.
+        StepArming::StepInFile => false,
+    }
+}
+
+/// Does `arming` stop at a command seam firing at `depth` in the
+/// file whose canonical identity is `seam_identity`?
+///
+/// The file-aware form of [`arming_stops_at_seam`]: every arming
+/// delegates to the depth rule except `StepInFile` (`step+`),
+/// which stops at the first seam whose identity equals the
+/// session's recorded step-file scope. Both strings are
+/// canonical identities (converged by
+/// `super::resolution::file_identity` at their own points), so
+/// the comparison is string equality on identities — a seam in
+/// a different file, however spelled, never matches.
+pub fn arming_stops_at_seam_in_file(
+    arming: StepArming,
+    depth: usize,
+    seam_identity: Option<&str>,
+    step_file_scope: Option<&str>,
+) -> bool {
+    match arming {
+        StepArming::StepInFile => {
+            matches!((seam_identity, step_file_scope), (Some(seam), Some(scope)) if seam == scope)
+        }
+        other => arming_stops_at_seam(other, depth),
     }
 }
 
@@ -149,6 +183,60 @@ mod tests {
                 "route {route:?} still leaves the finished frame"
             );
         }
+    }
+
+    #[test]
+    fn step_out_of_frame_stops_at_the_first_shallower_seam_only() {
+        let arming = StepArming::StepOutOfFrame { frame_depth: 2 };
+        assert!(!arming_stops_at_seam(arming, 2), "inside the frame");
+        assert!(!arming_stops_at_seam(arming, 3), "inside a callee");
+        assert!(arming_stops_at_seam(arming, 1), "back in the caller");
+        assert!(arming_stops_at_seam(arming, 0));
+        // ...and unlike Finish it is never serviced at a return
+        // site: its stop is the shallower seam itself.
+        assert!(!arming_stops_at_frame_return(
+            arming,
+            &frame_return(2, ReturnRoute::Completed)
+        ));
+    }
+
+    #[test]
+    fn step_in_file_compares_canonical_identities() {
+        use super::arming_stops_at_seam_in_file;
+        let arming = StepArming::StepInFile;
+        assert!(arming_stops_at_seam_in_file(
+            arming,
+            3,
+            Some("/x/a.sh"),
+            Some("/x/a.sh")
+        ));
+        assert!(!arming_stops_at_seam_in_file(
+            arming,
+            0,
+            Some("/x/b.sh"),
+            Some("/x/a.sh")
+        ));
+        assert!(!arming_stops_at_seam_in_file(
+            arming,
+            0,
+            None,
+            Some("/x/a.sh")
+        ));
+        assert!(!arming_stops_at_seam_in_file(
+            arming,
+            0,
+            Some("/x/a.sh"),
+            None
+        ));
+        // The depth-only predicate cannot decide a file rule.
+        assert!(!arming_stops_at_seam(arming, 0));
+        // Other armings ignore the file entirely.
+        assert!(arming_stops_at_seam_in_file(
+            StepArming::StepInto,
+            5,
+            Some("/x/b.sh"),
+            Some("/x/a.sh")
+        ));
     }
 
     #[test]

@@ -128,6 +128,34 @@ impl SessionDriver {
     }
 }
 
+/// Teardown disarms the gate (PLAN row 11, the row-5 tail).
+///
+/// Gate pairing has exactly three legitimate ends — termination
+/// (`debugger_note_exit`), detach (the serve loop takes the
+/// driver out and deactivates), and this one: the driver is
+/// dropped without either, because its owner went away mid-run
+/// (an executor dropped with a session still installed, an
+/// install replaced by a newer driver, a frontend returning
+/// early). Before this impl, the third end leaked: the process
+/// gate stayed armed with no session behind it, and every later
+/// seam paid a consult against a dead driver — the engine never
+/// returned to the inert state (S4 state (1)).
+///
+/// Disarming is an idempotent atomic store, so dropping a driver
+/// whose session already terminated or detached is a no-op; and
+/// installation activates *after* storing the new driver
+/// (`install_debug_session`), so a replaced driver's drop —
+/// which happens during the store — lands before the new
+/// session's activation, never after it. The single-session
+/// contract (one thread, one session) is what makes a bare
+/// disarm sound: there is never a second live session whose
+/// gate this could lower.
+impl Drop for SessionDriver {
+    fn drop(&mut self) {
+        self.session.deactivate();
+    }
+}
+
 impl fmt::Debug for SessionDriver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionDriver")

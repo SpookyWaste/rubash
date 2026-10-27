@@ -20,9 +20,16 @@ pub struct ShellInvocation {
     pub dump_po: bool,
     /// --pretty-print: parse input and print it back in normalized form.
     pub pretty_print: bool,
-    /// --debug: GNU shell.c:255 sets the vestigial `debugging` variable —
-    /// accepted, recorded, no behavioral effect (the native debugger,
-    /// rubash#497, will own this name when it lands).
+    /// --debug: GNU shell.c:255 sets the vestigial `debugging` variable.
+    /// The native debugger owns this name since PLAN row 11
+    /// (rubash#497; debugger design section 2): in the rubash
+    /// binary, the script-operand form dispatches to the
+    /// interactive frontend in main.rs's leading-option scan,
+    /// before this parser runs. The forms that reach this parser
+    /// (-c, -s, interactive) keep the recorded-flag behavior plus
+    /// the extdebug arming main.rs applies for them — the
+    /// debugger implies the gate internally on its own path and
+    /// never flips the user's extdebug observably.
     pub debug: bool,
     /// --debugger: GNU parity (shell.c:257 sets debugging_mode). The flag
     /// itself never touches extdebug — startup runs the bashdb starter file
