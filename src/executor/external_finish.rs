@@ -687,6 +687,23 @@ impl Executor {
             None
         };
 
+        // rubash#1888: the child is a fresh shell process, so its reader
+        // runs must enter execute_ast as FRESH runs. The parent's run is
+        // still active here, so EXECUTION_LOCK_DEPTH is 1 and execute_ast
+        // would take its nested branch, skipping the entry latch resets
+        // the grouped reader relies on (script_driver: "re-enters
+        // execute_ast per group, whose entry clears the pendings"). With
+        // the resets skipped, an evalerror DISCARD armed by one group
+        // (e.g. `history 10 42`'s no_args abort) leaks into the next
+        // group while its too-many companion is consumed by the first
+        // group's tail fold, and the next line observes the plain
+        // DISCARD status 1 instead of EX_BADUSAGE 2. A real child
+        // process starts at depth 0; mirror that for the emulation.
+        // The pendings themselves were already saved/reset at this
+        // boundary above and are restored below, so the fresh-entry
+        // clears can only ever erase this child's own stale latches.
+        let saved_lock_depth = super::EXECUTION_LOCK_DEPTH.with(|depth| depth.get());
+        super::EXECUTION_LOCK_DEPTH.with(|depth| depth.set(0));
         let result = if uses_history_driver && fresh_shell {
             // bashhist.c pre_process_line / shell.c reader loop: expand and
             // record history group-by-group so `!!`/`!str` see the entries
@@ -701,6 +718,7 @@ impl Executor {
         } else {
             self.execute_ast(&ast)
         };
+        super::EXECUTION_LOCK_DEPTH.with(|depth| depth.set(saved_lock_depth));
         let mut status = self.exit_code;
         // GNU shell.c exit_shell -> run_exit_trap: both ${THIS_SH} and
         // ENOEXEC children are fresh shells (shell.c:429-464

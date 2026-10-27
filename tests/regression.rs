@@ -3561,4 +3561,126 @@ mod win_face_fd_history {
         );
     }
 
+    /// rubash#1888: `history 10 42` (history.def no_args -> EX_USAGE)
+    /// leaves status 2 for the NEXT command in script mode. GNU bash
+    /// 5.3.20 oracle (script file): the same-line `echo` after
+    /// `history 10 42;` is abandoned with the rest of the logical line
+    /// (evalerror DISCARD), so no P2 line exists at all; the own-line
+    /// failure reports 2 to the following line. The Windows build
+    /// printed 1 (errors.snap golden divergence).
+    #[test]
+    fn issue_1888_history_too_many_arguments_status() {
+        let (stdout, stderr, code) = run(
+            "wf-1888",
+            "set -o history\n\
+             HISTFILE=/dev/null\n\
+             echo a >/dev/null\n\
+             echo b >/dev/null\n\
+             echo c >/dev/null\n\
+             history abcde\n\
+             echo \"P1 abcde: $?\"\n\
+             history 10 42; echo \"P2 toomany-same-line: $?\"\n\
+             history 10 42\n\
+             echo \"P3 toomany-own-line: $?\"\n\
+             echo \"P4 marker: $?\"\n\
+             set +o history\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "P1 abcde: 2\nP3 toomany-own-line: 2\nP4 marker: 0\n",
+            "stderr:\n{stderr}"
+        );
+    }
+
+    /// rubash#1888 (tail form): a script whose LAST command is
+    /// `history 10 42` exits 2 (the reader run is over; the armed
+    /// too-many discard does not fold the final status in script mode).
+    /// GNU bash 5.3.20 oracle: script exit status 2.
+    #[test]
+    fn issue_1888_history_too_many_arguments_last_command() {
+        let (stdout, stderr, code) = run(
+            "wf-1888-last",
+            "set -o history\nHISTFILE=/dev/null\nhistory 10 42\n",
+        );
+        assert_eq!(code, Some(2), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(stdout, "", "stderr:\n{stderr}");
+    }
+
+    /// rubash#1888 (mechanism form, all platforms): the history block
+    /// executed by an in-process `${THIS_SH}` child. A same-shell
+    /// script child runs on the parent's Executor while the parent's
+    /// reader run is still active; before the fix its groups entered
+    /// execute_ast through the nested branch, which skips the
+    /// fresh-run latch resets, so `history 10 42`'s evalerror DISCARD
+    /// leaked into the next group without its too-many companion and
+    /// the following line observed 1 instead of 2. Under a real child
+    /// process (or a non-rubash parent) the same script prints 2.
+    #[test]
+    fn issue_1888_in_process_child_history_status() {
+        let dir = case_scratch("wf-1888-inproc");
+        std::fs::write(
+            dir.join("child.sh"),
+            "set -o history\n\
+             HISTFILE=/dev/null\n\
+             echo a >/dev/null\n\
+             echo b >/dev/null\n\
+             echo c >/dev/null\n\
+             history abcde\n\
+             echo \"after history: $?\"\n\
+             history 10 42\n\
+             echo \"after history: $?\"\n\
+             set +o history\n",
+        )
+        .expect("write child script");
+        std::fs::write(dir.join("fg.sh"), "${THIS_SH} ./child.sh\n").expect("write wrapper");
+        let out = run_rubash_in(&dir, &["fg.sh"], Duration::from_secs(60));
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(
+            stdout, "after history: 2\nafter history: 2\n",
+            "stderr:\n{stderr}"
+        );
+    }
+
+    /// rubash#1888 (suite form): the verbatim upstream errors10.sub,
+    /// run as a child script exactly as errors.tests:369 runs it.
+    /// The isolated pin above passes on the Windows build; the suite
+    /// form carries the prefix state (ten `${THIS_SH} -c` children and
+    /// two for-loops before the history lines) under which the Windows
+    /// build printed "after history: 1".
+    ///
+    /// The assertion is the #1888 projection of the output — the two
+    /// history lines, in order, and no "after history: 1" anywhere —
+    /// not the full byte stream: the file's POSIX-mode `-c` children
+    /// print their "after" lines where GNU's posix shell dies on the
+    /// special-builtin error, a separate pre-existing divergence the
+    /// committed errors.snap golden has absorbed (the golden is a
+    /// rubash-recorded snapshot; the two history lines are the part
+    /// the GNU 5.3.20 oracle adjudicated for this issue).
+    #[test]
+    fn issue_1888_errors10_sub_verbatim() {
+        let sub =
+            std::fs::read_to_string(manifest_dir().join("third_party/bash/tests/errors10.sub"))
+                .expect("read errors10.sub");
+        let dir = case_scratch("wf-1888-sub");
+        std::fs::write(dir.join("errors10.sub"), sub).expect("write sub");
+        std::fs::write(
+            dir.join("fg.sh"),
+            "mkdir wtmp\nexport TMPDIR=\"$PWD/wtmp\"\n${THIS_SH} ./errors10.sub\n",
+        )
+        .expect("write wrapper");
+        let out = run_rubash_in(&dir, &["fg.sh"], Duration::from_secs(120));
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            stdout.contains("after history: 2\nafter history: 2\n"),
+            "history lines missing or wrong:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("after history: 1"),
+            "history status folded to 1:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
 }
