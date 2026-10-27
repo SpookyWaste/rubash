@@ -330,6 +330,17 @@ fn handshake(client: &mut Client, program: &str, extra: Vec<(&str, Json)>) {
     client.take_event("initialized");
 }
 
+/// The canonical spelling of a fixture path — the identity
+/// the server (and therefore the engine) reports for it.
+/// Temp-path assertions compare canonical-to-canonical:
+/// on macOS the temp dir is a symlink (`/var` → `/private/var`)
+/// and the raw spelling never matches the reported one.
+fn canonical_string(path: &str) -> String {
+    let resolved = std::fs::canonicalize(path).expect("fixture path canonicalizes");
+    let text = resolved.to_string_lossy().into_owned();
+    text.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(text)
+}
+
 /// Field shortcuts for assertions.
 fn s<'a>(json: &'a Json, key: &str) -> &'a str {
     json.get(key)
@@ -470,7 +481,7 @@ fn dap_breakpoints_hit_and_dead_line_verdicts() {
             .get("source")
             .and_then(|src| src.get("path"))
             .and_then(Json::as_str),
-        Some(program.as_str())
+        Some(canonical_string(&program).as_str())
     );
     client.ok("continue", Json::obj(vec![]));
     let (outputs, exit_code) = client.collect_outputs_until_terminated();
@@ -535,7 +546,7 @@ fn dap_breakpoint_in_sourced_file_pending_then_verified() {
             .get("source")
             .and_then(|src| src.get("path"))
             .and_then(Json::as_str),
-        Some(lib.as_str())
+        Some(canonical_string(&lib).as_str())
     );
     client.ok("continue", Json::obj(vec![]));
     let (outputs, exit_code) = client.collect_outputs_until_terminated();
@@ -1085,7 +1096,10 @@ fn dap_set_variable_writeback_and_readonly_refusal() {
         vec![
             (
                 "stderr".to_string(),
-                format!("{program}: line 1: LOCKED: readonly variable\n")
+                format!(
+                    "{}: line 1: LOCKED: readonly variable\n",
+                    canonical_string(&program)
+                )
             ),
             ("stdout".to_string(), "MSG=goodbye\n".to_string()),
         ]
@@ -1132,14 +1146,16 @@ fn dap_terminate_at_a_stop_reports_signal_status() {
 /// Pause during a free run: the reader thread applies the
 /// request to the session's asynchronous stop flag and the
 /// boundary poll parks the debuggee (DE-07). The script is a
-/// long pure-builtin loop, so the pause lands while it runs —
-/// no external binary, no sleep.
+/// pure-builtin loop long enough for the reader thread to be
+/// scheduled and land the pause (thousands of iterations),
+/// short enough for a debug test suite (seconds, not
+/// minutes) — no external binary, no sleep.
 #[test]
 fn dap_pause_during_a_free_run() {
     let _span = GateTestSpan::new();
     let program = program_file(
         "pause",
-        "I=0\nwhile [ $I -lt 400000 ]; do I=$((I + 1)); done\necho \"done $I\"\n",
+        "I=0\nwhile [ $I -lt 6000 ]; do I=$((I + 1)); done\necho \"done $I\"\n",
     );
     let (mut client, server) = start_server(DapLaunchPreset::default());
     handshake(&mut client, &program, vec![]);
@@ -1158,7 +1174,7 @@ fn dap_pause_during_a_free_run() {
     assert_eq!(exit_code, 0);
     assert_eq!(
         outputs,
-        vec![("stdout".to_string(), "done 400000\n".to_string())]
+        vec![("stdout".to_string(), "done 6000\n".to_string())]
     );
     client.ok("disconnect", Json::obj(vec![]));
     assert_eq!(server.join().expect("server thread"), 0);
