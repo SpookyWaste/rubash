@@ -498,6 +498,16 @@ fn check_word_chars(chars: &[char], whole: &str) -> Result<(), WhitelistRejectio
                         whole,
                     ));
                 }
+                // Extglob groups are pathname patterns too (the
+                // parser's own extglob record is checked at the
+                // command level as well; this arm keeps operand
+                // fragments, which have no AST, covered).
+                '@' | '+' if state == QuoteState::Unquoted && chars.get(i + 1) == Some(&'(') => {
+                    return Err(WhitelistRejection::new(
+                        RejectionKind::PathnamePattern,
+                        whole,
+                    ));
+                }
                 '{' if state == QuoteState::Unquoted => {
                     if let Some(end) = matched_span_end(chars, i, '{', '}') {
                         if brace_body_expands(&chars[i + 1..end - 1]) {
@@ -747,8 +757,10 @@ fn scan_body_operators(body: &[char], form: &str) -> Result<(), WhitelistRejecti
 /// subscript, or substring offset text): expansion spans inside
 /// it classify recursively by the word rules, and the operator
 /// inventory — taken with the parser's own arithmetic operator
-/// scan over the span-blanked text — must contain no assignment
-/// and no update operator.
+/// scan over the text with expansion spans and quoted string
+/// literals blanked (their contents are data, never operators:
+/// `arr["a=b"]` reads a key, it does not assign) — must contain
+/// no assignment and no update operator.
 fn check_arithmetic_body(chars: &[char], form: &str) -> Result<(), WhitelistRejection> {
     let mut blanked: Vec<char> = chars.to_vec();
     let mut state = QuoteState::Unquoted;
@@ -757,6 +769,7 @@ fn check_arithmetic_body(chars: &[char], form: &str) -> Result<(), WhitelistReje
         let ch = chars[i];
         match state {
             QuoteState::Single => {
+                blanked[i] = ' ';
                 if ch == '\'' {
                     state = QuoteState::Unquoted;
                 }
@@ -765,10 +778,12 @@ fn check_arithmetic_body(chars: &[char], form: &str) -> Result<(), WhitelistReje
             QuoteState::Unquoted | QuoteState::Double => match ch {
                 '\\' => i += 2,
                 '\'' if state == QuoteState::Unquoted => {
+                    blanked[i] = ' ';
                     state = QuoteState::Single;
                     i += 1;
                 }
                 '"' => {
+                    blanked[i] = ' ';
                     state = if state == QuoteState::Double {
                         QuoteState::Unquoted
                     } else {
@@ -790,6 +805,10 @@ fn check_arithmetic_body(chars: &[char], form: &str) -> Result<(), WhitelistReje
                         RejectionKind::BacktickSubstitution,
                         chars[i..end].iter().collect::<String>(),
                     ));
+                }
+                _ if state == QuoteState::Double => {
+                    blanked[i] = ' ';
+                    i += 1;
                 }
                 _ => i += 1,
             },

@@ -5807,14 +5807,16 @@ impl Executor {
             PowerMode::Implicit => match crate::debugger::check_implicit(&ast, &request.text) {
                 Ok(word) => {
                     let word = word.to_string();
-                    Ok(outcome(EvaluationResult::Value(self.expand_word(&word))))
+                    let value = self.debugger_expand_evaluation_word(&word);
+                    Ok(outcome(EvaluationResult::Value(value)))
                 }
                 Err(rejection) => Ok(outcome(EvaluationResult::Rejected(rejection.diagnostic()))),
             },
             PowerMode::Explicit => {
                 if let Some(word) = crate::debugger::single_expansion_word(&ast) {
                     let word = word.to_string();
-                    return Ok(outcome(EvaluationResult::Value(self.expand_word(&word))));
+                    let value = self.debugger_expand_evaluation_word(&word);
+                    return Ok(outcome(EvaluationResult::Value(value)));
                 }
                 match self.debugger_execute_evaluation(&ast)? {
                     (status, None) => Ok(outcome(EvaluationResult::Status(status))),
@@ -5830,6 +5832,23 @@ impl Executor {
                 }
             }
         }
+    }
+
+    /// Expand one evaluation word through the entry command
+    /// preparation itself uses (`expand_word_mut`): its `:=`
+    /// pre-scan applies assignment expansions exactly as a real
+    /// command word's would (an explicit print of `${x:=y}` is a
+    /// full-power act, design 5.3), and the expansion is the
+    /// engine's own. For whitelist-admitted implicit words the
+    /// pre-scan is inert by construction — the checker has
+    /// already refused every writing form — so both power rules
+    /// share this one expansion path and neither builds a shadow.
+    /// Arithmetic writes logged during the expansion are synced
+    /// to the variable table, as the arithmetic eval entries do.
+    fn debugger_expand_evaluation_word(&mut self, word: &str) -> String {
+        let value = self.expand_word_mut(word);
+        crate::executor::arithmetic::sync_arith_writes(self);
+        value
     }
 
     /// Execute an explicit evaluation's command list under the
