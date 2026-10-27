@@ -1351,17 +1351,21 @@ fn time_prefix_from_command(command: &mut CommandNode) -> Option<TimePipelinePre
 /// executor's assignment_dispatch forbids — by the time a value is
 /// expanded the quote evidence is gone; here it is not.
 ///
-/// Two word families deliberately stay in the word list:
+/// One word family deliberately stays in the word list:
 /// - Array-element words (`name[sub]=v`): push_command_word records
 ///   them through a separate channel and the executor consumes the
 ///   leading run itself (strip_invalid_env_assignment_prefixes /
 ///   execute_assignment_or_comment_command) — `time arr[0]=x` already
 ///   behaves per GNU untouched.
-/// - Compound values (values carrying COMPOUND_ASSIGNMENT_MARKER):
-///   token_actions collects them into compound_assignments through
-///   parser state (token spans) this stripped node no longer holds.
-///   (`time arr=(...)` is additionally rejected earlier, at parse
-///   time, by compound_assignment_position_ok.)
+///
+/// Compound values (values carrying COMPOUND_ASSIGNMENT_MARKER) DO
+/// restore: the marker word embeds the whole verbatim compound text,
+/// which is everything the Assignment-token path records for the
+/// atomic form (an assignment whose value carries the marker — the
+/// executor's assignment application interprets it as a compound
+/// assignment). The split form additionally recorded a
+/// compound_assignments entry through token spans; such nodes are
+/// refused by the gate above before this loop runs, as before.
 pub(crate) fn reclassify_leading_assignment_words(command: &mut CommandNode) {
     if !command.assignments.is_empty()
         || !command.compound_assignments.is_empty()
@@ -1386,9 +1390,7 @@ pub(crate) fn reclassify_leading_assignment_words(command: &mut CommandNode) {
             let Some((name, value)) = word.split_once('=') else {
                 break;
             };
-            if name.contains('[')
-                || value.starts_with(crate::executor::types::COMPOUND_ASSIGNMENT_MARKER)
-            {
+            if name.contains('[') {
                 break;
             }
             let raw_rhs = if metadata_aligned {
