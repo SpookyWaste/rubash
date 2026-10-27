@@ -537,6 +537,32 @@ impl Executor {
             }
         }
 
+        if let Some(callback) = callback.as_deref() {
+            // GNU builtins/mapfile.def read_array: records are pulled
+            // one at a time and the callback fires DURING the read,
+            // before the current record is bound (rubash#1586). That
+            // path owns its own incremental source resolution and
+            // live binding; Ok(None) means no input source exists and
+            // the clear-and-report tail below applies.
+            match self.execute_mapfile_with_callback(
+                cmd,
+                &name,
+                delimiter,
+                trim_newline,
+                skip,
+                count,
+                origin,
+                callback,
+                callback_quantum,
+                read_fd,
+                &stderr,
+            ) {
+                Ok(Some(status)) => return status,
+                Ok(None) => {}
+                Err(_) => return 1,
+            }
+        }
+
         if let Some(input) = self.mapfile_input_for_command(cmd, read_fd) {
             let mut values = split_mapfile_input(&input, delimiter, trim_newline)
                 .into_iter()
@@ -575,7 +601,7 @@ impl Executor {
                 if let Some(callback) = callback.as_deref() {
                     if (offset + 1) % callback_quantum == 0 {
                         if self
-                            .execute_mapfile_callback(callback, target_index, &value)
+                            .execute_mapfile_callback(callback, target_index, &value, cmd)
                             .is_err()
                         {
                             return 1;

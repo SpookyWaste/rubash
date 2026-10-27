@@ -68,8 +68,27 @@ impl Executor {
             }
             Vec::new()
         } else {
+            // rubash#1692: GNU binds a simple command's tempenv only
+            // for builtin/function commands; for a disk command the
+            // assignments become child-env entries and never bind in
+            // the shell (execute_cmd.c assign_in_env), so a bad
+            // tempenv locale warns only in the binding classes. The
+            // class is known from the command word up front; defer the
+            // locale attempts until just after the apply, then flush
+            // (binding class — GNU warns at bind time, before the
+            // command runs) or drop (disk class).
+            let tempenv_binds = cmd.words.first().is_some_and(|word| {
+                is_shell_builtin_name(word) || self.function_name_for_command_word(word).is_some()
+            });
+            self.defer_locale_assignment_warnings.set(true);
             let (applied, assignments_failed) =
                 self.apply_temporary_assignments(&cmd.assignments, assignment_raws);
+            self.defer_locale_assignment_warnings.set(false);
+            if tempenv_binds {
+                self.flush_deferred_locale_assignment_binds();
+            } else {
+                self.drop_deferred_locale_assignment_binds();
+            }
             // POSIX-mode notes item 36, GNU 5.3 verified cell-by-cell with
             // unbuffered per-process probes (the early "every command class
             // exits" reading was a stdout pipe-buffering artifact — GNU's
@@ -396,7 +415,19 @@ impl Executor {
                 .map(String::as_str)
                 != Some("1")
         {
-            self.maybe_run_error_trap(cmd)?;
+            // rubash#1611: inside a timed dispatch the ERR trap is
+            // adjudicated once, by the ast_exec time branch, when the
+            // timed command completes (rubash#1277) — firing here too
+            // would double it.
+            if self.timed_dispatch_depth.get() == 0 {
+                self.maybe_run_error_trap(cmd)?;
+            }
+            // rubash#1611: this is a conversion of a COMPLETED command's
+            // status, not a jump out of it — mark it so an enclosing
+            // execute_time_ast_command can still print its report (GNU
+            // adjudicates this exit in execute_time_command's caller,
+            // after print_time_info).
+            self.errexit_status_converted.set(true);
             Err(ExecuteError::ExitCode(self.exit_code))
         } else if matches!(result, Err(ExecuteError::Return(_)))
             && (self.shell_state.function_depth > 0 || self.source_nest_depth > 0)
@@ -417,7 +448,20 @@ impl Executor {
             // through to the function (or source) boundary untouched.
             result
         } else if self.errexit_enabled() && self.errexit_is_active() && self.exit_code != 0 {
-            self.maybe_run_error_trap(cmd)?;
+            // rubash#1611: inside a timed dispatch the ERR trap is
+            // adjudicated once, by the ast_exec time branch, when the
+            // timed command completes (rubash#1277) — firing here too
+            // would double it.
+            if self.timed_dispatch_depth.get() == 0 {
+                self.maybe_run_error_trap(cmd)?;
+            }
+            // rubash#1611: mark ONLY the conversion of an Ok completion —
+            // an Err already in flight (the exit builtin's own unwind)
+            // stays unmarked: it takes the print-and-propagate arm in
+            // execute_time_ast_command instead of the completion flow.
+            if result.is_ok() {
+                self.errexit_status_converted.set(true);
+            }
             Err(ExecuteError::ExitCode(self.exit_code))
         } else {
             result
@@ -569,6 +613,9 @@ impl Executor {
             );
             set_var_attrs(&mut self.shell_state.env_vars, name, merged_attrs);
             sync_shell_assignment_process_env(&self.shell_state.env_vars, name, &merged_value);
+            // rubash#1692: the merge reinstalls the binding — GNU's
+            // sv_locale watcher runs on the reinstall.
+            self.note_locale_assignment(name);
         }
     }
 }

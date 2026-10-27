@@ -279,6 +279,24 @@ impl Executor {
                     }
                     return Some(typed);
                 }
+                // Gate trusted and a structured assoc cell exists: the
+                // cell is a COMPLETE mirror of the render or absent
+                // (rubash#616 Phase 1a invariant), so a lookup miss is
+                // authoritative — the key is unset and the mirror scan
+                // below could only agree. Answer directly instead of
+                // cloning the whole mirror and linearly scanning it
+                // (the assoc_get_miss shape: Θ(n) per missed read).
+                // Names with no assoc cell (mirror-only or dynamic
+                // views) keep the mirror path untouched.
+                if matches!(
+                    self.shell_state
+                        .variables
+                        .get(storage_name)
+                        .map(|variable| &variable.value),
+                    Some(crate::shell::ShellValue::AssociativeArray(_))
+                ) {
+                    return None;
+                }
             }
             let storage_assoc = self.parameter_array_storage(array_name).unwrap_or_default();
             return assoc_value_at(&storage_assoc, &key);
@@ -399,6 +417,11 @@ impl Executor {
                         &overlaid,
                         Some(&self.shell_state.random_state),
                         Some(&dynamic_values),
+                        if matches!(&overlaid, std::borrow::Cow::Borrowed(_)) {
+                            Some(&self.shell_state.variables)
+                        } else {
+                            None
+                        },
                     );
                 if !writes.is_empty() {
                     crate::executor::expand_braced_indices::PENDING_SUBSCRIPT_WRITES.with(|w| {
@@ -548,9 +571,9 @@ impl Executor {
         // skipping the per-read O(n) mirror clone on a typed hit.
         // Admission (rubash#1510): global dirty bit clear OR per-name
         // fresh, same discipline as the assoc leg above.
-        if !self.shell_state.env_vars.array_cells_dirty()
-            || self.shell_state.env_vars.cell_is_fresh(storage_name)
-        {
+        let gate_trusted = !self.shell_state.env_vars.array_cells_dirty()
+            || self.shell_state.env_vars.cell_is_fresh(storage_name);
+        if gate_trusted {
             if let Ok(typed_index) = i64::try_from(index) {
                 if let Some(cell_value) = self
                     .shell_state
@@ -583,6 +606,24 @@ impl Executor {
                     return Some(typed);
                 }
             }
+        }
+        // Same completeness invariant as the assoc leg: under a trusted
+        // gate, an existing indexed cell that lacks this index proves
+        // the element unset — skip the mirror clone + re-parse the
+        // fallthrough below would pay per hole read. Negative indices
+        // stay with the mirror leg (it owns the rebase and the
+        // bad-subscript diagnostic), as do dynamic views and names
+        // without a complete cell (scalar bases, mirror-only arrays).
+        if gate_trusted
+            && index >= 0
+            && dynamic_values.is_none()
+            && self
+                .shell_state
+                .variables
+                .indexed_array_cell(storage_name)
+                .is_some()
+        {
+            return None;
         }
         // Mirror fetch for the remaining scalar/mirror legs only. The
         // assoc leg fetched its own mirror above (before subscript eval);
@@ -753,12 +794,18 @@ impl Executor {
         &self,
         array_name: &str,
         offset: isize,
-        length: Option<usize>,
+        length: Option<isize>,
     ) -> Option<Vec<String>> {
         let storage = self.parameter_array_storage(array_name)?;
         let resolved = self
             .resolved_variable_name(array_name)
             .unwrap_or_else(|| array_name.to_string());
+        // The signed length reaches this function unchanged (rubash#1600):
+        // the scalar branch below consumes it directly, while the array
+        // branches keep treating a negative length as "no length" — for a
+        // real array that case is the verify_substring_values error, which
+        // the parameter error scan reports before expansion runs.
+        let unsigned_length = length.and_then(|length| usize::try_from(length).ok());
         if !is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, &resolved) {
             // GNU subst.c:9064 get_var_and_type resolves / on
             // a scalar to VT_VARIABLE, so parameter_brace_substring
@@ -770,12 +817,10 @@ impl Executor {
             let is_array = self.parameter_is_array_variable(&resolved);
             if !is_array {
                 return Some(vec![crate::executor::parameter_substring(
-                    &storage,
-                    offset,
-                    length.map(|length| length as isize),
+                    &storage, offset, length,
                 )]);
             }
-            return Some(array_parameter_slice(&storage, offset, length));
+            return Some(array_parameter_slice(&storage, offset, unsigned_length));
         }
         let values = assoc_hash_ordered_values(
             &storage,
@@ -795,7 +840,7 @@ impl Executor {
             values
                 .into_iter()
                 .skip(skip)
-                .take(length.unwrap_or(usize::MAX))
+                .take(unsigned_length.unwrap_or(usize::MAX))
                 .collect(),
         )
     }
@@ -859,11 +904,7 @@ impl Executor {
                     .strip_suffix("[@]")
                     .or_else(|| name.strip_suffix("[*]"))
                 {
-                    return self.array_subscript_range_values(
-                        array_name,
-                        offset,
-                        length.and_then(|length| usize::try_from(length).ok()),
-                    );
+                    return self.array_subscript_range_values(array_name, offset, length);
                 }
             }
         }
@@ -892,11 +933,7 @@ impl Executor {
                             length.and_then(|length| usize::try_from(length).ok()),
                         ));
                     }
-                    return self.array_subscript_range_values(
-                        array_name,
-                        offset,
-                        length.and_then(|length| usize::try_from(length).ok()),
-                    );
+                    return self.array_subscript_range_values(array_name, offset, length);
                 }
             }
             if let Some(values) = self.indirect_array_reference_word_values(word, true) {

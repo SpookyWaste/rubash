@@ -73,6 +73,16 @@ impl Executor {
                 );
             }
         }
+        // GNU redir.c do_redirections opens every redirection in the
+        // forked child before exec: file targets are created/truncated
+        // and a failed open kills the command with status 1. The
+        // emulations below re-open only their fd 1/2 mirrors when they
+        // write, so without this walk an fd>=3 target was never opened
+        // at all and a failing one was silently ignored (rubash#1593:
+        // `cat 3>f` created nothing, `cat 3>sub/f` ran with rc 0).
+        if self.apply_redirect_setup_side_effects(cmd)? {
+            return Ok(true);
+        }
         match cmd.words[0].as_str() {
             "/bin/pwd" | "/usr/bin/pwd" => {
                 let mut pwd_cmd = cmd.clone();
@@ -364,7 +374,8 @@ impl Executor {
             // parent must fail ENOENT without -p, not silently create
             // the whole chain (on the Android/Termux host it surfaced as
             // a bogus EROFS instead).
-            let path = shell_path_to_windows(&expanded, &self.shell_state.env_vars);
+            let path =
+                self.session_path(shell_path_to_windows(&expanded, &self.shell_state.env_vars));
             let result = if parents {
                 fs::create_dir_all(&path)
             } else {
@@ -540,7 +551,8 @@ impl Executor {
             (now, now)
         });
         for expanded in operands {
-            let target = shell_path_to_windows(&expanded, &self.shell_state.env_vars);
+            let target =
+                self.session_path(shell_path_to_windows(&expanded, &self.shell_state.env_vars));
             let make_times = || {
                 let mut times = std::fs::FileTimes::new();
                 if stamp_accessed {
@@ -593,7 +605,8 @@ impl Executor {
     ) {
         match flag {
             'r' => {
-                let target = shell_path_to_windows(value, &self.shell_state.env_vars);
+                let target =
+                    self.session_path(shell_path_to_windows(value, &self.shell_state.env_vars));
                 match std::fs::metadata(&target) {
                     Ok(metadata) => {
                         let atime = metadata.accessed().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -987,7 +1000,10 @@ impl Executor {
         }
 
         let destination_word = &effective[effective.len() - 1];
-        let destination = shell_path_to_windows(destination_word, &self.shell_state.env_vars);
+        let destination = self.session_path(shell_path_to_windows(
+            destination_word,
+            &self.shell_state.env_vars,
+        ));
 
         // GNU null-device semantics: coreutils copy.c opens the destination
         // and the write goes nowhere, so `cp FILE /dev/null` succeeds without
@@ -1038,7 +1054,10 @@ impl Executor {
                 }
                 continue;
             }
-            let source = shell_path_to_windows(source_word, &self.shell_state.env_vars);
+            let source = self.session_path(shell_path_to_windows(
+                source_word,
+                &self.shell_state.env_vars,
+            ));
 
             // GNU coreutils cp.c copy_internal: an operand whose final
             // component is `.` (`src/.`, `./`, `.`) names the directory's
@@ -1352,7 +1371,8 @@ impl Executor {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         for expanded in operands {
-            let target = shell_path_to_windows(expanded, &self.shell_state.env_vars);
+            let target =
+                self.session_path(shell_path_to_windows(expanded, &self.shell_state.env_vars));
             // coreutils rm.c (niubash#534 wording residual): a recursive
             // removal whose operand's last component is `.` or `..` is
             // refused outright — `refusing to remove '.' or '..' directory:
@@ -1444,10 +1464,10 @@ impl Executor {
             // argv as-is — no second expand_word pass (issue #555, see
             // external_mkdir): a quoted '$FIX/rd' must never remove the
             // expanded neighbor.
-            let _ = fs::remove_dir(shell_path_to_windows(
+            let _ = fs::remove_dir(self.session_path(shell_path_to_windows(
                 path.as_str(),
                 &self.shell_state.env_vars,
-            ));
+            )));
         }
         self.exit_code = 0;
         Ok(true)
@@ -1514,10 +1534,9 @@ impl Executor {
                     self.exit_code = 0;
                     return Ok(true);
                 }
-                let mut file = open_redirect_append(&shell_path_to_windows(
-                    &target,
-                    &self.shell_state.env_vars,
-                ))?;
+                let mut file = open_redirect_append(
+                    &self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars)),
+                )?;
                 file.write_all(&output)?;
                 self.exit_code = 0;
                 return Ok(true);
@@ -1551,6 +1570,9 @@ impl Executor {
                     }
                 }
                 let target = self.expand_redirect_target(redirect);
+                if crate::executor::execution_misc::is_closed_redirect_target(&target) {
+                    return Err(super::external_finish::cat_closed_stdout_error());
+                }
                 if let Some(result) = self.write_dev_stdio_redirect_output(&target, &output) {
                     result?;
                     self.exit_code = 0;
@@ -1677,10 +1699,14 @@ impl Executor {
                 // would in a spawned cat.exe (same exists-first rule as the
                 // argv funnel). `<(cmd)` carrier paths exist, so the
                 // resolver keeps them byte-identical for procsub_stream_take.
-                let win = crate::executor::path::windows_operand_file_path(
+                // G-02: cat is emulated in-process here (not spawned),
+                // so a relative operand must anchor at the session cwd
+                // itself; procsub carrier paths are absolute and pass
+                // through unchanged.
+                let win = self.session_path(crate::executor::path::windows_operand_file_path(
                     shell_path_to_windows(&target, &self.shell_state.env_vars),
                     &self.shell_state.env_vars,
-                );
+                ));
                 // `<(cmd)` carrier path: the word names a draining stream —
                 // serve the shared remainder (subst.c:7143).
                 let read = match self.procsub_stream_take(&win) {
@@ -2631,7 +2657,8 @@ impl Executor {
             let host = if std::path::Path::new(&windows).is_absolute() {
                 std::path::PathBuf::from(&windows)
             } else {
-                std::env::current_dir().unwrap_or_default().join(&windows)
+                // G-02: relative operands anchor at the session cwd.
+                self.shell_state.cwd.join(&windows)
             };
             // Base mode for symbolic clauses: unix reads the file's real
             // inode mode (coreutils chmod(1) applies `+x`/`-w` clauses to

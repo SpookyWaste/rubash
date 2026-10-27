@@ -96,3 +96,18 @@ fn ifs_is_not_imported_from_environment() {
         .expect("run rubash");
     assert_eq!(String::from_utf8_lossy(&output.stdout), "<a:b>\n<c>\n");
 }
+
+// niubash#525: the EMPTY imported IFS is discarded the same way —
+// GNU variables.c never imports IFS from the environment, whatever
+// its value; word splitting uses the default IFS. (The `IFS=:`
+// sibling above is the form the niu side originally pinned.)
+#[test]
+fn empty_ifs_is_not_imported_from_environment() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+        .env("IFS", "")
+        .arg("-c")
+        .arg("v='a:b c'; printf '<%s>\\n' $v")
+        .output()
+        .expect("run rubash");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "<a:b>\n<c>\n");
+}

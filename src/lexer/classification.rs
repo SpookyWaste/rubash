@@ -21,7 +21,7 @@ pub(super) fn is_keyword(word: &str) -> bool {
     )
 }
 
-pub(super) fn is_assignment(word: &str) -> bool {
+pub(crate) fn is_assignment(word: &str) -> bool {
     let Some(pos) = word.find('=') else {
         return false;
     };

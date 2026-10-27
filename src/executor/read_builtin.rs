@@ -38,6 +38,17 @@ fn is_valid_read_name(
 
 impl Executor {
     pub(in crate::executor) fn execute_read(&mut self, cmd: &CommandNode) -> i32 {
+        // GNU redir.c do_redirections opens EVERY redirection before
+        // the builtin runs: output targets are created/truncated and a
+        // failed open aborts the command (rubash#1593 — `read l >f1`
+        // created nothing and `read l >sub/f1` failed silently). The
+        // fd-0 input probe below owns only the input side; this walk
+        // performs the remaining opens in list order.
+        match self.apply_redirect_setup_side_effects(cmd) {
+            Ok(true) => return 1,
+            Ok(false) => {}
+            Err(_) => return 1,
+        }
         // GNU execute_cmd.c do_redirections applies redirects before the
         // builtin runs: a failed input open aborts the command — read's
         // variables stay unset and the diagnostic is the redirect's
@@ -2244,9 +2255,20 @@ impl Executor {
 
         if let Some(fd) = read_fd {
             if !self.read_fd_is_available(cmd, fd) {
+                // GNU read.def:378-380: sh_validfd failing means the
+                // descriptor is not open at all — "invalid file
+                // descriptor". A descriptor that IS open but not
+                // readable (write-only) passes that check and fails in
+                // the read itself — read.def:911 "read error"
+                // (rubash#1592).
+                let wording = if self.fd_table.is_open(fd) {
+                    "read error"
+                } else {
+                    "invalid file descriptor"
+                };
                 let _ = writeln!(
                     &mut stderr,
-                    "{}read: {fd}: invalid file descriptor: Bad file descriptor",
+                    "{}read: {fd}: {wording}: Bad file descriptor",
                     self.diagnostic_prefix()
                 );
                 return self.finish_read_error(cmd, &stderr, 1);
@@ -2367,8 +2389,7 @@ impl Executor {
                 // characters read, then the array is located and the
                 // assignment attempted), so a readonly -a target fails
                 // here too (rubash#1457; see the post-read guard below).
-                if !invalid_name
-                    && is_marked_var(&self.shell_state.env_vars, READONLY_VARS, &name)
+                if !invalid_name && is_marked_var(&self.shell_state.env_vars, READONLY_VARS, &name)
                 {
                     let _ = writeln!(
                         &mut stderr,
@@ -2417,6 +2438,13 @@ impl Executor {
                 return if invalid_name {
                     self.finish_read_error(cmd, &stderr, 1)
                 } else {
+                    // rubash#1639 (read arm): an interrupted read is an
+                    // untrapped-SIGINT foreground wait — the flag is
+                    // only ever set under the armed guard (interactive
+                    // + untrapped) — so the rest of the line is
+                    // discarded like the sleep/external waits. Shape
+                    // ported from PR #1702 (a-rookie-of-C-language).
+                    self.fg_sigint_unwind = true;
                     128 + signal
                 };
             }
@@ -2435,8 +2463,7 @@ impl Executor {
             // before the array is ever located, so `read -t 0 -a
             // readonly` stays silent) and -n 0 has its own guard at its
             // early return (rubash#1457).
-            if !invalid_name && is_marked_var(&self.shell_state.env_vars, READONLY_VARS, &name)
-            {
+            if !invalid_name && is_marked_var(&self.shell_state.env_vars, READONLY_VARS, &name) {
                 let _ = writeln!(
                     &mut stderr,
                     "{}{name}: readonly variable",
@@ -2579,6 +2606,10 @@ impl Executor {
                 // it from the flag. Do not fall through to the EOF /
                 // timeout / fallback arms (the fallback would block
                 // on a second raw read).
+                // rubash#1639 (read arm): the same untrapped-SIGINT
+                // foreground-wait discard as the sleep/external waits
+                // (ported from PR #1702's shape set).
+                self.fg_sigint_unwind = true;
                 130
             } else if self.fd_table.read_error.is_some() {
                 // GNU read.def:911: a hard read(2) failure (EISDIR when
@@ -2804,7 +2835,9 @@ impl Executor {
             // assigns nothing (rubash#1250); on timeout the vars keep
             // the partial assignment above and the builtin returns
             // 128+SIGALRM=142 (read.def:539-562).
+            let mut interrupt_signal = None;
             let status = if let Some(signal) = self.take_read_interrupted_signal() {
+                interrupt_signal = Some(signal);
                 128 + signal
             } else if self.take_read_timed_out() {
                 142
@@ -2814,6 +2847,13 @@ impl Executor {
             return if invalid_name || fail_after_read {
                 self.finish_read_error(cmd, &stderr, 1)
             } else {
+                // rubash#1639 (read arm): arm the line discard only
+                // when the interrupted status is the one actually
+                // returned (the error arms above return 1 instead).
+                // Ported from PR #1702 (a-rookie-of-C-language).
+                if interrupt_signal.is_some() {
+                    self.fg_sigint_unwind = true;
+                }
                 status
             };
         }
@@ -3092,10 +3132,10 @@ impl Executor {
                     // niubash#177: same operand resolution as
                     // open_input_redirect so `-t` sees the same regular
                     // file the read itself opens.
-                    let path = crate::executor::path::windows_operand_file_path(
+                    let path = self.session_path(crate::executor::path::windows_operand_file_path(
                         shell_path_to_windows(&target, &self.shell_state.env_vars),
                         &self.shell_state.env_vars,
-                    );
+                    ));
                     return std::fs::metadata(&path)
                         .map(|m| m.is_file())
                         .unwrap_or(false);

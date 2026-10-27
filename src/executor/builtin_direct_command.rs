@@ -26,7 +26,14 @@ impl Executor {
             _ => args,
         };
         let Some(name) = args.first().map(String::as_str) else {
-            self.exit_code = 0;
+            // rubash#1643: a bare `builtin` runs no builtin, but GNU still
+            // performs the invocation's own redirections first (redir.c
+            // do_redirections runs for the command node, not for the named
+            // builtin): `builtin > f` creates/truncates f, `builtin 2> e`
+            // creates e, and a failing redirection fails the invocation
+            // with status 1. Same helper the `:`/`true`/`false` arms use.
+            let redirect_failed = self.apply_no_output_builtin_redirects_with_status(cmd)?;
+            self.exit_code = i32::from(redirect_failed);
             return Ok(());
         };
 

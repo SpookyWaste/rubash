@@ -38,6 +38,17 @@ pub struct ShellState {
     /// see `var_table`). Kept in sync with `variables` at mutation sites
     /// during the ongoing typed-store migration.
     pub(crate) env_vars: VarTable,
+    /// The session's current working directory, in physical (native)
+    /// form. GNU keeps the cwd in the process (builtins/cd.def cd_builtin
+    /// -> chdir), so a forked child inherits a COPY of it — ShellState
+    /// Clone is this port's fork boundary, and this field rides the
+    /// clone. The PROCESS cwd is not session state (multi-session
+    /// stop-bleed G-02): `cd`/`pushd`/`popd` move only this field, every
+    /// spawn passes it as `Command::current_dir`, and engine-internal
+    /// relative path resolution anchors here. `$PWD` in `env_vars` is
+    /// the logical display twin maintained by the cd family; this field
+    /// is the physical truth the filesystem sees.
+    pub(crate) cwd: std::path::PathBuf,
     /// rubash#618/#616: element writes append one storage segment in O(1)
     /// instead of re-rendering every key, so the storage string accumulates
     /// duplicate segments until the next canonical render folds them. This is
@@ -287,6 +298,17 @@ pub struct ShellState {
     /// offset. The `Rc` keeps the stream shared across `ShellState`
     /// clones, matching fork's shared open file description.
     pub(crate) procsub_streams: RefCell<HashMap<PathBuf, Rc<RefCell<ProcSubStream>>>>,
+    /// rubash#1691: ad-hoc carrier temps written when a registered
+    /// stream (or a text/fd endpoint) is served to a consumer that
+    /// needs a real `File` — `open_input_redirect`'s consume branch and
+    /// `open_fd_read_endpoint` write the remaining bytes to a FRESH
+    /// temp, hand out the opened File, and park the path here; the
+    /// per-command process-substitution finish removes the files.
+    /// Before this list existed the paths were dropped at the write
+    /// site and the carriers leaked in $TMPDIR for the shell's whole
+    /// lifetime. A clone starts empty: a fork child may only drain
+    /// carriers it wrote itself, never the parent's pending ones.
+    pub(crate) procsub_adhoc_carriers: RefCell<Vec<PathBuf>>,
 }
 
 /// The shape of the PIPESTATUS variable cell (variables.c:6291
@@ -536,6 +558,7 @@ impl Clone for ShellState {
         Self {
             variables: self.variables.clone(),
             env_vars: self.env_vars.clone(),
+            cwd: self.cwd.clone(),
             array_compact_budget: self.array_compact_budget.clone(),
             aliases: self.aliases.clone(),
             functions: self.functions.clone(),
@@ -598,6 +621,9 @@ impl Clone for ShellState {
             // process-substitution stream's read offset stays shared
             // across the clone boundary.
             procsub_streams: RefCell::new(self.procsub_streams.borrow().clone()),
+            // rubash#1691: see the field docs — a clone drains only
+            // its own ad-hoc carriers.
+            procsub_adhoc_carriers: RefCell::new(Vec::new()),
         }
     }
 }

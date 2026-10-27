@@ -199,6 +199,12 @@ impl Executor {
     /// execute_command prints. Shared so a command-substitution body that
     /// parsed to an error node can report GNU's `syntax error near ...`
     /// lines without executing the broken ast.
+    ///
+    /// Every line goes through write_diagnostic_fd2, never raw eprintln:
+    /// GNU parser_error (error.c) writes to fd 2 AS CURRENTLY BOUND, so a
+    /// parse error inside an eval/source body honors the caller's
+    /// redirections (`eval '...' 2>&1` routes the diagnostic to stdout;
+    /// rubash#1609, the #167 family).
     pub(in crate::executor) fn report_command_parse_error(&self, cmd: &crate::parser::CommandNode) {
         // The compound-EOF shape (parse.y yyerror EOF path, printed by the
         // execute_command arm for top-level nodes): a node carrying the
@@ -223,8 +229,11 @@ impl Executor {
             } else {
                 self.parser_error_prefix_for_line(eof_line)
             };
-            eprintln!(
-                "{prefix}syntax error: unexpected end of file from `{compound_name}' command on line {_open_line}"
+            self.write_diagnostic_fd2(
+                format!(
+                    "{prefix}syntax error: unexpected end of file from `{compound_name}' command on line {_open_line}\n"
+                )
+                .as_bytes(),
             );
             return;
         }
@@ -252,7 +261,7 @@ impl Executor {
             None => self.parser_error_prefix(),
         };
         if message.starts_with("syntax error:") || message.starts_with("arithmetic syntax error:") {
-            eprintln!("{prefix}{message}");
+            self.write_diagnostic_fd2(format!("{prefix}{message}\n").as_bytes());
             // GNU error.c:324-327 (parser_error): with
             // exit_immediately_on_error set, the first diagnostic line is
             // followed by an immediate exit_shell(2) — the second line of
@@ -264,12 +273,14 @@ impl Executor {
             // parse.y:6865: the offending-line echo is non-interactive only.
             if self.offending_line_echo_enabled() {
                 if let Some(source) = cmd.get_assignment("__RUBASH_PARSE_SOURCE__") {
-                    eprintln!("{prefix}syntax error: `{source}'");
+                    self.write_diagnostic_fd2(
+                        format!("{prefix}syntax error: `{source}'\n").as_bytes(),
+                    );
                 }
             }
         } else {
             let message = super::command_execute::bash_style_unexpected_token_message(message);
-            eprintln!("{prefix}syntax error near {message}");
+            self.write_diagnostic_fd2(format!("{prefix}syntax error near {message}\n").as_bytes());
             if self.errexit_active_at_diagnostic() {
                 return;
             }
@@ -281,7 +292,7 @@ impl Executor {
             // parse.y:6865: the echo is non-interactive only.
             if self.offending_line_echo_enabled() {
                 if let Some(source) = cmd.get_assignment("__RUBASH_PARSE_SOURCE__") {
-                    eprintln!("{prefix}`{source}'");
+                    self.write_diagnostic_fd2(format!("{prefix}`{source}'\n").as_bytes());
                 }
             }
         }
@@ -302,11 +313,13 @@ impl Executor {
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or_else(|| cmd.line.unwrap_or(1));
             let prefix = self.parser_error_prefix_for_line(line);
-            eprintln!("{prefix}syntax error near unexpected token `{token}'");
+            self.write_diagnostic_fd2(
+                format!("{prefix}syntax error near unexpected token `{token}'\n").as_bytes(),
+            );
             // parse.y:6865: the offending-line echo is non-interactive only.
             if self.offending_line_echo_enabled() {
                 if let Some(source) = cmd.get_assignment("__RUBASH_PARSE_SOURCE__") {
-                    eprintln!("{prefix}`{source}'");
+                    self.write_diagnostic_fd2(format!("{prefix}`{source}'\n").as_bytes());
                 }
             }
             return;
@@ -634,6 +647,16 @@ impl Executor {
             .env_vars
             .insert(name.to_string(), value.clone());
         if is_valid_process_env(name, &value) {
+            // G-03: a host-directed write is this lineage's mirror write
+            // and must be journaled exactly like remove_env's — set_env
+            // is called between runs, when no journal is on the stack,
+            // so without the push the write escaped the journal and
+            // leaked past Drop into every later Executor in the process
+            // (the __RUBASH_IS_C / __RUBASH_INTERACTIVE protocol markers
+            // are the observed case: a sibling session's markers became
+            // a later session's invocation context at Executor::new's
+            // process-env import).
+            let _journal = push_env_journal(&self.env_write_journal);
             set_process_env(name, &value);
         }
         // Keep the shell-variable view in sync with the environment mirror.
@@ -732,7 +755,10 @@ impl Executor {
 
     pub fn remove_env(&mut self, name: &str) {
         self.shell_state.env_vars.remove(name);
-        env::remove_var(name);
+        // G-03: a host-directed removal is still this lineage's
+        // mirror write — journal it so Drop treats it like any other.
+        let _journal = push_env_journal(&self.env_write_journal);
+        mirror_env_remove(name);
     }
 
     pub fn get_env(&self, name: &str) -> Option<&str> {
@@ -752,6 +778,26 @@ impl Executor {
         &self,
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::history::SessionHistory>>> {
         self.shell_state.session_history.clone()
+    }
+
+    /// Returns the session history list, creating and installing an
+    /// empty one on demand when the shell has none. This is the history
+    /// builtin's creation rule (builtins/history.def): the list exists
+    /// for history's consumers even in shells that never installed one
+    /// (the non-interactive stdin driver), but an installed host
+    /// provider IS the history list, so an auto-created empty session
+    /// must not shadow it — with a provider and no session this
+    /// returns None (rubash#1668).
+    pub fn ensure_session_history(
+        &mut self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::history::SessionHistory>>> {
+        if self.shell_state.session_history.is_none() && !self.has_history_provider() {
+            let session = std::rc::Rc::new(std::cell::RefCell::new(
+                crate::history::SessionHistory::new(),
+            ));
+            self.set_session_history(Some(session));
+        }
+        self.get_session_history()
     }
 
     /// Run `body` with user trap delivery (DEBUG/RETURN/ERR) suspended.
@@ -902,16 +948,17 @@ impl Executor {
             return self.call_function_inner(name, args, temporary_env);
         }
 
-        let _guard = EXECUTION_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let original_dir = env::current_dir().ok();
+        // G-01: no whole-call lock hold anymore (see execute_ast).
+        // G-02: the pre-call cwd restore now targets the session cwd field
+        // (formerly the process cwd). The $PWD variable is deliberately
+        // NOT restored, preserving the pre-G-02 observable shape.
+        let original_cwd = self.shell_state.cwd.clone();
         EXECUTION_LOCK_DEPTH.with(|depth| depth.set(1));
+        // G-03: journal this call's mirror writes to this executor.
+        let _env_journal_guard = push_env_journal(&self.env_write_journal);
         let result = self.call_function_inner(name, args, temporary_env);
         EXECUTION_LOCK_DEPTH.with(|depth| depth.set(0));
-        if let Some(original_dir) = original_dir {
-            let _ = env::set_current_dir(original_dir);
-        }
+        self.shell_state.cwd = original_cwd;
         result
     }
 
@@ -1000,7 +1047,8 @@ impl Executor {
         let old_names: Vec<String> = self.shell_state.env_vars.keys().cloned().collect();
         for name in old_names {
             if !saved_env.contains_key(&name) {
-                env::remove_var(&name);
+                // G-03: journal the removal as this lineage's write.
+                mirror_env_remove(&name);
             }
         }
 
@@ -1019,7 +1067,7 @@ impl Executor {
             if is_valid_process_env(name, value) {
                 set_process_env(name, value);
             } else {
-                env::remove_var(name);
+                mirror_env_remove(name);
             }
         }
 
@@ -1030,13 +1078,14 @@ impl Executor {
     /// state is the pre-entry ShellState clone — restore it wholesale so
     /// every semantic field (aliases, functions, scopes, positional params,
     /// env-carried traps, job bookkeeping) returns to the parent value.
-    /// Process env and cwd are shared in-place resources, so they resync
+    /// The process env is a shared in-place resource, so it resyncs
     /// separately: restore_shell_env must run before the swap because it
-    /// diffs the child's env_vars against the saved map.
+    /// diffs the child's env_vars against the saved map. The cwd needs no
+    /// separate resync since G-02: it is a ShellState field and rides the
+    /// wholesale swap.
     pub(in crate::executor) fn restore_flat_subshell(
         &mut self,
         saved_state: crate::shell::ShellState,
-        saved_cwd: Option<PathBuf>,
     ) {
         // Every caller is a fork boundary (flat `( )` regions and
         // command-substitution children): the region's descriptor copies
@@ -1046,9 +1095,6 @@ impl Executor {
         self.flush_region_owned_output_process_substitutions(&saved_state.env_vars);
         self.restore_shell_env(saved_state.env_vars.clone());
         self.shell_state = saved_state;
-        if let Some(dir) = saved_cwd {
-            let _ = env::set_current_dir(dir);
-        }
     }
 
     pub fn aliases_snapshot(&self) -> HashMap<String, String> {
@@ -1086,6 +1132,13 @@ impl Executor {
             }
         }
         snapshot
+    }
+
+    /// G-02: the session's current working directory (physical form).
+    /// cd/pushd/popd move this field only; the process cwd is never a
+    /// session-semantics source.
+    pub fn session_cwd(&self) -> &std::path::Path {
+        &self.shell_state.cwd
     }
 
     pub fn env_vars(&self) -> &HashMap<String, String> {
@@ -2303,9 +2356,12 @@ impl Executor {
             .heredoc_end_line
             .unwrap_or_else(|| gather_line + body_lines);
         let delimiter = cmd.heredoc_delimiter.as_deref().unwrap_or("");
-        eprintln!(
-            "{}warning: here-document at line {gather_line} delimited by end-of-file (wanted `{delimiter}')",
-            self.error_prefix_for_line(warning_line)
+        self.write_diagnostic_fd2(
+            format!(
+                "{}warning: here-document at line {gather_line} delimited by end-of-file (wanted `{delimiter}')\n",
+                self.error_prefix_for_line(warning_line)
+            )
+            .as_bytes(),
         );
     }
 
@@ -2329,9 +2385,12 @@ impl Executor {
             .heredoc_end_line
             .unwrap_or_else(|| gather_line + body_lines + 1);
         let delimiter = cmd.heredoc_delimiter.as_deref().unwrap_or("");
-        eprintln!(
-            "{}warning: here-document at line {gather_line} delimited by end-of-file (wanted `{delimiter}')",
-            self.error_prefix_for_line(delimiter_line)
+        self.write_diagnostic_fd2(
+            format!(
+                "{}warning: here-document at line {gather_line} delimited by end-of-file (wanted `{delimiter}')\n",
+                self.error_prefix_for_line(delimiter_line)
+            )
+            .as_bytes(),
         );
     }
 
@@ -2377,15 +2436,21 @@ impl Executor {
                 line_no += 1;
             }
             for (delim, at_line) in pending {
-                eprintln!(
-                    "{}warning: here-document at line {at_line} delimited by end-of-file (wanted `{delim}')",
-                    self.error_prefix_for_line(last_line)
+                self.write_diagnostic_fd2(
+                    format!(
+                        "{}warning: here-document at line {at_line} delimited by end-of-file (wanted `{delim}')\n",
+                        self.error_prefix_for_line(last_line)
+                    )
+                    .as_bytes(),
                 );
             }
         }
-        eprintln!(
-            "{}unexpected EOF while looking for matching `)'",
-            self.parser_error_prefix_for_line(last_line + 1)
+        self.write_diagnostic_fd2(
+            format!(
+                "{}unexpected EOF while looking for matching `)'\n",
+                self.parser_error_prefix_for_line(last_line + 1)
+            )
+            .as_bytes(),
         );
     }
 
@@ -2401,9 +2466,12 @@ impl Executor {
             .heredoc_end_line
             .unwrap_or_else(|| cmd.heredoc_gather_line.or(cmd.line).unwrap_or(1) + body_lines);
         let syntax_line = warning_line + 1;
-        eprintln!(
-            "{}syntax error: unexpected end of file from `(' command on line {start_line}",
-            self.parser_error_prefix_for_line(syntax_line)
+        self.write_diagnostic_fd2(
+            format!(
+                "{}syntax error: unexpected end of file from `(' command on line {start_line}\n",
+                self.parser_error_prefix_for_line(syntax_line)
+            )
+            .as_bytes(),
         );
     }
 }
@@ -2437,34 +2505,45 @@ impl Drop for Executor {
         // startup21: the process-env restore models an in-process child
         // leaving its parent's env untouched (rubash#182). The process-exit
         // executor's process dies with this drop — nothing can observe its
-        // environment afterward — so the diff + ~one putenv per startup
-        // variable (~0.45ms) is skipped there.
+        // environment afterward — so the restore is skipped there.
         if self.is_process_exit_executor {
             return;
         }
-        let current_names: Vec<String> = env::vars().map(|(name, _)| name).collect();
-        for name in current_names {
-            if !self.process_env_snapshot.contains_key(&name) {
-                env::remove_var(name);
-            }
-        }
-
-        for (name, value) in &self.process_env_snapshot {
-            // A fork-time snapshot restore is not an assignment mirror, so
-            // the #916 special-name gate in set_process_env must not apply:
-            // a comsub child that unbound an ordinary inherited name
-            // removed the real process-env copy (unset_process_env removes
-            // it now — rubash#917), and the parent's copy must come back
-            // exactly as the snapshot recorded it. TMPDIR keeps its
-            // pre-#916 exclusion (never mirrored, so leave it alone rather
-            // than restoring or removing it).
+        // G-03: the restore is scoped to this executor lineage's own
+        // process-env mirror writes (env_write_journal). The pre-G-03
+        // restore rolled EVERY name back to the birth snapshot — including
+        // names a still-live sibling session wrote after this executor was
+        // born, so the first session to Drop silently un-wrote the other
+        // sessions' variables. A journaled key returns to its snapshot
+        // state only when the current process value still equals the
+        // journal's final written state (no other writer has touched it
+        // since); otherwise the live owner's value stands. A fork-time
+        // snapshot restore is not an assignment mirror, so the #916
+        // special-name gate in set_process_env must not apply here
+        // (rubash#917). TMPDIR keeps its pre-#916 exclusion (never
+        // mirrored, so leave it alone rather than restoring or removing).
+        let journal = self.env_write_journal.borrow();
+        // G-01: the whole compare-and-restore sequence is one
+        // process-state critical section — a sibling's funnel write
+        // must not interleave between the compare and the restore.
+        let _process_state = crate::executor::local_helpers::acquire_process_state();
+        for (name, final_state) in journal.iter() {
             if name == "TMPDIR" {
                 continue;
             }
-            if is_valid_process_env(name, value) {
-                env::set_var(name, value);
-            } else {
-                env::remove_var(name);
+            let current = env::var_os(name).and_then(|value| value.into_string().ok());
+            if current.as_deref() != final_state.as_deref() {
+                continue;
+            }
+            match self.process_env_snapshot.get(name) {
+                Some(value) => {
+                    if is_valid_process_env(name, value) {
+                        env::set_var(name, value);
+                    } else {
+                        env::remove_var(name);
+                    }
+                }
+                None => env::remove_var(name),
             }
         }
     }

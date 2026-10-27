@@ -56,11 +56,20 @@ impl Executor {
         // then is skipped. GNU has no such snapshot because it has no
         // table: redir.c checks the kernel per redirect (redir.c:1160).
         let inherited_fds_snapshot = crate::fd::inherited_open_fds();
+        // G-01: the birth snapshot is a process-state read — take it
+        // under the lock so a sibling's mirror write cannot tear it.
         let process_env_snapshot: HashMap<String, String> = if process_exit {
             HashMap::new()
         } else {
-            std::env::vars().collect()
+            crate::executor::local_helpers::with_process_state_lock(|| std::env::vars().collect())
         };
+        // G-03: this executor's process-env write journal, pushed for the
+        // rest of construction so the init-time __RUBASH_* clears below
+        // are journaled as this lineage's writes (its Drop restores them
+        // against the snapshot above, conditionally — see Drop).
+        let env_write_journal: EnvWriteJournal =
+            std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
+        let _env_journal_guard = push_env_journal(&env_write_journal);
         // VarTable::from_values also imports any __RUBASH_*_VARS attribute
         // lists a parent rubash left in the environment — the structured
         // form of the cross-process attribute transport.
@@ -224,7 +233,11 @@ impl Executor {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(0);
         env_vars.remove("__RUBASH_SUBSHELL_DEPTH");
-        env::remove_var("__RUBASH_SUBSHELL_DEPTH");
+        // G-03/G-01: the init-time process-env clears route through
+        // mirror_env_remove — journaled to this executor's lineage
+        // (the journal guard above is still held) and serialized
+        // against sibling sessions' mirror writes.
+        mirror_env_remove("__RUBASH_SUBSHELL_DEPTH");
         // Rubash#234: a respawned `rubash -c` child is GNU's forked child —
         // it inherits the parent's job_control state and never re-runs
         // initialize_job_control. The env marker is stripped below, so
@@ -241,15 +254,20 @@ impl Executor {
         }
         env_vars.remove("__RUBASH_SHELL_NAME");
         env_vars.remove(crate::executor::path::COMPATIBLE_SHELL_PATH_ENV);
-        env::remove_var("__RUBASH_CURRENT_FUNCTION");
-        env::remove_var("__RUBASH_IN_SOURCE");
+        mirror_env_remove("__RUBASH_CURRENT_FUNCTION");
+        mirror_env_remove("__RUBASH_IN_SOURCE");
         if !internal_respawn {
-            env::remove_var("__RUBASH_SCRIPT_NAME");
-            env::remove_var("__RUBASH_ARGV0_AFTER_UNSET");
+            mirror_env_remove("__RUBASH_SCRIPT_NAME");
+            mirror_env_remove("__RUBASH_ARGV0_AFTER_UNSET");
         }
-        env::remove_var("__RUBASH_SHELL_NAME");
-        env::remove_var(crate::executor::path::COMPATIBLE_SHELL_PATH_ENV);
-        Self::initialize_fresh_shell_env_vars(&mut env_vars);
+        mirror_env_remove("__RUBASH_SHELL_NAME");
+        mirror_env_remove(crate::executor::path::COMPATIBLE_SHELL_PATH_ENV);
+        // Birth context: the session cwd field (set in the ShellState
+        // literal below) starts at the process cwd.
+        Self::initialize_fresh_shell_env_vars(
+            &mut env_vars,
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+        );
 
         let shell_pid = env_vars
             .get("__RUBASH_SHELL_PID")
@@ -268,12 +286,12 @@ impl Executor {
             .get("__RUBASH_BG_DEPTH")
             .and_then(|value| value.parse::<usize>().ok());
         env_vars.remove("__RUBASH_BG_DEPTH");
-        std::env::remove_var("__RUBASH_BG_DEPTH");
+        mirror_env_remove("__RUBASH_BG_DEPTH");
         let bg_bashpid_base = env_vars
             .get("__RUBASH_BG_BASHPID_BASE")
             .and_then(|value| value.parse::<usize>().ok());
         env_vars.remove("__RUBASH_BG_BASHPID_BASE");
-        std::env::remove_var("__RUBASH_BG_BASHPID_BASE");
+        mirror_env_remove("__RUBASH_BG_BASHPID_BASE");
 
         // Forked-child fd table restore: a `rubash -c` background/subshell
         // child inherits the parent's fd>=3 File endpoints through the
@@ -299,10 +317,10 @@ impl Executor {
                 if let Ok(fd) = num.parse::<u32>() {
                     inherited_fd_handles.entry(fd).or_default().2 = Some(value.clone());
                 }
-                std::env::remove_var(key);
+                mirror_env_remove(key);
                 return false;
             } else if let Some(num) = key.strip_prefix("__RUBASH_FD_WPATH_") {
-                std::env::remove_var(key);
+                mirror_env_remove(key);
                 return false;
             } else {
                 return true;
@@ -317,7 +335,7 @@ impl Executor {
                     entry.0 = handle;
                 }
             }
-            std::env::remove_var(key);
+            mirror_env_remove(key);
             false
         });
         let owns_signal_mailbox =
@@ -338,6 +356,11 @@ impl Executor {
             shell_state: ShellState {
                 variables: VariableStore::from_environment(&env_vars),
                 env_vars,
+                // G-02: a root session is born in the process cwd (the
+                // host's directory at Executor::new, exactly what GNU's
+                // startup getcwd reports); from here on the field, not
+                // the process, carries the session's cwd.
+                cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
                 array_compact_budget: HashMap::new(),
                 aliases: HashMap::new(),
                 functions: imported_functions,
@@ -403,6 +426,7 @@ impl Executor {
                 xtrace_fd: Cell::new(-1),
                 xtrace_fd_source: std::cell::RefCell::new(String::new()),
                 procsub_streams: std::cell::RefCell::new(HashMap::new()),
+                procsub_adhoc_carriers: std::cell::RefCell::new(Vec::new()),
             },
             fd_table: FdTable::new(),
             exit_code: 0,
@@ -421,6 +445,9 @@ impl Executor {
             foreground_wait_count: Cell::new(0),
             coproc_stderr_forwarders: HashMap::new(),
             assignment_output_process_substitutions: Vec::new(),
+            assignment_input_process_substitution_files: Vec::new(),
+            defer_locale_assignment_warnings: Cell::new(false),
+            deferred_locale_assignment_binds: Vec::new(),
             external_dispatch_ran: Cell::new(false),
             pipestatus_write_absorbed: Cell::new(false),
             tempenv_pipestatus_state: None,
@@ -445,6 +472,7 @@ impl Executor {
             trap_saved_exit_context: 0,
             exec_replaced: false,
             subshell_signal_death: None,
+            fg_sigint_unwind: false,
             // rubash#1175: a process root IS its process's shell; the
             // image-replacement gates live at the exec dispatcher.
             owns_process_image: true,
@@ -522,10 +550,13 @@ impl Executor {
             compound_redirect_failed: Cell::new(false),
             noclobber_prepared_targets: std::cell::RefCell::new(std::collections::HashSet::new()),
             exit_jump_pending: Cell::new(false),
+            errexit_status_converted: Cell::new(false),
+            timed_dispatch_depth: Cell::new(0),
             special_builtin_failed: Cell::new(false),
             last_builtin_write_failed: Cell::new(false),
             alias_introduced_words: Cell::new(0),
             redirect_target_memo: RefCell::new(HashMap::new()),
+            redirect_target_single_glob_match: RefCell::new(std::collections::HashSet::new()),
             assignment_expansion_memo: RefCell::new(HashMap::new()),
             fd_var_external_undo: Vec::new(),
             read_deadline: None,
@@ -545,6 +576,7 @@ impl Executor {
             elevation_handler: None,
             external_file_builtins_enabled: true,
             process_env_snapshot,
+            env_write_journal,
             history_provider: None,
         };
         for (fd, (read_h, write_h, path)) in inherited_fd_handles {
@@ -602,6 +634,7 @@ impl Executor {
     /// required Windows host vars).
     pub(in crate::executor) fn initialize_fresh_shell_env_vars(
         env_vars: &mut crate::shell::var_table::VarTable,
+        cwd: &std::path::Path,
     ) {
         env_vars.remove("BASH_ARGV0");
         env_vars.remove("BASH_EXECUTION_STRING");
@@ -613,14 +646,10 @@ impl Executor {
         // actual CWD; trusting it desynchronized cd/OLDPWD, so `cd $OLDPWD`
         // (assoc.tests) landed in the wrong directory and subsequent
         // `./assocN.sub` lookups failed. Always align PWD with the real CWD.
-        let pwd = match std::env::current_dir() {
-            Ok(path) => shell_pwd_display(&path.to_string_lossy().replace('\\', "/")),
-            Err(_) => env_vars
-                .get("PWD")
-                .cloned()
-                .map(|value| shell_pwd_display(&value))
-                .unwrap_or_else(|| "/".to_string()),
-        };
+        // G-02: the "real CWD" is the caller's session cwd field, passed in
+        // (at process birth it is the process cwd; for an in-process fresh
+        // shell it is the parent session's cwd).
+        let pwd = shell_pwd_display(&cwd.to_string_lossy().replace('\\', "/"));
         env_vars.insert("PWD".to_string(), pwd);
         // Windows-only: suites write $TMPDIR/$HOME into generated scripts
         // unquoted (posix2.tests conftest2: `$TMPDIR/conftest2 "$@"`; exp.tests
@@ -709,7 +738,7 @@ impl Executor {
             // Word expansion falls back to the live process environment
             // when a name is absent from env_vars, so clear it there too or
             // `$OLDPWD` would still expand to the rejected value.
-            env::remove_var("OLDPWD");
+            mirror_env_remove("OLDPWD");
         }
         initialize_shell_level(env_vars);
         mark_initial_exported_vars(env_vars);

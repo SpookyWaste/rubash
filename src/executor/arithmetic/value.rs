@@ -39,6 +39,50 @@ impl ConditionalArithParser<'_> {
         if index < 0 && !self.arith_base_is_array(name) {
             return None;
         }
+        // Typed-cell leg: when the Executor supplied the store and no
+        // unsynced mirror write is pending, the complete cell (rubash#616
+        // Phase 1a invariant) answers in O(log n) — the mirror leg below
+        // re-hashes the whole serialized array per read (Θ(bytes)), which
+        // is what made arithmetic reads scale linearly with array size.
+        // PIPESTATUS is excluded: its reads are owned by the dynamic
+        // context snapshot above (rubash#1364 R3). A cell miss falls
+        // through to the mirror leg unchanged (holes in a sparse cell
+        // and mirror-only arrays keep their existing answers).
+        if name != "PIPESTATUS" && !self.env_vars.array_cells_dirty() {
+            if let Some(cells) = self.cells {
+                if index >= 0 {
+                    if let Ok(typed_index) = i64::try_from(index) {
+                        if let Some(text) = cells.indexed_element(name, typed_index) {
+                            return Some(crate::executor::arrays::normalize_array_expanded_value(
+                                text.to_string(),
+                            ));
+                        }
+                    }
+                } else if let Some((_, max_index)) = cells.indexed_array_shape(name) {
+                    // Negative subscript: the cell shape rebases exactly
+                    // like resolve_indexed_array_subscript does against
+                    // the mirror's max index. A still-negative result is
+                    // INDEX_ERROR (the caller diagnoses it); an absent
+                    // resolved index is an unset element — both are the
+                    // mirror leg's answers, reached without the parse.
+                    let resolved = match max_index {
+                        Some(max) => i128::from(max) + 1 + index,
+                        None => -1,
+                    };
+                    if resolved < 0 {
+                        return None;
+                    }
+                    if let Ok(typed_index) = i64::try_from(resolved) {
+                        if let Some(text) = cells.indexed_element(name, typed_index) {
+                            return Some(crate::executor::arrays::normalize_array_expanded_value(
+                                text.to_string(),
+                            ));
+                        }
+                        return None;
+                    }
+                }
+            }
+        }
         self.env_vars.get(name).and_then(|value| {
             resolve_indexed_array_subscript(value, index)
                 .and_then(|resolved| array_value_at(value, resolved))
@@ -70,6 +114,18 @@ impl ConditionalArithParser<'_> {
         }
         if !self.arith_base_is_array(name) {
             return true;
+        }
+        // The typed cell's shape carries the same max index the mirror
+        // parse below would fold to, without building the entry map.
+        if name != "PIPESTATUS" && !self.env_vars.array_cells_dirty() {
+            if let Some(cells) = self.cells {
+                if let Some((_, max_index)) = cells.indexed_array_shape(name) {
+                    return match max_index {
+                        Some(max_index) => i128::from(max_index) + 1 + index < 0,
+                        None => true,
+                    };
+                }
+            }
         }
         let Some(value) = self.env_vars.get(name) else {
             return true;
@@ -142,6 +198,17 @@ impl ConditionalArithParser<'_> {
                 Some(0)
             }
             ArithLValue::Assoc { name, key } => {
+                // Typed-cell leg, same discipline as indexed_element_text:
+                // a hit answers from the complete cell; a miss keeps the
+                // mirror leg (which also owns mirror-only assoc state).
+                if !self.env_vars.array_cells_dirty() {
+                    if let Some(cells) = self.cells {
+                        if let Some(text) = cells.associative_element(name, key) {
+                            let value = text.to_string();
+                            return self.evaluate_variable_text(&format!("{name}[{key}]"), &value);
+                        }
+                    }
+                }
                 let value = self
                     .env_vars
                     .get(name)
@@ -212,6 +279,7 @@ impl ConditionalArithParser<'_> {
             self.env_vars,
             self.random_state,
             self.dynamic_values,
+            self.cells,
         );
         self.adopt_error(super::super::take_arith_eval_error());
         self.adopt_diags(super::super::take_arith_eval_diags());
@@ -264,6 +332,7 @@ impl ConditionalArithParser<'_> {
                         self.env_vars,
                         self.random_state,
                         self.dynamic_values,
+                        self.cells,
                     );
                     match value {
                         Some(value) => {
@@ -495,6 +564,7 @@ impl ConditionalArithParser<'_> {
             resolving,
             random_state: self.random_state,
             dynamic_values: self.dynamic_values,
+            cells: self.cells,
             error_category: None,
             no_expand: false,
             error: None,
@@ -698,6 +768,22 @@ impl ConditionalArithParser<'_> {
         if is_noassign_bash_array(name) {
             return;
         }
+        // A scalar bind over an array-shaped binding replaces the
+        // variable wholesale: the typed cell still holds the old array,
+        // so — exactly like the element binds in set_array_element /
+        // set_assoc_element — mark the cells dirty so element reads
+        // later in this evaluation take the (updated) mirror instead
+        // of trusting the cell. The check is one map probe plus a
+        // storage-shape test on the outgoing value.
+        if self
+            .env_vars
+            .get(name)
+            .is_some_and(|old| is_array_storage(old))
+            || is_marked_var(self.env_vars, ARRAY_VARS, name)
+            || is_marked_var(self.env_vars, ASSOC_VARS, name)
+        {
+            self.env_vars.mark_array_cells_dirty();
+        }
         let value = bash_arith(value).to_string();
         if name == "SECONDS" {
             // Assignment resets the reference point so the dynamic value
@@ -778,6 +864,7 @@ impl ConditionalArithParser<'_> {
                         self.env_vars,
                         self.random_state,
                         self.dynamic_values,
+                        self.cells,
                     );
                     if let Some(index) = index {
                         self.set_array_element(
@@ -799,6 +886,23 @@ impl ConditionalArithParser<'_> {
             }
             let numeric = value.parse::<i128>().unwrap_or(0);
             self.set_variable(&base_target.to_string(), numeric);
+            return;
+        }
+        // GNU expr.c: an unsubscripted array name in arithmetic denotes
+        // element 0 for writes as well as reads — the bind lands on that
+        // element and the remaining elements survive; rebinding the name
+        // to the scalar text collapses the whole array (rubash#1614). An
+        // associative name takes key "0" the same way (verified GNU
+        // 5.3.20: declare -A m=([x]=1 [y]=2); $((m=5)) leaves
+        // m=([0]="5" [y]="2" [x]="1")).
+        if is_marked_var(self.env_vars, ARRAY_VARS, name) {
+            let numeric = value.parse::<i128>().unwrap_or(0);
+            self.set_array_element(name, 0, numeric);
+            return;
+        }
+        if is_marked_var(self.env_vars, ASSOC_VARS, name) {
+            let numeric = value.parse::<i128>().unwrap_or(0);
+            self.set_assoc_element(name, "0", numeric);
             return;
         }
         let old_value = self.env_vars.get(name).cloned();

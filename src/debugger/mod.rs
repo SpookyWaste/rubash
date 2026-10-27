@@ -24,13 +24,24 @@ pub mod event;
 pub mod gate;
 pub mod session;
 
+// The re-exports below are the module's deliberate facade: the names are
+// the debugger vocabulary for consumers in later work packages, so most
+// have no in-tree consumer yet. Path dependents that build this crate
+// with `-D warnings` (niubash CI does, via its toolchain action's default
+// RUSTFLAGS, and path dependencies get no `--cap-lints` leniency) must
+// not be billed for that, so each facade group carries its own
+// `#[allow(unused_imports)]` instead of a module-wide allow.
+#[allow(unused_imports)]
 pub use breakpoints::{
     Breakpoint, BreakpointId, BreakpointKind, BreakpointResolution, BreakpointTable,
     BreakpointTarget, HitFlow, HitOutcome, WatchSnapshot,
 };
+#[allow(unused_imports)]
 pub use event::{
     DebugEvent, ExceptionKind, ExceptionSite, FrameReturn, OutputStream, ReturnRoute, SeamKind,
     SourceLocation, StopInfo, StopReason, SynthesizedFrameKind, WatchChange,
 };
+#[allow(unused_imports)]
 pub use gate::{GateFlag, SESSION_ACTIVE};
+#[allow(unused_imports)]
 pub use session::{DebugSession, SessionError, SessionState, StepArming, Termination};

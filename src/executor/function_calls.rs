@@ -504,7 +504,23 @@ impl Executor {
             // dbg-support.tests) and `caller` sees the full caller chain
             // (probe: BASH_LINENO[1]=[] vs GNU [0]).
             self.shell_state.bash_lineno_stack.insert(0, call_line);
-            let source = self.current_bash_source();
+            // GNU execute_cmd.c:5310-5313 execute_function: the call
+            // frame's BASH_SOURCE entry is `shell_fn->source_file` —
+            // the file the function was DEFINED in — not the caller's
+            // current source. Rubash records that site in
+            // function_definition_locations at definition time
+            // (rubash#1587: filling slot 0 from the caller made it
+            // always duplicate slot 1 and lose the definition file).
+            // Functions with no recorded definition site (imported
+            // from the environment) keep the caller-source fallback,
+            // whose empty case is the "environment" frame label.
+            let source = self
+                .shell_state
+                .function_definition_locations
+                .get(name)
+                .map(|location| location.source.clone())
+                .filter(|source| !source.is_empty())
+                .unwrap_or_else(|| self.current_bash_source());
             self.shell_state.bash_source_stack.insert(
                 0,
                 if source.is_empty() {
@@ -1010,73 +1026,102 @@ impl Executor {
         // must not be replayed as a stdout append on every inner command
         // (redir7.sub `stuff 4>&-' re-serialized the injected `>>&-' into a
         // spawned `-c' child and failed to parse it).
-        if !suppress_stdout {
-            if let Some(redirect) = call_cmd
-                .redirect_out
-                .as_ref()
-                .filter(|r| is_stdout_write_redirect(r))
-            {
+        // GNU redir.c do_redirections applies the call's list LEFT TO
+        // RIGHT, so when two entries bind the same descriptor the LATER
+        // one wins: `f &>f1 2>f2` ends with fd 2 on f2, while
+        // `f 2>f2 &>f1` ends with fd 2 on f1 (the `&>` fd-2 leg is a
+        // dup of fd 1 taken at its position, redir.c:1030-1037). The
+        // mirror fields lose that order (redirect_err and the synthetic
+        // redirect_err_append of a combined entry are separate slots),
+        // and injecting err-then-combined unconditionally made the
+        // combined leg win both orders (rubash#1595). The injectors
+        // themselves are first-come-first-served (a leaf keeps the
+        // first injected leg), so walk the list once performing the
+        // per-entry open side effects in order, remember only the LAST
+        // write leg per descriptor, and inject those two legs at the
+        // end.
+        let mut last_stdout_leg: Option<Redirect> = None;
+        let mut last_stderr_leg: Option<Redirect> = None;
+        for redirect in &call_cmd.redirects {
+            if redirect.fd_var.is_some() {
+                continue;
+            }
+            if !suppress_stdout && is_stdout_write_redirect(redirect) {
                 let target = self.expand_redirect_target(redirect);
-                if redirect_target_fd(&target).is_none() {
+                // A combined entry's fd-1 leg is the single open both
+                // streams share (r_err_and_out); a plain fd-1 entry
+                // opens its own target. fd-target entries (`> /dev/fd/N`
+                // spellings aside, `>&N` dups are not write redirects
+                // and never reach here) create nothing, and append
+                // entries are not pre-created either (a truncating
+                // create would eat the file's prior content — the
+                // body's own append open creates it instead).
+                if !redirect.append && redirect_target_fd(&target).is_none() {
                     self.create_redirect_output_prepared(&target, redirect.clobber)?;
                 }
                 let mut append_redirect = redirect.clone();
                 append_redirect.target = target;
                 append_redirect.append = true;
                 append_redirect.clobber = false;
-                apply_stdout_append_redirect(body, &append_redirect);
+                if matches!(
+                    append_redirect.kind,
+                    crate::parser::RedirectKind::CombinedOutput
+                        | crate::parser::RedirectKind::CombinedAppend
+                ) {
+                    // The injected leg must carry ONLY the fd-1 half:
+                    // a Combined-shaped entry replayed on a body leaf
+                    // re-binds fd 2 as well (r_err_and_out), which would
+                    // resurrect the combined target over a later genuine
+                    // `2>` leg the walk already selected. The fd-2 half
+                    // is represented by last_stderr_leg instead.
+                    append_redirect.kind = crate::parser::RedirectKind::Append;
+                    append_redirect.operator = ">>".to_string();
+                    append_redirect.fd = Some(1);
+                }
+                last_stdout_leg = Some(append_redirect);
             }
-            if let Some(redirect) = call_cmd
-                .append
-                .as_ref()
-                .filter(|r| is_stdout_write_redirect(r))
-            {
-                let mut append_redirect = redirect.clone();
-                append_redirect.target = self.expand_redirect_target(redirect);
-                apply_stdout_append_redirect(body, &append_redirect);
+            if suppress_stderr || !is_stderr_write_redirect(redirect) {
+                continue;
             }
-        }
-
-        if suppress_stderr {
-            return Ok(());
-        }
-        if let Some(redirect) = call_cmd
-            .redirect_err
-            .as_ref()
-            .filter(|r| is_stderr_write_redirect(r))
-        {
-            let target = self.expand_redirect_target(redirect);
-            if redirect_target_fd(&target).is_none() && !is_null_device(&target) {
-                self.create_redirect_output_prepared(&target, redirect.clobber)?;
-            }
-            let mut append_redirect = redirect.clone();
-            append_redirect.target = target;
-            append_redirect.append = true;
-            append_redirect.clobber = false;
-            apply_stderr_append_redirect(body, &append_redirect);
-        }
-        if let Some(redirect) = call_cmd
-            .redirect_err_append
-            .as_ref()
-            .filter(|r| is_stderr_write_redirect(r))
-        {
-            let mut append_redirect = redirect.clone();
-            append_redirect.target = self.expand_redirect_target(redirect);
-            // `&>`/`&>>` store their fd-2 leg as a Combined* kind. A body
-            // command's own `>other` redirect must still win fd 1, so the
-            // propagated leg claims fd 2 only (redir.c:899-900 splits
-            // r_err_and_out into fd-1 open plus fd-2 dup).
             if matches!(
-                append_redirect.kind,
+                redirect.kind,
                 crate::parser::RedirectKind::CombinedOutput
                     | crate::parser::RedirectKind::CombinedAppend
             ) {
+                // `&>`/`&>>` fd-2 leg: claims fd 2 only, as a dup of the
+                // fd-1 open at this list position (redir.c:899-900
+                // splits r_err_and_out into the fd-1 open plus the
+                // fd-2 dup) — a body command's own `>other` must still
+                // win fd 1. The target file was already created by the
+                // fd-1 leg above.
+                let mut append_redirect = redirect.clone();
+                append_redirect.target = self.expand_redirect_target(redirect);
                 append_redirect.kind = crate::parser::RedirectKind::Append;
                 append_redirect.operator = "2>>".to_string();
                 append_redirect.fd = Some(2);
                 append_redirect.append = true;
+                append_redirect.clobber = false;
+                last_stderr_leg = Some(append_redirect);
+            } else {
+                let target = self.expand_redirect_target(redirect);
+                if !redirect.append
+                    && redirect_target_fd(&target).is_none()
+                    && !is_null_device(&target)
+                {
+                    self.create_redirect_output_prepared(&target, redirect.clobber)?;
+                }
+                let mut append_redirect = redirect.clone();
+                append_redirect.target = target;
+                append_redirect.append = true;
+                append_redirect.clobber = false;
+                last_stderr_leg = Some(append_redirect);
             }
-            apply_stderr_append_redirect(body, &append_redirect);
+        }
+        if let Some(leg) = &last_stdout_leg {
+            apply_stdout_append_redirect(body, leg);
+        }
+        if let Some(leg) = &last_stderr_leg {
+            apply_stderr_append_redirect(body, leg);
         }
 
         Ok(())
@@ -1098,7 +1143,91 @@ impl Executor {
             && self.virtual_fd_stdin_remaining(0).is_none()
             && self.function_stdin_remaining().is_some();
         let Some(redirect) = &call_cmd.redirect_in else {
+            // rubash#1703: when fd 0 is a live File endpoint (a compound
+            // command's `< file` binding), a call without its own stdin
+            // redirection inherits that descriptor unchanged — GNU
+            // execute_function (execute_cmd.c:5181, body run at :5395)
+            // executes the body in-process on the caller's descriptors,
+            // and only a call's own redirections rebind fd 0, via
+            // do_redirections RX_UNDOABLE (execute_cmd.c:854), undone on
+            // return. Snapshotting the endpoint through
+            // stdin_string_for_command read_to_end's the shared-offset
+            // dup to EOF, and the staged text is then shadowed by the
+            // fd-table endpoint for every body reader — so the bytes are
+            // consumed AND discarded, and a `while read …; do f; done
+            // < file` loop ends after the line on which f was first
+            // called. Stage no text: the body reads the shared cursor
+            // through the fd table.
+            // The "call carries a stdin body of its own" judgment is
+            // made over the same stores stdin_string_for_command_mut
+            // consults — the fd-0 winner over `redirects`, with the
+            // legacy fields and the parallel `heredoc_redirects` store
+            // as fallback (the shape apply_external_stdin_redirect
+            // already uses) — so this guard and the consumer below can
+            // never disagree about whether the call brought a body.
+            // The two decisions that use it are the early return here
+            // (no body: stage nothing) and the fd-0 binding further
+            // down (body present: bind it, do not just stage it).
+            let call_has_own_stdin_body =
+                match crate::executor::shell_options::fd0_stdin_redirect_winner(call_cmd) {
+                    Some(kind) => matches!(
+                        kind,
+                        crate::parser::RedirectKind::HereDoc
+                            | crate::parser::RedirectKind::HereString
+                    ),
+                    None => {
+                        call_cmd.heredoc.is_some()
+                            || call_cmd.here_string.is_some()
+                            || call_cmd
+                                .heredoc_redirects
+                                .iter()
+                                .any(|redirect| redirect.fd.is_none() || redirect.fd == Some(0))
+                    }
+                };
+            if !call_has_own_stdin_body
+                && matches!(
+                    self.fd_table.read_endpoint(0),
+                    Some(FdReadEndpoint::File(_))
+                )
+            {
+                return Ok((None, false, None));
+            }
             if let Some(input) = self.stdin_string_for_command_mut(call_cmd) {
+                // A call's own heredoc/here-string body is normally
+                // staged as FUNCTION_STDIN text, but a live fd-0
+                // endpoint shadows the mirror for every body reader:
+                // read_input_for_command_inner serves a non-null File
+                // endpoint first because its cursor is the persistent
+                // one, and a Text/ProcessSubstitution endpoint (an
+                // enclosing call's bound body, a loop's staged input)
+                // is served before the mirror as well — so the body
+                // would read the caller's stream instead of its
+                // heredoc. GNU do_redirections (redir.c:854,
+                // RX_UNDOABLE, applied by execute_function) rebinds
+                // fd 0 itself for the body's duration — do the same:
+                // park the body on fd 0 as a text endpoint and let the
+                // caller's binding restore reinstate the caller's
+                // endpoint, shared cursor untouched, when the body
+                // returns. The null device is exempt: the read path
+                // falls through it to the mirror, so text staging
+                // already works there.
+                let fd0_endpoint_shadows_mirror = match self.fd_table.read_endpoint(0) {
+                    Some(FdReadEndpoint::File(ref file)) => {
+                        !crate::executor::is_null_device(&file.path.to_string_lossy())
+                    }
+                    Some(
+                        FdReadEndpoint::Text(_)
+                        | FdReadEndpoint::ProcessSubstitution(_)
+                        | FdReadEndpoint::CoprocStdout { .. },
+                    ) => true,
+                    _ => false,
+                };
+                if call_has_own_stdin_body && fd0_endpoint_shadows_mirror {
+                    let saved = self.fd_table.entries.get(&0).cloned();
+                    self.fd_table
+                        .open_input(0, FdReadEndpoint::text(input), false);
+                    return Ok((None, false, Some(FunctionCallStdinBinding { entry: saved })));
+                }
                 return Ok((Some(input), carves_parent_stdin, None));
             }
             // A shell script read through `< file` still has the unread
