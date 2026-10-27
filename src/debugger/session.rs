@@ -271,6 +271,24 @@ impl DebugSession {
         self.arming
     }
 
+    /// Could this session stop the debuggee at the next seam?
+    /// (design 4.4's inert shape.) True exactly when the session
+    /// is running AND something is armed: a stepping arming
+    /// other than `Continue`, or an enabled seam entry in the
+    /// breakpoint table. The funnel consult asks this before
+    /// any heavier work — the location read, the candidate
+    /// scan, the stop-time `$BASH_COMMAND` refresh — so a
+    /// session that cannot stop costs the consult one predicate,
+    /// and its behavior is the un-consulted path by
+    /// construction. The one consult side effect that is NOT a
+    /// stop decision — the function-definition note at entry
+    /// seams, which feeds breakpoint resolution — is not gated
+    /// by this predicate; the consult performs it separately.
+    pub fn can_stop_at_seam(&self) -> bool {
+        self.is_running()
+            && (self.arming != StepArming::Continue || self.breakpoints.has_enabled_seam_entries())
+    }
+
     /// How the session ended, once terminated.
     pub fn termination(&self) -> Option<Termination> {
         self.termination
@@ -546,6 +564,50 @@ mod tests {
         assert!(session.take_async_stop());
         assert!(!session.async_stop_requested());
         assert!(!session.take_async_stop(), "the request was consumed");
+    }
+
+    #[test]
+    fn can_stop_at_seam_names_the_inert_shapes() {
+        // A stopped session cannot stop: the predicate is about
+        // the running debuggee's next seam.
+        let mut session = DebugSession::new();
+        assert!(!session.can_stop_at_seam());
+        session.breakpoints_mut().insert_line("a.sh", 9);
+        assert!(
+            !session.can_stop_at_seam(),
+            "armed entries do not matter while stopped"
+        );
+
+        // Running under Continue with an enabled line entry: armed.
+        session.resume(StepArming::Continue).unwrap();
+        assert!(session.can_stop_at_seam());
+
+        // The same entry disabled: inert again.
+        let id = session.breakpoints().iter().next().expect("entry").id;
+        session.breakpoints_mut().set_enabled(id, false);
+        assert!(!session.can_stop_at_seam(), "disabled entries are inert");
+
+        // A watch entry alone never stops at a seam.
+        session.breakpoints_mut().clear();
+        session.breakpoints_mut().insert_watch("ACC");
+        assert!(!session.can_stop_at_seam(), "watch-only is inert");
+
+        // An enabled function entry is a seam stop.
+        session.breakpoints_mut().clear();
+        session.breakpoints_mut().insert_function("f");
+        assert!(session.can_stop_at_seam());
+
+        // Any stepping arming is a stop rule by itself.
+        session.breakpoints_mut().clear();
+        session.stop(seam_stop()).unwrap();
+        session
+            .resume(StepArming::StepOver { max_depth: 0 })
+            .unwrap();
+        assert!(session.can_stop_at_seam(), "a stepping arming is armed");
+
+        // Terminated: never.
+        session.exit(0).unwrap();
+        assert!(!session.can_stop_at_seam());
     }
 
     #[test]

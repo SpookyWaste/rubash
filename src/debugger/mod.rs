@@ -70,6 +70,8 @@ pub use stepping::{arming_stops_at_frame_return, arming_stops_at_seam};
 #[cfg(test)]
 mod evaluation_tests;
 #[cfg(test)]
+mod s4_states_tests;
+#[cfg(test)]
 mod stepping_tests;
 #[cfg(test)]
 mod wiring_tests;
