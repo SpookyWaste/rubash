@@ -65,6 +65,39 @@ fn timed_read_value(
     (value, 142)
 }
 
+/// rubash#1581: may the timed consumer model execute this followup
+/// command itself? Followups run with an empty stdin, so only commands
+/// that provably never read the pipeline stream qualify: the stream is
+/// untouched by `echo`/`printf` (they only write), by the no-op
+/// builtins, and by `sleep`; an assignment-only command runs no
+/// program at all; and a followup that rebinds its own fd 0 (input
+/// redirect, heredoc, here-string) reads that binding, not the stream.
+/// Everything else — a second `read`, `mapfile`, an external command,
+/// a name reached through expansion to one of those — declines.
+fn timed_followup_keeps_stream(command: &CommandNode, name: &str) -> bool {
+    if command.redirect_in.is_some()
+        || command.heredoc.is_some()
+        || command.here_string.is_some()
+        || command.redirects.iter().any(|redirect| {
+            (redirect.fd.is_none() || redirect.fd == Some(0))
+                && matches!(
+                    redirect.kind,
+                    crate::parser::RedirectKind::Input
+                        | crate::parser::RedirectKind::DuplicateInput
+                        | crate::parser::RedirectKind::CloseInput
+                        | crate::parser::RedirectKind::ReadWrite
+                        | crate::parser::RedirectKind::HereString
+                )
+        })
+    {
+        return true;
+    }
+    if command.words.is_empty() {
+        return true;
+    }
+    matches!(name, "echo" | "printf" | "true" | ":" | "false" | "sleep")
+}
+
 #[cfg(windows)]
 fn stdio_from_transferred_handle<T>(handle: T) -> Stdio
 where
@@ -1773,6 +1806,21 @@ impl Executor {
                     last_status = status;
                 }
                 _ if saw_read => {
+                    // rubash#1581: followups run with an empty stdin
+                    // (timed_read_followup_output passes "" as the stage
+                    // input): the modeled producer bytes beyond the first
+                    // read's record exist only as timing chunks and are
+                    // never materialized for the body. A followup that
+                    // reads fd 0 — a second `read`, `mapfile`, `cat`, any
+                    // external command — would see EOF where GNU serves
+                    // the not-yet-arrived data, so the model may only keep
+                    // followups that provably never consume the stream;
+                    // anything else declines to the sequential stage
+                    // path, whose TimedInput judge serves the same body
+                    // correctly (and still reports the timeout as 142).
+                    if !timed_followup_keeps_stream(command, &name) {
+                        return None;
+                    }
                     output.push_str(&self.timed_read_followup_output(
                         command,
                         &read_name,
