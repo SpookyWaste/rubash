@@ -2139,10 +2139,13 @@ fn cp_dot_slash_source_copies_contents_into_existing_directory() {
         concat!(
             "C1OK\nC2OK\n",
             "rc3=1\n",
-            "bash: line 1: cp: -r not specified; omitting directory 'src/.'\n",
+            // rubash#1596: the emulated cp's diagnostics are the
+            // program's own stderr — bare `cp: ...` lines, never the
+            // shell's `bash: line 1:` envelope (GNU coreutils verbatim).
+            "cp: -r not specified; omitting directory 'src/.'\n",
             "rc5=1\n",
-            "bash: line 1: cp: cannot overwrite non-directory 'f.txt' with directory 'src/.'\n",
-            "bash: line 1: cp: cannot stat 'f.txt/.': Not a directory\n"
+            "cp: cannot overwrite non-directory 'f.txt' with directory 'src/.'\n",
+            "cp: cannot stat 'f.txt/.': Not a directory\n"
         )
     );
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");

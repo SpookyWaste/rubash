@@ -471,11 +471,7 @@ impl Executor {
                     "version" | "help" => info_request = true,
                     _ => {
                         failed = true;
-                        eprintln!(
-                            "{}touch: unrecognized option '--{}'",
-                            self.diagnostic_prefix(),
-                            name
-                        );
+                        eprintln!("touch: unrecognized option '--{}'", name);
                     }
                 }
                 continue;
@@ -515,11 +511,7 @@ impl Executor {
                     }
                     bad => {
                         failed = true;
-                        eprintln!(
-                            "{}touch: invalid option -- '{}'",
-                            self.diagnostic_prefix(),
-                            bad
-                        );
+                        eprintln!("touch: invalid option -- '{}'", bad);
                         break;
                     }
                 }
@@ -533,11 +525,7 @@ impl Executor {
             return Ok(false);
         }
         if let Some(value) = &unevaluated_date {
-            eprintln!(
-                "{}touch: invalid date format '{}'",
-                self.diagnostic_prefix(),
-                value
-            );
+            eprintln!("touch: invalid date format '{}'", value);
             failed = true;
         }
         if ref_failed {
@@ -581,8 +569,7 @@ impl Executor {
             };
             if let Err(error) = outcome {
                 eprintln!(
-                    "{}touch: cannot touch '{}': {}",
-                    self.diagnostic_prefix(),
+                    "touch: cannot touch '{}': {}",
                     expanded,
                     crate::posix_errors::message(&error)
                 );
@@ -615,8 +602,7 @@ impl Executor {
                     }
                     Err(error) => {
                         eprintln!(
-                            "{}touch: failed to get attributes of '{}': {}",
-                            self.diagnostic_prefix(),
+                            "touch: failed to get attributes of '{}': {}",
                             value,
                             crate::posix_errors::message(&error)
                         );
@@ -831,7 +817,11 @@ impl Executor {
         let mut no_more_flags = false;
         let mut operands: Vec<String> = Vec::new();
 
-        let prefix = self.diagnostic_prefix();
+        // coreutils diagnostics are the emulated command's own stderr:
+        // bare `cp: ...` lines with no shell diagnostic prefix
+        // (rubash#1596; same convention as mkdir, rubash#1372). The
+        // sites below previously formatted through a `prefix` variable
+        // holding self.diagnostic_prefix().
         let mut stdout: Vec<u8> = Vec::new();
         let mut stderr: Vec<u8> = Vec::new();
         let mut words = cmd.words[1..].iter();
@@ -896,7 +886,7 @@ impl Executor {
                         return Ok(true);
                     }
                     other => {
-                        let _ = writeln!(stderr, "{}cp: unknown option '--{}'", prefix, other);
+                        let _ = writeln!(stderr, "cp: unknown option '--{}'", other);
                         self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
                         self.exit_code = 1;
                         return Ok(true);
@@ -935,7 +925,7 @@ impl Executor {
                         break;
                     }
                     other => {
-                        let _ = writeln!(stderr, "{}cp: invalid option -- '{}'", prefix, other);
+                        let _ = writeln!(stderr, "cp: invalid option -- '{}'", other);
                         self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
                         self.exit_code = 1;
                         return Ok(true);
@@ -948,8 +938,7 @@ impl Executor {
         if no_clobber {
             let _ = writeln!(
                 stderr,
-                "{}cp: warning: behavior of -n is non-portable and may change in future; use --update=none instead",
-                prefix
+                "cp: warning: behavior of -n is non-portable and may change in future; use --update=none instead",
             );
         }
 
@@ -972,8 +961,8 @@ impl Executor {
         {
             let _ = writeln!(
                 stderr,
-                "{}cp: '{}' and '{}' are the same file",
-                prefix, effective[0], effective[1]
+                "cp: '{}' and '{}' are the same file",
+                effective[0], effective[1]
             );
             self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
             self.exit_code = 1;
@@ -984,13 +973,12 @@ impl Executor {
             let _ = match effective.last() {
                 Some(last) => writeln!(
                     stderr,
-                    "{}cp: missing destination file operand after '{}'\nTry 'cp --help' for more information.",
-                    prefix, last
+                    "cp: missing destination file operand after '{}'\nTry 'cp --help' for more information.",
+                    last
                 ),
                 None => writeln!(
                     stderr,
-                    "{}cp: missing file operand\nTry 'cp --help' for more information.",
-                    prefix
+                    "cp: missing file operand\nTry 'cp --help' for more information.",
                 ),
             };
             self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
@@ -1014,8 +1002,8 @@ impl Executor {
         if effective.len() > 2 && !destination.exists() {
             let _ = writeln!(
                 stderr,
-                "{}cp: target '{}': No such file or directory",
-                prefix, destination_word
+                "cp: target '{}': No such file or directory",
+                destination_word
             );
             self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
             self.exit_code = 1;
@@ -1043,8 +1031,7 @@ impl Executor {
                     status = 1;
                     let _ = writeln!(
                         stderr,
-                        "{}cp: cannot create '{}': {}",
-                        prefix,
+                        "cp: cannot create '{}': {}",
                         target_path.display(),
                         crate::posix_errors::message(&error)
                     );
@@ -1069,8 +1056,7 @@ impl Executor {
                     status = 1;
                     let _ = writeln!(
                         stderr,
-                        "{}cp: cannot stat '{}': {}",
-                        prefix,
+                        "cp: cannot stat '{}': {}",
                         source_word,
                         crate::posix_errors::message(&error)
                     );
@@ -1080,8 +1066,8 @@ impl Executor {
                     status = 1;
                     let _ = writeln!(
                         stderr,
-                        "{}cp: -r not specified; omitting directory '{}'",
-                        prefix, source_word
+                        "cp: -r not specified; omitting directory '{}'",
+                        source_word
                     );
                     continue;
                 }
@@ -1089,8 +1075,8 @@ impl Executor {
                     status = 1;
                     let _ = writeln!(
                         stderr,
-                        "{}cp: cannot overwrite non-directory '{}' with directory '{}'",
-                        prefix, destination_word, source_word
+                        "cp: cannot overwrite non-directory '{}' with directory '{}'",
+                        destination_word, source_word
                     );
                     continue;
                 }
@@ -1100,8 +1086,7 @@ impl Executor {
                         Err(error) => {
                             let _ = writeln!(
                                 stderr,
-                                "{}cp: cannot access '{}': {}",
-                                prefix,
+                                "cp: cannot access '{}': {}",
                                 source_word,
                                 crate::posix_errors::message(&error)
                             );
@@ -1160,8 +1145,7 @@ impl Executor {
                                 Err(error) => {
                                     let _ = writeln!(
                                         stderr,
-                                        "{}cp: cannot create '{}': {}",
-                                        prefix,
+                                        "cp: cannot create '{}': {}",
                                         target.display(),
                                         crate::posix_errors::message(&error)
                                     );
@@ -1172,8 +1156,8 @@ impl Executor {
                         None => {
                             let _ = writeln!(
                                 stderr,
-                                "{}cp: cannot stat '{}': No such file or directory",
-                                prefix, source_word
+                                "cp: cannot stat '{}': No such file or directory",
+                                source_word
                             );
                             status = 1;
                         }
@@ -1184,8 +1168,8 @@ impl Executor {
                     let Some(name) = source.file_name() else {
                         let _ = writeln!(
                             stderr,
-                            "{}cp: missing destination file operand after '{}'",
-                            prefix, source_word
+                            "cp: missing destination file operand after '{}'",
+                            source_word
                         );
                         status = 1;
                         continue;
@@ -1210,8 +1194,8 @@ impl Executor {
                 if !source.exists() {
                     let _ = writeln!(
                         stderr,
-                        "{}cp: cannot stat '{}': No such file or directory",
-                        prefix, source_word
+                        "cp: cannot stat '{}': No such file or directory",
+                        source_word
                     );
                     status = 1;
                     continue;
@@ -1219,8 +1203,8 @@ impl Executor {
                 if source.is_dir() && !recursive {
                     let _ = writeln!(
                         stderr,
-                        "{}cp: -r not specified; omitting directory '{}'",
-                        prefix, source_word
+                        "cp: -r not specified; omitting directory '{}'",
+                        source_word
                     );
                     status = 1;
                     continue;
@@ -1275,8 +1259,7 @@ impl Executor {
                     Err(error) => {
                         let _ = writeln!(
                             stderr,
-                            "{}cp: cannot create '{}': {}",
-                            prefix,
+                            "cp: cannot create '{}': {}",
                             target.display(),
                             crate::posix_errors::message(&error)
                         );
@@ -1658,11 +1641,11 @@ impl Executor {
                     match self.dev_fd_operand_bytes_for_command(cmd, fd) {
                         Some(read) if read.stdout_file && !read.bytes.is_empty() => {
                             // GNU cat.c: input resolves to the file fd 1
-                            // writes to — report and skip it.
+                            // writes to — report and skip it. Bare, like
+                            // every cat diagnostic (rubash#1596).
                             writeln!(
                                 &mut diagnostics,
-                                "{}cat: {}: input file is output file",
-                                self.diagnostic_prefix(),
+                                "cat: {}: input file is output file",
                                 target
                             )?;
                             status = 1;
@@ -1825,18 +1808,16 @@ impl Executor {
 
     /// GNU coreutils cat on a closed stdin (cat.c): the read fails and the
     /// close of standard input fails too — two diagnostics, and the caller
-    /// sets exit status 1.
+    /// sets exit status 1. The lines are cat's OWN stderr, written bare:
+    /// an external command's diagnostics never carry the shell's
+    /// `script: line N:` envelope (rubash#1596; the same convention
+    /// rubash#1309 established for cat's operand errors).
     fn report_cat_closed_stdin(&mut self, cmd: &CommandNode) -> Result<(), ExecuteError> {
         let mut stderr = Vec::new();
+        writeln!(&mut stderr, "cat: -: Bad file descriptor")?;
         writeln!(
             &mut stderr,
-            "{}cat: -: Bad file descriptor",
-            self.diagnostic_prefix()
-        )?;
-        writeln!(
-            &mut stderr,
-            "{}cat: closing standard input: Bad file descriptor",
-            self.diagnostic_prefix()
+            "cat: closing standard input: Bad file descriptor"
         )?;
         self.write_buffered_builtin_output(cmd, &[], &stderr)?;
         Ok(())
