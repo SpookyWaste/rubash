@@ -257,8 +257,7 @@ pub(super) fn handle_token(tokens: &[Token], i: &mut usize, state: &mut ParseSta
                     .raw
                     .split_once('=')
                     .is_some_and(|(lhs, _)| valid_compound_assignment_lhs(lhs));
-                if compound_candidate && !compound_assignment_position_ok(&state.current_cmd.words)
-                {
+                if compound_candidate && !compound_assignment_position_ok(&state.current_cmd) {
                     return reject_compound_assignment_position(tokens, i, state, token);
                 }
                 // Atomic compound operand after a command word (declare -a
@@ -442,7 +441,7 @@ pub(super) fn handle_token(tokens: &[Token], i: &mut usize, state: &mut ParseSta
                             .split_once('=')
                             .is_some_and(|(lhs, _)| valid_compound_assignment_lhs(lhs));
                         if compound_candidate
-                            && !compound_assignment_position_ok(&state.current_cmd.words)
+                            && !compound_assignment_position_ok(&state.current_cmd)
                         {
                             return reject_compound_assignment_position(tokens, i, state, token);
                         }
@@ -550,7 +549,7 @@ pub(super) fn handle_token(tokens: &[Token], i: &mut usize, state: &mut ParseSta
                             let lhs = token.value.strip_suffix('=').unwrap_or(&token.value);
                             let compound_candidate = valid_compound_assignment_lhs(lhs);
                             if compound_candidate
-                                && !compound_assignment_position_ok(&state.current_cmd.words)
+                                && !compound_assignment_position_ok(&state.current_cmd)
                             {
                                 return reject_compound_assignment_position(
                                     tokens, i, state, token,
@@ -1470,7 +1469,19 @@ fn collect_process_substitution_suffix(
 /// (alias/declare/export/local/readonly/typeset), or after eval/let.
 /// Elsewhere the `(` is an unexpected token, e.g.
 /// `printf "%s\n" -a a=(a 'b  c')` (array1.sub:1).
-fn compound_assignment_position_ok(words: &[String]) -> bool {
+///
+/// rubash#1786: the words judged are the TIMED command's own. GNU's
+/// grammar derives the timed command from pipeline_command
+/// (parse.y:1416 `timespec pipeline_command`), so the simple command
+/// inside starts in pristine command position; a recorded `time` head
+/// (with its operand window, and any nested `time` heads behind it) is
+/// the timespec's, not the simple command's, and is skipped before the
+/// per-word rule runs — making the timed and untimed verdicts identical
+/// by construction. Only a head recorded as the reserved word strips:
+/// a plain-word `time` head (quoted, or reclassified by the lexer) is
+/// a command name and fails the rule like any other command word.
+fn compound_assignment_position_ok(command: &CommandNode) -> bool {
+    let words = &command.words[time_prefix_word_count(command)..];
     for word in words {
         let is_assignment_word = word
             .split_once('=')
@@ -1483,6 +1494,49 @@ fn compound_assignment_position_ok(words: &[String]) -> bool {
         }
     }
     true
+}
+
+/// The number of leading words of `command` consumed by recorded
+/// `time` timespec heads (each head's operand window included, nested
+/// heads iterated). Zero when the head is a plain word, when no `time`
+/// head is present, or when a recorded non-keyword kind vetoes the
+/// head — the same recorded-classification gates
+/// `time_prefix_from_command` applies before folding.
+fn time_prefix_word_count(command: &CommandNode) -> usize {
+    // rubash#1355: an assignment word recorded BEFORE the head makes
+    // the head a command name, not the keyword — nothing strips.
+    // Behind a genuine head, the timed command's own leading words
+    // are not yet classified at this point (they still sit in the
+    // word list), so the recorded assignment channels are empty
+    // exactly when every recorded assignment precedes the head.
+    // This is the same refusal set time_prefix_from_command applies
+    // before folding.
+    if !command.assignments.is_empty()
+        || !command.compound_assignments.is_empty()
+        || !command.array_element_assignments.is_empty()
+    {
+        return 0;
+    }
+    if command.time_head_plain_word {
+        return 0;
+    }
+    let aligned_kinds = command.word_kinds.len() == command.words.len();
+    let aligned_metadata = if command.word_metadata.len() == command.words.len() {
+        Some(command.word_metadata.as_slice())
+    } else {
+        None
+    };
+    let mut start = 0;
+    while command.words.get(start).map(String::as_str) == Some("time")
+        && (!aligned_kinds || command.word_kinds.get(start) == Some(&TokenKind::Keyword))
+    {
+        let scan = super::parse_loop::scan_time_prefix_words(
+            &command.words[start..],
+            aligned_metadata.map(|entries| &entries[start..]),
+        );
+        start += scan.next;
+    }
+    start
 }
 
 /// Emit the GNU `syntax error near unexpected token `('` parse error for a

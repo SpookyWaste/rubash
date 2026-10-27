@@ -136,6 +136,20 @@ impl Executor {
             return result;
         }
 
+        // rubash#1805: parse.y's timespec production is recursive
+        // (pipeline_command: timespec pipeline_command), so a
+        // TimeCommand wrapper can sit under another timed frame and
+        // reach this funnel directly through the outer frame's inner
+        // dispatch, without passing the execute_ast list loop that
+        // normally dispatches timed commands. Execute it here — the
+        // funnel every route shares — instead of letting the
+        // empty-words arm below mistake the wrapper (which carries no
+        // words of its own) for a null command and silently drop the
+        // whole timed command.
+        if let Some(time_command) = &cmd.time_command {
+            return self.execute_time_ast_command(time_command);
+        }
+
         if cmd.words.is_empty() {
             let result = self.execute_empty_words_command(cmd, None);
             // GNU execute_cmd.c:4625-4640: with WORDS==0 the null command
