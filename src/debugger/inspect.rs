@@ -9,7 +9,9 @@
 //! `caller` reads. Frontends (CLI, DAP) call these and own only the
 //! transport.
 
-use crate::api::views::{DynamicStateSnapshot, FrameSnapshot, InspectionSnapshot, VariableValue};
+use crate::api::views::{
+    DynamicStateSnapshot, FrameSnapshot, InspectionSnapshot, VariableSnapshot, VariableValue,
+};
 
 /// Which slice of a snapshot's variables a listing renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +92,37 @@ pub fn render_info_args(frame: &FrameSnapshot) -> String {
         .map(|(index, arg)| format!("{}: {}", index + 1, arg))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The rendered value of one snapshot variable for the
+/// stop-and-diff watch (design section 5.4): the value the
+/// watch compares across stops and quotes in its banner. A
+/// scalar renders as itself; an array renders as a
+/// parenthesized `[key]=value` list — the whole value, not the
+/// element-0 reading a plain `$NAME` expansion would give, so
+/// an element write is a visible difference. An unset variable
+/// renders as `None` (the watch's "no value" coordinate).
+pub fn render_watch_value(variable: &VariableSnapshot) -> Option<String> {
+    match &variable.value {
+        VariableValue::Unset => None,
+        VariableValue::Scalar(text) => Some(text.clone()),
+        VariableValue::Indexed(elements) => Some(format!(
+            "({})",
+            elements
+                .iter()
+                .map(|(index, value)| format!("[{index}]={value}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )),
+        VariableValue::Associative(elements) => Some(format!(
+            "({})",
+            elements
+                .iter()
+                .map(|(key, value)| format!("[{key}]={value}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )),
+    }
 }
 
 /// Render a variable listing as `declare -p` lines: the snapshot

@@ -267,6 +267,10 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
     // and interactive forms are unprofiled in M1 (owner ticket #815).
     let mut profile_mode = false;
     let mut profile_output: Option<String> = None;
+    // 1.5.0 debugger design section 13: `--dap` is an engine meta
+    // flag handled in this same leading scan, for the same reason
+    // as --profile — the GNU long-option contract stays untouched.
+    let mut dap_mode = false;
     let mut filtered_args: Vec<String> = Vec::with_capacity(args.len());
     {
         let mut index = 0usize;
@@ -275,6 +279,10 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
             match arg {
                 "--profile" => {
                     profile_mode = true;
+                    index += 1;
+                }
+                "--dap" => {
+                    dap_mode = true;
                     index += 1;
                 }
                 "--profile-output" => match args.get(index + 1) {
@@ -305,6 +313,37 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
         }
     }
     let args: &[String] = &filtered_args;
+    if dap_mode {
+        // The editor launch form: leading shell options (an
+        // editor's own `--debug`, say) are skipped — the DAP
+        // dispatch owns the run, so none of them are applied;
+        // in particular `--debug`'s extdebug arming does not
+        // happen on this path (design section 2: the debugger
+        // implies the gate internally and never flips the user's
+        // extdebug observably). The first non-option word is the
+        // program and the rest are its arguments; with no
+        // operand the adapter runs as a pure DAP server and the
+        // program arrives in the client's `launch` request.
+        // Like the scan above, value-taking options before the
+        // operand are not understood here.
+        let mut start = 0usize;
+        while start < args.len() {
+            let word = args[start].as_str();
+            if word == "--" {
+                start += 1;
+                break;
+            }
+            if word == "-" || !word.starts_with('-') {
+                break;
+            }
+            start += 1;
+        }
+        let operands = &args[start..];
+        return rubash::run_dap_stdio(rubash::DapLaunchPreset {
+            program: operands.first().cloned(),
+            args: operands.get(1..).unwrap_or(&[]).to_vec(),
+        });
+    }
     // TODO(shell.c): GNU Bash has a full option parser and shell-name handling.
     // This narrow parser supports the `-c` and `-o posix -c` forms used by
     // upstream alias tests.

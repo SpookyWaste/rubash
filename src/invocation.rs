@@ -29,6 +29,17 @@ pub struct ShellInvocation {
     /// (main.rs start_debugger) and clears the mode when it is missing
     /// (shell.c:1547-1566).
     pub debugger: bool,
+    /// --dap: the native debugger's protocol frontend (1.5.0
+    /// debugger design section 13; PLAN row 10) — the same debug
+    /// session `--debug` will front, over DAP. This is an engine
+    /// meta flag, not a GNU option: it is recorded here so a
+    /// host can dispatch on it before running anything (the
+    /// adapter owns its executor and the process stdio, so
+    /// `apply` deliberately takes no DAP action). The rubash
+    /// binary dispatches in main.rs's leading-option scan,
+    /// before the GNU parser, so the GNU long-option contract is
+    /// untouched.
+    pub dap: bool,
     pub command: Option<String>,
     pub command_name: Option<String>,
     pub positional_params: Vec<String>,
@@ -143,6 +154,7 @@ impl ShellInvocation {
             pretty_print: false,
             debug: false,
             debugger: false,
+            dap: false,
             command: None,
             command_name: None,
             positional_params: Vec::new(),
@@ -232,6 +244,10 @@ impl ShellInvocation {
                 }
                 "--debugger" => {
                     out.debugger = true;
+                    i += 1;
+                }
+                "--dap" => {
+                    out.dap = true;
                     i += 1;
                 }
                 "--restricted" => {
@@ -609,6 +625,10 @@ fn parse_post_c_option(
         }
         "--debug" => {
             out.debug = true;
+            Ok(Some(index + 1))
+        }
+        "--dap" => {
+            out.dap = true;
             Ok(Some(index + 1))
         }
         "--debugger" => {

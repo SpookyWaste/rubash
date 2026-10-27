@@ -5374,6 +5374,41 @@ impl Executor {
         self.debug_driver.as_mut()
     }
 
+    /// Bind this executor's standard streams for a DAP host
+    /// (design section 13): the protocol owns the process's
+    /// stdio, so the debuggee's fd 0 reads the given (empty)
+    /// file — a deterministic EOF — and its fd 1 and fd 2 write
+    /// the given capture files, which the adapter drains into
+    /// DAP `output` events. External children inherit the
+    /// materialized file endpoints, so their output lands in
+    /// the same captures. Returns false when a file could not
+    /// be opened; the caller then refuses the launch rather
+    /// than letting the debuggee write onto the protocol
+    /// channel.
+    pub(crate) fn debugger_bind_stdio(
+        &mut self,
+        stdin_path: &std::path::Path,
+        stdout_path: &std::path::Path,
+        stderr_path: &std::path::Path,
+    ) -> bool {
+        let stdin = match FileFd::open_read(stdin_path.to_path_buf()) {
+            Ok(file) => file,
+            Err(_) => return false,
+        };
+        self.fd_table
+            .open_input(0, FdReadEndpoint::File(stdin), false);
+        for (fd, path) in [(1u32, stdout_path), (2u32, stderr_path)] {
+            let handle = match std::fs::File::create(path) {
+                Ok(file) => file,
+                Err(_) => return false,
+            };
+            let file = FileFd::from_file(handle, path.to_path_buf());
+            self.fd_table
+                .open_output(fd, FdWriteEndpoint::File(file), false);
+        }
+        true
+    }
+
     /// The location facts a stop reports, read from the same state
     /// the trap path reads: the ambient line stamp and the
     /// BASH_SOURCE stack top (the innermost file), plus the frame
@@ -5408,6 +5443,111 @@ impl Executor {
         Ok(())
     }
 
+    /// The stop-and-diff watch re-check (design section 5.4;
+    /// PLAN row 10): at every stop, each enabled watch entry is
+    /// re-evaluated and diffed against its previous stop's
+    /// snapshot via [`crate::debugger::Breakpoint::diff_watch`];
+    /// a difference queues a `WatchChanged` event (DE-05) on the
+    /// session before the stop loop serves.
+    ///
+    /// A `watch NAME` entry renders through the variable views
+    /// and carries the VarTable mirror epoch, so an unchanged
+    /// tracked name is proven unchanged by the epoch alone. A
+    /// `watche EXPR` entry re-evaluates under the implicit power
+    /// checker (design section 7.5): a rejected or failed
+    /// re-check is skipped — the entry keeps its previous
+    /// snapshot and nothing executes — exactly the design's
+    /// "skipped and marked" rule. Watch entries never keep the
+    /// consult awake on their own (the table's seam predicate
+    /// excludes them), so a watch alone never slows a free run:
+    /// the design's documented limit, pinned by the row-10
+    /// wiring tests.
+    fn debugger_watch_prepass(&mut self) {
+        // Gather the enabled watch entries first: evaluation
+        // below runs engine machinery and must not hold the
+        // driver borrow while it does.
+        let watches: Vec<(
+            crate::debugger::BreakpointId,
+            crate::debugger::BreakpointKind,
+            String,
+        )> = match self.debug_driver.as_ref() {
+            Some(driver) => driver
+                .session()
+                .breakpoints()
+                .watch_entries()
+                .filter(|entry| entry.enabled)
+                .filter_map(|entry| match &entry.target {
+                    crate::debugger::BreakpointTarget::Expression { text } => {
+                        Some((entry.id, entry.kind, text.clone()))
+                    }
+                    _ => None,
+                })
+                .collect(),
+            None => return,
+        };
+        if watches.is_empty() {
+            return;
+        }
+        let mut changes: Vec<crate::debugger::WatchChange> = Vec::new();
+        for (id, kind, text) in watches {
+            let (rendered, epoch) = match kind {
+                crate::debugger::BreakpointKind::Watch => {
+                    // Render from the stop's own inspection
+                    // snapshot (installed by debugger_serve_stop
+                    // just before this pass): the whole value,
+                    // arrays included — a plain `$NAME` reading
+                    // would show only element 0 and hide element
+                    // writes. The VarTable epoch rides along as
+                    // the unchanged-proof (design section 5.4).
+                    let rendered = self
+                        .debug_driver
+                        .as_ref()
+                        .and_then(|driver| driver.session().inspection())
+                        .and_then(|snapshot| snapshot.variable(&text))
+                        .map(crate::debugger::render_watch_value)
+                        .unwrap_or_default();
+                    (rendered, self.shell_state.env_vars.mirror_epoch_of(&text))
+                }
+                crate::debugger::BreakpointKind::WatchExpression => {
+                    let request = crate::debugger::EvaluationRequest {
+                        mode: crate::debugger::PowerMode::Implicit,
+                        text: text.clone(),
+                        frame: None,
+                    };
+                    match self.debugger_evaluate(&request, None) {
+                        Ok(outcome) => match outcome.result {
+                            crate::debugger::EvaluationResult::Value(value) => (Some(value), None),
+                            // Rejected or failed: skipped, snapshot
+                            // kept (design section 7.5).
+                            _ => continue,
+                        },
+                        Err(_) => continue,
+                    }
+                }
+                _ => continue,
+            };
+            if let Some(driver) = self.debug_driver.as_mut() {
+                if let Some(entry) = driver.session_mut().breakpoints_mut().get_mut(id) {
+                    if let Some((old, new)) = entry.diff_watch(rendered, epoch) {
+                        changes.push(crate::debugger::WatchChange {
+                            id,
+                            expression: text,
+                            old_value: old,
+                            new_value: new,
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(driver) = self.debug_driver.as_mut() {
+            for change in changes {
+                driver
+                    .session_mut()
+                    .emit(crate::debugger::DebugEvent::WatchChanged(change));
+            }
+        }
+    }
+
     /// Serve the stop the session is parked at: run the driver's
     /// stop loop, then apply its outcome.
     fn debugger_serve_stop(&mut self) -> Result<(), ExecuteError> {
@@ -5420,6 +5560,13 @@ impl Executor {
         if let Some(driver) = self.debug_driver.as_mut() {
             driver.session_mut().set_inspection(inspection);
         }
+        // Design section 5.4 (stop-and-diff): before the stop
+        // loop runs, re-check the session's watch entries against
+        // the state the debuggee is stopped in, so a change is
+        // already queued as DE-05 when the frontend renders this
+        // stop. The check lives here — the stop funnel — not on
+        // any write path.
+        self.debugger_watch_prepass();
         // The serve loop: an evaluation outcome (WP-7) runs the
         // request through the consult's own evaluation machinery,
         // installs the outcome on the session, and serves the

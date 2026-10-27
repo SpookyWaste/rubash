@@ -7,8 +7,12 @@
 //! event stream, the breakpoint table, and the session state
 //! machine — and nothing else. In particular it contains:
 //!
-//! - no terminal or console handling (frontends are views; they live
-//!   elsewhere and only translate into session operations),
+//! - no debugging semantics in the frontends: the `--dap`
+//!   protocol frontend lives in this module (PLAN row 10) as a
+//!   pure view — it translates between framed protocol messages
+//!   and session operations and renders the session's own
+//!   snapshots, and owns no state machine of its own. The
+//!   interactive `--debug` view (row 11) follows the same rule,
 //! - no platform windowing or process facilities,
 //! - no execution logic: the executor consults the session through
 //!   the DEBUG-trap funnel (WP-3 wiring, in `executor::trap_exec`);
@@ -21,11 +25,13 @@
 //! atomic gate and stop-request flags.
 
 pub mod breakpoints;
+pub mod dap;
 pub mod driver;
 pub mod evaluation;
 pub mod event;
 pub mod gate;
 pub mod inspect;
+pub mod json;
 pub mod resolution;
 pub mod session;
 pub mod stepping;
@@ -42,6 +48,8 @@ pub use breakpoints::{
     Breakpoint, BreakpointId, BreakpointKind, BreakpointResolution, BreakpointTable,
     BreakpointTarget, HitFlow, HitOutcome, WatchSnapshot,
 };
+#[allow(unused_imports)]
+pub use dap::{run_dap_server, run_dap_stdio, DapLaunchPreset};
 #[allow(unused_imports)]
 pub use driver::{SessionDriver, StopLoop, StopLoopOutcome};
 #[allow(unused_imports)]
@@ -60,13 +68,15 @@ pub use gate::{GateFlag, SESSION_ACTIVE};
 #[allow(unused_imports)]
 pub use inspect::{
     render_caller, render_caller_bare, render_dynamic_state, render_info_args, render_pipestatus,
-    render_variables, render_where, VariablePartition,
+    render_variables, render_watch_value, render_where, VariablePartition,
 };
 #[allow(unused_imports)]
 pub use session::{DebugSession, SessionError, SessionState, StepArming, Termination};
 #[allow(unused_imports)]
 pub use stepping::{arming_stops_at_frame_return, arming_stops_at_seam};
 
+#[cfg(test)]
+mod dap_tests;
 #[cfg(test)]
 mod evaluation_tests;
 #[cfg(test)]
