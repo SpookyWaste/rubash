@@ -36,6 +36,13 @@ pub(crate) mod stack_growth;
 pub mod token_str;
 pub mod usage;
 
+// The DAP frontend entry points (1.5.0 debugger design section
+// 13; PLAN row 10): the one part of the debugger the binaries and
+// embedding hosts dispatch to. The session core stays crate-
+// private behind this facade until the API finalization gives it
+// a curated public surface.
+pub use debugger::{run_dap_server, run_dap_stdio, DapLaunchPreset};
+
 // Re-export commonly used types
 #[cfg(windows)]
 pub use executor::{ElevationOutput, ElevationRequest, SudoMode};

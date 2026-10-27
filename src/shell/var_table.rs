@@ -333,6 +333,20 @@ impl VarTable {
             == self.synced_epoch.get(name).copied().unwrap_or(0)
     }
 
+    /// The current mirror epoch of a tracked name, or `None` when
+    /// the name is untracked. This is the freshness coordinate the
+    /// debugger's stop-and-diff watch compares across stops
+    /// (debugger design section 5.4): equal epochs prove the value
+    /// did not move, without comparing rendered text. An untracked
+    /// name reports `None`, so the watch falls back to comparing
+    /// rendered values.
+    pub(crate) fn mirror_epoch_of(&self, name: &str) -> Option<u64> {
+        if !self.tracked.contains(name) {
+            return None;
+        }
+        Some(self.mirror_epoch.get(name).copied().unwrap_or(0))
+    }
+
     fn import_attr_strings(&mut self) {
         for key in ATTR_KEYS {
             for name in self.string_marked_names(key) {

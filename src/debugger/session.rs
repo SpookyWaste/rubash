@@ -30,6 +30,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use super::breakpoints::BreakpointTable;
 use super::evaluation::EvaluationOutcome;
@@ -130,17 +131,20 @@ impl std::error::Error for SessionError {}
 /// The debug session core.
 ///
 /// One session serves one debuggee on its owning thread. The
-/// asynchronous stop flag is the single field another context (the
-/// boundary poll's signal path, in a later work package) touches,
-/// so it is atomic; everything else is plain data under the
-/// single-threaded contract.
+/// asynchronous stop flag is the single field another context
+/// touches — the boundary poll's signal path, and a frontend
+/// thread such as the DAP protocol reader (design section 13),
+/// which holds a shared handle through
+/// [`DebugSession::async_stop_flag`] — so it is atomic;
+/// everything else is plain data under the single-threaded
+/// contract.
 #[derive(Debug)]
 pub struct DebugSession {
     state: SessionState,
     last_stop: Option<StopInfo>,
     arming: StepArming,
     breakpoints: BreakpointTable,
-    async_stop: AtomicBool,
+    async_stop: Arc<AtomicBool>,
     termination: Option<Termination>,
     pending_events: VecDeque<DebugEvent>,
     inspection: Option<InspectionSnapshot>,
@@ -177,7 +181,7 @@ impl DebugSession {
             last_stop: Some(entry_stop.clone()),
             arming: StepArming::Continue,
             breakpoints: BreakpointTable::new(),
-            async_stop: AtomicBool::new(false),
+            async_stop: Arc::new(AtomicBool::new(false)),
             termination: None,
             pending_events: VecDeque::new(),
             inspection: None,
@@ -391,6 +395,16 @@ impl DebugSession {
     /// [`DebugEvent::AsyncStopServiced`] event.
     pub fn request_async_stop(&self) {
         self.async_stop.store(true, Ordering::Release);
+    }
+
+    /// The shareable handle to this session's asynchronous stop
+    /// flag, for a frontend that must request a stop from another
+    /// thread (the DAP protocol reader, design section 13, asking
+    /// for a pause while the debuggee runs free). Storing `true`
+    /// in it is exactly [`DebugSession::request_async_stop`];
+    /// nothing else about the session is reachable through it.
+    pub fn async_stop_flag(&self) -> Arc<AtomicBool> {
+        self.async_stop.clone()
     }
 
     /// Whether an asynchronous stop is waiting to be serviced.
