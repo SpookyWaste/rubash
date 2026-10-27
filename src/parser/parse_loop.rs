@@ -120,6 +120,14 @@ pub fn parse_with_options(tokens: &[Token], options: ParseLoopOptions) -> Ast {
 /// old model re-walked every body once to find its closer and again to
 /// parse it, which multiplied token work by the nesting depth.
 pub(super) fn run_command_loop(tokens: &[Token], state: &mut ParseState, start: usize) -> usize {
+    // rubash#1801: nested sections re-enter this loop once per nesting
+    // level, so this is the parser's recursion hub — grow the host
+    // thread's stack on demand instead of overflowing it
+    // (src/stack_growth.rs).
+    crate::stack_growth::ensure_stack(|| run_command_loop_walk(tokens, state, start))
+}
+
+fn run_command_loop_walk(tokens: &[Token], state: &mut ParseState, start: usize) -> usize {
     state.section_token_start = start;
     let mut i = start;
     while i < tokens.len() {
