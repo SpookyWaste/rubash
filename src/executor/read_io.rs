@@ -326,8 +326,13 @@ impl Executor {
                 escape_aware,
                 raw,
             ) {
-                self.read_eof_no_delimiter |=
-                    !record_contains_delimiter(&output, delimiter, escape_aware);
+                // read.def:949 EOF accounting is owned by
+                // read_coproc_stdout itself: it sets read_eof_no_delimiter
+                // only when the pipe ended before the delimiter arrived.
+                // Re-deriving EOF here from the TRIMMED record inverted
+                // every success case — trim_read_input has already removed
+                // the delimiter, so a full line (or a -n/-N limit stop)
+                // always looked like EOF (rubash#1623).
                 return Some(trim_read_input(
                     output,
                     delimiter,
@@ -932,6 +937,12 @@ impl Executor {
         let mut bytes = Vec::new();
         let mut consumed_chars = 0usize;
         let mut ended = false;
+        // True only when the pipe itself reported EOF (empty read or a
+        // read error): a deadline break or a SIGINT abort leaves the
+        // descriptor open in GNU (read.def keeps the fd across builtin
+        // calls), so it must not fall into the EOF close below
+        // (rubash#1624).
+        let mut hit_eof = false;
         // rubash#1300: escaped bytes never terminate the record.
         let mut escapes = crate::executor::fd_table::ReadEscapeTracker::new(escape_aware);
         // Post-escape counting state for the char limit (rubash#1328).
@@ -953,6 +964,7 @@ impl Executor {
             match crate::fd::read_some(pipe.handle, 1) {
                 Ok(buf) if buf.is_empty() => {
                     ended = true;
+                    hit_eof = true;
                     break;
                 }
                 Ok(buf) => {
@@ -985,6 +997,7 @@ impl Executor {
                 }
                 Err(_) => {
                     ended = true;
+                    hit_eof = true;
                     break;
                 }
             }
@@ -1007,7 +1020,7 @@ impl Executor {
                     .any(|byte| delimiter_byte_matches(*byte, delimiter))
             };
         }
-        if ended
+        if hit_eof
             && matches!(
                 self.fd_table.read_endpoint(fd),
                 Some(FdReadEndpoint::CoprocStdout { .. })
