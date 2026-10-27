@@ -5336,6 +5336,15 @@ impl Executor {
     /// Serve the stop the session is parked at: run the driver's
     /// stop loop, then apply its outcome.
     fn debugger_serve_stop(&mut self) -> Result<(), ExecuteError> {
+        // PLAN row 6 / WP-6: capture the stop's inspection snapshot
+        // from the live engine state and install it on the session
+        // before the stop loop runs, so the frontend renders exactly
+        // the state the debuggee is stopped in — the same views the
+        // §5.3 API exposes, never a second rendering.
+        let inspection = self.capture_inspection();
+        if let Some(driver) = self.debug_driver.as_mut() {
+            driver.session_mut().set_inspection(inspection);
+        }
         let outcome = match self.debug_driver.as_mut() {
             Some(driver) => driver.serve_stop(),
             None => return Ok(()),

@@ -108,7 +108,14 @@ mod tests {
     /// construction and state transitions).
     #[test]
     fn session_active_global_roundtrip() {
-        let _guard = crate::debugger::gate::GATE_TEST_LOCK.lock().unwrap();
+        // Acquire the lock the way every GateTestSpan does —
+        // poison-tolerantly. A span holder that panics mid-span
+        // poisons this mutex; the flag itself is restored by the
+        // span's Drop disarm, so this test recovers the guard
+        // instead of exploding on the poison.
+        let _guard = crate::debugger::gate::GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(!SESSION_ACTIVE.is_armed());
         SESSION_ACTIVE.arm();
         assert!(SESSION_ACTIVE.is_armed());

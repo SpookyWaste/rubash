@@ -294,7 +294,55 @@ where
     Ok(status)
 }
 
-pub(super) fn declaration_names_to_print(
+/// The declaration line for one name, rendered by the same printer
+/// the builtin's per-name loop uses (`print_declaration` /
+/// `print_unset_declaration` over the mirror value and the mark
+/// sets). This is the single-name entry to that one rendering path:
+/// the 1.5.0 state views (PLAN row 6) render variable snapshots
+/// through here so an inspection snapshot and `declare -p NAME` can
+/// never drift into two formatters. The tempenv underlay and dynamic
+/// views are listing-time concerns of the builtin and deliberately
+/// not modeled here — callers that need them consult those paths
+/// first, exactly as the loop above does. Returns None when the name
+/// has no binding the printer would render (the builtin reports it
+/// as not found).
+pub(crate) fn declaration_line(
+    name: &str,
+    variables: &crate::shell::var_table::VarTable,
+    plain: bool,
+) -> Option<String> {
+    let attrs = DeclarationAttrs {
+        exported: exported_vars(variables).contains(name),
+        readonly: marked_vars(variables, READONLY_VARS).contains(name),
+        array: marked_vars(variables, ARRAY_VARS).contains(name),
+        assoc: marked_vars(variables, ASSOC_VARS).contains(name),
+        integer: marked_vars(variables, INTEGER_VARS).contains(name),
+        uppercase: marked_vars(variables, UPPERCASE_VARS).contains(name),
+        lowercase: marked_vars(variables, LOWERCASE_VARS).contains(name),
+        capcase: marked_vars(variables, super::CAPCASE_VARS).contains(name),
+        nameref: marked_vars(variables, NAMEREF_VARS).contains(name),
+        trace: variables.is_marked(super::TRACE_VARS, name),
+    };
+    let mut out: Vec<u8> = Vec::new();
+    if let Some(value) = variables.get(name) {
+        let nbuckets = crate::executor::assoc_nbuckets(variables, name);
+        if plain {
+            print_plain_declaration(name, value, attrs, nbuckets, &mut out).ok()?;
+        } else {
+            print_declaration(name, value, attrs, nbuckets, &mut out).ok()?;
+        }
+    } else if attrs.has_scalar_attribute()
+        || marked_vars(variables, DECLARED_UNSET_VARS).contains(name)
+    {
+        print_unset_declaration(name, attrs, &mut out).ok()?;
+    } else {
+        return None;
+    }
+    let text = String::from_utf8(out).ok()?;
+    Some(text.trim_end_matches('\n').to_string())
+}
+
+pub(crate) fn declaration_names_to_print(
     variables: &crate::shell::var_table::VarTable,
     export: bool,
     readonly: bool,

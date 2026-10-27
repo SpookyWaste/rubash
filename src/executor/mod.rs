@@ -164,6 +164,7 @@ impl std::io::Write for WriteFileStderr {
 
 mod shift_echo_builtins;
 mod source_type_state;
+mod state_views;
 pub(crate) mod subscript_expansion;
 pub(in crate::executor) use subscript_expansion::{
     is_plain_literal_subscript, IndexedSubscript, OperandSubscriptMode, SubscriptSource,
