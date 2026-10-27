@@ -1449,7 +1449,44 @@ fn snarf_hosts_from_file(path: &str, out: &mut Vec<String>, depth: usize) -> boo
 }
 
 fn user_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<String> {
-    let mut candidates = ["USER", "LOGNAME", "USERNAME"]
+    // GNU lib/readline/complete.c:2377 rl_username_completion_function
+    // walks getpwent() entries in database order; the files-backed
+    // database is /etc/passwd (name = first colon field). The
+    // environment is never consulted: a login name that exists only in
+    // $USER is not a completion candidate (rubash#1794). Windows has no
+    // passwd database (GNU's _WIN32 branch returns NULL); keep the
+    // environment names the Windows shell itself maintains there.
+    #[cfg(unix)]
+    {
+        let _ = env_vars;
+        account_db_names(&passwd_db_path())
+    }
+    #[cfg(windows)]
+    {
+        env_account_candidates(env_vars, &["USER", "LOGNAME", "USERNAME"])
+    }
+}
+
+fn group_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<String> {
+    // GNU bashline.c:2723 bash_groupname_completion_function walks
+    // getgrent() entries in database order over /etc/group (name =
+    // first colon field); see user_completion_candidates (rubash#1794).
+    #[cfg(unix)]
+    {
+        let _ = env_vars;
+        account_db_names(&group_db_path())
+    }
+    #[cfg(windows)]
+    {
+        env_account_candidates(env_vars, &["GROUP", "GROUPNAME", "USERDOMAIN"])
+    }
+}
+
+/// The Windows fallback for -A user/-A group: the account names the
+/// environment itself carries, sorted and deduplicated.
+#[cfg(windows)]
+fn env_account_candidates(env_vars: &HashMap<String, String>, keys: &[&str]) -> Vec<String> {
+    let mut candidates = keys
         .iter()
         .filter_map(|name| env_vars.get(*name))
         .filter(|value| !value.is_empty())
@@ -1460,16 +1497,39 @@ fn user_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<String>
     candidates
 }
 
-fn group_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<String> {
-    let mut candidates = ["GROUP", "GROUPNAME", "USERDOMAIN"]
-        .iter()
-        .filter_map(|name| env_vars.get(*name))
-        .filter(|value| !value.is_empty())
-        .cloned()
-        .collect::<Vec<_>>();
-    candidates.sort();
-    candidates.dedup();
-    candidates
+/// First colon field of every record in a getpwent()/getgrent()-style
+/// database file, in database order with no sort and no dedup — the
+/// order GNU's completion generators yield entries in. Comment and
+/// blank lines carry no record; a record with an empty name field is
+/// malformed and skipped. With no readable database the generators
+/// yield nothing (mirrors the #1044 services walk).
+fn account_db_names(path: &std::path::Path) -> Vec<String> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for line in contents.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let name = line.split(':').next().unwrap_or("");
+        if !name.is_empty() {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// The system passwd database `getpwent()` walks on unix.
+#[cfg(unix)]
+fn passwd_db_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/etc/passwd")
+}
+
+/// The system group database `getgrent()` walks on unix.
+#[cfg(unix)]
+fn group_db_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/etc/group")
 }
 
 fn service_completion_candidates(word: &str) -> Vec<String> {
