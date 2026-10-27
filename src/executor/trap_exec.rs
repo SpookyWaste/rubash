@@ -4355,17 +4355,11 @@ impl Executor {
         }
         let close_after_command = auto_close
             && crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "varredir_close");
-        let body = if redirect.body_carrier.is_some() {
-            if redirect.here_string {
-                self.expand_here_string_mut_from_carrier(&redirect.body_carrier)
-            } else {
-                self.expand_heredoc_body_mut_from_carrier(&redirect.body_carrier)
-            }
-        } else if let Some(body) = &redirect.body {
-            self.expand_heredoc_body_mut(body)
-        } else {
-            String::new()
-        };
+        // The canonical ladder (expand_heredoc_redirect_text): a
+        // `{var}<<<word` dynamic fd holds the same bytes GNU's
+        // here_document_to_fd produces — storage prefix decoded and
+        // the here-string newline present (rubash#1867).
+        let body = self.expand_heredoc_redirect_text(redirect);
         let Some(fd) = self.allocate_dynamic_fd() else {
             // GNU exhausts {var} heredocs through the same REDIR_VARASSIGN
             // fcntl F_DUPFD path (probe: ulimit -Sn 6 then exec {v}<<E

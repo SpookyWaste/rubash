@@ -350,9 +350,11 @@ impl Executor {
         // `for` keyword's line is the ambient line_number in force while
         // the body executes — inner while/if/group diagnostics report it.
         let for_line = cmd.line;
-        let result = self.with_command_input_redirects(cmd, |executor| {
-            executor.with_ambient_line(for_line, |executor| {
-                executor.execute_for_command(&for_command)
+        let result = self.with_loop_fd_heredocs(cmd, |executor| {
+            executor.with_command_input_redirects(cmd, |executor| {
+                executor.with_ambient_line(for_line, |executor| {
+                    executor.execute_for_command(&for_command)
+                })
             })
         });
         let status = self.exit_code;

@@ -1,5 +1,4 @@
 use super::*;
-use crate::executor::markers::STORAGE_WORD_PREFIX;
 
 #[derive(Debug, Default)]
 pub(in crate::executor) struct ProcessSubstitutionFiles {
@@ -1044,10 +1043,10 @@ impl Executor {
         // rubash#355: the recorded key is the `/dev/fd/N` word form; the
         // bytes live in the fd's ProcessSubstitution write carrier (its
         // temp path), not at the word itself.
-        let path = if let Some(fd) = target
+        let word_fd = target
             .strip_prefix("/dev/fd/")
-            .and_then(|fd| fd.parse::<u32>().ok())
-        {
+            .and_then(|fd| fd.parse::<u32>().ok());
+        let path = if let Some(fd) = word_fd {
             match self.fd_table.output_endpoint(fd) {
                 Some(FdWriteEndpoint::ProcessSubstitution { path, .. }) => path,
                 _ => return Ok(()),
@@ -1063,6 +1062,18 @@ impl Executor {
         // itself prints still go out on its own stderr.
         let _ = self.execute_persistent_output_process_substitution(&source, input, None);
         let _ = fs::remove_file(path);
+        // rubash#1871: the fd dies with the assignment command, exactly
+        // like the input side's command-scoped close (#545 cell 2/3,
+        // #1691): GNU closes a command's process-substitution fds when
+        // the command finishes, so the stored `/dev/fd/N` word dangles
+        // from the next command on and an open by that name fails
+        // ENOENT. Leaving the fd-table entry behind let a later
+        // `printf ... > "$p"` resolve in-shell to the dead carrier and
+        // silently swallow the write (the carrier file recreated by
+        // the flush open, the consumer never re-run).
+        if let Some(fd) = word_fd {
+            self.fd_table.entries.remove(&fd);
+        }
         Ok(())
     }
 
@@ -1638,25 +1649,10 @@ impl Executor {
             .iter()
             .rev()
             .find(|redirect| redirect.fd == Some(fd))?;
-        if redirect.body_carrier.is_some() {
-            let mut input = if redirect.here_string {
-                self.expand_here_string_mut_from_carrier(&redirect.body_carrier)
-            } else {
-                self.expand_heredoc_body_mut_from_carrier(&redirect.body_carrier)
-            };
-            if redirect.here_string {
-                input.push('\n');
-            }
-            return Some(input);
+        if redirect.body_carrier.is_none() {
+            redirect.body.as_ref()?;
         }
-        let body = redirect.body.as_deref()?;
-        if let Some(word) = body.strip_prefix(STORAGE_WORD_PREFIX) {
-            let mut input =
-                decode_ansi_c_quoted_word(word).unwrap_or_else(|| self.expand_word(word));
-            input.push('\n');
-            return Some(input);
-        }
-        Some(self.expand_heredoc_body_mut(body))
+        Some(self.expand_heredoc_redirect_text(redirect))
     }
 }
 
@@ -1666,7 +1662,7 @@ impl Executor {
 /// A write-only /dev/null reproduces that observable contract on Unix —
 /// read(2) on a write-only descriptor fails EBADF. Elsewhere fall back to
 /// the plain null device (EOF).
-fn closed_stdin() -> Stdio {
+pub(in crate::executor) fn closed_stdin() -> Stdio {
     #[cfg(unix)]
     {
         if let Ok(file) = OpenOptions::new().write(true).open("/dev/null") {
