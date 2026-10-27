@@ -2518,18 +2518,50 @@ mod kernel_signals {
     /// signal keeps its handler and never reaches the hold).
     static FG_INT_HOLD: AtomicBool = AtomicBool::new(false);
 
+    /// rubash#1824: the steady state the live hold found on entry,
+    /// recorded by the FIRST holder only (a nested hold finds the
+    /// outer hold's Handler routing and must not overwrite the
+    /// record). The release restores this state instead of always
+    /// routing back to Default: since the rubash#1662 interactive
+    /// pin, an interactive shell's untrapped SIGINT already sits at
+    /// the mailbox Handler when a foreground wait begins, and
+    /// flipping it to Default on release would reopen the unpinned
+    /// window the pin closed until the next boundary reconcile.
+    static FG_INT_WAS_DEFAULT: AtomicBool = AtomicBool::new(true);
+
+    fn sigint_at_default() -> bool {
+        // sigaction(null) query, same probe as the entry-ignored
+        // snapshot: only SIG_DFL counts as the Default steady state.
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigaction(libc::SIGINT, std::ptr::null(), &mut current) } != 0 {
+            return false;
+        }
+        current.sa_sigaction == libc::SIG_DFL
+    }
+
     /// Route untrapped SIGINT to the mailbox handler and hold it there.
     /// Deliveries become observable pending entries (aborted as 128+SIGINT
     /// by the waiter's slice loop) instead of DFL deaths.
     pub(super) fn hold_fg_sigint() {
-        FG_INT_HOLD.store(true, Ordering::SeqCst);
+        if !FG_INT_HOLD.swap(true, Ordering::SeqCst) {
+            FG_INT_WAS_DEFAULT.store(sigint_at_default(), Ordering::SeqCst);
+        }
         reconcile(&[(libc::SIGINT as i32, Disposition::Handler)]);
     }
 
-    /// Release the hold: clear the flag first so the Default wish applies.
+    /// Release the hold: clear the flag first so the recorded wish
+    /// applies, then restore the steady state the hold found
+    /// (rubash#1824) — Default when the wait started from SIG_DFL,
+    /// Handler when the rubash#1662 pin had already routed SIGINT
+    /// to the mailbox.
     pub(super) fn release_fg_sigint() {
         FG_INT_HOLD.store(false, Ordering::SeqCst);
-        reconcile(&[(libc::SIGINT as i32, Disposition::Default)]);
+        let target = if FG_INT_WAS_DEFAULT.load(Ordering::SeqCst) {
+            Disposition::Default
+        } else {
+            Disposition::Handler
+        };
+        reconcile(&[(libc::SIGINT as i32, target)]);
     }
 
     static ENTRY_CAPTURED: std::sync::Once = std::sync::Once::new();
@@ -3123,8 +3155,9 @@ pub fn block_sigpipe_on_this_thread() {
     kernel_signals::block_sigpipe_on_this_thread()
 }
 
-/// rubash#1250: release the foreground SIGINT hold (restores Default,
-/// honoring the entry-ignore policy like any other Default wish).
+/// rubash#1250: release the foreground SIGINT hold (restores the
+/// steady state the hold found — Default, or the rubash#1662
+/// interactive pin's Handler routing; rubash#1824).
 #[cfg(unix)]
 pub fn release_fg_sigint() {
     kernel_signals::release_fg_sigint()
