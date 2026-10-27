@@ -109,13 +109,23 @@ fn wired_executor(handler: Handler) -> Wired {
 
 /// Write `script` to a fresh temp file and return the driver input
 /// that sources it plus the file's path string.
+///
+/// The path reaches the driver input **quoted**. It is a
+/// native-spelling path, and in a bare word the lexer treats `\`
+/// as an escape character: on Windows an unquoted
+/// `C:\Users\...` loses every separator, `.` cannot find the
+/// file, and the debuggee never runs (status 1, zero stops) —
+/// the harness shape the api consumer tests hit before this
+/// helper's callers did. Quoting delivers the path verbatim;
+/// this helper is the only interpolation point for every test
+/// in this module, so the quote lives here, not per test.
 fn sourced_script(name: &str, script: &str) -> (String, String) {
     let dir = std::env::temp_dir().join(format!("rubash-150-wiring-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let path = dir.join(format!("{name}.sh"));
     std::fs::write(&path, script).expect("write script");
     let path = path.to_string_lossy().into_owned();
-    (format!(". {path}"), path)
+    (format!(". \"{path}\""), path)
 }
 
 fn env_of(executor: &Executor, name: &str) -> Option<String> {
