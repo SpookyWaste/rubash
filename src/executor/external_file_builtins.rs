@@ -2638,6 +2638,21 @@ impl Executor {
     /// separated) and octal modes are honored; unknown option-looking words
     /// that precede the mode are ignored the way coreutils skips -f/-R/-v.
     fn external_chmod(&mut self, cmd: &CommandNode) -> Result<bool, ExecuteError> {
+        // rubash#1636/#1726 narrowing (2026-10-27 ruling): the parse
+        // below evaluates exactly one form — a bare MODE plus file
+        // operands, with a mode made of plain rwx bits. Every option
+        // is accepted but never applied (-R does not recurse, -c/-v
+        // never print, --reference is swallowed and the following
+        // word is misparsed as the mode), and whole mode classes are
+        // silently mishandled (special bits masked off by `& 0o777`,
+        // the `s`/`t` letters and copy classes rejected). Those
+        // shapes decline to the real binary (chmod_declines) — and so
+        // do invocations with no mode or no file operand, which the
+        // emulation answered silently where GNU reports a missing
+        // operand.
+        if chmod_declines(&cmd.words[1..]) {
+            return Ok(false);
+        }
         let mut mode: Option<&str> = None;
         let mut files: Vec<String> = Vec::new();
         for arg in &cmd.words[1..] {
@@ -2822,6 +2837,100 @@ fn current_umask(env_vars: &HashMap<String, String>) -> u32 {
     {
         0o022
     }
+}
+
+/// rubash#1636/#1726: whether a chmod invocation uses a shape the
+/// emulation does not implement — see external_chmod's header. The
+/// scan mirrors the handler's own classification (options and the
+/// mode come before file operands; `--` makes the next word the mode
+/// whatever it looks like) and judges only shape classes, never
+/// individual cases.
+fn chmod_declines(words: &[String]) -> bool {
+    let mut mode: Option<&str> = None;
+    let mut files = 0usize;
+    let mut after_terminator = false;
+    for word in words {
+        let arg = word.as_str();
+        if mode.is_some() {
+            files += 1;
+            continue;
+        }
+        if after_terminator {
+            mode = Some(arg);
+            if chmod_mode_declines(arg) {
+                return true;
+            }
+            continue;
+        }
+        if arg == "--" {
+            after_terminator = true;
+            continue;
+        }
+        if arg.starts_with('-') && arg.len() > 1 {
+            // Every option declines: the short letters the handler
+            // parses (-f/-R/-v/-c) are accepted but never applied,
+            // and every long option is swallowed the same way.
+            return true;
+        }
+        mode = Some(arg);
+        if chmod_mode_declines(arg) {
+            return true;
+        }
+    }
+    mode.is_none() || files == 0
+}
+
+/// rubash#1726: whether one chmod MODE operand needs semantics the
+/// emulation's evaluator does not have — an octal value carrying
+/// special bits (setuid/setgid/sticky) the emulation silently masks
+/// off with `& 0o777`, or a symbolic clause using the `s`/`t`
+/// permission letters, a copy class (`u`/`g`/`o` in the permission
+/// slot), or more than one operator. GNU coreutils chmod evaluates
+/// all of these (modechange.c), so the invocation declines instead
+/// of answering wrongly or failing a legal mode.
+fn chmod_mode_declines(mode: &str) -> bool {
+    if !mode.is_empty() && mode.chars().all(|ch| ch.is_ascii_digit()) {
+        // Octal form (a digit string with 8/9 is invalid in both
+        // implementations and stays on the emulation's error path).
+        return u32::from_str_radix(mode, 8)
+            .map(|value| value > 0o777)
+            .unwrap_or(false);
+    }
+    for clause in mode.split(',') {
+        let chars: Vec<char> = clause.chars().collect();
+        let mut index = 0;
+        while index < chars.len() && matches!(chars[index], 'u' | 'g' | 'o' | 'a') {
+            index += 1;
+        }
+        let mut operators = 0;
+        while index < chars.len() {
+            if !matches!(chars[index], '+' | '-' | '=') {
+                break;
+            }
+            operators += 1;
+            if operators > 1 {
+                return true;
+            }
+            index += 1;
+            // A copy class is a lone u/g/o in the permission slot.
+            if index < chars.len()
+                && matches!(chars[index], 'u' | 'g' | 'o')
+                && (index + 1 == chars.len() || matches!(chars[index + 1], '+' | '-' | '='))
+            {
+                return true;
+            }
+            while index < chars.len() && matches!(chars[index], 'r' | 'w' | 'x' | 'X') {
+                index += 1;
+            }
+            if index < chars.len() && matches!(chars[index], 's' | 't') {
+                return true;
+            }
+            if index < chars.len() && !matches!(chars[index], '+' | '-' | '=') {
+                break;
+            }
+        }
+    }
+    false
 }
 
 /// Apply one chmod MODE operand (octal or symbolic clauses) to BASE.

@@ -120,7 +120,11 @@ fn issue1725_mkfifo_creates_a_real_fifo() {
 fn issue1725_mkfifo_failure_is_the_real_binarys_diagnostic() {
     let dir = scratch("mkfifo-exists");
     std::fs::write(dir.join("p"), b"taken").expect("fixture file");
-    let out = run_in_dir(&dir, "mkfifo p 2>err.txt; echo rc=$?; cat err.txt", SYSTEM_PATH);
+    let out = run_in_dir(
+        &dir,
+        "mkfifo p 2>err.txt; echo rc=$?; cat err.txt",
+        SYSTEM_PATH,
+    );
     let _ = std::fs::remove_dir_all(&dir);
     // GNU coreutils mkfifo on an existing path: rc 1 and its own
     // `cannot create fifo ... File exists` text on the command's
@@ -129,11 +133,92 @@ fn issue1725_mkfifo_failure_is_the_real_binarys_diagnostic() {
     assert!(
         out.stdout.contains("rc=1"),
         "stdout={:?} stderr={:?}",
-        out.stdout, out.stderr
+        out.stdout,
+        out.stderr
     );
     assert!(
         out.stdout.contains("File exists"),
         "stdout={:?} stderr={:?}",
-        out.stdout, out.stderr
+        out.stdout,
+        out.stderr
     );
+}
+
+// --------------------------------------------------------------------
+// rubash#1726 — chmod: mode classes and option shapes the evaluator
+// cannot honor decline to the real binary; the bare MODE + files form
+// with plain rwx bits stays in-process.
+// --------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn issue1726_chmod_octal_special_bits_are_preserved() {
+    let dir = scratch("chmod-1777");
+    // Pre-fix the emulation masked the value with & 0o777 and landed
+    // 0777 without a word; GNU keeps the sticky bit.
+    let out = run_in_dir(&dir, "touch f; chmod 1777 f; stat -c %a f", SYSTEM_PATH);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out.stdout.trim(), "1777", "stderr={:?}", out.stderr);
+}
+
+#[cfg(unix)]
+#[test]
+fn issue1726_chmod_symbolic_special_bits_apply() {
+    let dir = scratch("chmod-symbolic");
+    // The issue's seed: `a+rwxt` is legal GNU (rwx for all + sticky);
+    // pre-fix the emulation rejected it as an invalid mode.
+    let out = run_in_dir(
+        &dir,
+        "touch f; chmod 755 f; chmod a+rwxt f; stat -c %a f",
+        SYSTEM_PATH,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out.stdout.trim(), "1777", "stderr={:?}", out.stderr);
+}
+
+#[cfg(unix)]
+#[test]
+fn issue1726_chmod_unhonored_shapes_reach_the_path_binary() {
+    let dir = scratch("chmod-decline");
+    std::fs::write(dir.join("f"), b"x").expect("fixture f");
+    std::fs::create_dir_all(dir.join("d")).expect("fixture d");
+    let path = fakebin_path(&dir, &["chmod"]);
+    for script in [
+        // -R never recursed; --reference was swallowed and the next
+        // word misparsed as the mode; a missing operand was answered
+        // silently; s/t and copy classes and special bits are #1726.
+        "chmod -R 700 d",
+        "chmod --reference=f f",
+        "chmod",
+        "chmod 1777 f",
+        "chmod u+s f",
+        "chmod g=u f",
+        "chmod u+rw-x f",
+    ] {
+        let out = run_in_dir(&dir, script, &path);
+        assert!(
+            out.stdout.contains("FAKEBIN-chmod") && out.status == 42,
+            "{script}: expected the PATH binary to answer, got status={} stdout={:?} stderr={:?}",
+            out.status,
+            out.stdout,
+            out.stderr
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn issue1726_chmod_plain_forms_stay_in_process() {
+    let dir = scratch("chmod-kept");
+    std::fs::write(dir.join("f"), b"x").expect("fixture f");
+    let path = fakebin_path(&dir, &["chmod"]);
+    // Kept subset: bare octal and single-operator rwx symbolics are
+    // evaluated exactly by the emulation — no marker, and the real
+    // inode mode (read back through the real stat) proves it answered.
+    let out = run_in_dir(&dir, "chmod 755 f; stat -c %a f", &path);
+    assert_eq!(out.stdout.trim(), "755", "stderr={:?}", out.stderr);
+    let out = run_in_dir(&dir, "chmod u+x f; stat -c %a f", &path);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out.stdout.trim(), "755", "stderr={:?}", out.stderr);
 }
