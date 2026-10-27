@@ -5419,56 +5419,80 @@ impl Executor {
                         driver.session_mut().set_inspection(inspection);
                     }
                 }
-            crate::debugger::StopLoopOutcome::Resume(arming) => {
-                let Some(driver) = self.debug_driver.as_mut() else {
-                    return Ok(());
-                };
-                return match driver.session_mut().resume(arming) {
-                    Ok(()) => Ok(()),
-                    Err(_) => {
-                        // The stop loop ended the session while
-                        // parked (exit/die) and still asked to
-                        // resume: no debuggee is left to continue,
-                        // so the run unwinds with the session's
-                        // final status — the same shape as the
-                        // debuggee exiting at this point.
-                        let status = driver
-                            .session()
-                            .termination()
-                            .map(|termination| termination.status())
-                            .unwrap_or(self.exit_code);
-                        Err(ExecuteError::ExitCode(status))
-                    }
-                }
-            }
-            crate::debugger::StopLoopOutcome::ForceReturn(status) => {
-                // Design 6.1 (`return [status]`): force the frame
-                // the debuggee is stopped in to return now. The
-                // unwind is the engine's own return path — the
-                // same ExecuteError::Return the `return` builtin
-                // raises — so the frame's return site reports the
-                // return (DE-04) carrying the forced status, and
-                // the finish-style arming installed here stops the
-                // session in the caller at the return point.
-                let function_depth = self.shell_state.function_depth;
-                let in_function = function_depth > 0;
-                let in_source = self.source_nest_depth > 0;
-                let forced_status = status.unwrap_or(self.exit_code);
-                let Some(driver) = self.debug_driver.as_mut() else {
-                    return Ok(());
-                };
-                if !in_function && !in_source {
-                    // Rejected at the main frame: there is no frame
-                    // to return from, so the debuggee simply
-                    // resumes (the frontend owns telling the user
-                    // why). A session the stop loop ended while
-                    // parked unwinds with its final status, exactly
-                    // like the Resume outcome's failure shape.
-                    return match driver
-                        .session_mut()
-                        .resume(crate::debugger::StepArming::Continue)
-                    {
+                crate::debugger::StopLoopOutcome::Resume(arming) => {
+                    let Some(driver) = self.debug_driver.as_mut() else {
+                        return Ok(());
+                    };
+                    return match driver.session_mut().resume(arming) {
                         Ok(()) => Ok(()),
+                        Err(_) => {
+                            // The stop loop ended the session while
+                            // parked (exit/die) and still asked to
+                            // resume: no debuggee is left to continue,
+                            // so the run unwinds with the session's
+                            // final status — the same shape as the
+                            // debuggee exiting at this point.
+                            let status = driver
+                                .session()
+                                .termination()
+                                .map(|termination| termination.status())
+                                .unwrap_or(self.exit_code);
+                            Err(ExecuteError::ExitCode(status))
+                        }
+                    };
+                }
+                crate::debugger::StopLoopOutcome::ForceReturn(status) => {
+                    // Design 6.1 (`return [status]`): force the frame
+                    // the debuggee is stopped in to return now. The
+                    // unwind is the engine's own return path — the
+                    // same ExecuteError::Return the `return` builtin
+                    // raises — so the frame's return site reports the
+                    // return (DE-04) carrying the forced status, and
+                    // the finish-style arming installed here stops the
+                    // session in the caller at the return point.
+                    let function_depth = self.shell_state.function_depth;
+                    let in_function = function_depth > 0;
+                    let in_source = self.source_nest_depth > 0;
+                    let forced_status = status.unwrap_or(self.exit_code);
+                    let Some(driver) = self.debug_driver.as_mut() else {
+                        return Ok(());
+                    };
+                    if !in_function && !in_source {
+                        // Rejected at the main frame: there is no frame
+                        // to return from, so the debuggee simply
+                        // resumes (the frontend owns telling the user
+                        // why). A session the stop loop ended while
+                        // parked unwinds with its final status, exactly
+                        // like the Resume outcome's failure shape.
+                        return match driver
+                            .session_mut()
+                            .resume(crate::debugger::StepArming::Continue)
+                        {
+                            Ok(()) => Ok(()),
+                            Err(_) => Err(ExecuteError::ExitCode(
+                                driver
+                                    .session()
+                                    .termination()
+                                    .map(|termination| termination.status())
+                                    .unwrap_or(self.exit_code),
+                            )),
+                        };
+                    }
+                    let arming = if in_function {
+                        crate::debugger::StepArming::Finish {
+                            frame_depth: function_depth,
+                        }
+                    } else {
+                        // A sourced file's return has no function
+                        // return site to service a Finish arming: the
+                        // return point in the caller is its next seam,
+                        // which a step-over armed at this depth names.
+                        crate::debugger::StepArming::StepOver {
+                            max_depth: function_depth,
+                        }
+                    };
+                    return match driver.session_mut().resume(arming) {
+                        Ok(()) => Err(ExecuteError::Return(forced_status)),
                         Err(_) => Err(ExecuteError::ExitCode(
                             driver
                                 .session()
@@ -5478,30 +5502,6 @@ impl Executor {
                         )),
                     };
                 }
-                let arming = if in_function {
-                    crate::debugger::StepArming::Finish {
-                        frame_depth: function_depth,
-                    }
-                } else {
-                    // A sourced file's return has no function
-                    // return site to service a Finish arming: the
-                    // return point in the caller is its next seam,
-                    // which a step-over armed at this depth names.
-                    crate::debugger::StepArming::StepOver {
-                        max_depth: function_depth,
-                    }
-                };
-                return match driver.session_mut().resume(arming) {
-                    Ok(()) => Err(ExecuteError::Return(forced_status)),
-                    Err(_) => Err(ExecuteError::ExitCode(
-                        driver
-                            .session()
-                            .termination()
-                            .map(|termination| termination.status())
-                            .unwrap_or(self.exit_code),
-                    )),
-                }
-            }
                 crate::debugger::StopLoopOutcome::Detach => {
                     if let Some(driver) = self.debug_driver.take() {
                         driver.session().deactivate();

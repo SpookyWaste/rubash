@@ -219,38 +219,24 @@ impl WhitelistRejection {
     /// The human reason for the class, as the design states it.
     pub fn reason(&self) -> &'static str {
         match self.kind {
-            RejectionKind::CommandSubstitution => {
-                "command substitution is not a read-only form"
-            }
-            RejectionKind::BacktickSubstitution => {
-                "backquote substitution is not a read-only form"
-            }
-            RejectionKind::ProcessSubstitution => {
-                "process substitution is not a read-only form"
-            }
+            RejectionKind::CommandSubstitution => "command substitution is not a read-only form",
+            RejectionKind::BacktickSubstitution => "backquote substitution is not a read-only form",
+            RejectionKind::ProcessSubstitution => "process substitution is not a read-only form",
             RejectionKind::AssignmentExpansion => {
                 "the expansion assigns to the debuggee's variables"
             }
-            RejectionKind::ErrorExpansion => {
-                "the expansion can abort the debuggee"
-            }
+            RejectionKind::ErrorExpansion => "the expansion can abort the debuggee",
             RejectionKind::ArithmeticAssignment => {
                 "the arithmetic assigns to the debuggee's variables"
             }
-            RejectionKind::ArithmeticUpdate => {
-                "the arithmetic updates the debuggee's variables"
-            }
+            RejectionKind::ArithmeticUpdate => "the arithmetic updates the debuggee's variables",
             RejectionKind::AssignmentForm => "an assignment is not an expansion",
             RejectionKind::RedirectForm => "a redirection is not an expansion",
-            RejectionKind::NotOneExpansion => {
-                "implicit evaluation takes exactly one expansion"
-            }
+            RejectionKind::NotOneExpansion => "implicit evaluation takes exactly one expansion",
             RejectionKind::PathnamePattern => {
                 "pathname expansion depends on the filesystem, not the frame"
             }
-            RejectionKind::BraceExpansion => {
-                "brace expansion yields more than one field"
-            }
+            RejectionKind::BraceExpansion => "brace expansion yields more than one field",
         }
     }
 
@@ -418,8 +404,7 @@ pub fn parse_failure(ast: &Ast) -> Option<EvaluationDiagnostic> {
             .iter()
             .find(|(name, _)| name == "__RUBASH_PARSE_ERROR__")
         {
-            let mut diagnostic =
-                EvaluationDiagnostic::new(DiagnosticKind::Parse, message.clone());
+            let mut diagnostic = EvaluationDiagnostic::new(DiagnosticKind::Parse, message.clone());
             diagnostic.line = cmd.line;
             return Some(diagnostic);
         }
@@ -656,8 +641,7 @@ fn classify_braced_body(body: &[char], form: &str) -> Result<(), WhitelistReject
     // Optional subscript: its text is arithmetic context (plus
     // expansion spans of its own).
     if rest.first() == Some(&'[') {
-        let end = matched_span_end(rest, 0, '[', ']')
-            .unwrap_or(rest.len());
+        let end = matched_span_end(rest, 0, '[', ']').unwrap_or(rest.len());
         let inner = if end >= 2 && rest[end - 1] == ']' {
             &rest[1..end - 1]
         } else {
@@ -679,10 +663,7 @@ fn classify_braced_body(body: &[char], form: &str) -> Result<(), WhitelistReject
                 RejectionKind::AssignmentExpansion,
                 form,
             )),
-            '?' => Err(WhitelistRejection::new(
-                RejectionKind::ErrorExpansion,
-                form,
-            )),
+            '?' => Err(WhitelistRejection::new(RejectionKind::ErrorExpansion, form)),
             // Substring: the offset/length text is arithmetic.
             _ => check_arithmetic_body(&rest[1..], form),
         },
@@ -691,10 +672,7 @@ fn classify_braced_body(body: &[char], form: &str) -> Result<(), WhitelistReject
             RejectionKind::AssignmentExpansion,
             form,
         )),
-        '?' => Err(WhitelistRejection::new(
-            RejectionKind::ErrorExpansion,
-            form,
-        )),
+        '?' => Err(WhitelistRejection::new(RejectionKind::ErrorExpansion, form)),
         '#' | '%' => {
             let op_len = if rest.get(1) == Some(&rest[0]) { 2 } else { 1 };
             check_word_chars(&rest[op_len..], form)

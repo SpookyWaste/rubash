@@ -161,10 +161,7 @@ fn implicit_whitelist_rejects_each_listed_form() {
         ("$((x--))", RejectionKind::ArithmeticUpdate),
         ("$((++x))", RejectionKind::ArithmeticUpdate),
         ("$((--x))", RejectionKind::ArithmeticUpdate),
-        (
-            "${arr[$((i+=1))]}",
-            RejectionKind::ArithmeticAssignment,
-        ),
+        ("${arr[$((i+=1))]}", RejectionKind::ArithmeticAssignment),
         ("${arr[i++]}", RejectionKind::ArithmeticUpdate),
         ("${x:-$(date)}", RejectionKind::CommandSubstitution),
         ("${x:-`date`}", RejectionKind::BacktickSubstitution),
@@ -218,7 +215,14 @@ fn explicit_routing_shape() {
             "{text}: one expansion routes to word expansion"
         );
     }
-    for text in ["x=1", "arr[1]=v", "echo hi", "x=1 y=2", "local L=1", "set -- a b"] {
+    for text in [
+        "x=1",
+        "arr[1]=v",
+        "echo hi",
+        "x=1 y=2",
+        "local L=1",
+        "set -- a b",
+    ] {
         let ast = parse(text);
         assert!(
             single_expansion_word(&ast).is_none(),
@@ -297,7 +301,9 @@ impl StopLoop for EvalLoop {
         }
         let info = session.last_stop().cloned().expect("serve implies a stop");
         if info.reason == StopReason::Entry {
-            session.breakpoints_mut().insert_line(self.file.clone(), self.line);
+            session
+                .breakpoints_mut()
+                .insert_line(self.file.clone(), self.line);
             return StopLoopOutcome::Resume(StepArming::Continue);
         }
         if matches!(info.reason, StopReason::Breakpoint(_)) {
@@ -339,7 +345,9 @@ impl OutcomeCursor<'_> {
             EvaluationResult::Rejected(diagnostic) => {
                 assert_eq!(diagnostic.kind, DiagnosticKind::Expansion);
                 assert!(
-                    diagnostic.message.starts_with("implicit evaluation skipped: "),
+                    diagnostic
+                        .message
+                        .starts_with("implicit evaluation skipped: "),
                     "diagnostic shape: {}",
                     diagnostic.message
                 );
@@ -668,4 +676,3 @@ fn extglob_pattern_is_refused_at_a_stop() {
     }
     assert_eq!(read(&dir, "done.txt").trim_end(), "done ok");
 }
-
