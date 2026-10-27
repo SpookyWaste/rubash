@@ -27,7 +27,6 @@ fn rubash(script: &str) -> (String, String, Option<i32>) {
 }
 
 #[test]
-#[ignore = "issue#1278 drift on master ec279df1: no timing report at all when errexit fires on `time false` (stderr empty; GNU prints the report) — reported in bf-w3-a REPORT.md as a suspected live bug"]
 fn time_report_printed_when_errexit_fires() {
     let (stdout, stderr, code) = rubash("set -e\ntime false\necho lived");
     assert_eq!(stdout, "");
@@ -39,7 +38,6 @@ fn time_report_printed_when_errexit_fires() {
 }
 
 #[test]
-#[ignore = "issue#1278 drift on master ec279df1: the -p timing report is likewise dropped when errexit fires — reported in bf-w3-a REPORT.md as a suspected live bug"]
 fn time_p_report_printed_when_errexit_fires() {
     let (stdout, stderr, code) = rubash("set -e\ntime -p false\necho lived");
     assert_eq!(stdout, "");
