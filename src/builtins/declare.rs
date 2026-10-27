@@ -14,6 +14,9 @@ mod output;
 mod print;
 pub(in crate::builtins) mod storage;
 
+pub(crate) use output::{print_declaration, DeclarationAttrs};
+pub(crate) use print::{declaration_line, declaration_names_to_print};
+
 use crate::shell::VariableStore;
 use assign::assign_declare_names;
 use attrs::{apply_declare_attrs, DeclareOptions};
