@@ -61,7 +61,20 @@ fn program_file(name: &str, source: &str) -> (std::path::PathBuf, String) {
     let path = dir.join(format!("{name}.sh"));
     std::fs::write(&path, source).expect("write program");
     let canonical = std::fs::canonicalize(&path).expect("canonicalize");
-    (dir, canonical.to_string_lossy().into_owned())
+    // The identity form the session core itself uses: the
+    // canonicalizer's extended-length prefix stripped, so the
+    // string the test normalizes by is the string the frontend
+    // prints (a mismatch here fails on Windows only, with the
+    // behavior itself byte-identical).
+    let text = canonical.to_string_lossy().into_owned();
+    let identity = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        text
+    };
+    (dir, identity)
 }
 
 /// Run one scripted CLI session; return (status, transcript with
