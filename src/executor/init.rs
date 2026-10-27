@@ -691,6 +691,14 @@ impl Executor {
         env_vars.entry("PATH".to_string()).or_insert_with(|| {
             "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:.".to_string()
         });
+        // Whether THIS_SH arrived with the environment: like the
+        // SHELL/PATH fallbacks above, a value fabricated here is a
+        // shell-internal convenience (the shell-under-test pointer for
+        // ${THIS_SH} recursion), not a GNU shell variable — GNU has no
+        // THIS_SH at all — so a fabricated one must NOT carry the export
+        // mark into child environments (rubash#1806). An inherited
+        // THIS_SH keeps its imported mark, as any imported variable does.
+        let this_sh_inherited = env_vars.contains_key("THIS_SH");
         // GNU test scripts use ${THIS_SH} to invoke the shell under test
         // (e.g. `${THIS_SH} -c '...'`). Rubash is always the shell under
         // test, so the auto-detected executable path must OVERRIDE any
@@ -754,6 +762,9 @@ impl Executor {
         #[cfg(unix)]
         if !path_inherited {
             unmark_env_name(env_vars, EXPORTED_VARS, "PATH");
+        }
+        if !this_sh_inherited {
+            unmark_env_name(env_vars, EXPORTED_VARS, "THIS_SH");
         }
         // GNU variables.c initialize_shell_variables only imports TMPDIR from
         // the environment — it never invents a value (WSL probe: `env -i

@@ -2280,7 +2280,7 @@ impl Executor {
             // element's assignment values on this shared executor —
             // bracket it so binds land only in the child's env.
             let saved_env = self.snapshot_spec_env(&consumers[index]);
-            self.apply_external_environment(&consumers[index], &mut process);
+            self.apply_external_environment(&consumers[index], &mut process, program);
             self.restore_spec_env_into_process(saved_env, &mut process);
             // Consumer j's stdin is pipe[j]'s read end.
             {
@@ -2884,7 +2884,7 @@ impl Executor {
             // shared executor — bracket it so binds land only in the
             // child's env (see restore_spec_env_into_process).
             let saved_env = self.snapshot_spec_env(&commands[index]);
-            self.apply_external_environment(&commands[index], &mut process);
+            self.apply_external_environment(&commands[index], &mut process, program);
             self.restore_spec_env_into_process(saved_env, &mut process);
 
             if index == 0 {
@@ -3147,7 +3147,7 @@ impl Executor {
             };
             // rubash#1564: tempenv bracket, as in spawn_wait above.
             let saved_env = self.snapshot_spec_env(commands[index]);
-            self.apply_external_environment(commands[index], &mut process);
+            self.apply_external_environment(commands[index], &mut process, program);
             self.restore_spec_env_into_process(saved_env, &mut process);
             if index == 0 {
                 if stage0_inherits {
@@ -3615,7 +3615,7 @@ impl Executor {
             // Same tempenv application as the os_pipe path above.
             // rubash#1564: tempenv bracket, as in spawn_wait above.
             let saved_env = self.snapshot_spec_env(&commands[index]);
-            self.apply_external_environment(&commands[index], &mut process);
+            self.apply_external_environment(&commands[index], &mut process, program);
             self.restore_spec_env_into_process(saved_env, &mut process);
 
             if let Some(stdout) = previous_stdout.take() {

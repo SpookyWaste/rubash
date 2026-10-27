@@ -94,15 +94,22 @@ impl Executor {
         let Some(config) = self.parse_env_command_args(args)? else {
             return Ok(());
         };
-        let Some(env_vars) = self.materialize_env_command_environment(&config)? else {
+        let Some(env_vars) = self.materialize_env_command_environment(cmd, &config)? else {
             return Ok(());
         };
+        // Lookup view of the composed environment for the consumers
+        // that take a name->value map (program resolution, argv0
+        // detection, chdir translation); composition ORDER lives only
+        // in env_vars itself.
+        let env_map: HashMap<String, String> = env_vars.iter().cloned().collect();
 
         if config.command.is_empty() {
             let mut output = Vec::new();
-            let mut entries = env_vars.iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-            for (key, value) in entries {
+            // Composition order is the output order (rubash#1806): GNU
+            // env prints the environment array it was exec'd with,
+            // which maybe_make_export_env built temporary-block first
+            // and `_` last — no sorting anywhere in the chain.
+            for (key, value) in &env_vars {
                 output.extend_from_slice(key.as_bytes());
                 output.push(b'=');
                 // GNU coreutils env writes each exported value cell's raw
@@ -131,7 +138,7 @@ impl Executor {
             return Ok(());
         }
 
-        let Some(program) = find_user_command(&config.command[0], &env_vars) else {
+        let Some(program) = find_user_command(&config.command[0], &env_map) else {
             let mut stderr = Vec::new();
             writeln!(
                 &mut stderr,
@@ -152,8 +159,8 @@ impl Executor {
             &program,
             Some(&config.command[0]),
             &dev_args,
-            &env_vars,
-            env_vars
+            &env_map,
+            env_map
                 .get("BASH_ARGV0")
                 .is_some_and(|value| !value.is_empty()),
         );
@@ -173,7 +180,7 @@ impl Executor {
         process.current_dir(&self.shell_state.cwd);
         apply_env_command_environment(&mut process, &env_vars, !config.ignore_environment);
         if let Some(chdir) = &config.chdir {
-            let directory = shell_path_to_windows(chdir, &env_vars);
+            let directory = shell_path_to_windows(chdir, &env_map);
             if !directory.is_dir() {
                 self.write_default_stderr(b"env: cannot change directory\n")?;
                 self.exit_code = 125;
@@ -322,7 +329,7 @@ impl Executor {
             }
 
             if let Some((name, value)) = parse_env_assignment_arg(&arg) {
-                config.assignments.insert(name, value);
+                config.assignments.push((name, value));
                 continue;
             }
 
@@ -341,11 +348,64 @@ impl Executor {
 
     fn materialize_env_command_environment(
         &mut self,
+        cmd: &CommandNode,
         config: &EnvCommandConfig,
-    ) -> Result<Option<HashMap<String, String>>, ExecuteError> {
-        let mut env_vars = HashMap::new();
+    ) -> Result<Option<Vec<(String, String)>>, ExecuteError> {
+        // The composed environment is ORDERED (rubash#1806): GNU
+        // variables.c maybe_make_export_env flattens the variable
+        // contexts into the child env array in a fixed block order —
+        // the temporary_env context (this command's prefix assignments)
+        // FIRST, then the shell_variables contexts, then the exported
+        // functions — with add_or_supercede semantics (a name already
+        // present is replaced in place, never appended twice), so the
+        // temporary binding shadows the global of the same name. Within
+        // the global block GNU iterates hash chains, whose order is an
+        // implementation artifact, not a contract; this composition
+        // sorts that block by name so the emitted order is
+        // deterministic. The bare-`env` print path emits this order
+        // verbatim.
+        let mut env_vars: Vec<(String, String)> = Vec::new();
         if !config.ignore_environment {
-            for name in marked_env_names(&self.shell_state.env_vars, EXPORTED_VARS) {
+            // Block 1: this command's prefix assignments, in source
+            // order, valued exactly as apply_external_environment
+            // values them for the real spawn path (append assignments
+            // read the value the dispatch seam already composed into
+            // the table; plain assignments re-derive from the expanded
+            // word — cmd.assignments are post-expansion text).
+            let raws_aligned = cmd.assignment_raws.len() == cmd.assignments.len();
+            for (index, (var_name, var_value)) in cmd.assignments.iter().enumerate() {
+                let (base_name, append) = assignment_name_and_append(var_name);
+                let Some(env_name) = self.tempenv_export_name(base_name) else {
+                    continue;
+                };
+                if append {
+                    if let Some(value) = self.shell_state.env_vars.get(base_name) {
+                        ordered_env_insert(&mut env_vars, env_name, value.clone());
+                    }
+                    continue;
+                }
+                let raw = raws_aligned
+                    .then(|| cmd.assignment_raws.get(index))
+                    .flatten()
+                    .map(String::as_str);
+                let expanded_value =
+                    self.expand_assignment_value_with_raw(var_name, var_value, raw);
+                let expanded_value = expanded_value
+                    .strip_prefix(crate::executor::types::COMPOUND_ASSIGNMENT_MARKER)
+                    .unwrap_or(&expanded_value);
+                ordered_env_insert(&mut env_vars, env_name, expanded_value.to_string());
+            }
+            // Block 2: exported shell variables. A name the prefix block
+            // already emitted is shadowed by it (GNU flatten rule) and
+            // must not be appended a second time. GNU iterates its hash
+            // chains here (an artifact order); rubash composes this
+            // block sorted by name so the print order is deterministic.
+            let mut global_names = marked_env_names(&self.shell_state.env_vars, EXPORTED_VARS);
+            global_names.sort();
+            for name in global_names {
+                if ordered_env_contains(&env_vars, &name) {
+                    continue;
+                }
                 // GNU variables.c make_env_array_from_var_list: array and
                 // associative variables never cross the child env boundary
                 // (rubash#534) — `env`'s internal emulation mirrors the
@@ -354,17 +414,22 @@ impl Executor {
                     continue;
                 }
                 if let Some(value) = self.shell_state.env_vars.get(&name) {
-                    env_vars.insert(name, value.clone());
+                    ordered_env_insert(&mut env_vars, name, value.clone());
                 }
             }
-            for (name, value) in local_export_env_values(&self.shell_state.env_vars) {
+            let mut stash_entries = local_export_env_values(&self.shell_state.env_vars);
+            stash_entries.sort();
+            for (name, value) in stash_entries {
+                if ordered_env_contains(&env_vars, &name) {
+                    continue;
+                }
                 // Same rule as apply_child_environment: the stash stands
                 // in for the shadowed outer binding only while the local
                 // is not itself a live export candidate (rubash#970).
                 if !local_export_env_entry_applies(&self.shell_state.env_vars, &name) {
                     continue;
                 }
-                env_vars.insert(name, value);
+                ordered_env_insert(&mut env_vars, name, value);
             }
             // GNU `env` is an external binary that inherits the shell's OS
             // environment, in which every exported function was
@@ -374,7 +439,10 @@ impl Executor {
             // real spawn path does (apply_exported_functions_to_child),
             // or `env | grep BASH_FUNC` reports nothing while `printenv`
             // (a real external) sees the function (rubash#253).
-            for name in marked_env_names(&self.shell_state.env_vars, EXPORTED_FUNCTIONS) {
+            let mut function_names =
+                marked_env_names(&self.shell_state.env_vars, EXPORTED_FUNCTIONS);
+            function_names.sort();
+            for name in function_names {
                 if let Some(body) = self.shell_state.functions.get(&name) {
                     let def_redirects = self
                         .shell_state
@@ -382,7 +450,8 @@ impl Executor {
                         .get(&name)
                         .map(|info| info.def_redirects.as_slice())
                         .unwrap_or(&[]);
-                    env_vars.insert(
+                    ordered_env_insert(
+                        &mut env_vars,
                         exported_function_env_name(&name),
                         exported_function_env_value(&body.commands, def_redirects),
                     );
@@ -395,6 +464,9 @@ impl Executor {
             // given (builtins/../coreutils env semantics).
             #[cfg(windows)]
             for name in ["SystemRoot", "WINDIR", "ComSpec"] {
+                if ordered_env_contains(&env_vars, name) {
+                    continue;
+                }
                 if let Some(value) = self
                     .shell_state
                     .env_vars
@@ -402,8 +474,27 @@ impl Executor {
                     .cloned()
                     .or_else(|| env::var(name).ok())
                 {
-                    env_vars.entry(name.to_string()).or_insert(value);
+                    ordered_env_insert(&mut env_vars, name.to_string(), value);
                 }
+            }
+            // Final entry: `_`. GNU execute_cmd.c execute_disk_command
+            // calls put_command_name_into_env (variables.c) with the
+            // pathname search_for_command resolved for the command about
+            // to run — for the `env` emulation that command is `env`
+            // itself, so the composed environment ends with `_` naming
+            // the resolved env program (coreutils env does not rewrite
+            // `_` for its own child; it is inherited as-is). Resolution
+            // runs against the environment composed so far, so a prefix
+            // PATH assignment steers it exactly as the real spawn path
+            // would steer the lookup of `env`. If `env` does not
+            // resolve, no `_` is fabricated.
+            let lookup_map: HashMap<String, String> = env_vars.iter().cloned().collect();
+            if let Some(env_program) = find_user_command("env", &lookup_map) {
+                ordered_env_insert(
+                    &mut env_vars,
+                    "_".to_string(),
+                    env_program.to_string_lossy().into_owned(),
+                );
             }
         }
 
@@ -416,7 +507,7 @@ impl Executor {
                             continue;
                         }
                         if let Some((name, value)) = parse_env_assignment_arg(line) {
-                            env_vars.insert(name, value);
+                            ordered_env_insert(&mut env_vars, name, value);
                         }
                     }
                 }
@@ -430,10 +521,10 @@ impl Executor {
             }
         }
         for name in &config.unset_names {
-            env_vars.remove(name);
+            ordered_env_remove(&mut env_vars, name);
         }
         for (name, value) in &config.assignments {
-            env_vars.insert(name.clone(), value.clone());
+            ordered_env_insert(&mut env_vars, name.clone(), value.clone());
         }
         materialize_required_windows_env(
             &mut env_vars,
@@ -715,7 +806,7 @@ impl Executor {
         );
         // G-02: children are born in the session cwd, not the process cwd.
         process.current_dir(&self.shell_state.cwd);
-        self.apply_external_environment(cmd, &mut process);
+        self.apply_external_environment(cmd, &mut process, &program);
         self.apply_external_redirects(cmd, &mut process)?;
         self.spawn_external_process(cmd, &program, process, used_shell, dev_ops)
     }
@@ -911,6 +1002,7 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
         process: &mut Command,
+        program: &std::path::Path,
     ) {
         self.apply_child_environment(process);
         let raws_aligned = cmd.assignment_raws.len() == cmd.assignments.len();
@@ -950,6 +1042,14 @@ impl Executor {
                 }
             }
         }
+        // GNU execute_cmd.c execute_disk_command finishes the child
+        // environment with put_command_name_into_env (variables.c):
+        // `_` is set to the pathname search_for_command resolved for
+        // the command about to run, superseding any inherited or
+        // prefix-assigned entry, for every external command
+        // (rubash#1806). Setting it last in this composition is what
+        // makes the supersede hold over both sources above.
+        process.env("_", program.to_string_lossy().into_owned());
     }
 
     /// GNU variables.c:3564-3578 assign_in_env -> bind_variable (ASS_NAMEREF):
@@ -1633,7 +1733,7 @@ impl Executor {
                         shell_process.args(&cmd.words[1..]);
                         // G-02: children are born in the session cwd.
                         shell_process.current_dir(&self.shell_state.cwd);
-                        self.apply_external_environment(cmd, &mut shell_process);
+                        self.apply_external_environment(cmd, &mut shell_process, program);
                         self.apply_external_redirects(cmd, &mut shell_process)?;
                         return self.spawn_external_process(
                             cmd,
@@ -2060,7 +2160,10 @@ struct EnvCommandConfig {
     null_terminated: bool,
     debug: bool,
     unset_names: Vec<String>,
-    assignments: HashMap<String, String>,
+    // Kept in argument order: coreutils env applies its NAME=value
+    // operands in order (later operands supersede in place), and the
+    // composed environment's print order exposes it (rubash#1806).
+    assignments: Vec<(String, String)>,
     file: Option<String>,
     chdir: Option<String>,
     argv0: Option<String>,
@@ -2079,23 +2182,50 @@ fn long_option_value(arg: &str, long_prefix: &str) -> Option<String> {
     None
 }
 
+/// Insert into an ordered environment composition with GNU
+/// add_or_supercede semantics (variables.c): an existing name is
+/// replaced in place, a new name is appended (rubash#1806).
+fn ordered_env_insert(entries: &mut Vec<(String, String)>, name: String, value: String) {
+    if let Some(slot) = entries.iter_mut().find(|(existing, _)| *existing == name) {
+        slot.1 = value;
+    } else {
+        entries.push((name, value));
+    }
+}
+
+fn ordered_env_contains(entries: &[(String, String)], name: &str) -> bool {
+    entries.iter().any(|(existing, _)| existing == name)
+}
+
+fn ordered_env_get<'a>(entries: &'a [(String, String)], name: &str) -> Option<&'a String> {
+    entries
+        .iter()
+        .find(|(existing, _)| existing == name)
+        .map(|(_, value)| value)
+}
+
+fn ordered_env_remove(entries: &mut Vec<(String, String)>, name: &str) {
+    entries.retain(|(existing, _)| existing != name);
+}
+
 fn apply_env_command_environment(
     process: &mut Command,
-    env_vars: &HashMap<String, String>,
+    env_vars: &[(String, String)],
     inherit_required_windows: bool,
 ) {
     process.env_clear();
+    let env_map: HashMap<String, String> = env_vars.iter().cloned().collect();
     for (name, value) in env_vars {
         if is_valid_process_env(name, value) {
             let value = if cfg!(windows) && name.eq_ignore_ascii_case("PATH") {
-                shell_path_to_process(value, env_vars)
+                shell_path_to_process(value, &env_map)
             } else if cfg!(windows) && name == "TMPDIR" {
                 // Same child-boundary contract as child_env_value
                 // (unixwin/niubash#162): exported TMPDIR crosses in
                 // Windows-native forward-slash form, never the slash-drive
                 // `/c/...` display form that foreign children (Bun-compiled
                 // executables) resolve drive-relative and fail on.
-                shell_path_to_windows(value, env_vars)
+                shell_path_to_windows(value, &env_map)
                     .to_string_lossy()
                     .replace('\\', "/")
             } else {
@@ -2109,13 +2239,13 @@ fn apply_env_command_environment(
         }
     }
     if inherit_required_windows {
-        apply_required_windows_child_environment(process, env_vars);
+        apply_required_windows_child_environment(process, &env_map);
     }
 }
 
 #[cfg(windows)]
 fn materialize_required_windows_env(
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut Vec<(String, String)>,
     shell_env_vars: &HashMap<String, String>,
     ignore_environment: bool,
 ) {
@@ -2124,7 +2254,7 @@ fn materialize_required_windows_env(
     }
 
     for name in ["SystemRoot", "WINDIR", "ComSpec"] {
-        if env_vars.contains_key(name) {
+        if ordered_env_contains(env_vars, name) {
             continue;
         }
         if let Some(value) = shell_env_vars
@@ -2132,18 +2262,16 @@ fn materialize_required_windows_env(
             .cloned()
             .or_else(|| env::var(name).ok())
         {
-            env_vars.insert(name.to_string(), value);
+            ordered_env_insert(env_vars, name.to_string(), value);
         }
     }
 
-    let home = env_vars
-        .get("USERPROFILE")
+    let home = ordered_env_get(env_vars, "USERPROFILE")
         .cloned()
         .or_else(|| shell_env_vars.get("USERPROFILE").cloned())
         .or_else(|| env::var("USERPROFILE").ok())
         .or_else(|| {
-            env_vars
-                .get("HOME")
+            ordered_env_get(env_vars, "HOME")
                 .or_else(|| shell_env_vars.get("HOME"))
                 .map(|value| {
                     shell_path_to_windows(value, shell_env_vars)
@@ -2156,28 +2284,40 @@ fn materialize_required_windows_env(
     };
 
     let native_home = home.replace('/', "\\");
-    env_vars
-        .entry("USERPROFILE".to_string())
-        .or_insert_with(|| native_home.clone());
-    env_vars
-        .entry("HOME".to_string())
-        .or_insert_with(|| native_home.clone());
+    if !ordered_env_contains(env_vars, "USERPROFILE") {
+        ordered_env_insert(env_vars, "USERPROFILE".to_string(), native_home.clone());
+    }
+    if !ordered_env_contains(env_vars, "HOME") {
+        ordered_env_insert(env_vars, "HOME".to_string(), native_home.clone());
+    }
     if let Some((drive, path)) = windows_drive_and_home_path(&native_home) {
-        env_vars.entry("HOMEDRIVE".to_string()).or_insert(drive);
-        env_vars.entry("HOMEPATH".to_string()).or_insert(path);
+        if !ordered_env_contains(env_vars, "HOMEDRIVE") {
+            ordered_env_insert(env_vars, "HOMEDRIVE".to_string(), drive);
+        }
+        if !ordered_env_contains(env_vars, "HOMEPATH") {
+            ordered_env_insert(env_vars, "HOMEPATH".to_string(), path);
+        }
     }
     let base = native_home.trim_end_matches('\\');
-    env_vars
-        .entry("APPDATA".to_string())
-        .or_insert_with(|| format!("{base}\\AppData\\Roaming"));
-    env_vars
-        .entry("LOCALAPPDATA".to_string())
-        .or_insert_with(|| format!("{base}\\AppData\\Local"));
+    if !ordered_env_contains(env_vars, "APPDATA") {
+        ordered_env_insert(
+            env_vars,
+            "APPDATA".to_string(),
+            format!("{base}\\AppData\\Roaming"),
+        );
+    }
+    if !ordered_env_contains(env_vars, "LOCALAPPDATA") {
+        ordered_env_insert(
+            env_vars,
+            "LOCALAPPDATA".to_string(),
+            format!("{base}\\AppData\\Local"),
+        );
+    }
 }
 
 #[cfg(not(windows))]
 fn materialize_required_windows_env(
-    _env_vars: &mut HashMap<String, String>,
+    _env_vars: &mut Vec<(String, String)>,
     _shell_env_vars: &HashMap<String, String>,
     _ignore_environment: bool,
 ) {

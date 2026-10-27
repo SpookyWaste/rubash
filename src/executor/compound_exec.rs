@@ -592,7 +592,7 @@ impl Executor {
                 .stderr(stderr_stdio);
             // Same environment application as every foreground external
             // (exported shell vars; no assignments exist at this gate).
-            self.apply_external_environment(&background_command.command, &mut process);
+            self.apply_external_environment(&background_command.command, &mut process, &program);
             // rubash#229/#737 unix arm: reset inherited signal dispositions
             // in the child exactly like the foreground spawn path. The #737
             // pdeathsig arm keys off __RUBASH_BACKGROUND_WRAPPER, which is
