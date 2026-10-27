@@ -2283,6 +2283,14 @@ mod kernel_signals {
         is_managed(sig) && HANDLER_SET.load(Ordering::Relaxed) & bit(sig) != 0
     }
 
+    /// True when `sig` was SIG_IGN at process entry (captured by
+    /// capture_entry_and_policy). Entry-ignored dispositions are sticky
+    /// (trap.c:850): neither traps nor the interactive SIGINT pin
+    /// (rubash#1662) may route them to the handler.
+    pub(super) fn entry_ignored(sig: i32) -> bool {
+        is_managed(sig) && ENTRY_IGNORED.load(Ordering::Relaxed) & bit(sig) != 0
+    }
+
     /// Whether the boundary dispatcher can adjudicate `sig` at all
     /// (the managed set or the fatal set). The rubash#1654 ancestor
     /// route queues only signals whose top-level verdict the
@@ -2889,8 +2897,14 @@ pub fn reconcile_kernel_trap_dispositions(env_vars: &std::collections::HashMap<S
     let exit_armed = env_vars
         .get("__RUBASH_TRAP_EXIT")
         .is_some_and(|action| !action.is_empty());
+    // rubash#1662: an interactive shell's untrapped SIGINT is pinned to
+    // the mailbox handler (see the disposition loop below), so the
+    // all-Default steady state is never the interactive steady state --
+    // the fast path must not skip the pin's first application.
+    let interactive = env_vars.get("__RUBASH_INTERACTIVE").map(String::as_str) == Some("1");
     if !any_armed
         && !exit_armed
+        && !interactive
         && no_reset
         && kernel_signals::at_default_state()
         && kernel_signals::fatal_at_default()
@@ -2935,6 +2949,34 @@ pub fn reconcile_kernel_trap_dispositions(env_vars: &std::collections::HashMap<S
             // signal through the handler (sig.c:226-229 above) — but
             // only for GNU's terminating set (see exit_reroutes).
             None if exit_armed && exit_reroutes(*sig) => Disposition::Handler,
+            // rubash#1662: GNU sig.c:315-316 -- initialize_terminating_
+            // signals is interactive-only: an interactive shell catches
+            // SIGINT itself from startup, independent of the trap table.
+            // Without the pin, an untrapped interactive SIGINT sits at
+            // SIG_DFL in every window the foreground guards do not cover
+            // (the prompt reader, in-process builtin execution), and the
+            // kernel default action kills the shell on the first ^C.
+            // The mailbox delivery becomes the boundary dispatch's
+            // 128+SIGINT abort instead. Entry-ignored SIGINT stays
+            // ignored (the pin must not un-ignore it).
+            None if interactive
+                && *sig == libc::SIGINT as i32
+                && !kernel_signals::entry_ignored(*sig) =>
+            {
+                Disposition::Handler
+            }
+            // The same sig.c block: an interactive shell also ignores
+            // SIGTERM (initialize_shell_signals: `if (interactive) ...
+            // set_signal_handler (SIGTERM, SIG_IGN)`), so a directed
+            // TERM cannot kill it either. An armed EXIT trap still wins
+            // via the reroute arm above (Handler), and a user trap on
+            // TERM is unaffected (the Some arms).
+            None if interactive
+                && *sig == libc::SIGTERM as i32
+                && !kernel_signals::entry_ignored(*sig) =>
+            {
+                Disposition::Ignore
+            }
             None => Disposition::Default,
         };
         dispositions.push((*sig, want));

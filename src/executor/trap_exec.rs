@@ -1348,6 +1348,22 @@ impl Executor {
                     continue;
                 }
                 self.exit_code = 128 + signal;
+                // rubash#1662: in an interactive shell this abort is a
+                // DISCARD-class unwind (GNU: the interrupted command
+                // ends with 128+sig and the reader prompts again), not
+                // an exit — mark it so run_source_impl does not record
+                // an exit jump for the unit. Non-interactive shells keep
+                // the exit classification (the delivery is how a script
+                // shell dies at 128+sig, running any EXIT trap).
+                if self
+                    .shell_state
+                    .env_vars
+                    .get("__RUBASH_INTERACTIVE")
+                    .map(String::as_str)
+                    == Some("1")
+                {
+                    self.signal_discard_pending = true;
+                }
                 return Err(ExecuteError::ExitCode(128 + signal));
             };
             if action.is_empty() {

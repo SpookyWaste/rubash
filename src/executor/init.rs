@@ -431,6 +431,7 @@ impl Executor {
             fd_table: FdTable::new(),
             exit_code: 0,
             parse_error_occurred: false,
+            signal_discard_pending: false,
             bash_logout_sourced: false,
             shell_pid,
             bashpid_origin_depth: bg_bashpid_base.unwrap_or(0),

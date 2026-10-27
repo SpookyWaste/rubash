@@ -3310,7 +3310,14 @@ fn run_source_impl(
         // The grouped drivers must stop reading — record it before the
         // status conversion loses the distinction.
         Err(ExecuteError::ExitCode(code)) => {
-            executor.exit_jump_pending.set(true);
+            // rubash#1662: a signal-discard abort (untrapped SIGINT in
+            // an interactive shell) reaches the top as ExitCode too,
+            // but it is not a jump_to_top_level exit — the dispatch
+            // marked it DISCARD, so the reader keeps the session and
+            // prompts again with $? = code.
+            if !executor.take_signal_discard_pending() {
+                executor.exit_jump_pending.set(true);
+            }
             code
         }
         Err(ExecuteError::FatalFunctionError(code)) => {
@@ -3669,6 +3676,13 @@ pub const READ_STDIN_MARKER: &str = "__RUBASH_READ_STDIN";
 /// readline/misc.c rl_operate_and_get_next) executes the current line and
 /// replaces the buffer with the next history entry.
 pub fn run_interactive_stdin(executor: &mut Executor) -> i32 {
+    // rubash#1662: GNU installs the interactive signal dispositions
+    // before the first prompt is read (sig.c:315-316); the command-
+    // boundary reconcile only runs after a command completes, so
+    // without this call the first prompt would still sit at the SIGINT
+    // kernel default.
+    #[cfg(unix)]
+    crate::builtins::kill::reconcile_kernel_trap_dispositions(&executor.shell_state.env_vars);
     // parse.y:1710: the SAME reader serves tty and non-tty stdin; the two
     // cases differ only in who echoes the accepted line (readline echoes
     // itself on a tty — the Windows cooked console echoes each typed key —
@@ -3968,6 +3982,29 @@ pub fn run_interactive_stdin(executor: &mut Executor) -> i32 {
                 preload_operate_and_get_next(executor, &mut st, src_abs);
             }
             continue;
+        }
+
+        // rubash#1662: dispatch pending signals before blocking on the
+        // next line, and while waiting for one at a fresh prompt (see
+        // prompt_wait_for_input). A delivery that aborts here discards
+        // the line being edited — GNU's reader leaves the read with
+        // the partial line dropped and $? = 128+sig — instead of the
+        // stale delivery ambushing the next completed line at its
+        // first command boundary. An exit jump recorded by a trap
+        // action is honored by the loop-top check after the cleanup.
+        #[cfg(unix)]
+        if console.is_none() {
+            let aborted = if pending.is_empty() && st.buffer.is_empty() {
+                matches!(prompt_wait_for_input(executor), PromptWait::Aborted)
+            } else {
+                executor.run_pending_signal_traps().is_err()
+            };
+            if aborted {
+                pending.clear();
+                group.clear();
+                st = EditState::default();
+                continue;
+            }
         }
 
         let mut raw = String::new();
@@ -4507,6 +4544,43 @@ fn normalize_bridge_line(raw: &str) -> String {
         i += 1;
     }
     output
+}
+
+/// Outcome of [`prompt_wait_for_input`].
+#[cfg(unix)]
+enum PromptWait {
+    /// fd 0 is readable (or at EOF): proceed with the line read.
+    Ready,
+    /// The pending-signal dispatch unwound: the current line is
+    /// discarded and the reader re-prompts.
+    Aborted,
+}
+
+/// rubash#1662: wait at a fresh interactive prompt until fd 0 is
+/// readable, dispatching pending signals between poll slices. fd
+/// reads retry on EINTR by design (fd::read_some: "let the
+/// pending-signal queue dispatch at the next command boundary"), but
+/// at a prompt there is no next command yet — an undispatched SIGINT
+/// would sit in the mailbox and abort the next typed line instead of
+/// the empty current one. GNU's reader instead leaves the read at
+/// once: partial line dropped, $? = 128+sig, fresh prompt.
+#[cfg(unix)]
+fn prompt_wait_for_input(executor: &mut Executor) -> PromptWait {
+    loop {
+        if executor.run_pending_signal_traps().is_err() {
+            return PromptWait::Aborted;
+        }
+        let mut pfd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, 50) };
+        if rc > 0 || pfd.revents != 0 {
+            return PromptWait::Ready;
+        }
+        // Slice expired or EINTR: loop and re-check the signal queue.
+    }
 }
 
 pub fn read_unbuffered_line(output: &mut String) -> io::Result<usize> {

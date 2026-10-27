@@ -1621,6 +1621,7 @@ impl Executor {
             fd_table,
             exit_code: self.exit_code,
             parse_error_occurred: false,
+            signal_discard_pending: false,
             // GNU exit.def bash_logout: subshells never source ~/.bash_logout
             // (subshell_environment check); inherit the parent's latch so a
             // subshell logout cannot double-source it either.

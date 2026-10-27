@@ -331,6 +331,12 @@ impl Executor {
         std::mem::take(&mut self.parse_error_occurred)
     }
 
+    /// rubash#1662: take-style read of the signal-discard mark (see
+    /// Executor::signal_discard_pending).
+    pub fn take_signal_discard_pending(&mut self) -> bool {
+        std::mem::take(&mut self.signal_discard_pending)
+    }
+
     /// GNU execute_cmd.c:652-656: `!` gives the command CMD_IGNORE_RETURN
     /// under errexit — the grouped drivers' post-group `status != 0 &&
     /// errexit` check reads this to honor the exemption.
