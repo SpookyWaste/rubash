@@ -140,9 +140,24 @@ fn ctrl_c_discards(line: &str, forbidden: &[&str]) {
     session.pump(Duration::from_millis(1200));
     session.send_line("echo NEXT_$?");
     session.wait_for("NEXT_130", Duration::from_secs(15));
+    // Assert on the OUTPUT side of the echo, not the raw transcript
+    // (GATE-READJUDICATION B): the PTY necessarily echoes the typed
+    // line, and every forbidden marker is part of that line's text,
+    // so a bare `!transcript.contains(marker)` is false for ANY
+    // product behavior. The line's own echo (its first occurrence)
+    // is stripped; a marker that actually ran would print again in
+    // what remains, so the check keeps its teeth. If the echo is not
+    // found verbatim, fail loudly instead of passing on an
+    // unstripped transcript.
+    assert!(
+        session.transcript.contains(line),
+        "typed line's echo not found in transcript; transcript: {:?}",
+        session.transcript
+    );
+    let output_side = session.transcript.replacen(line, "", 1);
     for marker in forbidden {
         assert!(
-            !session.transcript.contains(marker),
+            !output_side.contains(marker),
             "{marker:?} ran despite the Ctrl-C discard; transcript: {:?}",
             session.transcript
         );

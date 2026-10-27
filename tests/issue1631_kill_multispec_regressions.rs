@@ -70,7 +70,26 @@ fn issue1631_dash_s_after_bare_spec_still_selects_signal() {
          kill -TERM -s USR1 $v; echo kill_rc=$?\n\
          wait $v; echo wait_rc=$?",
     );
-    assert!(stderr.is_empty(), "stderr: {stderr}");
+    // GNU prints the job death notice on stderr when `wait` reaps
+    // the USR1-killed victim — 5.3.20 oracle, both script forms,
+    // 10/10 runs, stderr never empty (GATE-READJUDICATION A1; the
+    // original pin's is_empty was a wrong pin). The notice's line
+    // attribution wobbles between the kill and wait lines, so the
+    // line number is NOT pinned; the notice shape is. What must stay
+    // absent is any diagnostic from `kill` itself: `-s` after a bare
+    // spec is a legal continuation, not a badpid operand.
+    assert!(
+        stderr.contains("User defined signal 1"),
+        "job death notice missing; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("/usr/bin/sleep 30"),
+        "death notice must name the job command; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not a pid or valid job spec"),
+        "kill emitted a badpid diagnostic; stderr: {stderr}"
+    );
     assert!(stdout.contains("kill_rc=0\n"), "stdout: {stdout}");
     assert!(stdout.contains("wait_rc=138\n"), "stdout: {stdout}");
     assert_eq!(code, Some(0));
