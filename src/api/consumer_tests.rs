@@ -38,6 +38,25 @@ fn read(dir: &PathBuf, name: &str) -> String {
     std::fs::read_to_string(dir.join(name)).expect("output file written by the script")
 }
 
+/// The native spelling of a path the shell printed (its `pwd`
+/// output): on Windows the shell namespace spells a drive path
+/// `/c/...`; everywhere else the printed spelling is already the
+/// native one. Only the drive-letter class is translated — the
+/// temp dirs these tests use always live on one.
+fn shell_spelling_to_native(text: &str) -> PathBuf {
+    if cfg!(windows) {
+        let bytes = text.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0] == b'/'
+            && bytes[1].is_ascii_alphabetic()
+            && bytes[2] == b'/'
+        {
+            return PathBuf::from(format!("{}:{}", bytes[1] as char, &text[2..]));
+        }
+    }
+    PathBuf::from(text)
+}
+
 #[test]
 fn act1_host_drives_session_through_state_views_only() {
     let dir = temp_dir("act1");
@@ -183,9 +202,19 @@ fn act1_host_drives_session_through_state_views_only() {
         );
     }
     assert_eq!(run(&mut executor, "pwd > \"$OUT/pwd.txt\""), 0);
+    // `pwd` prints the shell spelling of the directory (the shell
+    // namespace on Windows, the logical path through symlinks on
+    // macOS); the view-set cwd is the native canonical path. The
+    // two spellings differ as strings (on Windows by the `/c/`
+    // namespace, 8.3 short names and the `\\?\` prefix; on macOS
+    // by `/private`), so compare filesystem identity instead:
+    // canonicalize the printed spelling and require the same
+    // directory the view set.
+    let pwd_text = read(&dir, "pwd.txt").trim_end().to_string();
+    let pwd_canon = std::fs::canonicalize(shell_spelling_to_native(&pwd_text))
+        .expect("the shell's pwd names a real directory");
     assert_eq!(
-        read(&dir, "pwd.txt").trim_end(),
-        subdir_canon.to_string_lossy(),
+        pwd_canon, subdir_canon,
         "the shell's pwd is the view-set cwd"
     );
 
@@ -388,7 +417,11 @@ fn act2_inspection_snapshot_matches_debuggee_own_output() {
     let mut executor = Executor::new();
     executor.set_env("OUT", &dir_text);
     executor.install_debug_session(driver);
-    let status = run(&mut executor, &format!(". {script_path_text}"));
+    // The path is interpolated into shell source, so quote it: an
+    // unquoted native Windows spelling cannot survive the lexer
+    // (a backslash in a bare word is an escape and eats the path
+    // separators, so the source fails before anything runs).
+    let status = run(&mut executor, &format!(". \"{script_path_text}\""));
     assert_eq!(status, 0);
 
     let stops = stops.borrow();
