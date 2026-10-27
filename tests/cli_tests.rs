@@ -2210,7 +2210,12 @@ fn subshell_trap_listing_keeps_parent_table_entries() {
     // rubash#546 cell 1: a dev-shell parent can carry the cross-process
     // inherited-ignore marker (__RUBASH_TRAP_ORIG_IGN); GNU lists an
     // inherited ignore, so strip it to pin the fresh-shell contract the
-    // ticket adjudicates.
+    // ticket adjudicates. The test-runner entry mask is sanitized the
+    // same way (a dirty Termux SigIgn SIGQUIT would otherwise seed a
+    // hard-ignore here); an immutable host entry-ignore (Termux 38,
+    // listed by GNU bash 5.3.20 too) sorts after both explicit traps
+    // in the numeric canonical order.
+    sanitize_entry_ignores();
     let output = rubash_command()
         .env_remove("__RUBASH_TRAP_ORIG_IGN")
         .env_remove("__RUBASH_TRAP_SIGRTMIN")
@@ -2225,9 +2230,62 @@ fn subshell_trap_listing_keeps_parent_table_entries() {
     // parent entries the subshell inherits appear.
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "trap -- '' SIGHUP\ntrap -- 'echo bad' SIGTERM\n"
+        format!(
+            "trap -- '' SIGHUP\ntrap -- 'echo bad' SIGTERM\n{}",
+            live_entry_ignore_suffix()
+        )
     );
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+/// Reset launcher-inherited SIG_IGN dispositions (except SIGPIPE, which
+/// the Rust runtime owns) to SIG_DFL in THIS test process before
+/// spawning the shell under test (trap.c initialize_traps hard-ignore
+/// seed, rubash#1124). Host-independent: a no-op on clean CI runners.
+/// See issue546_trap_semantics_regressions for the full rationale.
+#[cfg(unix)]
+fn sanitize_entry_ignores() {
+    for sig in 1..=64 {
+        if sig == libc::SIGPIPE as i32 {
+            continue;
+        }
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigaction(sig, std::ptr::null(), &mut current) } != 0 {
+            continue;
+        }
+        if current.sa_sigaction == libc::SIG_IGN {
+            unsafe {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn sanitize_entry_ignores() {}
+
+/// `trap -p` lines a fresh child image lists with no explicit traps
+/// (immutable host entry-ignores, e.g. Termux 38 — listed by GNU too;
+/// "" on clean hosts). The explicit traps above sort before every
+/// suffix signal.
+fn live_entry_ignore_suffix() -> String {
+    sanitize_entry_ignores();
+    let mut command = rubash_command();
+    command.env_remove("__RUBASH_TRAP_ORIG_IGN");
+    command.env_remove("__RUBASH_TRAP_SIGRTMIN");
+    let leaked: Vec<String> = std::env::vars()
+        .map(|(key, _)| key)
+        .filter(|key| key.starts_with("__RUBASH_TRAP"))
+        .collect();
+    for key in leaked {
+        command.env_remove(key);
+    }
+    let output = command
+        .arg("-c")
+        .arg("trap -p")
+        .output()
+        .expect("spawn rubash");
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 #[test]

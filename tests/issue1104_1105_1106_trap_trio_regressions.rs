@@ -16,10 +16,11 @@
 //! gate dropped the outer fire (and the missing entry save/restore dropped
 //! the v4 restore).
 //!
-//! #1106 (P3, pathological): `return N` inside a RETURN action recurses
-//! forever in GNU (the from_return_trap setter is `#if 0`'d out, so
-//! execute_cmd.c:5377 refires; bash 5.3.20 hangs). Rubash deliberately
-//! absorbs it once as the function status: no hang, no stray diagnostic.
+//! #1106 (P3, pathological): `return N` inside a RETURN action re-arms
+//! the trap in GNU (trap.c _run_trap_internal rethrows through
+//! return_catch and execute_cmd.c:5377 refires because the
+//! from_return_trap setter is `#if 0`'d out, trap.c:1252 — bash 5.3.20
+//! recurses forever). Rubash loops the fire the same way.
 //!
 //! All expectations byte-verified against bash 5.3.20 via script files.
 
@@ -109,12 +110,29 @@ fn untraced_nested_functions_do_not_fire_inherited_return_trap() {
     assert_eq!(code, Some(0));
 }
 
-/// #1106: `return N` in the RETURN action runs once (GNU hangs here).
+/// #1106: `return N` in the RETURN action re-arms the trap (GNU
+/// recurses forever here — verified with `timeout`, bash 5.3.20 never
+/// prints and dies 124). The guard file lets the second firing exit
+/// instead of hanging: GNU fires twice and exits 42 through the action;
+/// the old absorb-once build fired once and printed `rc=9`.
 #[test]
-fn return_inside_return_trap_runs_once_without_hang() {
-    let (stdout, stderr, code) =
-        rubash("r() { trap 'return 3' RETURN; echo in-r; return 0; }\nr; echo \"rc=$?\"");
+fn return_inside_return_trap_rearms_like_gnu() {
+    let dir = std::env::temp_dir();
+    let tag = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    );
+    let guard = dir.join(format!("rubash-1106-guard-{tag}"));
+    let guard_str = guard.to_string_lossy().into_owned();
+    let (stdout, stderr, code) = rubash(&format!(
+        "r() {{ trap 'if [ -e {guard_str} ]; then exit 42; fi; touch {guard_str}; return 3' RETURN; echo in-r; return 0; }}\nr; echo \"rc=$?\""
+    ));
+    let _ = std::fs::remove_file(&guard);
     assert_eq!(stderr, "");
-    assert_eq!(stdout, "in-r\nrc=3\n");
-    assert_eq!(code, Some(0));
+    assert_eq!(stdout, "in-r\n");
+    assert_eq!(code, Some(42));
 }

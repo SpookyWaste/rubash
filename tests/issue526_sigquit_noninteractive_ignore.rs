@@ -43,6 +43,7 @@ struct Output {
 }
 
 fn run_args(args: &[&str], stdin_script: Option<&str>) -> Output {
+    sanitize_entry_ignores();
     let mut child = Command::new(shell_bin())
         .args(args)
         .stdin(Stdio::piped())
@@ -73,6 +74,35 @@ fn run_c(script: &str) -> Output {
 fn run_s(script: &str) -> Output {
     run_args(&["-s"], Some(script))
 }
+
+/// Reset launcher-inherited SIG_IGN dispositions (except SIGPIPE, which
+/// the Rust runtime owns) to SIG_DFL in THIS test process before
+/// spawning the shell under test. GNU snapshots entry dispositions at
+/// startup (trap.c initialize_traps -> SIG_HARD_IGNORE, rubash#1124):
+/// a dirty test-runner entry mask (e.g. Termux SigIgn SIGQUIT) would
+/// otherwise seed a hard-ignore and refuse the installs these tests
+/// premise as trappable. Restoring a clean entry keeps the tests
+/// host-independent (a no-op on clean CI runners).
+#[cfg(unix)]
+fn sanitize_entry_ignores() {
+    for sig in 1..=64 {
+        if sig == libc::SIGPIPE as i32 {
+            continue;
+        }
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigaction(sig, std::ptr::null(), &mut current) } != 0 {
+            continue;
+        }
+        if current.sa_sigaction == libc::SIG_IGN {
+            unsafe {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn sanitize_entry_ignores() {}
 
 /// The issue's exact repro via -c: the shell must survive its own SIGQUIT
 /// and continue with the kill's status.

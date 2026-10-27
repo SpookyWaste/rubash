@@ -69,10 +69,18 @@ fn run_main() -> i32 {
     rubash::builtins::kill::consume_background_wrapper_handshake(&mut args);
     // rubash#1035: an asynchronous-job respawn starts with SIGINT/SIGQUIT
     // ignored (GNU execute_cmd.c setup_async_signals, job_control == 0).
-    // Consume the spawn-site marker here — before the executor seeds the
-    // trap table and captures kernel entry dispositions — so the ignore is
-    // in place for both. Runs for plain invocations too, where it is just
-    // the scrub.
+    // Freeze the launcher-entry ignore snapshot FIRST: the probe cannot
+    // tell a launcher-inherited SIG_IGN from this async ignore, and GNU
+    // execute_cmd.c:5727-5730 forbids promoting the async ignore to
+    // hard-ignore ("that would prevent the trap builtin from setting a
+    // trap") — a compound background body must stay trappable, while a
+    // true entry ignore (e.g. Termux SigIgn 38, rubash#1124) still lists
+    // as `trap -- '' SIG`. Consume the spawn-site marker after the
+    // freeze — before the executor seeds the trap table and captures
+    // kernel entry dispositions — so the ignore is in place for both.
+    // Runs for plain invocations too, where both are just the scrub.
+    #[cfg(unix)]
+    rubash::builtins::kill::capture_entry_ignored_snapshot();
     #[cfg(unix)]
     rubash::builtins::kill::apply_async_child_entry_ignores();
     let invocation_name = invoked_as.clone().or_else(|| args.first().cloned());

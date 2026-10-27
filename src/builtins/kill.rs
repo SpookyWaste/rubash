@@ -751,6 +751,28 @@ pub(crate) fn entry_ignored_signal_numbers() -> Vec<i32> {
         .collect()
 }
 
+/// Freeze the entry-ignore snapshot at process startup, before main()
+/// applies its own disposition mutations (rubash#1035 async-child
+/// INT/QUIT ignores, the sig.c:333 SIGQUIT policy ignore).
+///
+/// GNU execute_cmd.c:5727-5730 (setup_async_signals): "We can't set the
+/// hard ignored flag because that would prevent the trap builtin from
+/// setting a trap. We also have to special-case set_signal so we can
+/// set a trap for one of these signals." The async ignore is
+/// SIG_ASYNCSIG (trap.c:69), not SIG_HARD_IGNORE — a later `trap`
+/// overrides it. The probe backing [`entry_ignored_signal_numbers`]
+/// cannot tell a launcher-inherited SIG_IGN from one our own startup
+/// just installed, so without this freeze the async INT/QUIT ignore
+/// (applied by apply_async_child_entry_ignores before the executor
+/// seeds) would surface as `trap -- '' SIGINT` hard-ignore and a
+/// compound background body's `trap ... INT` would be refused —
+/// while launcher-inherited ignores (e.g. a Termux SigIgn entry hole)
+/// must still list as `trap -- '' SIG` (trap.c:850, trap.def:308).
+#[cfg(unix)]
+pub fn capture_entry_ignored_snapshot() {
+    let _ = entry_ignored_signal_numbers();
+}
+
 #[cfg(not(unix))]
 pub(crate) fn entry_ignored_signal_numbers() -> Vec<i32> {
     Vec::new()

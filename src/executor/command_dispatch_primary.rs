@@ -151,15 +151,17 @@ impl Executor {
                     // sleep_interruptibly slices the wait so the Windows
                     // mailbox is observed with the same deferral semantics.
                     if let Some(seconds) = crate::builtins::sleep::total_duration(&cmd.words[1..]) {
-                        // rubash#1034: Some(sig) means the virtual child
-                        // was killed by a trapped terminating signal and
-                        // its trap already dispatched — the command's
-                        // status is the signal death 128+sig, like GNU
-                        // reaping a real sleep killed the same way.
-                        match self.sleep_interruptibly(seconds)? {
-                            Some(signal) => self.exit_code = 128 + signal,
-                            None => self.exit_code = 0,
-                        }
+                        // rubash#1034: GNU jobs.c:3064 wait_for defers
+                        // trapped signals until the foreground child
+                        // completes (wait_sigint_handler records instead of
+                        // trapping mid-wait); the trap fires at the next
+                        // command boundary. The fast path keeps that
+                        // deferral: the sleep runs to its deadline, the
+                        // pending trap stays queued, and the boundary poll
+                        // dispatches it — bash 5.3.20 prints GOTINT only
+                        // after the full `sleep 10`.
+                        self.sleep_interruptibly(seconds)?;
+                        self.exit_code = 0;
                     } else {
                         let (status, stderr) = crate::builtins::sleep::execute(&cmd.words[1..]);
                         if let Some(stderr) = stderr {

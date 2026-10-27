@@ -23,6 +23,7 @@
 use std::process::Command;
 
 fn run(script: &str) -> (String, String, Option<i32>) {
+    sanitize_entry_ignores();
     let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
         .env_remove("__RUBASH_TRAP_ORIG_IGN")
         .env_remove("__RUBASH_TRAP_SIGRTMIN")
@@ -37,10 +38,75 @@ fn run(script: &str) -> (String, String, Option<i32>) {
     )
 }
 
+/// Reset launcher-inherited SIG_IGN dispositions (except SIGPIPE, which
+/// the Rust runtime owns) to SIG_DFL in THIS test process before
+/// spawning the shell under test. GNU snapshots entry dispositions at
+/// startup (trap.c initialize_traps -> SIG_HARD_IGNORE, rubash#1124):
+/// a dirty test-runner entry mask (e.g. Termux SigIgn 38 + SIGQUIT)
+/// would otherwise seed `trap -- '' SIG` lines into every "fresh
+/// shell" listing and refuse foreground installs. The fresh-shell
+/// tests premise a clean entry; restoring it keeps them
+/// host-independent (a no-op on clean CI runners). Script-level
+/// ignores (`trap '' INT` in a parent script + spawn) still propagate
+/// through the kernel and are unaffected.
+#[cfg(unix)]
+fn sanitize_entry_ignores() {
+    for sig in 1..=64 {
+        if sig == libc::SIGPIPE as i32 {
+            continue;
+        }
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigaction(sig, std::ptr::null(), &mut current) } != 0 {
+            continue;
+        }
+        if current.sa_sigaction == libc::SIG_IGN {
+            unsafe {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn sanitize_entry_ignores() {}
+
+/// `trap -p` display lines a fresh child image lists with no explicit
+/// traps: entry-ignores the host imposes at every exec, which no
+/// process can reset. On this Termux host bionic re-applies SigIgn 38
+/// (a realtime hole) in every new process image — even children of a
+/// sanitized parent list it, exactly like GNU bash 5.3.20 does
+/// (`trap -- '' 38`). Clean-entry hosts (all CI runners) yield "".
+/// The explicit traps in these tests sort before every suffix signal,
+/// so concatenation matches GNU's numeric canonical order.
+fn live_entry_ignore_suffix() -> String {
+    sanitize_entry_ignores();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rubash"));
+    command.env_remove("__RUBASH_TRAP_ORIG_IGN");
+    command.env_remove("__RUBASH_TRAP_SIGRTMIN");
+    // A rubash-based launcher exports its whole trap table; the
+    // per-signal keys would seed the child independent of entry state.
+    let leaked: Vec<String> = std::env::vars()
+        .map(|(key, _)| key)
+        .filter(|key| key.starts_with("__RUBASH_TRAP"))
+        .collect();
+    for key in leaked {
+        command.env_remove(key);
+    }
+    let output = command
+        .arg("-c")
+        .arg("trap -p")
+        .output()
+        .expect("spawn rubash");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 #[test]
 fn fresh_shell_trap_listing_is_empty() {
+    // On hosts with an immutable launcher entry-ignore (Termux SigIgn
+    // 38) GNU lists it too — the "empty" contract holds modulo that
+    // host suffix (empty on clean CI runners).
     let (stdout, stderr, rc) = run("trap");
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, live_entry_ignore_suffix());
     assert_eq!(stderr, "");
     assert_eq!(rc, Some(0));
 }
@@ -48,7 +114,7 @@ fn fresh_shell_trap_listing_is_empty() {
 #[test]
 fn fresh_shell_trap_p_listing_is_empty() {
     let (stdout, stderr, rc) = run("trap -p");
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, live_entry_ignore_suffix());
     assert_eq!(stderr, "");
     assert_eq!(rc, Some(0));
 }
@@ -57,8 +123,15 @@ fn fresh_shell_trap_p_listing_is_empty() {
 fn explicit_traps_still_list() {
     let (stdout, stderr, rc) = run("trap 'echo bad' TERM; trap '' HUP; (trap)");
     // Subshell keeps the parent's table; the shell-internal SIGRTMIN
-    // ignore leaks nothing.
-    assert_eq!(stdout, "trap -- '' SIGHUP\ntrap -- 'echo bad' SIGTERM\n");
+    // ignore leaks nothing. An immutable host entry-ignore (Termux 38)
+    // sorts after both explicit traps in GNU's numeric canonical order.
+    assert_eq!(
+        stdout,
+        format!(
+            "trap -- '' SIGHUP\ntrap -- 'echo bad' SIGTERM\n{}",
+            live_entry_ignore_suffix()
+        )
+    );
     assert_eq!(stderr, "");
     assert_eq!(rc, Some(0));
 }
@@ -67,7 +140,9 @@ fn explicit_traps_still_list() {
 fn inherited_ignore_marker_still_lists() {
     // A signal ignored BEFORE startup is a real inherited ignore (GNU
     // probe: parent `trap '' RTMIN` -> child lists `trap -- '' SIGRTMIN`);
-    // rubash transports it in __RUBASH_TRAP_ORIG_IGN.
+    // rubash transports it in __RUBASH_TRAP_ORIG_IGN. An immutable host
+    // entry-ignore (SIGUSR2 is 12 < 38) sorts after it.
+    sanitize_entry_ignores();
     let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
         .env("__RUBASH_TRAP_ORIG_IGN", "SIGUSR2")
         .arg("-c")
@@ -76,7 +151,7 @@ fn inherited_ignore_marker_still_lists() {
         .expect("run rubash");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "trap -- '' SIGUSR2\n"
+        format!("trap -- '' SIGUSR2\n{}", live_entry_ignore_suffix())
     );
     assert_eq!(output.status.code(), Some(0));
 }

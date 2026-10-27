@@ -922,9 +922,10 @@ impl Executor {
                 Ok(())
             }
             Err(ExecuteError::Return(status)) => {
-                // A `return N` absorbed from the RETURN trap action ran
-                // after the body completed, so it wins over the body's own
-                // return (rubash#1106: run once, trap's status stands).
+                // A `return N` inside the RETURN action re-arms the trap
+                // (GNU infinite recursion, rubash#1106): it never resolves
+                // to a status here — run_function_return_trap loops the
+                // fire above — so this arm is only the body's own return.
                 self.exit_code = trap_return_status.unwrap_or(status);
                 Ok(())
             }

@@ -20,6 +20,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 fn run_shell(body: &str) -> (String, String, Option<i32>) {
+    sanitize_entry_ignores();
     let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
         .arg("-c")
         .arg(body)
@@ -34,6 +35,37 @@ fn run_shell(body: &str) -> (String, String, Option<i32>) {
         output.status.code(),
     )
 }
+
+/// Reset launcher-inherited SIG_IGN dispositions (except SIGPIPE, which
+/// the Rust runtime owns) to SIG_DFL in THIS test process before
+/// spawning the shell under test. GNU snapshots entry dispositions at
+/// startup (trap.c initialize_traps -> SIG_HARD_IGNORE, rubash#1124):
+/// a dirty test-runner entry mask (e.g. Termux SigIgn 38 + SIGQUIT)
+/// would otherwise seed `trap -- '' SIG` lines into every listing and
+/// refuse foreground installs the test premises as trappable. Restoring
+/// a clean entry keeps the tests host-independent (a no-op on clean CI
+/// runners). Script-level ignores (`trap '' INT` in a parent script +
+/// spawn) still propagate through the kernel and are unaffected.
+#[cfg(unix)]
+fn sanitize_entry_ignores() {
+    for sig in 1..=64 {
+        if sig == libc::SIGPIPE as i32 {
+            continue;
+        }
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigaction(sig, std::ptr::null(), &mut current) } != 0 {
+            continue;
+        }
+        if current.sa_sigaction == libc::SIG_IGN {
+            unsafe {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn sanitize_entry_ignores() {}
 
 fn write_executable(path: &std::path::Path, body: &str) {
     let mut file = std::fs::File::create(path).expect("temp script");

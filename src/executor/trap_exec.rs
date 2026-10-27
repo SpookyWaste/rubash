@@ -1446,63 +1446,30 @@ impl Executor {
     /// in-process fast path emulates that by slicing the sleep and running
     /// observe_signals_while_blocked between slices.
     ///
-    /// rubash#1034: the emulation has one gap a real child does not —
-    /// a group-delivered terminating signal (^C, `kill` of the job)
-    /// kills GNU's real sleep instantly, wait_for returns, and the
-    /// shell's trap dispatches at once; the virtual child cannot die,
-    /// so the trap used to sit queued for the sleep's whole remainder.
-    /// When a pending delivery is a trapped signal from the kernel-
-    /// managed terminating set (HUP/INT/QUIT/TERM/USR1/USR2 — the set
-    /// a default-disposition child dies from), model the child as
-    /// killed by it: dispatch the pending traps now and end the sleep,
-    /// reporting the killing signal so the caller records 128+sig as
-    /// the command's status, exactly like a reaped signal death.
-    /// Non-terminating trapped signals (WINCH, CHLD...) keep GNU's
-    /// defer-to-completion semantics untouched.
-    pub(crate) fn sleep_interruptibly(
-        &mut self,
-        seconds: f64,
-    ) -> Result<Option<i32>, ExecuteError> {
+    /// rubash#1034: trapped signals stay deferred until the sleep
+    /// completes. GNU wait_for installs wait_sigint_handler while the
+    /// foreground child runs (jobs.c:2908-2948), which only records
+    /// wait_sigint_received and does NOT set pending_traps — a
+    /// shell-directed delivery (`kill -INT $$`, trap.c:545 trap_handler
+    /// replaced for the wait) leaves the child alive and the trap
+    /// dispatches after wait_for returns, when the child exits. The trap
+    /// action therefore runs at the next command boundary
+    /// (execute_cmd.c:643 run_pending_traps), never mid-sleep — bash
+    /// 5.3.20 prints GOTINT only after the full `sleep 10`.
+    pub(crate) fn sleep_interruptibly(&mut self, seconds: f64) -> Result<(), ExecuteError> {
         const SLICE: std::time::Duration = std::time::Duration::from_millis(50);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds);
         loop {
             let now = std::time::Instant::now();
             if now >= deadline {
-                return Ok(None);
+                return Ok(());
             }
             std::thread::sleep((deadline - now).min(SLICE));
+            // Re-queues trapped deliveries for the command-boundary poll
+            // and returns 128+sig immediately for untrapped terminating
+            // signals (the SIG_DFL death); trapped ones stay queued until
+            // the sleep completes, exactly like GNU's wait_for deferral.
             self.observe_signals_while_blocked()?;
-            // observe_signals_while_blocked re-queued any trapped
-            // deliveries; take them back for the virtual-child check
-            // and put back whatever does not abort the sleep.
-            let pending = crate::builtins::kill::take_pending_signals_now(std::process::id())
-                .unwrap_or_default();
-            if pending.is_empty() {
-                continue;
-            }
-            let abort = pending.iter().copied().find(|&signal| {
-                #[cfg(unix)]
-                {
-                    crate::builtins::kill::kernel_handler_installed(signal)
-                        && signal_trap_name(signal).is_some_and(|name| {
-                            crate::builtins::trap::get_trap_action(
-                                &self.shell_state.env_vars,
-                                &name,
-                            )
-                            .is_some_and(|action| !action.is_empty())
-                        })
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = signal;
-                    false
-                }
-            });
-            crate::builtins::kill::requeue_pending_signals(pending);
-            if let Some(signal) = abort {
-                self.run_pending_signal_traps()?;
-                return Ok(Some(signal));
-            }
         }
     }
 
@@ -1761,15 +1728,20 @@ impl Executor {
         // The old function-scoped gate (__RUBASH_RETURN_TRAP_FUNCTION:
         // outer-must-match) dropped the outer fire.
         //
-        // A `return N` inside the RETURN action would recurse forever in GNU
-        // (trap.c _run_trap_internal rethrows through return_catch and
-        // execute_cmd.c:5377 refires because the from_return_trap setter is
-        // #if 0'd out — probe p1106 hangs bash 5.3.20): absorb it once as
-        // the function's status instead of hanging (rubash#1106).
-        match self.run_return_trap() {
-            Err(ExecuteError::Return(status)) => Ok(Some(status)),
-            Ok(()) => Ok(None),
-            Err(error) => Err(error),
+        // A `return N` inside the RETURN action re-arms the trap in GNU:
+        // trap.c _run_trap_internal rethrows through return_catch and
+        // execute_cmd.c:5377 refires because the from_return_trap setter
+        // is #if 0'd out (trap.c:1252) — probe p1106 hangs bash 5.3.20
+        // in infinite recursion. Loop the fire instead of absorbing it
+        // once, so `return` in the action refires like GNU (rubash#1106).
+        // A bare `exit`/`exit N` in the action still propagates out and
+        // ends the recursion, as does an action that returns normally.
+        loop {
+            match self.run_return_trap() {
+                Err(ExecuteError::Return(_)) => continue,
+                Ok(()) => return Ok(None),
+                Err(error) => return Err(error),
+            }
         }
     }
 

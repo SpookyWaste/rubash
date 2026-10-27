@@ -451,7 +451,7 @@ where
                 print_usage(stderr)?;
                 return Ok(EX_USAGE_INTERNAL);
             }
-            remove_trap(env_vars, signal);
+            remove_trap(env_vars, &signal);
             #[cfg(unix)]
             crate::builtins::kill::reconcile_kernel_trap_dispositions(env_vars);
             return Ok(0);
@@ -603,7 +603,7 @@ where
     let mut invalid = false;
     for arg in args {
         match normalize_signal(arg) {
-            Some(signal) => signals.push(signal.to_string()),
+            Some(signal) => signals.push(signal),
             None => {
                 invalid = true;
                 writeln!(stderr, "{prefix}trap: {arg}: invalid signal specification")?;
@@ -654,27 +654,38 @@ where
     Ok(())
 }
 
-fn normalize_signal(signal: &str) -> Option<&'static str> {
-    let signal = signal.to_ascii_uppercase();
-    match signal.as_str() {
-        "0" | "EXIT" => return Some("EXIT"),
-        "DEBUG" => return Some("DEBUG"),
-        "ERR" => return Some("ERR"),
-        "RETURN" => return Some("RETURN"),
+fn normalize_signal(signal: &str) -> Option<String> {
+    let upper = signal.to_ascii_uppercase();
+    match upper.as_str() {
+        "0" | "EXIT" => return Some("EXIT".to_string()),
+        "DEBUG" => return Some("DEBUG".to_string()),
+        "ERR" => return Some("ERR".to_string()),
+        "RETURN" => return Some("RETURN".to_string()),
         _ => {}
     }
 
-    if let Ok(number) = signal.parse::<usize>() {
-        return number
-            .checked_sub(1)
-            .and_then(|index| SIGNALS.get(index).copied());
+    if let Ok(number) = upper.parse::<usize>() {
+        let slot = number.checked_sub(1).and_then(|index| SIGNALS.get(index));
+        return match slot {
+            // GNU trap.c:236 decode_signal accepts any number < NSIG,
+            // and support/signames.c:458-464 names the holes
+            // "SIGJUNK(n)", which builtins/trap.def:308-311 prints as
+            // the bare number (`trap -- '' 38`). The trap table keys
+            // the hole by its number so entry-ignored holes list and
+            // stay hard-ignored (rubash#1124 on bionic, where 32..40
+            // are holes).
+            Some(name) if !name.is_empty() => Some(name.to_string()),
+            Some(_) => Some(number.to_string()),
+            None => None,
+        };
     }
 
-    let name = signal.strip_prefix("SIG").unwrap_or(&signal);
+    let name = upper.strip_prefix("SIG").unwrap_or(&upper);
     SIGNALS
         .iter()
         .copied()
         .find(|candidate| candidate.strip_prefix("SIG") == Some(name))
+        .map(str::to_string)
 }
 
 /// GNU trap.c set_signal for the special traps. `pub(crate)` for the
@@ -801,13 +812,19 @@ pub(crate) fn seed_startup_traps(env_vars: &mut VarTable) {
     // Idempotent (orig list is sorted/deduped), so subshell executors
     // re-entering this constructor keep the same set.
     for number in crate::builtins::kill::entry_ignored_signal_numbers() {
-        if let Some(name) = SIGNALS
+        // Hole numbers (32..33 on Linux, 32..40 on bionic — SIGNALS
+        // holds "") key by number: GNU trap.c:236 decode_signal accepts
+        // any number < NSIG and builtins/trap.def:308-311 showtrap prints
+        // holes as the bare number (`trap -- '' 38` via SIGJUNK), so the
+        // table must carry "38", not "" (which would collide every hole
+        // on one key).
+        let key = SIGNALS
             .get((number - 1) as usize)
             .copied()
             .filter(|name| !name.is_empty())
-        {
-            add_orig_ignored_signal(env_vars, name);
-        }
+            .map(str::to_string)
+            .unwrap_or_else(|| number.to_string());
+        add_orig_ignored_signal(env_vars, &key);
     }
     // Rebuild the empty trap-table entries for ignores transported across a
     // process boundary (transport_inherited_ignores): the per-signal "" keys
@@ -822,7 +839,7 @@ pub(crate) fn seed_startup_traps(env_vars: &mut VarTable) {
             store_trap_list(env_vars, signals);
         }
     }
-    for signal in SIGNALS {
+    for signal in SIGNALS.iter().copied().filter(|signal| !signal.is_empty()) {
         let key = trap_key(signal);
         if env_vars.get(&key).is_some_and(String::is_empty) {
             let mut signals = trap_list(env_vars);
@@ -1222,7 +1239,7 @@ mod tests {
             if let Some(name) = crate::builtins::kill::translate_signal(&number.to_string()) {
                 let expected = format!("SIG{name}");
                 assert_eq!(
-                    super::normalize_signal(&number.to_string()),
+                    super::normalize_signal(&number.to_string()).as_deref(),
                     Some(expected.as_str()),
                     "trap slot for signal {number}"
                 );
@@ -1268,11 +1285,19 @@ mod tests {
                 .copied()
                 .unwrap_or("<past end>");
             assert_eq!(slot, name, "slot for libc signal {name}");
-            assert_eq!(super::normalize_signal(name), Some(name), "{name}");
-            let bare = name.trim_start_matches("SIG");
-            assert_eq!(super::normalize_signal(bare), Some(name), "{bare}");
             assert_eq!(
-                super::normalize_signal(&constant.to_string()),
+                super::normalize_signal(name).as_deref(),
+                Some(name),
+                "{name}"
+            );
+            let bare = name.trim_start_matches("SIG");
+            assert_eq!(
+                super::normalize_signal(bare).as_deref(),
+                Some(name),
+                "{bare}"
+            );
+            assert_eq!(
+                super::normalize_signal(&constant.to_string()).as_deref(),
                 Some(name),
                 "numeric {name}"
             );
@@ -1284,14 +1309,25 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_realtime_and_holes() {
-        assert_eq!(super::normalize_signal("RTMIN"), Some("SIGRTMIN"));
-        assert_eq!(super::normalize_signal("RTMIN+1"), Some("SIGRTMIN+1"));
-        assert_eq!(super::normalize_signal("34"), Some("SIGRTMIN"));
-        assert_eq!(super::normalize_signal("64"), Some("SIGRTMAX"));
-        assert_eq!(super::normalize_signal("STKFLT"), Some("SIGSTKFLT"));
-        assert_eq!(super::normalize_signal("17"), Some("SIGCHLD"));
-        assert_eq!(super::normalize_signal("32"), Some(""));
-        assert_eq!(super::normalize_signal("33"), Some(""));
+        assert_eq!(
+            super::normalize_signal("RTMIN").as_deref(),
+            Some("SIGRTMIN")
+        );
+        assert_eq!(
+            super::normalize_signal("RTMIN+1").as_deref(),
+            Some("SIGRTMIN+1")
+        );
+        assert_eq!(super::normalize_signal("34").as_deref(), Some("SIGRTMIN"));
+        assert_eq!(super::normalize_signal("64").as_deref(), Some("SIGRTMAX"));
+        assert_eq!(
+            super::normalize_signal("STKFLT").as_deref(),
+            Some("SIGSTKFLT")
+        );
+        assert_eq!(super::normalize_signal("17").as_deref(), Some("SIGCHLD"));
+        // Holes key by number (GNU decode_signal accepts any number <
+        // NSIG; showtrap prints SIGJUNK slots as the bare number).
+        assert_eq!(super::normalize_signal("32").as_deref(), Some("32"));
+        assert_eq!(super::normalize_signal("33").as_deref(), Some("33"));
         assert_eq!(super::normalize_signal("65"), None);
     }
 
@@ -1301,18 +1337,40 @@ mod tests {
     #[cfg(target_os = "android")]
     #[test]
     fn android_realtime_and_holes() {
-        assert_eq!(super::normalize_signal("RTMIN"), Some("SIGRTMIN"));
-        assert_eq!(super::normalize_signal("RTMIN+7"), Some("SIGRTMIN+7"));
-        assert_eq!(super::normalize_signal("RTMAX"), Some("SIGRTMAX"));
-        assert_eq!(super::normalize_signal("RTMAX-1"), Some("SIGRTMAX-1"));
-        assert_eq!(super::normalize_signal("41"), Some("SIGRTMIN"));
-        assert_eq!(super::normalize_signal("52"), Some("SIGRTMIN+11"));
-        assert_eq!(super::normalize_signal("53"), Some("SIGRTMAX-11"));
-        assert_eq!(super::normalize_signal("64"), Some("SIGRTMAX"));
-        assert_eq!(super::normalize_signal("STKFLT"), Some("SIGSTKFLT"));
-        assert_eq!(super::normalize_signal("17"), Some("SIGCHLD"));
-        assert_eq!(super::normalize_signal("32"), Some(""));
-        assert_eq!(super::normalize_signal("40"), Some(""));
+        assert_eq!(
+            super::normalize_signal("RTMIN").as_deref(),
+            Some("SIGRTMIN")
+        );
+        assert_eq!(
+            super::normalize_signal("RTMIN+7").as_deref(),
+            Some("SIGRTMIN+7")
+        );
+        assert_eq!(
+            super::normalize_signal("RTMAX").as_deref(),
+            Some("SIGRTMAX")
+        );
+        assert_eq!(
+            super::normalize_signal("RTMAX-1").as_deref(),
+            Some("SIGRTMAX-1")
+        );
+        assert_eq!(super::normalize_signal("41").as_deref(), Some("SIGRTMIN"));
+        assert_eq!(
+            super::normalize_signal("52").as_deref(),
+            Some("SIGRTMIN+11")
+        );
+        assert_eq!(
+            super::normalize_signal("53").as_deref(),
+            Some("SIGRTMAX-11")
+        );
+        assert_eq!(super::normalize_signal("64").as_deref(), Some("SIGRTMAX"));
+        assert_eq!(
+            super::normalize_signal("STKFLT").as_deref(),
+            Some("SIGSTKFLT")
+        );
+        assert_eq!(super::normalize_signal("17").as_deref(), Some("SIGCHLD"));
+        // Holes key by number (see the Linux test above).
+        assert_eq!(super::normalize_signal("32").as_deref(), Some("32"));
+        assert_eq!(super::normalize_signal("40").as_deref(), Some("40"));
         assert_eq!(super::normalize_signal("65"), None);
     }
 
@@ -1320,14 +1378,14 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     #[test]
     fn darwin_family_slots() {
-        assert_eq!(super::normalize_signal("EMT"), Some("SIGEMT"));
-        assert_eq!(super::normalize_signal("INFO"), Some("SIGINFO"));
-        assert_eq!(super::normalize_signal("17"), Some("SIGSTOP"));
-        assert_eq!(super::normalize_signal("18"), Some("SIGTSTP"));
-        assert_eq!(super::normalize_signal("19"), Some("SIGCONT"));
-        assert_eq!(super::normalize_signal("20"), Some("SIGCHLD"));
-        assert_eq!(super::normalize_signal("30"), Some("SIGUSR1"));
-        assert_eq!(super::normalize_signal("31"), Some("SIGUSR2"));
+        assert_eq!(super::normalize_signal("EMT").as_deref(), Some("SIGEMT"));
+        assert_eq!(super::normalize_signal("INFO").as_deref(), Some("SIGINFO"));
+        assert_eq!(super::normalize_signal("17").as_deref(), Some("SIGSTOP"));
+        assert_eq!(super::normalize_signal("18").as_deref(), Some("SIGTSTP"));
+        assert_eq!(super::normalize_signal("19").as_deref(), Some("SIGCONT"));
+        assert_eq!(super::normalize_signal("20").as_deref(), Some("SIGCHLD"));
+        assert_eq!(super::normalize_signal("30").as_deref(), Some("SIGUSR1"));
+        assert_eq!(super::normalize_signal("31").as_deref(), Some("SIGUSR2"));
         assert_eq!(super::normalize_signal("STKFLT"), None);
         assert_eq!(super::normalize_signal("PWR"), None);
         assert_eq!(super::normalize_signal("RTMIN"), None);
