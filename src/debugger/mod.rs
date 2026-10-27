@@ -61,4 +61,6 @@ pub use session::{DebugSession, SessionError, SessionState, StepArming, Terminat
 pub use stepping::{arming_stops_at_frame_return, arming_stops_at_seam};
 
 #[cfg(test)]
+mod stepping_tests;
+#[cfg(test)]
 mod wiring_tests;

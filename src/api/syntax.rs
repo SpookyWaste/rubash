@@ -313,10 +313,14 @@ impl Walker<'_> {
             return;
         }
         if let Some(function) = &node.function_command {
-            // A definition is an executable simple-shaped command:
-            // the seam fires before it like before any command the
-            // executor dispatches, and executing it is what makes
-            // the name defined.
+            // The definition line is stoppable, but not because a
+            // seam fires before the definition executes — none
+            // does (the executor's seam admission skips definition
+            // commands outright, matching GNU's dispatch). It is
+            // stoppable because the function-entry seam reports
+            // this line: at entry the engine stamps the current
+            // line with the definition line, so a line breakpoint
+            // here binds and fires at each call's entry seam.
             self.record(node, true, detached);
             if let Some(line) = node_line(node) {
                 let site = FunctionSite {
