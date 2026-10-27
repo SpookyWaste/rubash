@@ -1024,7 +1024,17 @@ impl Executor {
             // arrival — the consult is asked here too (150-c
             // REPORT section 5, note 1).
             if crate::debugger::SESSION_ACTIVE.is_armed() {
-                self.debugger_consult(seam, command_text)?;
+                // The re-entrancy flag stays up for the consult
+                // itself (its condition evaluations rely on it),
+                // but it comes down before any error propagates:
+                // a forced return (design 6.1) unwinds out of the
+                // consult with the run still alive in the caller,
+                // and a stuck flag would silence every later seam
+                // of this executor.
+                let consult_result = self.debugger_consult(seam, command_text);
+                self.debug_trap_running = false;
+                consult_result?;
+                return Ok(None);
             }
             self.debug_trap_running = false;
             return Ok(None);
@@ -5279,6 +5289,38 @@ impl Executor {
         crate::debugger::SESSION_ACTIVE.is_armed() && self.debug_driver.is_some()
     }
 
+    /// WP-8 (design 5.1): register one parsed reader unit's syntax
+    /// view with the attached session, under the file identity the
+    /// engine itself reports for the unit. Called by the two
+    /// file-backed group drivers — the grouped script reader (via
+    /// the `debug_syntax_unit_file` hand-off into
+    /// `run_source_impl`) and the `source` builtin's group runner —
+    /// after parsing and before execution, so a unit's own lines
+    /// are resolvable from its first seam on. With no session
+    /// attached this is one gate check and out.
+    pub(crate) fn debugger_register_syntax(&mut self, file: &str, ast: &crate::parser::Ast) {
+        if !self.debugger_session_here() {
+            return;
+        }
+        let view = crate::api::syntax::SyntaxView::from_ast(file, ast);
+        if let Some(driver) = self.debug_driver.as_mut() {
+            driver.session_mut().register_syntax_view(view);
+        }
+    }
+
+    /// WP-8 (design 5.1): note that a file's reader reached its
+    /// end, so the session may soundly convict lines no parsed
+    /// unit covered. Called by the same two group drivers that
+    /// register views, on their normal-completion path only.
+    pub(crate) fn debugger_note_syntax_complete(&mut self, file: &str) {
+        if !self.debugger_session_here() {
+            return;
+        }
+        if let Some(driver) = self.debug_driver.as_mut() {
+            driver.session_mut().note_syntax_file_complete(file);
+        }
+    }
+
     /// Install a debug session on this executor. Gate pairing is
     /// the driver layer's job (150-c REPORT section 5, note 7):
     /// installation activates the session; termination
@@ -5372,6 +5414,67 @@ impl Executor {
                     }
                 }
             }
+            crate::debugger::StopLoopOutcome::ForceReturn(status) => {
+                // Design 6.1 (`return [status]`): force the frame
+                // the debuggee is stopped in to return now. The
+                // unwind is the engine's own return path — the
+                // same ExecuteError::Return the `return` builtin
+                // raises — so the frame's return site reports the
+                // return (DE-04) carrying the forced status, and
+                // the finish-style arming installed here stops the
+                // session in the caller at the return point.
+                let function_depth = self.shell_state.function_depth;
+                let in_function = function_depth > 0;
+                let in_source = self.source_nest_depth > 0;
+                let forced_status = status.unwrap_or(self.exit_code);
+                let Some(driver) = self.debug_driver.as_mut() else {
+                    return Ok(());
+                };
+                if !in_function && !in_source {
+                    // Rejected at the main frame: there is no frame
+                    // to return from, so the debuggee simply
+                    // resumes (the frontend owns telling the user
+                    // why). A session the stop loop ended while
+                    // parked unwinds with its final status, exactly
+                    // like the Resume outcome's failure shape.
+                    return match driver
+                        .session_mut()
+                        .resume(crate::debugger::StepArming::Continue)
+                    {
+                        Ok(()) => Ok(()),
+                        Err(_) => Err(ExecuteError::ExitCode(
+                            driver
+                                .session()
+                                .termination()
+                                .map(|termination| termination.status())
+                                .unwrap_or(self.exit_code),
+                        )),
+                    };
+                }
+                let arming = if in_function {
+                    crate::debugger::StepArming::Finish {
+                        frame_depth: function_depth,
+                    }
+                } else {
+                    // A sourced file's return has no function
+                    // return site to service a Finish arming: the
+                    // return point in the caller is its next seam,
+                    // which a step-over armed at this depth names.
+                    crate::debugger::StepArming::StepOver {
+                        max_depth: function_depth,
+                    }
+                };
+                match driver.session_mut().resume(arming) {
+                    Ok(()) => Err(ExecuteError::Return(forced_status)),
+                    Err(_) => Err(ExecuteError::ExitCode(
+                        driver
+                            .session()
+                            .termination()
+                            .map(|termination| termination.status())
+                            .unwrap_or(self.exit_code),
+                    )),
+                }
+            }
             crate::debugger::StopLoopOutcome::Detach => {
                 if let Some(driver) = self.debug_driver.take() {
                     driver.session().deactivate();
@@ -5414,7 +5517,7 @@ impl Executor {
         seam: crate::debugger::SeamKind,
         command_text: &str,
     ) -> Result<(), ExecuteError> {
-        use crate::debugger::{HitOutcome, SeamKind, StepArming, StopInfo, StopReason};
+        use crate::debugger::{HitOutcome, SeamKind, StopInfo, StopReason};
 
         let (location, depth) = self.debugger_location();
         let function_name = if seam == SeamKind::FunctionEntry {
@@ -5432,6 +5535,15 @@ impl Executor {
         if let Some(driver) = self.debug_driver.as_mut() {
             let session = driver.session_mut();
             if session.is_running() {
+                // WP-8 (design 5.2): a function-entry seam proves
+                // the entered function is defined. For a name no
+                // syntax view covers — an eval-defined function —
+                // this note is what resolves its pending entries,
+                // and it lands before hit accounting so a
+                // just-resolved entry can stop at this very entry.
+                if let Some(name) = &function_name {
+                    session.note_function_defined(name);
+                }
                 // Breakpoint accounting (design 5.1/5.2/5.5):
                 // register_hit counts the hit and spends ignore
                 // credit before any condition is evaluated.
@@ -5477,15 +5589,15 @@ impl Executor {
                     }
                 }
                 if matches!(pending, Pending::None) {
-                    // Stepping predicates (design section 6): the
-                    // arming installed by the last resume is a
-                    // one-shot rule evaluated here. Finish is
-                    // evaluated at the return site, not at seams.
-                    let step_stop = match session.arming() {
-                        StepArming::StepInto => true,
-                        StepArming::StepOver { max_depth } => depth <= max_depth,
-                        StepArming::Continue | StepArming::Finish { .. } => false,
-                    };
+                    // Stepping predicates (design section 6; WP-4):
+                    // the arming installed by the last resume is a
+                    // one-shot rule, evaluated by the predicates in
+                    // debugger::stepping — the arming's one owner —
+                    // against the engine's own function depth. A
+                    // Finish arming is primarily serviced at the
+                    // frame's return site; the seam predicate
+                    // carries its shallower-frame backstop.
+                    let step_stop = crate::debugger::arming_stops_at_seam(session.arming(), depth);
                     if step_stop {
                         pending = Pending::Stop(StopInfo {
                             reason: StopReason::Step,
@@ -5644,19 +5756,18 @@ impl Executor {
         let mut finish_stop = false;
         if let Some(driver) = self.debug_driver.as_mut() {
             let session = driver.session_mut();
-            session.emit(crate::debugger::DebugEvent::FrameReturned(
-                crate::debugger::FrameReturn {
-                    function: Some(function.to_string()),
-                    frame_depth,
-                    status,
-                    route,
-                },
-            ));
+            let frame = crate::debugger::FrameReturn {
+                function: Some(function.to_string()),
+                frame_depth,
+                status,
+                route,
+            };
+            // WP-4 (design 6.1): the finish predicate is the
+            // stepping module's, evaluated against the frame as
+            // reported here — the same payload DE-04 carries.
             finish_stop = session.is_running()
-                && matches!(
-                    session.arming(),
-                    crate::debugger::StepArming::Finish { frame_depth: armed } if armed == frame_depth
-                );
+                && crate::debugger::arming_stops_at_frame_return(session.arming(), &frame);
+            session.emit(crate::debugger::DebugEvent::FrameReturned(frame));
         }
         if finish_stop {
             self.debugger_stop_and_serve(crate::debugger::StopInfo {

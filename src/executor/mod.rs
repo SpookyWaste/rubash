@@ -320,9 +320,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use self::path::{
     adopt_orphan_console, apply_required_windows_child_environment,
-    external_command_for_named_program, find_shell, find_user_command, find_user_command_without_hash,
-    shell_path_to_process,
-    shell_path_to_windows, standard_path, suppress_orphan_console,
+    external_command_for_named_program, find_shell, find_user_command,
+    find_user_command_without_hash, shell_path_to_process, shell_path_to_windows, standard_path,
+    suppress_orphan_console,
 };
 
 // version.c:90 show_shell_version(): the --version banner prints the same
@@ -741,6 +741,18 @@ pub struct Executor {
     /// inside a synthesized frame (DE-12's frame model is a later
     /// work package).
     debug_driver: Option<crate::debugger::SessionDriver>,
+    /// WP-8 (debugger design 5.1): the file identity the next
+    /// `run_source_impl` unit belongs to, when that unit is backed
+    /// by a real file. Set by the two file-backed group drivers
+    /// (the grouped script reader and the `source` builtin's
+    /// incomplete-group arm) immediately before they hand a unit
+    /// over; `run_source_impl` takes it at entry and registers the
+    /// parsed unit's syntax view with the attached session under
+    /// exactly this identity — the same string the engine puts on
+    /// the BASH_SOURCE stack for the unit. Synthetic units (eval
+    /// strings, -c text, trap actions) never set it, so they never
+    /// register a view.
+    pub(crate) debug_syntax_unit_file: Option<String>,
     return_trap_running: bool,
     signal_trap_running: bool,
     /// The last value written to the OS environment's

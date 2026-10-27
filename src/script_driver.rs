@@ -373,6 +373,17 @@ fn run_script_grouped_at_line_offset(
                     trimmed.is_empty() || trimmed.starts_with('#')
                 }),
         );
+        // WP-8 (debugger design 5.1): name this group for syntax
+        // registration (consumed by run_source_impl at its entry).
+        // The identity is the source stack's top — the same string
+        // this file's stops carry. A command string has no file to
+        // name (its stack seed is $0, not a file), so it sets
+        // nothing and its units never register.
+        executor.debug_syntax_unit_file = if executor.command_string_mode() {
+            None
+        } else {
+            executor.shell_state.bash_source_stack.first().cloned()
+        };
         let status = run_history_group(
             executor,
             &session,
@@ -403,6 +414,16 @@ fn run_script_grouped_at_line_offset(
                 executor.last_exit_code(),
                 (exit_jump && !parse_error) || errexit_stop,
             );
+        }
+    }
+    // WP-8 (debugger design 5.1): the reader reached the end of
+    // this input — the same completion note the source builtin
+    // gives, under the same identity rule as the per-group
+    // registration above. The early returns in the loop (parse
+    // aborts, exit jumps) skip it on purpose.
+    if !executor.command_string_mode() {
+        if let Some(file) = executor.shell_state.bash_source_stack.first().cloned() {
+            executor.debugger_note_syntax_complete(&file);
         }
     }
     (executor.last_exit_code(), false)
@@ -2848,6 +2869,13 @@ fn run_source_impl(
     pre_lexed: Option<Vec<Token>>,
     suppress_unclosed_diagnostic: bool,
 ) -> i32 {
+    // WP-8 (debugger design 5.1): take the file identity the
+    // calling group driver set for this unit, if any (see
+    // `Executor::debug_syntax_unit_file`). Taking at entry means a
+    // nested unit — a sourced file inside this one, an eval string —
+    // never inherits the identity: its own driver sets it for its
+    // own units, or it stays unset and the unit registers nothing.
+    let syntax_unit_file = executor.debug_syntax_unit_file.take();
     // rubash#1485: a prefix run hands diagnostic ownership to its caller
     // (run_source_prefix_diagnostic_owned); every report inside the
     // unclosed-diagnostics route below goes through this gate so the
@@ -3298,6 +3326,15 @@ fn run_source_impl(
     // -c string) restores the enclosing frame state untouched after
     // its run; its own walks never see the frame raised, because the
     // pending flag was already taken by the outer unit.
+    // WP-8 (debugger design 5.1): a file-backed unit registers its
+    // syntax view with the attached session before it executes,
+    // so the unit's breakpoints are resolvable from its first seam
+    // on. Unset identity (eval strings, -c text, interactive
+    // units): nothing registers.
+    if let Some(file) = &syntax_unit_file {
+        executor.debugger_register_syntax(file, &ast);
+    }
+
     let saved_final_frame = executor.exec_replace_final_frame.get();
     let final_unit = executor.command_string_final_pending.take() && executor.command_string_mode();
     executor.exec_replace_final_frame.set(final_unit);

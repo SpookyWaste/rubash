@@ -22,5 +22,7 @@
 
 pub mod views;
 
+pub(crate) mod syntax;
+
 #[cfg(test)]
 mod consumer_tests;

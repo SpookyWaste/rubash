@@ -100,6 +100,12 @@ fn run_source_groups(
                 .env_vars
                 .insert("__RUBASH_ALIAS_STREAMED".to_string(), "1".to_string());
             let saved_list_boundary = executor.enter_discard_boundary_list();
+            // WP-8 (debugger design 5.1): name this incomplete unit
+            // for syntax registration — run_source_impl takes the
+            // identity at its entry. The stack top is this file:
+            // the source builtin pushed it before reading groups.
+            executor.debug_syntax_unit_file =
+                executor.shell_state.bash_source_stack.first().cloned();
             // GNU builtins/evalfile.c runs the sourced text through
             // parse_and_execute (builtins/evalstring.c:348), which bumps
             // indirection_level: under `set -x` the file's commands trace
@@ -239,6 +245,14 @@ fn run_source_groups(
             .env_vars
             .insert("__RUBASH_ALIAS_STREAMED".to_string(), "1".to_string());
         let saved_list_boundary = executor.enter_discard_boundary_list();
+        // WP-8 (debugger design 5.1): register this unit's syntax
+        // view with the attached session before it executes, under
+        // the identity on the source stack's top — the file the
+        // source builtin pushed before reading groups, in the
+        // engine's own spelling.
+        if let Some(file) = executor.shell_state.bash_source_stack.first().cloned() {
+            executor.debugger_register_syntax(&file, &ast);
+        }
         // Same parse_and_execute indirection bump as the incomplete-group
         // arm above (builtins/evalstring.c:348; rubash#1341).
         let group_result = executor.with_xtrace_indirection(|executor| executor.execute_ast(&ast));
@@ -275,6 +289,15 @@ fn run_source_groups(
             }
             Err(error) => return Err(error),
         }
+    }
+    // WP-8 (debugger design 5.1): the reader reached the end of
+    // the file — lines no group attributed a command to are now
+    // soundly dead rather than pending. (The early returns above —
+    // parse aborts — skip this on purpose: that text was not read
+    // to its end.) The stack top is still this file here; the
+    // caller pops it after this returns.
+    if let Some(file) = executor.shell_state.bash_source_stack.first().cloned() {
+        executor.debugger_note_syntax_complete(&file);
     }
     // GNU builtins/source.def: the return status of `.` is the exit status
     // of the last command executed in the file, or **zero** when no commands
