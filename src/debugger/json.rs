@@ -67,7 +67,9 @@ impl Json {
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             Json::Int(value) => Some(*value),
-            Json::Float(value) if value.fract() == 0.0 && value.abs() < 9.0e15 => Some(*value as i64),
+            Json::Float(value) if value.fract() == 0.0 && value.abs() < 9.0e15 => {
+                Some(*value as i64)
+            }
             _ => None,
         }
     }
@@ -360,8 +362,7 @@ impl<'a> Parser<'a> {
                                                 + (((first as u32 - 0xD800) << 10)
                                                     | (second as u32 - 0xDC00));
                                             out.push(
-                                                char::from_u32(combined)
-                                                    .unwrap_or('\u{FFFD}'),
+                                                char::from_u32(combined).unwrap_or('\u{FFFD}'),
                                             );
                                             continue;
                                         }
@@ -387,9 +388,7 @@ impl<'a> Parser<'a> {
                     }
                     match std::str::from_utf8(&self.bytes[start..end]) {
                         Ok(text) => out.push_str(text),
-                        Err(_) => {
-                            return Err(format!("invalid UTF-8 in string at byte {start}"))
-                        }
+                        Err(_) => return Err(format!("invalid UTF-8 in string at byte {start}")),
                     }
                     self.pos = end;
                 }
@@ -446,7 +445,10 @@ mod tests {
     fn roundtrips_the_dap_shapes() {
         let text = r#"{"seq":3,"type":"request","command":"evaluate","arguments":{"expression":"${x:=1}","context":"hover","frameId":12},"flag":true,"none":null,"list":[1,2.5,"a\nb"]}"#;
         let value = Json::parse(text).expect("parses");
-        assert_eq!(value.get("command").and_then(Json::as_str), Some("evaluate"));
+        assert_eq!(
+            value.get("command").and_then(Json::as_str),
+            Some("evaluate")
+        );
         assert_eq!(value.get("seq").and_then(Json::as_i64), Some(3));
         assert_eq!(
             value

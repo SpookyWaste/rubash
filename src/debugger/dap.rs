@@ -131,7 +131,10 @@ fn spawn_reader<R: Read + Send + 'static>(
                                 }
                             }
                         }
-                        if sender.send(Inbound::Request(seq, command, arguments)).is_err() {
+                        if sender
+                            .send(Inbound::Request(seq, command, arguments))
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -272,10 +275,7 @@ impl<W: Write> Transport<W> {
     }
 
     fn event(&mut self, name: &str, body: Option<Json>) {
-        let mut pairs = vec![
-            ("type", Json::from("event")),
-            ("event", Json::from(name)),
-        ];
+        let mut pairs = vec![("type", Json::from("event")), ("event", Json::from(name))];
         if let Some(body) = body {
             pairs.push(("body", body));
         }
@@ -352,8 +352,16 @@ impl OutputCapture {
     fn drain(&mut self) -> Vec<(OutputStream, String)> {
         let mut chunks = Vec::new();
         for (handle, offset, stream) in [
-            (&mut self.stdout, &mut self.stdout_offset, OutputStream::Stdout),
-            (&mut self.stderr, &mut self.stderr_offset, OutputStream::Stderr),
+            (
+                &mut self.stdout,
+                &mut self.stdout_offset,
+                OutputStream::Stdout,
+            ),
+            (
+                &mut self.stderr,
+                &mut self.stderr_offset,
+                OutputStream::Stderr,
+            ),
         ] {
             let Some(file) = handle.as_mut() else {
                 continue;
@@ -773,11 +781,12 @@ impl<W: Write + 'static> Server<W> {
         if !bound {
             let mut shared = self.shared.borrow_mut();
             shared.console("dap: could not bind the debuggee's stdio captures\n".to_string());
-            shared.transport.event(
-                "exited",
-                Some(Json::obj(vec![("exitCode", Json::Int(1))])),
-            );
-            shared.transport.event("terminated", Some(Json::obj(vec![])));
+            shared
+                .transport
+                .event("exited", Some(Json::obj(vec![("exitCode", Json::Int(1))])));
+            shared
+                .transport
+                .event("terminated", Some(Json::obj(vec![])));
             return 1;
         }
         if let Some(cwd) = &self.launch_cwd {
@@ -811,7 +820,11 @@ impl<W: Write + 'static> Server<W> {
             status = crate::script_driver::run_source(&mut executor, &input, false);
             detached = executor.debug_driver().is_none();
         }
-        self.shared.borrow_mut().bridge.running.store(false, Ordering::Release);
+        self.shared
+            .borrow_mut()
+            .bridge
+            .running
+            .store(false, Ordering::Release);
         *self.shared.borrow_mut().bridge.session_flag.lock().unwrap() = None;
 
         // Epilogue: remaining debuggee output first, then the
@@ -849,9 +862,14 @@ impl<W: Write + 'static> Server<W> {
             }
             shared.transport.event(
                 "exited",
-                Some(Json::obj(vec![("exitCode", Json::Int(i64::from(final_status)))])),
+                Some(Json::obj(vec![(
+                    "exitCode",
+                    Json::Int(i64::from(final_status)),
+                )])),
             );
-            shared.transport.event("terminated", Some(Json::obj(vec![])));
+            shared
+                .transport
+                .event("terminated", Some(Json::obj(vec![])));
         }
 
         if detached {
@@ -969,7 +987,9 @@ fn capabilities() -> Json {
 /// (`\\?\`) the canonicalizer adds stripped back off.
 fn path_string(path: &std::path::Path) -> String {
     let text = path.to_string_lossy().into_owned();
-    text.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(text)
+    text.strip_prefix(r"\\?\")
+        .map(str::to_string)
+        .unwrap_or(text)
 }
 
 /// The breakpoint identity for a client-supplied path: its
@@ -1290,15 +1310,22 @@ impl<W: Write + 'static> DapStopLoop<W> {
         reference
     }
 
-    /// Mark the debuggee as running free and produce the
-    /// resume outcome: from here the reader thread owns any
-    /// `pause` that arrives, via the bridge.
-    fn resume(&mut self, arming: StepArming) -> StopLoopOutcome {
+    /// Mark the debuggee as running free: from here the reader
+    /// thread owns any `pause` that arrives, via the bridge.
+    /// Resume-class request handlers call this BEFORE sending
+    /// their response, so a client that answers the response
+    /// with an immediate `pause` can never race the flag.
+    fn mark_running(&mut self) {
         self.shared
             .borrow()
             .bridge
             .running
             .store(true, Ordering::Release);
+    }
+
+    /// Mark running and produce the resume outcome.
+    fn resume(&mut self, arming: StepArming) -> StopLoopOutcome {
+        self.mark_running();
         StopLoopOutcome::Resume(arming)
     }
 
@@ -1363,8 +1390,8 @@ impl<W: Write + 'static> DapStopLoop<W> {
                         .error_response(seq, "setVariable", &message);
                 }
                 Some(_) => {
-                    let value = refreshed_value(session, &parent, element.as_deref())
-                        .unwrap_or(sent_value);
+                    let value =
+                        refreshed_value(session, &parent, element.as_deref()).unwrap_or(sent_value);
                     self.shared.borrow_mut().transport.response(
                         seq,
                         "setVariable",
@@ -1404,7 +1431,9 @@ impl<W: Write + 'static> DapStopLoop<W> {
                     session.breakpoints_mut().insert_watch(stored.clone());
                 }
                 _ => {
-                    session.breakpoints_mut().insert_watch_expression(stored.clone());
+                    session
+                        .breakpoints_mut()
+                        .insert_watch_expression(stored.clone());
                 }
             }
         }
@@ -1622,7 +1651,10 @@ impl<W: Write + 'static> DapStopLoop<W> {
     /// detaches the debuggee — or the client vanishes, which
     /// terminates it (nobody is listening anymore).
     fn request_loop(&mut self, session: &mut DebugSession) -> StopLoopOutcome {
-        let frame_depth = session.last_stop().map(|stop| stop.frame_depth).unwrap_or(0);
+        let frame_depth = session
+            .last_stop()
+            .map(|stop| stop.frame_depth)
+            .unwrap_or(0);
         loop {
             let Some((seq, command, arguments)) = self.shared.borrow_mut().next_request() else {
                 let _ = session.die(TERMINATE_SIGNAL);
@@ -1686,12 +1718,24 @@ impl<W: Write + 'static> DapStopLoop<W> {
                         .get("context")
                         .and_then(Json::as_str)
                         .unwrap_or("repl");
+                    let mut eval_text = expression.clone();
                     let mode = match context {
                         // Implicit faces: the strict checker
                         // (design sections 5.3/7.5).
                         "hover" | "clipboard" => PowerMode::Implicit,
                         "watch" => {
                             self.register_watch(session, &expression);
+                            // The watch face evaluates the
+                            // registered form: a bare name the
+                            // user typed means the variable, so
+                            // the evaluation text is its `$`-form
+                            // (the same text the stop-and-diff
+                            // re-check will use at later stops).
+                            let (kind, stored) = watch_registration_form(expression.trim());
+                            eval_text = match kind {
+                                BreakpointKind::Watch => format!("${stored}"),
+                                _ => stored,
+                            };
                             PowerMode::Implicit
                         }
                         // The debug console is an explicit user
@@ -1711,23 +1755,21 @@ impl<W: Write + 'static> DapStopLoop<W> {
                     self.pending_reply = Some(PendingReply::Evaluate { seq });
                     return StopLoopOutcome::Evaluate(EvaluationRequest {
                         mode,
-                        text: expression,
+                        text: eval_text,
                         frame,
                     });
                 }
-                "setVariable" => {
-                    match self.prepare_set_variable(seq, &arguments) {
-                        Ok((text, pending)) => {
-                            self.pending_reply = Some(pending);
-                            return StopLoopOutcome::Evaluate(EvaluationRequest {
-                                mode: PowerMode::Explicit,
-                                text,
-                                frame: None,
-                            });
-                        }
-                        Err(message) => self.fail(seq, "setVariable", &message),
+                "setVariable" => match self.prepare_set_variable(seq, &arguments) {
+                    Ok((text, pending)) => {
+                        self.pending_reply = Some(pending);
+                        return StopLoopOutcome::Evaluate(EvaluationRequest {
+                            mode: PowerMode::Explicit,
+                            text,
+                            frame: None,
+                        });
                     }
-                }
+                    Err(message) => self.fail(seq, "setVariable", &message),
+                },
                 "setBreakpoints" => {
                     let given = arguments
                         .get("source")
@@ -1769,28 +1811,30 @@ impl<W: Write + 'static> DapStopLoop<W> {
                     );
                 }
                 "continue" => {
+                    self.mark_running();
                     self.respond(
                         seq,
                         "continue",
                         Some(Json::obj(vec![("allThreadsContinued", Json::Bool(true))])),
                     );
-                    return self.resume(StepArming::Continue);
+                    return StopLoopOutcome::Resume(StepArming::Continue);
                 }
                 "next" => {
+                    self.mark_running();
                     self.respond(seq, "next", None);
-                    return self.resume(StepArming::StepOver {
+                    return StopLoopOutcome::Resume(StepArming::StepOver {
                         max_depth: frame_depth,
                     });
                 }
                 "stepIn" => {
+                    self.mark_running();
                     self.respond(seq, "stepIn", None);
-                    return self.resume(StepArming::StepInto);
+                    return StopLoopOutcome::Resume(StepArming::StepInto);
                 }
                 "stepOut" => {
+                    self.mark_running();
                     self.respond(seq, "stepOut", None);
-                    return self.resume(StepArming::Finish {
-                        frame_depth,
-                    });
+                    return StopLoopOutcome::Resume(StepArming::Finish { frame_depth });
                 }
                 "pause" => {
                     // Already parked: the pause is serviced by
@@ -1938,10 +1982,7 @@ impl<W: Write + 'static> DapStopLoop<W> {
             .get("frameId")
             .and_then(Json::as_i64)
             .ok_or("scopes requires a frameId")?;
-        let frame = *self
-            .frame_ids
-            .get(&frame_id)
-            .ok_or("unknown frameId")?;
+        let frame = *self.frame_ids.get(&frame_id).ok_or("unknown frameId")?;
         let locals = self.alloc_ref(VarRefKey::Scope {
             frame,
             locals: true,
@@ -1966,7 +2007,11 @@ impl<W: Write + 'static> DapStopLoop<W> {
 
     /// Render one registry entry's children from the current
     /// snapshot.
-    fn render_variables(&mut self, session: &DebugSession, arguments: &Json) -> Result<Vec<Json>, String> {
+    fn render_variables(
+        &mut self,
+        session: &DebugSession,
+        arguments: &Json,
+    ) -> Result<Vec<Json>, String> {
         let reference = arguments
             .get("variablesReference")
             .and_then(Json::as_i64)
@@ -2005,10 +2050,7 @@ impl<W: Write + 'static> DapStopLoop<W> {
                             rendered.push(Json::obj(vec![
                                 ("name", Json::from(format!("[{index}]"))),
                                 ("value", Json::from(value.clone())),
-                                (
-                                    "evaluateName",
-                                    Json::from(format!("${parent}[{index}]")),
-                                ),
+                                ("evaluateName", Json::from(format!("${parent}[{index}]"))),
                                 ("variablesReference", Json::Int(0)),
                             ]));
                         }
@@ -2018,10 +2060,7 @@ impl<W: Write + 'static> DapStopLoop<W> {
                             rendered.push(Json::obj(vec![
                                 ("name", Json::from(key.clone())),
                                 ("value", Json::from(value.clone())),
-                                (
-                                    "evaluateName",
-                                    Json::from(format!("${parent}[{key}]")),
-                                ),
+                                ("evaluateName", Json::from(format!("${parent}[{key}]"))),
                                 ("variablesReference", Json::Int(0)),
                             ]));
                         }
@@ -2048,10 +2087,7 @@ impl<W: Write + 'static> DapStopLoop<W> {
         Json::obj(vec![
             ("name", Json::from(variable.name.clone())),
             ("value", Json::from(value)),
-            (
-                "evaluateName",
-                Json::from(format!("${}", variable.name)),
-            ),
+            ("evaluateName", Json::from(format!("${}", variable.name))),
             ("variablesReference", Json::Int(reference)),
         ])
     }

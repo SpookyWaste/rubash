@@ -68,7 +68,7 @@ pub use gate::{GateFlag, SESSION_ACTIVE};
 #[allow(unused_imports)]
 pub use inspect::{
     render_caller, render_caller_bare, render_dynamic_state, render_info_args, render_pipestatus,
-    render_variables, render_where, VariablePartition,
+    render_variables, render_watch_value, render_where, VariablePartition,
 };
 #[allow(unused_imports)]
 pub use session::{DebugSession, SessionError, SessionState, StepArming, Termination};
