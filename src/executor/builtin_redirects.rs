@@ -338,6 +338,95 @@ impl Executor {
             }
         }
 
+        // rubash#1687: numbered redirects (`3>file`, `3<file`, `3>&1`)
+        // live only in the ordered `cmd.redirects` list — the structured
+        // fields above mirror just fds 0-2 (parser redirect_assign.rs).
+        // GNU performs every redirection on the command node
+        // (redir.c do_redirections), so a no-output builtin must still
+        // create/truncate/validate its numbered targets even though it
+        // writes nothing itself: `builtin 3>f` and `: 3>f` create f, a
+        // bad target fails the builtin with status 1, and a dup from a
+        // closed fd fails EBADF. `{var}` redirects were applied by
+        // apply_dynamic_fd_var_redirects before this helper (see the
+        // note at the top) and are skipped, as are close/heredoc forms
+        // with no open to perform.
+        for redirect in &cmd.redirects {
+            if redirect.fd_var.is_some() {
+                continue;
+            }
+            let Some(fd) = redirect.fd else {
+                continue;
+            };
+            if fd < 3 {
+                continue;
+            }
+            let target = self.expand_redirect_target(redirect);
+            if self.redirect_failglob_aborted() {
+                return Err(ExecuteError::ExpansionFailure(1));
+            }
+            match redirect.kind {
+                crate::parser::RedirectKind::Output
+                | crate::parser::RedirectKind::ClobberOutput
+                | crate::parser::RedirectKind::CombinedOutput
+                | crate::parser::RedirectKind::CombinedAppend => {
+                    if is_closed_redirect_target(&target) {
+                    } else if let Some((source_fd, _)) = redirect_target_fd_and_move(&target) {
+                        self.validate_builtin_dup_source(source_fd)?;
+                    } else if !target.starts_with("<(") && !target.starts_with(">(") {
+                        self.create_redirect_output(&target, redirect.clobber)?;
+                    }
+                }
+                crate::parser::RedirectKind::Append => {
+                    if !is_closed_redirect_target(&target)
+                        && redirect_target_fd(&target).is_none()
+                        && !target.starts_with("<(")
+                        && !target.starts_with(">(")
+                    {
+                        self.open_output_fd_append(&target).or_else(|_| {
+                            if is_null_device(&target) {
+                                self.create_redirect_output(&target, true)
+                            } else {
+                                open_redirect_append(&shell_path_to_windows(
+                                    &target,
+                                    &self.shell_state.env_vars,
+                                ))
+                                .map_err(|e| crate::posix_errors::path_error(&target, e))
+                            }
+                        })?;
+                    }
+                }
+                crate::parser::RedirectKind::Input => {
+                    if is_closed_redirect_target(&target) {
+                    } else if let Some((source_fd, _)) = redirect_target_fd_and_move(&target) {
+                        self.validate_builtin_dup_source(source_fd)?;
+                    } else if !target.starts_with("<(") && !target.starts_with(">(") {
+                        self.probe_input_redirect(&target)?;
+                    }
+                }
+                crate::parser::RedirectKind::ReadWrite => {
+                    if !is_closed_redirect_target(&target)
+                        && redirect_target_fd(&target).is_none()
+                        && !target.starts_with("<(")
+                        && !target.starts_with(">(")
+                    {
+                        OpenOptions::new()
+                            .create(true)
+                            .read(true)
+                            .write(true)
+                            .open(shell_path_to_windows(&target, &self.shell_state.env_vars))
+                            .map_err(|e| crate::posix_errors::path_error(&target, e))?;
+                    }
+                }
+                crate::parser::RedirectKind::DuplicateInput
+                | crate::parser::RedirectKind::DuplicateOutput => {
+                    if let Some((source_fd, _)) = redirect_target_fd_and_move(&target) {
+                        self.validate_builtin_dup_source(source_fd)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+
         Ok(redirect_failed)
     }
 

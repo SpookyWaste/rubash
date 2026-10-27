@@ -1158,6 +1158,102 @@ impl Executor {
         (current - 1).max(0).to_string()
     }
 
+    /// rubash#1626/#1688: the ambient-fd pin table for one external
+    /// child — (parent descriptor, slot) for every fd-table entry >= 3
+    /// backed by a real descriptor (a File endpoint, or a coproc
+    /// endpoint's raw descriptor), for `pin_ambient_fds_in_child` to
+    /// dup2 onto the slot numbers between fork and exec. GNU forks every
+    /// external child — simple command or pipeline element alike
+    /// (execute_cmd.c:2620 execute_pipeline) — from the shell, so the
+    /// child inherits the shell's descriptors at their numbers; the pin
+    /// mirrors that inheritance for the table's CLOEXEC descriptors.
+    /// Slots the command itself redirects are skipped — the command's
+    /// binding is the more local one and travels its own pins / the env
+    /// channel — except an injected group redirect, whose binding this
+    /// entry already IS. Shared by spawn_external_process and the
+    /// pipeline spawn loops, which build their stage processes by hand.
+    #[cfg(unix)]
+    pub(in crate::executor) fn ambient_fd_pins_for(
+        &self,
+        cmd: &crate::parser::CommandNode,
+    ) -> Vec<(std::os::unix::io::RawFd, u32)> {
+        let mut pins: Vec<(std::os::unix::io::RawFd, u32)> = Vec::new();
+        for (fd, entry) in &self.fd_table.entries {
+            if *fd < 3 || entry.closed {
+                continue;
+            }
+            if let Some(redirect) = cmd
+                .redirects
+                .iter()
+                .find(|redirect| redirect.fd == Some(*fd))
+            {
+                // The command rebinds this slot itself (see the doc
+                // comment); only the injected-group case falls through
+                // and pins the entry that already is its binding.
+                if !crate::executor::support_names::is_injected_group_redirect(redirect) {
+                    continue;
+                }
+            }
+            let mut take =
+                |endpoint: Option<&Rc<crate::executor::fd_table::FileFd>>,
+                 pins: &mut Vec<(std::os::unix::io::RawFd, u32)>| {
+                    if let Some(file) = endpoint {
+                        let pin = (file.handle, *fd);
+                        if !pins.contains(&pin) {
+                            pins.push(pin);
+                        }
+                    }
+                };
+            take(
+                entry.read.as_ref().and_then(|read| match read {
+                    crate::executor::fd_table::FdReadEndpoint::File(file) => Some(file),
+                    crate::executor::fd_table::FdReadEndpoint::CoprocStdout { fd, .. } => Some(fd),
+                    _ => None,
+                }),
+                &mut pins,
+            );
+            take(
+                entry.write.as_ref().and_then(|write| match write {
+                    crate::executor::fd_table::FdWriteEndpoint::File(file) => Some(file),
+                    crate::executor::fd_table::FdWriteEndpoint::CoprocStdin { fd, .. } => Some(fd),
+                    _ => None,
+                }),
+                &mut pins,
+            );
+        }
+        pins
+    }
+
+    /// rubash#1688: register the ambient-fd pin on a stage process built
+    /// by hand in the pipeline spawn loops (they bypass
+    /// spawn_external_process, so without this a pipeline member sees
+    /// EBADF on every ambient descriptor).
+    #[cfg(unix)]
+    pub(in crate::executor) fn attach_ambient_fd_pins(
+        &self,
+        cmd: &crate::parser::CommandNode,
+        process: &mut std::process::Command,
+    ) {
+        let pins = self.ambient_fd_pins_for(cmd);
+        if !pins.is_empty() {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: same contract as the spawn_external_process
+            // registration — the closure runs only in the forked child
+            // before exec and only dup2/closes raw descriptors.
+            unsafe {
+                process.pre_exec(move || pin_ambient_fds_in_child(&pins));
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(in crate::executor) fn attach_ambient_fd_pins(
+        &self,
+        _cmd: &crate::parser::CommandNode,
+        _process: &mut std::process::Command,
+    ) {
+    }
+
     fn spawn_external_process(
         &mut self,
         cmd: &CommandNode,
@@ -1227,6 +1323,12 @@ impl Executor {
         // them here for the child alone: GNU do_redirections opens them in
         // the parent, the fork inherits, and the parent's copy closes at
         // command end (redir.c undo) — the parent's fd table stays untouched.
+        // rubash#1686: on Unix each opened descriptor is also recorded as a
+        // pin (merged into the pin registration below): the env channel
+        // reaches only rubash children, so a foreign child otherwise gets
+        // EBADF on the command's own fds even though the file was created.
+        #[cfg(unix)]
+        let mut command_fd_pins: Vec<(std::os::unix::io::RawFd, u32)> = Vec::new();
         for redirect in &cmd.redirects {
             if redirect.fd_var.is_some() {
                 continue;
@@ -1250,7 +1352,16 @@ impl Executor {
                     | crate::parser::RedirectKind::CloseInput
                     | crate::parser::RedirectKind::ReadWrite
             );
-            if self.fd_table.entries.contains_key(&fd) {
+            if self.fd_table.entries.contains_key(&fd)
+                && crate::executor::support_names::is_injected_group_redirect(redirect)
+            {
+                // The table entry already IS this redirect's binding (a
+                // compound applied it to its real descriptors and injected
+                // the mirror); re-opening would truncate the shared
+                // description. The pin registration below delivers the
+                // table entry instead (rubash#1686). A merely ambient
+                // entry does NOT skip: the command's binding is the more
+                // local one and must win the slot.
                 continue;
             }
             let opened =
@@ -1283,6 +1394,8 @@ impl Executor {
             let Ok(dup) = crate::fd::duplicate_handle_inheritable(raw) else {
                 continue;
             };
+            #[cfg(unix)]
+            command_fd_pins.push((dup, fd));
             process.env(
                 format!("__RUBASH_FD_{}HANDLE_{fd}", if write { "W" } else { "" }),
                 format!("{dup:#x}"),
@@ -1304,57 +1417,17 @@ impl Executor {
         // either: every ambient fd bound by `exec N>file` / `exec N<file`
         // / `exec N<>file` fails EBADF there. GNU's fork simply inherits
         // the descriptors at their numbers. Mirror that on Unix with a
-        // pre_exec pin (registered below): each fd-table entry >= 3
-        // backed by a real descriptor is dup2'ed onto its slot number in
-        // the child. Slots the command itself redirects are left alone —
-        // the command's binding is the more local one and travels the
-        // env channel / scoped paths above; pinning the ambient target
-        // under it would hand the child the wrong file.
+        // pre_exec pin (registered below); the pin table itself is
+        // computed by ambient_fd_pins_for so hand-built pipeline stage
+        // processes inherit the same descriptors (rubash#1688).
         #[cfg(unix)]
         let ambient_fd_pins: Vec<(std::os::unix::io::RawFd, u32)> = {
-            let mut pins: Vec<(std::os::unix::io::RawFd, u32)> = Vec::new();
-            for (fd, entry) in &self.fd_table.entries {
-                if *fd < 3 || entry.closed {
-                    continue;
-                }
-                if cmd
-                    .redirects
-                    .iter()
-                    .any(|redirect| redirect.fd == Some(*fd))
-                {
-                    continue;
-                }
-                let mut take =
-                    |endpoint: Option<&Rc<crate::executor::fd_table::FileFd>>,
-                     pins: &mut Vec<(std::os::unix::io::RawFd, u32)>| {
-                        if let Some(file) = endpoint {
-                            let pin = (file.handle, *fd);
-                            if !pins.contains(&pin) {
-                                pins.push(pin);
-                            }
-                        }
-                    };
-                take(
-                    entry.read.as_ref().and_then(|read| match read {
-                        crate::executor::fd_table::FdReadEndpoint::File(file) => Some(file),
-                        crate::executor::fd_table::FdReadEndpoint::CoprocStdout { fd, .. } => {
-                            Some(fd)
-                        }
-                        _ => None,
-                    }),
-                    &mut pins,
-                );
-                take(
-                    entry.write.as_ref().and_then(|write| match write {
-                        crate::executor::fd_table::FdWriteEndpoint::File(file) => Some(file),
-                        crate::executor::fd_table::FdWriteEndpoint::CoprocStdin { fd, .. } => {
-                            Some(fd)
-                        }
-                        _ => None,
-                    }),
-                    &mut pins,
-                );
-            }
+            let mut pins = self.ambient_fd_pins_for(cmd);
+            // rubash#1686: the command's own redirect descriptors ride
+            // the same registration, appended after the ambient pins so
+            // a command binding wins any slot both sides name (the pin
+            // helper dup2's in list order).
+            pins.extend(command_fd_pins);
             pins
         };
         // rubash#229: restore GNU's child signal dispositions between fork

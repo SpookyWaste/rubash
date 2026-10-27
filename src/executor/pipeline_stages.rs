@@ -1209,6 +1209,11 @@ impl Executor {
             }
         }
 
+        // rubash#1688: this sequential stage spawner builds its child by
+        // hand like the concurrent pipeline loops — pin the ambient
+        // descriptors, or a member of a mixed (builtin-headed) pipeline
+        // sees EBADF on every `exec` fd the concurrent path delivers.
+        self.attach_ambient_fd_pins(command, &mut process);
         // rubash#438: pin the buffered process-substitution pipe read ends at
         // their /dev/fd/N numbers in the child (fork-exec dup2), so the
         // literal argv word resolves through the OS /dev/fd layer.

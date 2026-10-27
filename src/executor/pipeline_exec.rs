@@ -2302,6 +2302,9 @@ impl Executor {
                 process.stdout(Stdio::piped());
                 process.stderr(Stdio::piped());
             }
+            // rubash#1688: a pipeline member is a fork of the shell
+            // like any external child — pin the ambient descriptors.
+            self.attach_ambient_fd_pins(consumers[index], &mut process);
             process.current_dir(&self.shell_state.cwd);
             suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
@@ -2919,6 +2922,8 @@ impl Executor {
             // niubash#141: keep the failed stage's resolved program in the
             // diagnostic — a bare `line 1: Unknown error` hid which stage's
             // CreateProcess failed (and with which binary).
+            // rubash#1688: pin the ambient descriptors for the stage.
+            self.attach_ambient_fd_pins(&commands[index], &mut process);
             process.current_dir(&self.shell_state.cwd);
             suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
@@ -3165,6 +3170,8 @@ impl Executor {
             process.stdout(stdio_from_transferred_handle(
                 write.take().expect("producer writer already transferred"),
             ));
+            // rubash#1688: pin the ambient descriptors for the stage.
+            self.attach_ambient_fd_pins(commands[index], &mut process);
             process.current_dir(&self.shell_state.cwd);
             suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
@@ -3643,6 +3650,8 @@ impl Executor {
                 }
             }
 
+            // rubash#1688: pin the ambient descriptors for the stage.
+            self.attach_ambient_fd_pins(&commands[index], &mut process);
             process.current_dir(&self.shell_state.cwd);
             suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
