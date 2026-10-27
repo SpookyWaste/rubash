@@ -3413,6 +3413,10 @@ impl Executor {
         // shell engine, so resolve them here before the builtin generates
         // candidates from the static actions.
         let mut dynamic: Option<crate::builtins::complete::CompgenDynamic> = None;
+        // rubash#1798: the fd table saved while the compgen command's
+        // own stdio redirects are bound as the resolution frame (see
+        // the will_run branch below); restored after the final output.
+        let mut framed_fd_table: Option<crate::executor::fd_table::FdTable> = None;
         if matches!(
             builtin,
             crate::builtins::complete::CompletionBuiltin::Compgen
@@ -3454,7 +3458,35 @@ impl Executor {
                                 .funcname
                                 .as_deref()
                                 .is_some_and(|funcname| self.has_function(funcname));
-                        if will_run {
+                        if will_run && compgen_stdio_redirected(cmd) {
+                            // rubash#1798: GNU installs a builtin's
+                            // redirections before it runs (execute_cmd.c
+                            // do_redirections), so everything the -F
+                            // function / -C command writes to fd 1/2 —
+                            // including a nested compopt's `not
+                            // currently executing` diagnostic — travels
+                            // through THIS command's redirect frame.
+                            // Bind the frame into the fd table for the
+                            // resolution and the final output, and write
+                            // the warning through it now (its GNU
+                            // position precedes the run). The buffered
+                            // flush cannot be used while framed: it
+                            // re-opens the targets, and the second open
+                            // truncates what the frame already wrote
+                            // (the #1090/#1041 hazard — it was already
+                            // erasing this very warning on the will_run
+                            // path).
+                            framed_fd_table = Some(self.fd_table.clone());
+                            if let Err(error) = self.bind_conditional_stdio_redirects(cmd) {
+                                self.fd_table = framed_fd_table.take().unwrap();
+                                return Err(error);
+                            }
+                            if let Err(error) = self.write_default_stderr(&stderr) {
+                                self.fd_table = framed_fd_table.take().unwrap();
+                                return Err(error);
+                            }
+                            stderr.clear();
+                        } else if will_run {
                             self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
                             stdout.clear();
                             stderr.clear();
@@ -3462,6 +3494,13 @@ impl Executor {
                     }
                     let word = parsed.word().to_string();
                     let mut resolved = crate::builtins::complete::CompgenDynamic::default();
+                    // rubash#1799: -A variable lists PIPESTATUS only
+                    // while its cell exists as a visible variable —
+                    // materialized by a completed pipeline (LiveArray)
+                    // or created by a scalar bind (Scalar); the
+                    // valueless declare shapes stay att_invisible in
+                    // GNU and an absent cell is no variable at all.
+                    resolved.pipestatus = self.pipestatus_listing();
                     if let Some(funcname) = parsed.funcname.as_deref() {
                         // GNU pcomplete.c:1058-1066 gen_shell_function_matches:
                         // a missing -F function is internal_error
@@ -3490,7 +3529,7 @@ impl Executor {
                 }
             }
         }
-        let status = if matches!(
+        let status = match (if matches!(
             builtin,
             crate::builtins::complete::CompletionBuiltin::Compgen
         ) {
@@ -3508,7 +3547,7 @@ impl Executor {
                 &underlay,
                 &mut stdout,
                 &mut stderr,
-            )?
+            )
         } else {
             crate::builtins::complete::execute_with_io(
                 builtin,
@@ -3520,7 +3559,17 @@ impl Executor {
                 &diagnostic_prefix,
                 &mut stdout,
                 &mut stderr,
-            )?
+            )
+        }) {
+            Ok(status) => status,
+            Err(error) => {
+                // rubash#1798: never leak a bound frame past this
+                // builtin, whatever failed inside it.
+                if let Some(saved) = framed_fd_table.take() {
+                    self.fd_table = saved;
+                }
+                return Err(error.into());
+            }
         };
         if matches!(
             builtin,
@@ -3540,7 +3589,23 @@ impl Executor {
                 stdout.clear();
             }
         }
-        self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+        if let Some(saved) = framed_fd_table.take() {
+            // rubash#1798: framed mode — the matches (and any residue)
+            // go through the bound frame in order, then the frame is
+            // restored. The buffered flush would re-open the targets
+            // and truncate the resolution's own writes.
+            let mut result: Result<(), ExecuteError> = Ok(());
+            if !stdout.is_empty() {
+                result = self.write_default_stdout(&stdout);
+            }
+            if result.is_ok() && !stderr.is_empty() {
+                result = self.write_default_stderr(&stderr);
+            }
+            self.fd_table = saved;
+            result?;
+        } else {
+            self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+        }
         Ok(status)
     }
 
@@ -3573,7 +3638,7 @@ impl Executor {
             );
             return Vec::new();
         }
-        self.bind_compfunc_variables("", 0, &[], -1);
+        self.bind_compfunc_variables("", 0, &[], -1, false);
         let args = [cmd.to_string(), word.to_string(), String::new()];
         let _ = self.call_function(funcname, args);
         let reply = self
@@ -3595,7 +3660,7 @@ impl Executor {
         cmd: &str,
         word: &str,
     ) -> Vec<String> {
-        self.bind_compfunc_variables("", 0, &[], 0);
+        self.bind_compfunc_variables("", 0, &[], 0, true);
         let result = self.run_completion_command_line(command, cmd, word, "");
         self.unbind_compfunc_variables();
         result
@@ -3701,6 +3766,8 @@ impl Executor {
                 )
             };
         let mut dynamic = crate::builtins::complete::CompgenDynamic::default();
+        // rubash#1799: same PIPESTATUS cell rule as the compgen arm.
+        dynamic.pipestatus = self.pipestatus_listing();
         if let Some(funcname) = spec.funcname.as_deref() {
             dynamic.function_candidates = self.run_completion_function_live(
                 funcname,
@@ -3810,16 +3877,26 @@ impl Executor {
         self.set_env("COMP_CWORD", &cword.to_string());
     }
 
-    /// pcomplete.c:863 gen_wordlist_matches: split the -W wordlist at shell
-    /// delimiters (quotes group and are removed — the splitter's
-    /// GNU-parse.y-compatible pass in alias_helpers), then expand each word
-    /// with the shellexp rules: a quoted word keeps one field per array
-    /// element and never glob-splits; an unquoted word goes through the
+    /// pcomplete.c:863 gen_wordlist_matches: split the -W wordlist with
+    /// split_at_delims (subst.c:2616) at the CURRENT $IFS (quotes group
+    /// and are retained in the pieces), then expand each word with the
+    /// shellexp rules: a quoted word keeps one field per array element
+    /// and never glob-splits; an unquoted word goes through the
     /// for-list expander (parameter expansion, field splitting, pathname
     /// expansion).
     fn expand_compgen_wordlist(&mut self, wordlist: &str) -> Vec<String> {
+        // subst.c:2630: with delims == NULL the splitter reads
+        // ifs_value — the shell's current IFS (this command's tempenv
+        // frame included), or the default " \t\n" while IFS is unset.
+        // An empty IFS splits nowhere.
+        let ifs = self
+            .shell_state
+            .env_vars
+            .get("IFS")
+            .cloned()
+            .unwrap_or_else(|| " \t\n".to_string());
         let mut values = Vec::new();
-        for (word, quoted) in split_shell_words_with_quote_info(wordlist) {
+        for (word, quoted) in split_compgen_wordlist(wordlist, &ifs) {
             if quoted {
                 // expand_words_shellexp keeps W_QUOTED words whole; a word
                 // that IS an array reference yields one field per element
@@ -3839,16 +3916,51 @@ impl Executor {
         values
     }
 
+    /// rubash#1799: the PIPESTATUS cell facts for the -A variable /
+    /// -A arrayvar listings, read from the cell shape the status writer
+    /// maintains: a completed pipeline (or array bind) leaves a
+    /// LiveArray cell, a scalar bind a Scalar cell — both visible
+    /// variables in GNU's table; the valueless declare shapes are
+    /// att_invisible and an Absent shape is no cell at all.
+    fn pipestatus_listing(&self) -> crate::builtins::complete::PipestatusListing {
+        use crate::shell::state::PipestatusShape;
+        crate::builtins::complete::PipestatusListing {
+            cell_visible: matches!(
+                self.shell_state.pipestatus_shape,
+                PipestatusShape::LiveArray | PipestatusShape::Scalar
+            ),
+            live_array: self.shell_state.pipestatus_shape == PipestatusShape::LiveArray,
+        }
+    }
+
     /// pcomplete.c:929 bind_compfunc_variables with the compgen shape: an
     /// empty line and a zero index (COMP_LINE "", COMP_POINT 0,
     /// COMP_TYPE 0, COMP_KEY 0 — readline is not completing here), the
     /// COMP_WORDS array, and COMP_CWORD (cw - 1 for functions,
     /// pcomplete.c:1073-1074).
-    fn bind_compfunc_variables(&mut self, line: &str, point: usize, words: &[String], cword: i64) {
+    ///
+    /// The `exported` arm is the -C shape (pcomplete.c:1156
+    /// gen_command_matches passes exported=1): only the four scalar
+    /// variables are bound — COMP_WORDS and COMP_CWORD are bound solely
+    /// in the exported==0 (function) arm, so a -C command observes them
+    /// exactly as the caller left them (unset in a fresh shell,
+    /// rubash#1796). unbind_compfunc_variables removes all six either
+    /// way (pcomplete.c:976), matching GNU.
+    fn bind_compfunc_variables(
+        &mut self,
+        line: &str,
+        point: usize,
+        words: &[String],
+        cword: i64,
+        exported: bool,
+    ) {
         self.set_env("COMP_LINE", line);
         self.set_env("COMP_POINT", &point.to_string());
         self.set_env("COMP_TYPE", "0");
         self.set_env("COMP_KEY", "0");
+        if exported {
+            return;
+        }
         // GNU compgen passes the caller's COMP_WORDS through to the -F
         // function: outside a live completion there is no word list to
         // bind, so a COMP_WORDS the script already set stays visible
@@ -4095,4 +4207,295 @@ where
         "{diagnostic_prefix}wait: `{operand}': not a pid or valid job spec"
     )?;
     Ok(1)
+}
+
+/// subst.c:2616 split_at_delims with delims == NULL, as driven by
+/// pcomplete.c:863 gen_wordlist_matches for the -W wordlist: the
+/// delimiter set is the current $IFS; a maximal run of delimiter
+/// characters separates two fields and leading/trailing runs vanish,
+/// so no empty fields are ever produced (with delims == NULL the d2
+/// empty-field branch of split_at_delims never fires). Grouping
+/// follows subst.c:2199 skip_to_delim: a backslash quotes the next
+/// character before any delimiter test, and single/double quotes,
+/// backquotes, $'...', $(...) and ${...} spans group — delimiter
+/// characters inside a span are field content. Pieces keep their
+/// quote characters for the shellexp expansion arms; a piece is
+/// reported quoted when it carries top-level quoting (a quote, an
+/// escape, or a $'...' span), which is what keeps its expansion
+/// unsplit (rubash#1797).
+fn split_compgen_wordlist(wordlist: &str, ifs: &str) -> Vec<(String, bool)> {
+    CompgenWordlistScanner {
+        chars: wordlist.chars().collect(),
+        ifs,
+        pos: 0,
+    }
+    .split()
+}
+
+struct CompgenWordlistScanner<'a> {
+    chars: Vec<char>,
+    ifs: &'a str,
+    pos: usize,
+}
+
+impl CompgenWordlistScanner<'_> {
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+
+    fn peek_next(&self) -> Option<char> {
+        self.chars.get(self.pos + 1).copied()
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let c = self.peek()?;
+        self.pos += 1;
+        Some(c)
+    }
+
+    fn is_delim(&self, c: char) -> bool {
+        self.ifs.contains(c)
+    }
+
+    fn split(mut self) -> Vec<(String, bool)> {
+        let mut words = Vec::new();
+        loop {
+            // A delimiter run is one separator; leading runs vanish.
+            while matches!(self.peek(), Some(c) if self.is_delim(c)) {
+                self.pos += 1;
+            }
+            if self.peek().is_none() {
+                break;
+            }
+            let (piece, quoted) = self.field();
+            if !piece.is_empty() {
+                words.push((piece, quoted));
+            }
+        }
+        words
+    }
+
+    /// One field: consume until an unquoted delimiter or end of input.
+    /// The test order mirrors skip_to_delim: backslash and backquote
+    /// are recognized before the delimiter test; quotes and dollar
+    /// spans after it.
+    fn field(&mut self) -> (String, bool) {
+        let mut piece = String::new();
+        let mut quoted = false;
+        while let Some(c) = self.peek() {
+            match c {
+                '\\' => {
+                    // A top-level escape quotes the field. The escaped
+                    // character is decoded with the same carrier
+                    // encoding the alias_helpers splitter produces, so
+                    // the shellexp arms see the piece in the form they
+                    // already handle (a raw backslash would survive
+                    // expand_word verbatim: `a\ b` must yield `a b`).
+                    quoted = true;
+                    self.bump();
+                    match self.bump() {
+                        None => piece.push('\\'),
+                        Some('\n') => {}
+                        Some('\\') => piece.push(crate::executor::markers::DATA_BACKSLASH),
+                        Some('$') => piece.push(crate::executor::markers::DATA_DOLLAR),
+                        Some('`') => piece.push(crate::executor::markers::DATA_BACKTICK),
+                        Some('\'') => piece.push(crate::executor::markers::DATA_SQUOTE),
+                        Some('"') => piece.push(crate::executor::markers::DATA_DQUOTE),
+                        Some(other) => piece.push(other),
+                    }
+                }
+                '`' => self.backquote_span(&mut piece),
+                _ if self.is_delim(c) => break,
+                '\'' => {
+                    quoted = true;
+                    self.squote_span(&mut piece);
+                }
+                '"' => {
+                    quoted = true;
+                    self.dquote_span(&mut piece);
+                }
+                '$' if self.peek_next() == Some('\'') => {
+                    quoted = true;
+                    self.ansi_c_span(&mut piece);
+                }
+                '$' if self.peek_next() == Some('"') => {
+                    quoted = true;
+                    piece.push(self.bump().unwrap());
+                    self.dquote_span(&mut piece);
+                }
+                '$' if self.peek_next() == Some('(') => self.dollar_paren_span(&mut piece),
+                '$' if self.peek_next() == Some('{') => self.dollar_brace_span(&mut piece),
+                _ => piece.push(self.bump().unwrap()),
+            }
+        }
+        (piece, quoted)
+    }
+
+    fn squote_span(&mut self, piece: &mut String) {
+        piece.push(self.bump().unwrap_or('\''));
+        while let Some(c) = self.peek() {
+            piece.push(self.bump().unwrap());
+            if c == '\'' {
+                break;
+            }
+        }
+    }
+
+    fn ansi_c_span(&mut self, piece: &mut String) {
+        piece.push(self.bump().unwrap_or('$'));
+        piece.push(self.bump().unwrap_or('\''));
+        while let Some(c) = self.peek() {
+            if c == '\\' {
+                piece.push(self.bump().unwrap());
+                if let Some(escaped) = self.bump() {
+                    piece.push(escaped);
+                }
+                continue;
+            }
+            piece.push(self.bump().unwrap());
+            if c == '\'' {
+                break;
+            }
+        }
+    }
+
+    fn dquote_span(&mut self, piece: &mut String) {
+        piece.push(self.bump().unwrap_or('"'));
+        while let Some(c) = self.peek() {
+            match c {
+                '"' => {
+                    piece.push(self.bump().unwrap());
+                    break;
+                }
+                '\\' => {
+                    piece.push(self.bump().unwrap());
+                    // Inside double quotes a backslash quotes only
+                    // $, `, ", \ and newline (skip_double_quoted).
+                    if matches!(self.peek(), Some('$' | '`' | '"' | '\\' | '\n')) {
+                        piece.push(self.bump().unwrap());
+                    }
+                }
+                '`' => self.backquote_span(piece),
+                '$' if self.peek_next() == Some('(') => self.dollar_paren_span(piece),
+                '$' if self.peek_next() == Some('{') => self.dollar_brace_span(piece),
+                _ => piece.push(self.bump().unwrap()),
+            }
+        }
+    }
+
+    fn backquote_span(&mut self, piece: &mut String) {
+        piece.push(self.bump().unwrap_or('`'));
+        while let Some(c) = self.peek() {
+            if c == '\\' {
+                piece.push(self.bump().unwrap());
+                if let Some(escaped) = self.bump() {
+                    piece.push(escaped);
+                }
+                continue;
+            }
+            piece.push(self.bump().unwrap());
+            if c == '`' {
+                break;
+            }
+        }
+    }
+
+    fn dollar_paren_span(&mut self, piece: &mut String) {
+        piece.push(self.bump().unwrap_or('$'));
+        piece.push(self.bump().unwrap_or('('));
+        let mut depth = 1usize;
+        while depth > 0 {
+            let Some(c) = self.peek() else { break };
+            match c {
+                '\\' => {
+                    piece.push(self.bump().unwrap());
+                    if let Some(escaped) = self.bump() {
+                        piece.push(escaped);
+                    }
+                }
+                '\'' => self.squote_span(piece),
+                '"' => self.dquote_span(piece),
+                '`' => self.backquote_span(piece),
+                '$' if self.peek_next() == Some('\'') => self.ansi_c_span(piece),
+                '$' if self.peek_next() == Some('(') => {
+                    piece.push(self.bump().unwrap());
+                    piece.push(self.bump().unwrap());
+                    depth += 1;
+                }
+                '$' if self.peek_next() == Some('{') => self.dollar_brace_span(piece),
+                '(' => {
+                    piece.push(self.bump().unwrap());
+                    depth += 1;
+                }
+                ')' => {
+                    piece.push(self.bump().unwrap());
+                    depth -= 1;
+                }
+                _ => piece.push(self.bump().unwrap()),
+            }
+        }
+    }
+
+    fn dollar_brace_span(&mut self, piece: &mut String) {
+        piece.push(self.bump().unwrap_or('$'));
+        piece.push(self.bump().unwrap_or('{'));
+        let mut depth = 1usize;
+        while depth > 0 {
+            let Some(c) = self.peek() else { break };
+            match c {
+                '\\' => {
+                    piece.push(self.bump().unwrap());
+                    if let Some(escaped) = self.bump() {
+                        piece.push(escaped);
+                    }
+                }
+                '\'' => self.squote_span(piece),
+                '"' => self.dquote_span(piece),
+                '`' => self.backquote_span(piece),
+                '$' if self.peek_next() == Some('\'') => self.ansi_c_span(piece),
+                '$' if self.peek_next() == Some('(') => self.dollar_paren_span(piece),
+                '$' if self.peek_next() == Some('{') => {
+                    piece.push(self.bump().unwrap());
+                    piece.push(self.bump().unwrap());
+                    depth += 1;
+                }
+                '{' => {
+                    piece.push(self.bump().unwrap());
+                    depth += 1;
+                }
+                '}' => {
+                    piece.push(self.bump().unwrap());
+                    depth -= 1;
+                }
+                _ => piece.push(self.bump().unwrap()),
+            }
+        }
+    }
+}
+
+/// Whether a command node carries its own fd 1 / fd 2 output
+/// redirection (an ordered `redirects` entry with an output kind
+/// naming fd 1 or 2, or defaulting to fd 1) — the trigger for running
+/// compgen's dynamic resolution under a bound fd frame
+/// (rubash#1798). fd_var entries bind a fresh descriptor, never
+/// fd 1/2, and input-side kinds name fd 0; neither installs a stdio
+/// frame in GNU either (do_redirections binds exactly the listed
+/// descriptors).
+fn compgen_stdio_redirected(cmd: &CommandNode) -> bool {
+    use crate::parser::RedirectKind;
+    cmd.redirects.iter().any(|redirect| {
+        if redirect.fd_var.is_some() {
+            return false;
+        }
+        match redirect.kind {
+            RedirectKind::Output
+            | RedirectKind::Append
+            | RedirectKind::ClobberOutput
+            | RedirectKind::CombinedOutput
+            | RedirectKind::CombinedAppend
+            | RedirectKind::DuplicateOutput
+            | RedirectKind::CloseOutput => matches!(redirect.fd, None | Some(1) | Some(2)),
+            _ => false,
+        }
+    })
 }
