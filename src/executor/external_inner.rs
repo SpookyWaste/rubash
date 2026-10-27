@@ -1822,19 +1822,38 @@ impl ForegroundWaitSigintGuard {
 }
 
 /// Shared predicate for both foreground SIGINT guards (rubash#1250):
-/// an interactive reader session and SIGINT sits at SIG_DFL — i.e. no
-/// trap installed (a handler means the trap path owns the delivery)
-/// and not entry-ignored. rubash#1639: the session test is
-/// interactive_reader_session, not the full expansion-discard rule —
-/// the discard rule's frame conditions (depth 0, no comsub body)
-/// govern where an expansion error is FATAL, while a foreground wait
-/// needs protection at any depth: in the flat model the subshell
-/// frame's wait is the process's foreground wait, and GNU protects
-/// the corresponding wait_for (the parent's, for the subshell job)
-/// identically.
+/// an interactive reader session and SIGINT is untrapped, with the
+/// kernel disposition in one of the two untrapped steady states —
+/// SIG_DFL, or the mailbox handler the rubash#1662 interactive pin
+/// installs from the command boundary on (GNU sig.c:315-316: an
+/// interactive shell catches SIGINT itself from startup). Before the
+/// pin, SIG_DFL alone proved "untrapped"; the pin made that test
+/// read Handler for every untrapped interactive SIGINT, the guards
+/// never armed, and deliveries queued in the mailbox with no consumer
+/// during in-process blocking waits — a `read` ate the next input
+/// line and a subshell frame's virtual child slept through the ^C
+/// (rubash#1824). A handler alone still does not arm the guard: the
+/// trap table decides ownership — a trapped SIGINT (any table entry,
+/// including an ignore) keeps the trap path, and an entry-ignored
+/// SIGINT (SIG_IGN, no handler) stays untouched.
+/// rubash#1639: the session test is interactive_reader_session, not
+/// the full expansion-discard rule — the discard rule's frame
+/// conditions (depth 0, no comsub body) govern where an expansion
+/// error is FATAL, while a foreground wait needs protection at any
+/// depth: in the flat model the subshell frame's wait is the
+/// process's foreground wait, and GNU protects the corresponding
+/// wait_for (the parent's, for the subshell job) identically.
 #[cfg(unix)]
 pub(in crate::executor) fn foreground_sigint_needs_protection(executor: &Executor) -> bool {
-    executor.interactive_reader_session() && sigint_disposition_is_default()
+    if !executor.interactive_reader_session() {
+        return false;
+    }
+    if sigint_disposition_is_default() {
+        return true;
+    }
+    crate::builtins::kill::kernel_handler_installed(libc::SIGINT)
+        && crate::builtins::trap::get_trap_action(&executor.shell_state.env_vars, "SIGINT")
+            .is_none()
 }
 
 #[cfg(unix)]
