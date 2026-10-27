@@ -303,10 +303,14 @@ pub(in crate::executor) fn bash_command_text(cmd: &CommandNode) -> String {
         // carries the source quotes, so `x="$(a) ($(b | cat))"` re-parses
         // as one assignment. The cooked value drops those quotes, which
         // corrupted respawned background children (rubash#1664: the
-        // payload became `x=$(a) ($(b cat))`, a syntax error). Prefer
-        // the raw RHS when the parser recorded it; fall back to the
-        // cooked value (with the lexer's private quoted-RHS marker
-        // stripped, so BASH_COMMAND never exposes that sentinel).
+        // payload became `x=$(a) ($(b cat))`, a syntax error; rubash#1704:
+        // a multi-line quoted value re-parsed as separate commands and a
+        // quoted comsub lost its quotes in BASH_COMMAND and every other
+        // text exposure). Prefer the raw RHS when the parser recorded
+        // it; fall back to the cooked value (with the lexer's private
+        // quoted-RHS marker stripped, so BASH_COMMAND never exposes
+        // that sentinel). The raws are only trusted when they align with
+        // the assignments; synthesized assignments carry no raw.
         let raw = raws_aligned
             .then(|| cmd.assignment_raws.get(index))
             .flatten()
@@ -880,10 +884,46 @@ pub(in crate::executor) fn case_command_head_source_text(case_command: &CaseComm
 }
 
 fn case_command_source_text(case_command: &CaseCommand) -> String {
-    let mut text = format!("case {} in", case_command.word);
+    // GNU print_cmd.c:750 (print_case_command) prints the subject word
+    // and every clause pattern from their raw token text — quotes
+    // intact — with patterns joined by command_print_word_list's
+    // " | " (print_cmd.c:782). Rendering the cooked forms instead
+    // dropped the quoting: an empty-string pattern `''` rendered as
+    // nothing (an unparseable ` )` clause head) and a quoted subject
+    // lost its quotes, corrupting every respawned background child
+    // whose prelude carried such a case (rubash#1704:
+    // nvm_download_artifact). Same raw contract ComsubPrinter's case
+    // arm already keeps.
+    let word = if case_command.word_metadata.value == case_command.word
+        && !case_command.word_metadata.raw.is_empty()
+    {
+        case_command.word_metadata.raw.clone()
+    } else {
+        case_command.word.clone()
+    };
+    let mut text = format!("case {} in", word);
     for clause in &case_command.clauses {
         text.push(' ');
-        text.push_str(&clause.patterns.join("|"));
+        let patterns = clause
+            .patterns
+            .iter()
+            .enumerate()
+            .map(|(index, pattern)| {
+                clause
+                    .pattern_nodes
+                    .get(index)
+                    .map(|node| node.raw_text.trim().to_string())
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or_else(|| pattern.clone())
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        // An `esac` pattern only parses behind an opening paren
+        // (print_cmd.c:782-787).
+        if clause.patterns.first().is_some_and(|p| p == "esac") {
+            text.push('(');
+        }
+        text.push_str(&patterns);
         text.push_str(") ");
         text.push_str(&bash_command_sequence_text(&clause.body));
         text.push(' ');
