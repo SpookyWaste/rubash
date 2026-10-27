@@ -1388,52 +1388,65 @@ fn group_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<String
 }
 
 fn service_completion_candidates(word: &str) -> Vec<String> {
-    // GNU bashline.c:2668 bash_servicename_completion_function walks
-    // getservent() entries in database order: an entry contributes its
-    // primary s_name when the name matches the word prefix; only when
-    // the name does NOT match may the entry contribute a matching
-    // alias instead — never both, and duplicates (tcp/udp pairs) are
-    // kept. The files-backed database is /etc/services on unix and
-    // %SystemRoot%\System32\drivers\etc\services on Windows (the file
-    // the OS resolver itself consults); the IANA layout is identical:
-    // name = first field, port/proto second, aliases after, `#`
-    // comments. With no readable database getservent yields nothing
-    // (rubash#1044).
-    let Ok(contents) = std::fs::read_to_string(services_db_path()) else {
-        return Vec::new();
-    };
+    // GNU bashline.c:2667 bash_servicename_completion_function walks the
+    // libc getservent() database in resolver order: an entry contributes
+    // its primary s_name when the name matches the word prefix; only when
+    // the name does NOT match may the entry contribute the first matching
+    // alias instead — never both, and duplicates (tcp/udp pairs) are kept
+    // (pcomplete.c:820 GEN_XCOMPS appends without dedup). getservent() is
+    // the resolver itself, so libc fallbacks without an on-disk database
+    // (bionic's 545-entry built-in table, nsswitch sources) list exactly
+    // what GNU lists (rubash#1044). GNU returns NULL unconditionally on
+    // Windows (bashline.c `#if defined (__WIN32__)`) — no fallback file.
+    #[cfg(unix)]
+    {
+        service_completion_candidates_via_getservent(word)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = word;
+        Vec::new()
+    }
+}
+
+/// Unix half of [`service_completion_candidates`]: one
+/// setservent/getservent/endservent pass mirroring the state machine in
+/// bash_servicename_completion_function (state 0 saves the word, each call
+/// yields the next matching entry's primary-or-first-matching-alias).
+#[cfg(unix)]
+fn service_completion_candidates_via_getservent(word: &str) -> Vec<String> {
+    use std::ffi::CStr;
     let mut candidates = Vec::new();
-    for raw_line in contents.lines() {
-        let line = raw_line.split('#').next().unwrap_or("");
-        let mut fields = line.split_whitespace();
-        let Some(name) = fields.next() else {
-            continue;
-        };
-        // field 2 is port/proto; the rest are aliases.
-        let _ = fields.next();
-        if name.starts_with(word) {
-            candidates.push(name.to_string());
-        } else if let Some(alias) = fields.find(|alias| alias.starts_with(word)) {
-            candidates.push(alias.to_string());
+    // SAFETY: getservent's static storage is process-global; compgen runs
+    // on the single shell thread, and every pointer is consumed (copied
+    // into an owned String) before the next getservent call invalidates it.
+    unsafe {
+        libc::setservent(0);
+        loop {
+            let entry = libc::getservent();
+            if entry.is_null() {
+                break;
+            }
+            let name = CStr::from_ptr((*entry).s_name);
+            let name = String::from_utf8_lossy(name.to_bytes()).into_owned();
+            if name.starts_with(word) {
+                candidates.push(name);
+                continue;
+            }
+            let mut aliases = (*entry).s_aliases;
+            while !aliases.is_null() && !(*aliases).is_null() {
+                let alias = CStr::from_ptr(*aliases);
+                let alias = String::from_utf8_lossy(alias.to_bytes()).into_owned();
+                if alias.starts_with(word) {
+                    candidates.push(alias);
+                    break;
+                }
+                aliases = aliases.add(1);
+            }
         }
+        libc::endservent();
     }
     candidates
-}
-
-/// The system services database `getservent()` walks: /etc/services on
-/// unix; the resolver file the Windows TCP/IP stack reads on Windows.
-#[cfg(unix)]
-fn services_db_path() -> std::path::PathBuf {
-    std::path::PathBuf::from("/etc/services")
-}
-
-#[cfg(windows)]
-fn services_db_path() -> std::path::PathBuf {
-    let root = std::env::var_os("SystemRoot")
-        .or_else(|| std::env::var_os("windir"))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
-    root.join(r"System32\drivers\etc\services")
 }
 
 fn variable_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<String> {
@@ -1555,7 +1568,17 @@ fn path_command_completion_candidates(env_vars: &HashMap<String, String>) -> Vec
             continue;
         };
         for entry in entries {
-            if entry.is_file {
+            // GNU bashline.c:2460 executable_completion (searching_path)
+            // stat()s each PATH hit: a symlink to a file is a file, so it
+            // is listed once per PATH directory alongside the builtin
+            // source (rubash#1089). DirEntry::file_type is lstat-based, so
+            // a symlink reads as neither file nor dir — resolve through
+            // the link the way file_status() does. Symlinks to
+            // directories stay excluded (GNU lists no directory names
+            // when searching $PATH).
+            if entry.is_file
+                || (!entry.is_dir && std::fs::metadata(&entry.path).is_ok_and(|m| m.is_file()))
+            {
                 candidates.push(entry.name);
             }
         }

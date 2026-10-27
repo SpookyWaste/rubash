@@ -39,6 +39,48 @@ fn timed_read_value(input: &TimedPipelineInput, start: f64, timeout: f64) -> (St
     (value, 142)
 }
 
+/// Whether a timed-consumer body element is a plain simple command the
+/// timing model may interpret: no redirections, no compound wrappers, no
+/// connectors. The pre-existing sleep/read/echo arms predate this check
+/// and keep their looser admission; the TMOUT-setup and select arms added
+/// for rubash#1141 require it, so a redirected or compound consumer keeps
+/// the sequential path.
+fn timed_consumer_command_simple(command: &CommandNode, allow_select: bool) -> bool {
+    (allow_select || command.select_command.is_none())
+        && command.and_or.is_none()
+        && !command.background
+        && command.pipe.is_none()
+        && !command.inverted
+        && command.redirect_in.is_none()
+        && command.redirect_out.is_none()
+        && command.append.is_none()
+        && command.redirect_err.is_none()
+        && command.redirect_err_append.is_none()
+        && command.redirects.is_empty()
+        && command.heredoc.is_none()
+        && command.heredoc_body.is_none()
+        && command.here_string.is_none()
+        && command.here_string_carrier.is_none()
+        && command.heredoc_redirects.is_empty()
+        && command.subshell_command.is_none()
+        && command.brace_group.is_none()
+        && command.pipeline_command.is_none()
+        && command.and_or_list.is_none()
+        && command.time_command.is_none()
+        && command.background_command.is_none()
+        && command.inverted_command.is_none()
+        && command.for_command.is_none()
+        && command.arithmetic_command.is_none()
+        && command.if_command.is_none()
+        && command.loop_command.is_none()
+        && command.conditional_command.is_none()
+        && command.case_command.is_none()
+        && command.function_command.is_none()
+        && command.coproc_command.is_none()
+        && !command.subshell
+        && !command.subshell_end
+}
+
 #[cfg(windows)]
 fn stdio_from_transferred_handle<T>(handle: T) -> Stdio
 where
@@ -956,7 +998,19 @@ impl Executor {
         // words itself. Snapshot, reseed for the attempt, restore.
         let saved_random = self.shell_state.random_state.clone_state();
         self.shell_state.random_state.reseed_fresh();
+        // Pipeline elements run in subshells: a modeled `TMOUT=n` setup
+        // assignment must not leak into the parent shell when the fast
+        // path declines after applying it (rubash#1141).
+        let saved_tmout = self.shell_state.env_vars.get("TMOUT").cloned();
         let result = self.execute_timed_read_pipeline_inner(commands);
+        match saved_tmout {
+            Some(value) => {
+                self.shell_state.env_vars.insert("TMOUT".to_string(), value);
+            }
+            None => {
+                self.shell_state.env_vars.remove("TMOUT");
+            }
+        }
         self.shell_state.random_state.restore_state(&saved_random);
         let nounset_hit = self.restore_arithmetic_error_flags(&saved);
         match (result, nounset_hit) {
@@ -1013,6 +1067,16 @@ impl Executor {
         let mut chunks = Vec::new();
         if let Some(group) = &command.brace_group {
             for command in &group.body {
+                self.timed_pipeline_step(command, &mut at, &mut chunks)?;
+            }
+            return Some(TimedPipelineInput { chunks, eof_at: at });
+        }
+        // A `( ... )` producer is the same concurrent fork as a `{ ...; }`
+        // producer (execute_cmd.c forks both sides of the pipe); only the
+        // subshell boundary differs, which the timing model does not
+        // observe. Model each element identically (rubash#1141).
+        if let Some(subshell) = &command.subshell_command {
+            for command in &subshell.body {
                 self.timed_pipeline_step(command, &mut at, &mut chunks)?;
             }
             return Some(TimedPipelineInput { chunks, eof_at: at });
@@ -1126,7 +1190,34 @@ impl Executor {
         let mut output = String::new();
         let mut last_status = 0;
         for command in body {
-            let name = self.expand_word(command.words.first()?);
+            // A `TMOUT=n` setup before the timed read is subshell-scoped
+            // state, not a modeled action: apply it to the environment so
+            // the read/select below observes it the way read.def:449
+            // observes $TMOUT at read time (rubash#1141). The outer fast
+            // path restores the parent value on exit. Anything but a bare
+            // TMOUT assignment declines the model.
+            if !saw_read && command.words.is_empty() && !command.assignments.is_empty() {
+                if !timed_consumer_command_simple(command, false) {
+                    return None;
+                }
+                for (assign_name, assign_value) in &command.assignments {
+                    if assign_name != "TMOUT" {
+                        return None;
+                    }
+                    let expanded = self.expand_word(assign_value);
+                    self.shell_state
+                        .env_vars
+                        .insert("TMOUT".to_string(), expanded);
+                }
+                continue;
+            }
+            // Keyword commands (select) carry no words; the compound struct
+            // owns the name.
+            let name = match command.words.first() {
+                Some(first) => self.expand_word(first),
+                None if command.select_command.is_some() => "select".to_string(),
+                None => return None,
+            };
             match name.as_str() {
                 "sleep" if !saw_read => {
                     at += command
@@ -1135,13 +1226,89 @@ impl Executor {
                         .and_then(|word| self.expand_word(word).parse::<f64>().ok())?;
                 }
                 "read" if !saw_read => {
-                    let (timeout, name) = self.timed_read_options(command)?;
-                    read_name = name;
+                    let (timeout, name, from_t) = self.timed_read_options(command)?;
+                    if !from_t && !timed_consumer_command_simple(command, false) {
+                        return None;
+                    }
                     let (value, status) = timed_read_value(input, at, timeout);
+                    if !from_t && status != 142 {
+                        // TMOUT-sourced (no -t): the deadline did not fire
+                        // first, so the sequential stage loop's materialized
+                        // input is byte-identical to GNU's arrived-bytes
+                        // read — decline and let it run.
+                        return None;
+                    }
+                    read_name = name;
                     read_value = value;
                     read_status = status;
                     saw_read = true;
                     last_status = status;
+                }
+                "select" if !saw_read => {
+                    // execute_cmd.c:3464 select_query reads the reply through
+                    // read_builtin(NULL): TMOUT (prefix or environment)
+                    // bounds the wait exactly like `read` (read.def:449).
+                    // Only the timeout branch is modeled: when the deadline
+                    // does not fire first the sequential path serves the
+                    // arrived bytes identically — decline and let it run.
+                    let select_command = match &command.select_command {
+                        Some(select_command) => select_command.clone(),
+                        None => return None,
+                    };
+                    if !timed_consumer_command_simple(command, true) {
+                        return None;
+                    }
+                    let timeout = self.timed_consumer_tmout(command)?;
+                    let values: Vec<String> = if select_command.default_positional {
+                        self.shell_state.positional_window_cloned()
+                    } else {
+                        let mut values = Vec::new();
+                        for (index, word) in select_command.words.iter().enumerate() {
+                            let raw = select_command
+                                .word_metadata
+                                .get(index)
+                                .map(|metadata| metadata.raw.as_str());
+                            let metadata = select_command.word_metadata.get(index);
+                            match self.expand_for_word_values_result(word, raw, metadata) {
+                                Ok(expanded) => values.extend(expanded),
+                                Err(_) => return None,
+                            }
+                        }
+                        values
+                    };
+                    if values.is_empty() {
+                        // execute_cmd.c:3538-3545: an empty word list
+                        // returns success without printing or reading.
+                        saw_read = true;
+                        continue;
+                    }
+                    let (_, status) = timed_read_value(input, at, timeout);
+                    if status != 142 {
+                        return None;
+                    }
+                    // execute_cmd.c:3426-3469 select_query: print the menu
+                    // plus the PS3 prompt to stderr, then the failed
+                    // (timed-out) read prints a newline to stdout and yields
+                    // NULL — the body never runs, the select status is 1,
+                    // and REPLY keeps the empty partial record.
+                    let ps3 = self
+                        .shell_state
+                        .env_vars
+                        .get("PS3")
+                        .cloned()
+                        .unwrap_or_else(|| "#? ".to_string());
+                    let mut menu = Vec::new();
+                    for (index, value) in values.iter().enumerate() {
+                        let _ = writeln!(&mut menu, "{}) {}", index + 1, value);
+                    }
+                    menu.extend_from_slice(ps3.as_bytes());
+                    let _ = self.write_default_stderr(&menu);
+                    output.push('\n');
+                    read_name = String::from("REPLY");
+                    read_value = String::new();
+                    read_status = 1;
+                    saw_read = true;
+                    last_status = 1;
                 }
                 _ if saw_read => {
                     output.push_str(&self.timed_read_followup_output(
@@ -1158,19 +1325,22 @@ impl Executor {
         saw_read.then_some((output, last_status))
     }
 
-    fn timed_read_options(&mut self, command: &CommandNode) -> Option<(f64, String)> {
+    fn timed_read_options(&mut self, command: &CommandNode) -> Option<(f64, String, bool)> {
         let mut timeout = None;
+        let mut have_t = false;
         let mut names = Vec::new();
         let mut index = 1usize;
         while index < command.words.len() {
             let word = self.expand_word(command.words.get(index)?);
             if word == "-t" {
+                have_t = true;
                 index += 1;
                 timeout = command
                     .words
                     .get(index)
                     .and_then(|word| self.expand_word(word).parse::<f64>().ok());
             } else if let Some(value) = word.strip_prefix("-t").filter(|value| !value.is_empty()) {
+                have_t = true;
                 timeout = value.parse::<f64>().ok();
             } else if matches!(
                 word.as_str(),
@@ -1183,13 +1353,50 @@ impl Executor {
             }
             index += 1;
         }
+        // GNU read.def:449-450: $TMOUT is the default timeout when -t is
+        // absent. An invalid -t still declines (the sequential path reports
+        // the invalid-timeout error); an absent/invalid/non-positive TMOUT
+        // arms no timeout, which the sequential path serves exactly.
+        let timeout = match (have_t, timeout) {
+            (true, Some(timeout)) => timeout,
+            (true, None) => return None,
+            (false, _) => self.timed_consumer_tmout(command)?,
+        };
         Some((
-            timeout?,
+            timeout,
             names
                 .into_iter()
                 .next()
                 .unwrap_or_else(|| "REPLY".to_string()),
+            have_t,
         ))
+    }
+
+    /// Effective TMOUT for a timed consumer without an explicit `-t`
+    /// (read.def:449-450). A `TMOUT=n` prefix on the consuming command is
+    /// that command's environment; anything else (non-TMOUT prefixes, an
+    /// unparsable/non-positive value) declines the timing model — GNU arms
+    /// no timeout there, which the sequential path serves exactly.
+    fn timed_consumer_tmout(&mut self, command: &CommandNode) -> Option<f64> {
+        if !command.assignments.is_empty() {
+            let mut temp: Option<f64> = None;
+            for (assign_name, assign_value) in &command.assignments {
+                if assign_name != "TMOUT" {
+                    return None;
+                }
+                temp = self
+                    .expand_word(assign_value)
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|timeout| timeout.is_finite() && *timeout > 0.0);
+            }
+            return temp;
+        }
+        self.shell_state
+            .env_vars
+            .get("TMOUT")
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|timeout| timeout.is_finite() && *timeout > 0.0)
     }
 
     fn timed_read_followup_output(

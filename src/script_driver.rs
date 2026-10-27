@@ -25,28 +25,51 @@ use crate::parser::CommandNode;
 /// bashhist.c: does this script turn history on? Detects the long-form
 /// option (set -o history / -o histexpand) and the short flag cluster
 /// containing -H, which is how the histexp tests enable expansion.
+///
+/// GNU shell.c runs a script through an incremental reader: `set -o
+/// history` takes effect the moment it executes, wherever it sits in its
+/// command — including after `;`/`&&`/`||`/pipelines
+/// (`true; set -o history; set -H` enables expansion for every later
+/// line, and with histverify the expanded `!!` line is then held and
+/// discarded instead of left literal). The admission must therefore cover
+/// `set` in ANY command position, not just line-initially: each line is
+/// split into command segments and every segment holding a standalone
+/// `set` token runs the option scan (rubash#1072). Segments from quotes
+/// or comments over-admit, which is only slower, never wrong — the same
+/// over-admission shape as script_uses_aliases.
 pub fn script_uses_history(contents: &str) -> bool {
     for line in contents.lines() {
-        let Some(rest) = line.trim_start().strip_prefix("set ") else {
-            continue;
-        };
-        let mut expecting_option = false;
-        for token in rest.split_whitespace() {
-            if expecting_option {
-                if token == "history" || token == "histexpand" {
-                    return true;
-                }
-                expecting_option = false;
+        // Command separators that can precede a `set` command word.
+        // `&&`/`||` are covered via the `&`/`|` split.
+        for segment in line.split([';', '&', '|', '(', '{']) {
+            let mut tokens = segment.split_whitespace();
+            // The segment enables history only if it invokes `set`
+            // itself; a bare `set` token anywhere in the segment means
+            // the option scan below decides (a non-leading `set` is a
+            // non-command argument — the scan then finds no `-o history`
+            // / `-H` in option position... unless one is genuinely there,
+            // which only over-admits).
+            if !tokens.clone().any(|token| token == "set") {
                 continue;
             }
-            if token == "-o" {
-                expecting_option = true;
-            } else if token.len() >= 2
-                && token.starts_with('-')
-                && !token.starts_with("--")
-                && token[1..].contains('H')
-            {
-                return true;
+            let mut expecting_option = false;
+            for token in tokens {
+                if expecting_option {
+                    if token == "history" || token == "histexpand" {
+                        return true;
+                    }
+                    expecting_option = false;
+                    continue;
+                }
+                if token == "-o" {
+                    expecting_option = true;
+                } else if token.len() >= 2
+                    && token.starts_with('-')
+                    && !token.starts_with("--")
+                    && token[1..].contains('H')
+                {
+                    return true;
+                }
             }
         }
     }
