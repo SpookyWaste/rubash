@@ -1080,7 +1080,27 @@ impl Executor {
                 }
                 last_stdout_leg = Some(append_redirect);
             }
-            if suppress_stderr || !is_stderr_write_redirect(redirect) {
+            // A list entry's missing fd defaults by DIRECTION
+            // (redir.c: an output redirection with no redirector binds
+            // fd 1), so a plain `> file` entry never claims fd 2 —
+            // is_stderr_write_redirect's unwrap_or(2) serves the FIELD
+            // contexts (the redirect_err slot is fd-2 by construction)
+            // and must not be applied to list entries raw: it classified
+            // the call's plain `> cap` as a stderr leg too, and the
+            // stderr applicator then pushed that clone into body leaves
+            // AFTER their own `> file` entries, so the ordered walk
+            // resolved fd 1 to the call's target and the leaf's own
+            // output redirect lost its bytes (the ecosuite bats chain's
+            // setup_file markers came out empty — rubash#1720 chain
+            // layer). Only an explicit fd-2 entry, or a combined entry
+            // whose fd-2 half is split out below, claims the leg.
+            let claims_fd2 = redirect.fd == Some(2)
+                || matches!(
+                    redirect.kind,
+                    crate::parser::RedirectKind::CombinedOutput
+                        | crate::parser::RedirectKind::CombinedAppend
+                );
+            if suppress_stderr || !claims_fd2 || !is_stderr_write_redirect(redirect) {
                 continue;
             }
             if matches!(
