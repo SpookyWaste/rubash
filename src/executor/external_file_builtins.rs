@@ -1979,41 +1979,61 @@ impl Executor {
     }
 
     fn external_mkfifo(&mut self, cmd: &CommandNode) -> Result<bool, ExecuteError> {
-        // Windows has no POSIX fifo object; creating a regular file would
-        // silently change semantics (a fifo's blocking open/read behavior
-        // would become an instant regular-file EOF). GNU coreutils mkfifo
-        // reports per-operand failures and exits 1 — match that honestly:
+        // rubash#1725 (2026-10-27 narrowing ruling): off Windows the
+        // platform has a real fifo object, so the emulation must not
+        // answer at all — decline and let the resolved PATH binary
+        // create the fifo (dispatch reaches this handler only when the
+        // name resolved, rubash#1545). The unconditional
+        // `Operation not supported` refusal below is the Windows-only
+        // answer: Windows has no POSIX fifo object, and creating a
+        // regular file instead would silently change semantics (a
+        // fifo's blocking open/read behavior would become an instant
+        // regular-file EOF). GNU coreutils mkfifo reports per-operand
+        // failures and exits 1 — match that honestly:
         // `mkfifo: cannot create fifo 'NAME': Operation not supported`.
-        // -m MODE consumes a value; other options are accepted and ignored.
-        let mut mode_value_pending = false;
-        let mut no_more_flags = false;
-        let mut failed = false;
-        for word in &cmd.words[1..] {
-            let expanded = self.expand_word(word);
-            if mode_value_pending {
-                mode_value_pending = false;
-                continue;
-            }
-            if !no_more_flags && expanded == "--" {
-                no_more_flags = true;
-                continue;
-            }
-            if !no_more_flags && expanded.starts_with('-') && expanded != "-" {
-                if expanded == "-m" {
-                    mode_value_pending = true;
-                }
-                continue;
-            }
-            let mut stderr = Vec::new();
-            let _ = writeln!(
-                &mut stderr,
-                "mkfifo: cannot create fifo '{expanded}': Operation not supported"
-            );
-            self.write_default_stderr(&stderr)?;
-            failed = true;
+        #[cfg(not(windows))]
+        {
+            let _ = cmd;
+            return Ok(false);
         }
-        self.exit_code = if failed { 1 } else { 0 };
-        Ok(true)
+        #[cfg(windows)]
+        {
+            // -m MODE consumes a value; other options are accepted and
+            // ignored. argv as-is — no second expand_word pass (issue
+            // #555, see external_mkdir). Diagnostics are the emulated
+            // command's own stderr and go through the command's
+            // redirections (rubash#1372/#1725), never straight to the
+            // terminal via the shell's default stderr.
+            let mut mode_value_pending = false;
+            let mut no_more_flags = false;
+            let mut failed = false;
+            let mut stderr: Vec<u8> = Vec::new();
+            for word in &cmd.words[1..] {
+                let expanded = word.as_str();
+                if mode_value_pending {
+                    mode_value_pending = false;
+                    continue;
+                }
+                if !no_more_flags && expanded == "--" {
+                    no_more_flags = true;
+                    continue;
+                }
+                if !no_more_flags && expanded.starts_with('-') && expanded != "-" {
+                    if expanded == "-m" {
+                        mode_value_pending = true;
+                    }
+                    continue;
+                }
+                writeln!(
+                    stderr,
+                    "mkfifo: cannot create fifo '{expanded}': Operation not supported"
+                )?;
+                failed = true;
+            }
+            self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+            self.exit_code = if failed { 1 } else { 0 };
+            Ok(true)
+        }
     }
 }
 
