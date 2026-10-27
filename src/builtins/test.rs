@@ -578,6 +578,17 @@ fn eval_unary(
 }
 
 fn virtual_device_test(op: &str, operand: &str) -> Option<bool> {
+    // GNU test.c:561-568: -O/-G compare the file's st_uid/st_gid with
+    // the process's effective uid/gid — a stat fact about the concrete
+    // file, never a device-class constant. On Unix the operands below
+    // stat like any other path (/dev/null is owned by uid 0;
+    // /dev/stdin resolves through /proc/self/fd to the real descriptor
+    // target), so the hardcoded tables must not answer ownership
+    // questions there (rubash#1708). They only stand where the device
+    // names have no stat-able filesystem node (Windows).
+    if cfg!(unix) && matches!(op, "-O" | "-G") {
+        return None;
+    }
     if crate::executor::path::is_shell_null_device(operand) {
         return Some(match op {
             "-a" | "-e" | "-r" | "-w" | "-c" => true,
@@ -670,7 +681,21 @@ fn fd_pipe_test(
 }
 
 fn test_path(operand: &str, env_vars: &crate::shell::var_table::VarTable) -> std::path::PathBuf {
-    crate::executor::path::shell_path_to_windows_for_lookup(operand, env_vars)
+    let path = crate::executor::path::shell_path_to_windows_for_lookup(operand, env_vars);
+    if path.is_absolute() {
+        return path;
+    }
+    // G-02: relative operands anchor at the session cwd, whose logical
+    // display form is $PWD (the cd family keeps the variable and the
+    // ShellState.cwd field in sync; before G-02 the process cwd resolved
+    // them). The one documented exception is call_function_owned's
+    // field-only cwd restore, where $PWD keeps the function's value.
+    match env_vars.get("PWD") {
+        Some(pwd) => {
+            crate::executor::path::shell_path_to_windows_for_lookup(pwd, env_vars).join(path)
+        }
+        None => path,
+    }
 }
 
 fn marked_vars(env_vars: &crate::shell::var_table::VarTable, key: &str) -> Vec<String> {

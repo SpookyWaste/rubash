@@ -1203,6 +1203,9 @@ impl Executor {
         let mut finished = Vec::new();
         for (pid, child) in &mut self.background_children {
             if let Some(status) = child.try_wait()? {
+                // rubash#1776: sample the reaped child's CPU for the
+                // Windows CHILDREN half while its handle is live.
+                super::read_helpers::note_reaped_child_cpu(child);
                 // rubash#1528: stamp the reap instant for a timed
                 // coproc — its deferred report must measure to the
                 // death, not to whenever the completion is applied.
@@ -1614,6 +1617,9 @@ impl Executor {
                 }
             }
             if let Some(done) = child.try_wait()? {
+                // rubash#1776: sample the reaped child's CPU for the
+                // Windows CHILDREN half while its handle is live.
+                super::read_helpers::note_reaped_child_cpu(&child);
                 // rubash#229: queue the signal-death notice (the job entry
                 // still exists here, so its command text is available).
                 if let Some(signal) = crate::executor::wait_status::exit_status_signal(&done) {
@@ -3871,7 +3877,8 @@ impl Executor {
         ] {
             self.shell_state.env_vars.remove(name);
             self.shell_state.variables.remove(name);
-            env::remove_var(name);
+            // G-03: journal the completion-state cleanup removal.
+            crate::executor::local_helpers::mirror_env_remove(name);
         }
     }
 }

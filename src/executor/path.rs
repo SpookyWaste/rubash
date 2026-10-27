@@ -211,9 +211,31 @@ pub(crate) fn set_command_lookup_cache(name: &str, path: Option<PathBuf>) {
 /// Environment values that can change a lookup result. The cache resets
 /// whenever any of them differ, which covers `PATH=`/`PATH` unset without
 /// needing a hook in the assignment path.
+/// G-02: anchor a relative lookup candidate at the session cwd (the $PWD
+/// variable is the session cwd's logical display form; the cd family
+/// keeps it in sync with the ShellState.cwd field). Before G-02 these
+/// candidates resolved against the process cwd, which the session owned;
+/// with per-session cwd fields they must anchor explicitly. Absolute
+/// candidates pass through unchanged.
+fn anchor_at_session_cwd(candidate: PathBuf, env_vars: &HashMap<String, String>) -> PathBuf {
+    if candidate.is_absolute() {
+        return candidate;
+    }
+    if let Some(pwd) = env_vars.get("PWD") {
+        let base = shell_path_to_windows(pwd, env_vars);
+        if base.is_absolute() {
+            return base.join(candidate);
+        }
+    }
+    candidate
+}
+
 fn command_lookup_fingerprint(env_vars: &HashMap<String, String>) -> String {
     const ENV_KEYS: &[&str] = &[
         "PATH",
+        // G-02: cached lookup results are anchored at the session cwd
+        // (relative PATH elements), so a cd must invalidate the memo.
+        "PWD",
         "PATHEXT",
         "TMPDIR",
         "HOME",
@@ -272,10 +294,19 @@ pub(crate) fn shell_directory_entries(
     env_vars: &HashMap<String, String>,
 ) -> io::Result<Vec<ShellDirectoryEntry>> {
     let physical_dir = shell_path_to_windows(path, env_vars);
+    shell_directory_entries_in(&physical_dir)
+}
+
+/// Enumerate a directory from an already-resolved physical path (G-02:
+/// glob walks carry the session-anchored physical directory explicitly,
+/// so relative logical forms never fall back to the process cwd).
+pub(crate) fn shell_directory_entries_in(
+    physical_dir: &std::path::Path,
+) -> io::Result<Vec<ShellDirectoryEntry>> {
     let mut entries = Vec::new();
     let mut physical_error = None;
 
-    match fs::read_dir(&physical_dir) {
+    match fs::read_dir(physical_dir) {
         Ok(directory) => {
             for entry in directory {
                 let entry = entry?;
@@ -673,7 +704,7 @@ fn path_scan_scaffold(
     if cache.path_dirs.is_none() {
         let dirs = split_shell_path(env_vars.get("PATH").map(String::as_str).unwrap_or_default())
             .into_iter()
-            .map(|dir| shell_path_to_windows(&dir, env_vars))
+            .map(|dir| anchor_at_session_cwd(shell_path_to_windows(&dir, env_vars), env_vars))
             .collect::<Vec<_>>();
         cache.path_dirs = Some(Arc::new(dirs));
     }
@@ -943,7 +974,7 @@ fn find_user_command_uncached(
                 return Some(found);
             }
         }
-        let candidate = shell_path_to_windows(name, env_vars);
+        let candidate = anchor_at_session_cwd(shell_path_to_windows(name, env_vars), env_vars);
         if let Some(found) = executable_candidate(&candidate, env_vars) {
             return Some(found);
         }
@@ -986,7 +1017,8 @@ fn find_user_command_uncached(
     {
         let mut file_to_lose_on: Option<PathBuf> = None;
         for dir in split_shell_path(env_vars.get("PATH").map(String::as_str).unwrap_or_default()) {
-            let candidate = shell_path_to_windows(&dir, env_vars).join(name);
+            let candidate =
+                anchor_at_session_cwd(shell_path_to_windows(&dir, env_vars).join(name), env_vars);
             if !candidate.is_file() {
                 continue;
             }

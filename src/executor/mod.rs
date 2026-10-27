@@ -339,9 +339,18 @@ pub use self::support_names::machtype_value;
 // prefixes, etc.) live in `types.rs` and are re-exported via
 // `pub(crate) use types::*;` above. Do not redeclare them here.
 
+// G-01: the process-state lock. Once held for whole execute_ast
+// runs; now taken only at process-global touch points through
+// local_helpers::acquire_process_state (env mirror writes, trap
+// disposition reconcile, birth snapshots, Drop restore, fresh-shell
+// env swap).
 static EXECUTION_LOCK: Mutex<()> = Mutex::new(());
 
 thread_local! {
+    // Run-nesting marker for execute_ast / call_function_owned: at
+    // depth 0 the caller is a fresh reader-level run and the
+    // evalerror latches reset. (Historically this tracked the
+    // EXECUTION_LOCK hold; the lock no longer spans runs.)
     static EXECUTION_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -589,6 +598,28 @@ pub struct Executor {
     /// and the bodies' observable effects order the same way,
     /// rubash#1523). Keyed by the `/dev/fd/N` word form.
     assignment_output_process_substitutions: Vec<(String, String)>,
+    /// rubash#1691: backing temp files of assignment-RHS INPUT process
+    /// substitutions, in materialization order. The fd word's payload
+    /// lives in the stream registry, but the on-disk carrier is only
+    /// owned by this list — it is drained (files removed) at the same
+    /// per-command finish as the output queue above, which is the
+    /// lifetime GNU gives the substitution's fd (dead by the next
+    /// command). Before this list existed the paths were discarded at
+    /// the write site and the files leaked in $TMPDIR for the shell's
+    /// whole lifetime.
+    assignment_input_process_substitution_files: Vec<PathBuf>,
+    /// rubash#1692: while a simple command's tempenv is being applied
+    /// and its class (builtin/function vs disk command) is not yet
+    /// known, locale-family binds are recorded in
+    /// `deferred_locale_assignment_binds` instead of running GNU's
+    /// setlocale attempt: GNU binds tempenv only for builtin/function
+    /// commands (assign_in_env makes a child-env entry for disk
+    /// commands, never a shell binding, so a bad tempenv locale warns
+    /// only when the binding is restored afterwards). The dispatch
+    /// flushes the deferred binds when the command turns out to bind,
+    /// and drops them when it does not.
+    defer_locale_assignment_warnings: Cell<bool>,
+    deferred_locale_assignment_binds: Vec<String>,
     /// rubash#1525: set by execute_external so the simple-command
     /// funnel can tell which completion-write class a command fell
     /// into (GNU execute_cmd.c: the tempenv of a disk command is
@@ -1464,6 +1495,10 @@ pub struct Executor {
     elevation_handler: Option<ElevationHandler>,
     external_file_builtins_enabled: bool,
     process_env_snapshot: HashMap<String, String>,
+    /// G-03: this lineage's process-env mirror-write journal (see
+    /// local_helpers::EnvWriteJournal). Drop restores only journaled keys
+    /// whose current value still equals the journal's final state.
+    env_write_journal: EnvWriteJournal,
     history_provider: Option<crate::history::SharedHistoryProvider>,
 }
 

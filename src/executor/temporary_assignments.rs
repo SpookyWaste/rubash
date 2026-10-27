@@ -604,6 +604,8 @@ impl Executor {
                         &target,
                         &expanded_value,
                     );
+                    // rubash#1692: the shadow store is a bind too.
+                    self.note_locale_assignment(&target);
                     self.tempenv_names.push(target);
                     continue;
                 }
@@ -1604,6 +1606,7 @@ impl Executor {
                             integer,
                             self.shell_state.env_vars.get("IFS").map(String::as_str),
                             &self.shell_state.env_vars,
+                            &self.shell_state.cwd,
                         ) {
                             Ok(outcome) => render_indexed_outcome(&current, outcome),
                             Err(_) => current,
@@ -1707,6 +1710,7 @@ impl Executor {
                     is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name),
                     self.shell_state.env_vars.get("IFS").map(String::as_str),
                     &self.shell_state.env_vars,
+                    &self.shell_state.cwd,
                 ) {
                     Ok(outcome) => {
                         element_values_converted = true;
@@ -1856,6 +1860,7 @@ impl Executor {
                 is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name),
                 self.shell_state.env_vars.get("IFS").map(String::as_str),
                 &self.shell_state.env_vars,
+                &self.shell_state.cwd,
             ) {
                 Ok(outcome) => {
                     element_values_converted = true;
@@ -2049,6 +2054,9 @@ impl Executor {
             value.as_str()
         };
         sync_shell_assignment_process_env(&self.shell_state.env_vars, base_name, projected);
+        // rubash#1692: the store above is a bind — GNU's sv_locale
+        // watcher fires on it (variables.c:6272).
+        self.note_locale_assignment(base_name);
         if let Some(word) = bad_subscript {
             // GNU assign_compound_array_list (arrayfunc.c:804-809): when a
             // negative subscript still lands before the array start,

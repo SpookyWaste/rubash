@@ -691,8 +691,9 @@ pub(super) fn word_is_unquoted_array_list_expansion(word: &str) -> bool {
 pub(super) fn pathname_expand_array_token(
     token: &str,
     env_vars: &HashMap<String, String>,
+    cwd: &std::path::Path,
 ) -> crate::executor::glob::PathnameExpansion {
-    crate::executor::glob::pathname_expand_word(token, env_vars)
+    crate::executor::glob::pathname_expand_word(token, env_vars, cwd)
 }
 
 /// GNU arrayfunc.c quote_array_assignment_chars (arrayfunc.c:1107+) marks
@@ -995,6 +996,7 @@ pub(super) fn append_array_value(
     integer: bool,
     ifs: Option<&str>,
     env_vars: &crate::shell::var_table::VarTable,
+    cwd: &std::path::Path,
 ) -> Result<IndexedAppendOutcome, String> {
     let mut entries = IndexedDecodeBase {
         cell,
@@ -1061,7 +1063,7 @@ pub(super) fn append_array_value(
             } else {
                 crate::executor::glob::compound_element_glob_pattern(&token)
             };
-            match crate::executor::glob::pathname_expand_word(&glob_word, env_vars) {
+            match crate::executor::glob::pathname_expand_word(&glob_word, env_vars, cwd) {
                 crate::executor::glob::PathnameExpansion::Matches(matches) => {
                     for value in matches {
                         entries.insert(next_index, value);
@@ -1141,7 +1143,7 @@ pub(super) fn append_array_value(
         let quoted_token = token_is_fully_quoted(&token) && !command_subst_token;
         if let Some(token) = token.strip_prefix(ARRAY_FIELD_SPLIT_MARKER) {
             let token = unquote_storage_value(token);
-            match pathname_expand_array_token(&token, env_vars) {
+            match pathname_expand_array_token(&token, env_vars, cwd) {
                 crate::executor::glob::PathnameExpansion::Matches(matches) => {
                     for value in matches {
                         entries.insert(next_index, value);
@@ -1217,7 +1219,7 @@ pub(super) fn append_array_value(
         let token = crate::executor::markers::dequote_ctlesc_pairs(&token);
         if let Some(expanded_array) = token.strip_prefix(STORAGE_WORD_PREFIX) {
             for value in field_split_values_with_ifs(expanded_array, ifs) {
-                match pathname_expand_array_token(&value, env_vars) {
+                match pathname_expand_array_token(&value, env_vars, cwd) {
                     crate::executor::glob::PathnameExpansion::Matches(matches) => {
                         for value in matches {
                             entries.insert(next_index, value);

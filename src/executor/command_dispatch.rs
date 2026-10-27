@@ -68,8 +68,27 @@ impl Executor {
             }
             Vec::new()
         } else {
+            // rubash#1692: GNU binds a simple command's tempenv only
+            // for builtin/function commands; for a disk command the
+            // assignments become child-env entries and never bind in
+            // the shell (execute_cmd.c assign_in_env), so a bad
+            // tempenv locale warns only in the binding classes. The
+            // class is known from the command word up front; defer the
+            // locale attempts until just after the apply, then flush
+            // (binding class — GNU warns at bind time, before the
+            // command runs) or drop (disk class).
+            let tempenv_binds = cmd.words.first().is_some_and(|word| {
+                is_shell_builtin_name(word) || self.function_name_for_command_word(word).is_some()
+            });
+            self.defer_locale_assignment_warnings.set(true);
             let (applied, assignments_failed) =
                 self.apply_temporary_assignments(&cmd.assignments, assignment_raws);
+            self.defer_locale_assignment_warnings.set(false);
+            if tempenv_binds {
+                self.flush_deferred_locale_assignment_binds();
+            } else {
+                self.drop_deferred_locale_assignment_binds();
+            }
             // POSIX-mode notes item 36, GNU 5.3 verified cell-by-cell with
             // unbuffered per-process probes (the early "every command class
             // exits" reading was a stdout pipe-buffering artifact — GNU's
@@ -594,6 +613,9 @@ impl Executor {
             );
             set_var_attrs(&mut self.shell_state.env_vars, name, merged_attrs);
             sync_shell_assignment_process_env(&self.shell_state.env_vars, name, &merged_value);
+            // rubash#1692: the merge reinstalls the binding — GNU's
+            // sv_locale watcher runs on the reinstall.
+            self.note_locale_assignment(name);
         }
     }
 }

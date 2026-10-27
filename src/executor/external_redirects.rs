@@ -614,8 +614,10 @@ impl Executor {
             // other redirect diagnostic (redir.c:149-176 redirection_error,
             // issue #518): a bare OS error renders message-only and drops
             // `$FIX/b` from `$FIX/b: No such file or directory`.
-            open_redirect_append(&shell_path_to_windows(target, &self.shell_state.env_vars))
-                .map_err(|e| crate::posix_errors::path_error(target, e))?
+            open_redirect_append(
+                &self.session_path(shell_path_to_windows(target, &self.shell_state.env_vars)),
+            )
+            .map_err(|e| crate::posix_errors::path_error(target, e))?
         } else {
             self.create_redirect_output(target, redirect.clobber)?
         };
@@ -647,6 +649,7 @@ impl Executor {
             let stderr_target = self.expand_redirect_target(stderr_redirect);
             if stdout_target == stderr_target {
                 let path = shell_path_to_windows(&stdout_target, &self.shell_state.env_vars);
+                let path = self.session_path(path);
                 let mut file = OpenOptions::new().create(true).write(true).open(&path)?;
                 if !is_dos_device_path(&path) {
                     file.seek(SeekFrom::End(0))?;
@@ -706,6 +709,7 @@ impl Executor {
                     process.stdout(Stdio::from(self.open_output_fd_append(&target)?));
                 } else if redirect_target_fd(&target).is_none() {
                     let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
+                    let path = self.session_path(path);
                     let mut file = OpenOptions::new().create(true).write(true).open(&path)?;
                     if !is_dos_device_path(&path) {
                         file.seek(SeekFrom::End(0))?;
@@ -828,6 +832,7 @@ impl Executor {
                     process.stderr(Stdio::from(self.open_output_fd_append(&target)?));
                 } else if redirect_target_fd(&target).is_none() {
                     let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
+                    let path = self.session_path(path);
                     let mut file = OpenOptions::new().create(true).write(true).open(&path)?;
                     if !is_dos_device_path(&path) {
                         file.seek(SeekFrom::End(0))?;

@@ -8,6 +8,27 @@ use crate::executor::glob::{pathname_expand_word, PathnameExpansion};
 /// somewhere for `99999` instead of failing), and a non-numeric word is
 /// a service name looked up in /etc/services (getservbyname). Returns
 /// None when the service name is unknown (EAI_SERVICE).
+/// The system services database getservbyname walks: /etc/services on
+/// unix; the resolver file the Windows TCP/IP stack reads on Windows
+/// (rubash#1775 — resolve_net_service_port used to read /etc/services
+/// unconditionally, so every service name failed on Windows with
+/// "Servname not supported" even though the Windows file lists http).
+/// Same file src/builtins/complete.rs consults for service-name
+/// completion (rubash#1044), same fallback chain.
+#[cfg(unix)]
+fn services_db_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/etc/services")
+}
+
+#[cfg(windows)]
+fn services_db_path() -> std::path::PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("windir"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    root.join(r"System32\drivers\etc\services")
+}
+
 fn resolve_net_service_port(port_text: &str, udp: bool) -> Option<u16> {
     if let Ok(port) = port_text.parse::<u16>() {
         return Some(port);
@@ -19,7 +40,7 @@ fn resolve_net_service_port(port_text: &str, udp: bool) -> Option<u16> {
             .map(|value| (value % 65536) as u16);
     }
     let proto = if udp { "udp" } else { "tcp" };
-    let services = std::fs::read_to_string("/etc/services").ok()?;
+    let services = std::fs::read_to_string(services_db_path()).ok()?;
     for line in services.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -62,7 +83,7 @@ impl Executor {
         &self,
         target: &str,
     ) -> io::Result<File> {
-        let path = shell_path_to_windows(target, &self.shell_state.env_vars);
+        let path = self.session_path(shell_path_to_windows(target, &self.shell_state.env_vars));
         // niubash#519: CON has no read+write handle (GENERIC_READ|
         // GENERIC_WRITE -> ERROR_INVALID_PARAMETER); the real `<>` bind
         // splits it into CONIN$/CONOUT$ (FileFd::open_readwrite_pair),
@@ -218,10 +239,10 @@ impl Executor {
         // opens the same file `test -f /usr/bin/seq` says exists; the
         // POSIX target word is kept for diagnostics. A path that exists
         // (or misses under both spellings) keeps the plain mapped form.
-        let win_path = crate::executor::path::windows_operand_file_path(
+        let win_path = self.session_path(crate::executor::path::windows_operand_file_path(
             shell_path_to_windows(target, &self.shell_state.env_vars),
             &self.shell_state.env_vars,
-        );
+        ));
         // A spawned child reading a `<(cmd)` carrier must get the stream's
         // REMAINING bytes — GNU hands it a dup of the shared pipe offset,
         // so the parent's next open sees what the child left
@@ -234,6 +255,13 @@ impl Executor {
                     .map_err(|_| {
                         io::Error::new(io::ErrorKind::Other, "failed to materialize input")
                     })?;
+                // rubash#1691: this fresh carrier backs the returned
+                // File only — park the path so the per-command procsub
+                // finish removes it once the consumer is done.
+                self.shell_state
+                    .procsub_adhoc_carriers
+                    .borrow_mut()
+                    .push(path.clone());
                 return File::open(&path).map_err(|e| crate::posix_errors::path_error(target, e));
             }
         }
@@ -280,6 +308,12 @@ impl Executor {
                     .map_err(|_| {
                         io::Error::new(io::ErrorKind::Other, "failed to materialize fd input")
                     })?;
+                // rubash#1691: same ad-hoc carrier bookkeeping as
+                // open_input_redirect's consume branch.
+                self.shell_state
+                    .procsub_adhoc_carriers
+                    .borrow_mut()
+                    .push(path.clone());
                 File::open(&path)
             }
             Some(FdReadEndpoint::InheritedProcessStdin) => {
@@ -494,6 +528,18 @@ impl Executor {
         false
     }
 
+    /// G-02: absolutize a host path against the session cwd.
+    /// `shell_path_to_windows` deliberately keeps relative spellings
+    /// relative; every open performed by the session itself must anchor
+    /// them at `ShellState.cwd`, never at the process cwd.
+    pub(in crate::executor) fn session_path(&self, path: std::path::PathBuf) -> std::path::PathBuf {
+        if path.is_absolute() {
+            path
+        } else {
+            self.shell_state.cwd.join(path)
+        }
+    }
+
     pub(in crate::executor) fn create_redirect_output(
         &self,
         target: &str,
@@ -511,7 +557,7 @@ impl Executor {
             ));
         }
         let target = self.redirect_output_path_target(target);
-        let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
+        let path = self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars));
         if !clobber
             && crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "noclobber")
             && !Self::noclobber_target_is_device_like(&path)
@@ -586,7 +632,7 @@ impl Executor {
             return target.to_string();
         }
 
-        match pathname_expand_word(target, &self.shell_state.env_vars) {
+        match pathname_expand_word(target, &self.shell_state.env_vars, &self.shell_state.cwd) {
             PathnameExpansion::Matches(matches) if matches.len() == 1 => matches[0].clone(),
             _ => target.to_string(),
         }

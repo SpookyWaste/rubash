@@ -42,9 +42,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Barrier;
 use std::time::Instant;
 
-/// Restore the test process cwd on drop: session scripts `cd` through the
-/// engine, and the engine's `cd` chdirs the whole process (builtins/cd.rs),
-/// so without this the harness would leak directories into cargo itself.
+/// Restore the test process cwd on drop. Historical note: pre-G-02 the
+/// engine's `cd` chdir'd the whole process, so session scripts leaked
+/// directories into cargo itself; post-G-02 `cd` moves only the session
+/// cwd field in ShellState and this guard is just belt-and-braces for
+/// the harness's own relative-path uses.
 struct CwdGuard {
     saved: PathBuf,
 }
@@ -93,7 +95,10 @@ fn steps_for(i: usize, dir: &Path) -> Vec<String> {
         ),
         // 2: cwd (a) — builtin pwd (reads the executor's $PWD).
         format!("pwd > {d}/cwd_builtin.txt"),
-        // 3: cwd (b) — external /bin/pwd (reads the process getcwd()).
+        // 3: cwd (b) — external /bin/pwd. Post-G-02 the child is spawned
+        // with current_dir(session cwd), so this reports the SESSION's
+        // directory; pre-G-02 it reported the shared process cwd and
+        // stepwise rounds cross-talked deterministically.
         format!("/bin/pwd > {d}/cwd_external.txt"),
         // 4: cwd (c) — relative-path redirect: wherever this file lands IS
         // the verdict on which directory the session really writes in.
@@ -279,8 +284,8 @@ fn workload(i: usize, dir: &Path) -> String {
     let d = shell_path(dir);
     format!(
         "s=0; str=\"\"\n\
-         for ((k=0;k<1500;k++)); do s=$((s + k % 7)); str=\"${{str}}x\"; \
-         if [ $((k % 500)) -eq 0 ]; then /bin/echo tick >> {d}/tp_out.txt; fi; done\n\
+         for ((k=0;k<6000;k++)); do s=$((s + k % 7)); str=\"${{str}}x\"; \
+         if [ $((k % 2000)) -eq 0 ]; then /bin/echo tick >> {d}/tp_out.txt; fi; done\n\
          echo \"$s ${{#str}}\" > {d}/tp.txt"
     )
 }
@@ -335,8 +340,7 @@ fn multi_session_isolation_matrix() {
         }
         for i in 0..n {
             let _statuses = run_session_serial(i, &dirs[i]);
-            // The engine's cd moved the whole process; walk it back so
-            // the next serial session starts from the same place.
+            // Defensive only (post-G-02 cd no longer moves the process).
             let _ = std::env::set_current_dir(&_cwd.saved);
         }
         let trees: Trees = dirs.iter().map(|d| read_tree(d)).collect();
@@ -388,6 +392,132 @@ fn multi_session_isolation_matrix() {
         }
     }
 
+    // ---- G-03: env-mirror rollback --------------------------------------
+    // Session A mirrors a variable into the process env and spawn-verifies
+    // it; session B (born BEFORE the write) drops first; A spawn-verifies
+    // again — the variable must survive B's Drop. Pre-G-03, Drop restored
+    // the whole birth snapshot and silently un-wrote A's variable.
+    // `__RUBASH_*` names pass the process-env mirror gate unconditionally.
+    {
+        const PROBE: &str = "__RUBASH_MS_PROBE";
+        std::env::remove_var(PROBE);
+        let root = fresh_root("envrollback");
+        let dir_a = sess_dir(&root, 0);
+        std::fs::create_dir_all(&dir_a).unwrap();
+        let da = shell_path(&dir_a);
+        let mut a = Executor::new();
+        let mut b = Executor::new();
+        run_source(&mut a, &format!("{PROBE}=probe-a"), false);
+        let mirrored = std::env::var(PROBE).ok();
+        summary.push_str(&format!(
+            "G-03 env rollback: after A assigns, process env = {mirrored:?}\n"
+        ));
+        if mirrored.as_deref() != Some("probe-a") {
+            deviations.push(format!(
+                "G-03 env rollback: A's assignment never reached the process env mirror ({mirrored:?})"
+            ));
+        }
+        run_source(
+            &mut a,
+            &format!("/usr/bin/env > {da}/env_before.txt"),
+            false,
+        );
+        drop(b);
+        let after_b = std::env::var(PROBE).ok();
+        summary.push_str(&format!(
+            "G-03 env rollback: after B drops, process env = {after_b:?}\n"
+        ));
+        if after_b.as_deref() != Some("probe-a") {
+            deviations.push(format!(
+                "G-03 env rollback: B's Drop rolled back A's live variable (now {after_b:?})"
+            ));
+        }
+        run_source(&mut a, &format!("/usr/bin/env > {da}/env_after.txt"), false);
+        let env_after = std::fs::read_to_string(dir_a.join("env_after.txt")).unwrap_or_default();
+        if !env_after.contains(&format!("{PROBE}=probe-a")) {
+            deviations.push(
+                "G-03 env rollback: A's spawned child no longer sees the variable after B's Drop"
+                    .to_string(),
+            );
+        }
+        drop(a);
+        let after_a = std::env::var(PROBE).ok();
+        summary.push_str(&format!(
+            "G-03 env rollback: after A drops, process env = {after_a:?} (owner restore)\n"
+        ));
+        if after_a.is_some() {
+            deviations.push(format!(
+                "G-03 env rollback: A's own Drop failed to restore its journaled write (still {after_a:?})"
+            ));
+        }
+    }
+
+    // ---- G-01: anti-starvation -------------------------------------------
+    // Session A runs a long PURE-COMPUTE script (arithmetic only — no
+    // spawns, no mirrored assignments, so post-G-01 it takes the
+    // process-state lock zero times). Session B's trivial command must
+    // complete, within a bounded wait, while A is still running.
+    // Pre-G-01, execute_ast held EXECUTION_LOCK for the whole run and B
+    // could not start until A finished entirely.
+    {
+        let root = fresh_root("antistarve");
+        let dir_a = sess_dir(&root, 0);
+        let dir_b = sess_dir(&root, 1);
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let da = shell_path(&dir_a);
+        let db = shell_path(&dir_b);
+        let a_script = format!(
+            "echo started > {da}/started.txt\n\
+             s=0\n\
+             for ((k=0;k<3000000;k++)); do s=$((s + k % 7)); done\n\
+             echo \"done:$s\" > {da}/done.txt"
+        );
+        let b_script = format!("echo b-trivial > {db}/b.txt");
+        let started = dir_a.join("started.txt");
+        let done = dir_a.join("done.txt");
+        let (a_elapsed, b_elapsed, a_still_running) = std::thread::scope(|scope| {
+            let a_handle = scope.spawn(|| {
+                let t = Instant::now();
+                let mut executor = Executor::new();
+                run_source(&mut executor, &a_script, false);
+                t.elapsed()
+            });
+            // Wait until A is demonstrably inside its run.
+            let wait_start = Instant::now();
+            while !started.exists() && wait_start.elapsed().as_secs() < 60 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let mut b_executor = Executor::new();
+            let tb = Instant::now();
+            run_source(&mut b_executor, &b_script, false);
+            let b_elapsed = tb.elapsed();
+            let a_still_running = started.exists() && !done.exists();
+            let a_elapsed = a_handle.join().unwrap_or_default();
+            (a_elapsed, b_elapsed, a_still_running)
+        });
+        let b_content = std::fs::read_to_string(dir_b.join("b.txt")).unwrap_or_default();
+        summary.push_str(&format!(
+            "G-01 anti-starvation: A pure-compute total={a_elapsed:?}; B trivial elapsed={b_elapsed:?} while A running={a_still_running}; B output={b_content:?}\n"
+        ));
+        if !a_still_running {
+            deviations.push(
+                "G-01 anti-starvation: A finished before B ran — the scenario did not overlap"
+                    .to_string(),
+            );
+        }
+        if b_elapsed.as_secs() > 60 {
+            deviations.push(format!(
+                "G-01 anti-starvation: B's trivial command took {b_elapsed:?} behind A's compute run"
+            ));
+        }
+        if b_content.trim() != "b-trivial" {
+            deviations.push(format!(
+                "G-01 anti-starvation: B's output wrong: {b_content:?}"
+            ));
+        }
+    }
+
     // ---- Throughput indicator: fixed workload, sessions 1/2/4 -----------
     summary.push_str("throughput indicator (single rep, debug build, loaded host):\n");
     for n in [1usize, 2, 4] {
@@ -402,6 +532,13 @@ fn multi_session_isolation_matrix() {
         summary.push_str(&format!(
             "  sessions={n} serial_total={serial_t:?} concurrent_wall={conc_t:?} tp_txt_agree={agree}\n"
         ));
+        // G-01 acceptance: with the lock narrowed to touch points, the
+        // compute-dominated workload must actually parallelize.
+        if n >= 2 && conc_t.as_secs_f64() > serial_t.as_secs_f64() * 0.85 {
+            deviations.push(format!(
+                "G-01 throughput: sessions={n} concurrent_wall {conc_t:?} not significantly below serial_total {serial_t:?}"
+            ));
+        }
     }
 
     summary.push_str(&format!(

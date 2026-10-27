@@ -108,19 +108,20 @@ impl Executor {
             // then runs sh_makepath(NULL, name, MP_DOCWD), which reports the
             // physical working directory as an absolute path.
             None => {
-                let cwd = self.shell_state.env_vars.get("PWD").cloned().or_else(|| {
-                    std::env::current_dir()
-                        .ok()
-                        .map(|p| p.to_string_lossy().replace('\\', "/"))
-                })?;
+                let cwd = self
+                    .shell_state
+                    .env_vars
+                    .get("PWD")
+                    .cloned()
+                    .unwrap_or_else(|| self.shell_state.cwd.to_string_lossy().replace('\\', "/"));
                 (cwd.clone(), cwd)
             }
             Some(_) => return None,
         };
-        // GNU file_status() resolves NAME against the process's physical cwd;
-        // prefer that, then translate the logical directory for shells whose
-        // cwd did not follow the `cd`.
-        let exists = std::path::Path::new(name).is_file()
+        // GNU file_status() resolves NAME against the shell's physical cwd
+        // (the session cwd field since G-02); prefer that, then translate
+        // the logical directory.
+        let exists = self.shell_state.cwd.join(name).is_file()
             || std::path::Path::new(&check_dir).join(name).is_file()
             || shell_path_to_windows(&format!("{check_dir}/{name}"), &self.shell_state.env_vars)
                 .is_file();
