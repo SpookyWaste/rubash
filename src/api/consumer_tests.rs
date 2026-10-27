@@ -304,6 +304,7 @@ type StopHandler = Box<dyn FnMut(&mut DebugSession) -> StopLoopOutcome>;
 
 struct InspectLoop {
     stops: Rc<RefCell<Vec<(Option<u32>, InspectionSnapshot)>>>,
+    command_texts: Rc<RefCell<Vec<(Option<u32>, Option<String>)>>>,
     handler: StopHandler,
 }
 
@@ -314,6 +315,10 @@ impl StopLoop for InspectLoop {
                 .last_stop()
                 .and_then(|stop| stop.location.as_ref().map(|loc| loc.line));
             self.stops.borrow_mut().push((line, inspection));
+            let command_text = session
+                .last_stop()
+                .and_then(|stop| stop.command_text.clone());
+            self.command_texts.borrow_mut().push((line, command_text));
         }
         (self.handler)(session)
     }
@@ -394,11 +399,14 @@ fn act2_inspection_snapshot_matches_debuggee_own_output() {
 
     let stops: Rc<RefCell<Vec<(Option<u32>, InspectionSnapshot)>>> =
         Rc::new(RefCell::new(Vec::new()));
+    let command_texts: Rc<RefCell<Vec<(Option<u32>, Option<String>)>>> =
+        Rc::new(RefCell::new(Vec::new()));
     let file_for_bp = script_path_text.clone();
     let driver = SessionDriver::new(
         DebugSession::new(),
         Box::new(InspectLoop {
             stops: stops.clone(),
+            command_texts: command_texts.clone(),
             handler: Box::new(move |session: &mut DebugSession| {
                 if session.last_stop().map(|stop| stop.reason)
                     == Some(crate::debugger::event::StopReason::Entry)
@@ -451,17 +459,25 @@ fn act2_inspection_snapshot_matches_debuggee_own_output() {
         read(&dir, "pipe.txt").trim_end(),
         "snapshot PIPESTATUS declaration == declare -p PIPESTATUS at the same stop"
     );
-    // $BASH_COMMAND at a funnel stop is the engine's dynamic read:
-    // the last command that began executing (here the pipeline's
-    // last stage). The about-to-run text lives in the stop's own
-    // command_text; aligning the dynamic read itself with GNU's
-    // trap-time value is a funnel-ordering question for the WP-3
-    // line, recorded in the cluster REPORT — the view's duty is to
-    // report the engine's read faithfully, which it does.
+    // $BASH_COMMAND at a funnel stop is the about-to-run command
+    // (design 7.3; the section 4.2 ordering refreshes the
+    // engine's cell before the consult — WP-7 closed the
+    // one-command lag this fixture originally recorded, under
+    // which the read was the pipeline's last stage, `false`).
+    // The snapshot's dynamic read equals the stop's own frozen
+    // command text — the engine's dequoted rendering of line
+    // 12's command, the command this stop precedes.
+    let stop_text = command_texts
+        .borrow()
+        .iter()
+        .find(|(stop_line, _)| *stop_line == Some(12))
+        .and_then(|(_, text)| text.clone())
+        .expect("the line-12 stop recorded its command text");
+    assert_eq!(stop_text, "declare -p PIPESTATUS > $OUT/pipe.txt");
     assert_eq!(
         pipe_stop.dynamic.bash_command.as_deref(),
-        Some("false"),
-        "BASH_COMMAND at the stop is the engine's dynamic read\n{}",
+        Some(stop_text.as_str()),
+        "BASH_COMMAND at the stop is the about-to-run command\n{}",
         dump_stops(&stops)
     );
 
