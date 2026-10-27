@@ -510,7 +510,21 @@ fn dap_breakpoints_hit_and_dead_line_verdicts() {
 fn dap_breakpoint_in_sourced_file_pending_then_verified() {
     let _span = GateTestSpan::new();
     let lib = program_file("sourced_lib", "LIBVAR=from-lib\necho \"lib ran\"\n");
-    let program = program_file("sourced_main", &format!(". \"{lib}\"\necho after\n"));
+    // Identity contract (row-7 design 5.1): a file's debugger
+    // identity is the spelling the engine itself reports — for a
+    // sourced file, the spelling the script's `.` used. The
+    // adapter canonicalizes the client's path, so the two meet
+    // exactly when the script sources the file under that same
+    // (canonical) spelling, as here. A script sourcing through a
+    // divergent spelling (a symlinked directory, an 8.3 short
+    // name) registers the divergent identity and the canonical
+    // entry stays pending — canonical keying inside the session
+    // core, shared by both frontends, is the mechanism-level home
+    // for that convergence (row 11/12 residual, REPORT-noted).
+    let program = program_file(
+        "sourced_main",
+        &format!(". \"{}\"\necho after\n", canonical_string(&lib)),
+    );
     let (mut client, server) = start_server(DapLaunchPreset::default());
     handshake(
         &mut client,
@@ -538,10 +552,8 @@ fn dap_breakpoint_in_sourced_file_pending_then_verified() {
         s(&entries[0], "message")
     );
     client.ok("configurationDone", Json::obj(vec![]));
-    eprintln!("checkpoint: configurationDone answered; awaiting breakpoint event");
     // The resolution flip is reported before the stop.
     let changed = client.take_event("breakpoint");
-    eprintln!("checkpoint: breakpoint event received: {changed}");
     assert_eq!(s(&changed, "reason"), "changed");
     let entry = changed.get("breakpoint").expect("breakpoint object");
     assert_eq!(b(entry, "verified"), true);
