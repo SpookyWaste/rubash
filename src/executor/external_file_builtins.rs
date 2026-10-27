@@ -282,28 +282,46 @@ impl Executor {
     }
 
     fn external_tty(&mut self, cmd: &CommandNode) -> Result<bool, ExecuteError> {
-        let silent = cmd
-            .words
-            .iter()
-            .skip(1)
-            .any(|arg| arg == "-s" || arg == "--silent" || arg == "--quiet");
-        let output = if std::io::stdin().is_terminal() {
-            // A real tty device name is platform-specific; the non-tty case is
-            // the compatibility-critical path for bashdb command input.
-            "/dev/tty
-"
-        } else {
-            "not a tty
-"
-        };
-        if !silent {
-            self.write_cat_output(cmd, output.as_bytes())?;
+        // rubash#1636 narrowing (2026-10-27 ruling): the emulation
+        // evaluates exactly two shapes -- `-s` (either stdin state)
+        // and a bare invocation whose stdin is not a terminal
+        // (`not a tty`, status 1; the non-tty case is the
+        // compatibility-critical path for bashdb command input).
+        // Everything else declines to the real binary: an extra
+        // operand is GNU's usage error (exit 2) and was silently
+        // ignored here, other options (--help/--version included)
+        // are unimplemented, and a bare invocation on a terminal
+        // would have to print a device name the emulation cannot
+        // know -- the `/dev/tty` it used to print is fabricated (no
+        // such name on Windows, the wrong name everywhere else).
+        let mut silent = false;
+        for arg in &cmd.words[1..] {
+            match arg.as_str() {
+                "-s" | "--silent" | "--quiet" => silent = true,
+                _ => return Ok(false),
+            }
         }
-        self.exit_code = if std::io::stdin().is_terminal() { 0 } else { 1 };
+        let on_terminal = std::io::stdin().is_terminal();
+        if !silent && on_terminal {
+            return Ok(false);
+        }
+        if !silent {
+            self.write_cat_output(cmd, b"not a tty\n")?;
+        }
+        self.exit_code = if on_terminal { 0 } else { 1 };
         Ok(true)
     }
 
     fn external_mkdir(&mut self, cmd: &CommandNode) -> Result<bool, ExecuteError> {
+        // rubash#1636 narrowing (2026-10-27 ruling): the parse below
+        // implements -p/--parents exactly; every other option shape
+        // was accepted and dropped (-m's mode is consumed and never
+        // applied, -v never prints, unknown options are silently
+        // swallowed while the directory is still created). Those
+        // shapes decline to the real binary (mkdir_declines).
+        if mkdir_declines(&cmd.words[1..]) {
+            return Ok(false);
+        }
         // GNU mkdir (coreutils) parses options before operands: -p creates
         // parents (and only -p does — without it mkdir(2) is single-level
         // and a missing parent is ENOENT), -m MODE consumes a value,
@@ -397,6 +415,16 @@ impl Executor {
     }
 
     fn external_touch(&mut self, cmd: &CommandNode) -> Result<bool, ExecuteError> {
+        // rubash#1636 narrowing (2026-10-27 ruling): -h is parsed as
+        // a no-op below, so the stamp lands on the symlink's TARGET
+        // where GNU touches the link itself; and an invocation with
+        // no operands exits 0 silently where GNU reports a missing
+        // file operand. Both shapes decline (touch_declines); the
+        // delegation further down already covers --help/--version
+        // and out-of-grammar dates.
+        if touch_declines(&cmd.words[1..]) {
+            return Ok(false);
+        }
         // GNU coreutils touch.c do_touch: for an EXISTING operand,
         // utimensat(AT_FDCWD, file, NULL, 0) stamps atime and mtime with
         // the current time — the file is opened O_WRONLY only when it has
@@ -802,6 +830,15 @@ fn local_utc_offset_seconds(_epoch: i64) -> i64 {
 }
 impl Executor {
     fn external_cp(&mut self, cmd: &CommandNode) -> Result<bool, ExecuteError> {
+        // rubash#1636 narrowing (2026-10-27 ruling): option shapes
+        // the parse below accepts but does not implement decline
+        // before any work happens (cp_declines): link creation,
+        // no-dereference policy, --parents, the backup machinery,
+        // context, force, --update values other than the implemented
+        // `older` semantics, and the --help/--version info requests.
+        if cp_declines(&cmd.words[1..]) {
+            return Ok(false);
+        }
         // GNU cp (coreutils cp.c) parses long and short options before and
         // between operands, and `--` ends option parsing. -r/-R/-a recurse
         // into directories, -n/--no-clobber skips files that already exist
@@ -816,8 +853,11 @@ impl Executor {
         // -dR --preserve=all, so it preserves too. Ownership from the
         // preserve list is parsed but not actionable (an unprivileged GNU
         // cp skips it silently as well).
-        // Tolerated but unimplemented (accepted as no-ops, like cp itself):
-        // -f, -l, -s, -d/-P, --parents, --backup, -S/--suffix.
+        // Formerly "tolerated but unimplemented" shapes (-f, -l, -s,
+        // -d/-P, --parents, --backup, -S/--suffix) are no longer
+        // tolerated: cp_declines turns them away above, since the
+        // emulation does not implement them; the no-op arms in the
+        // parse below remain only as a defensive fallback.
         let mut recursive = false;
         let mut preserve_mode = false;
         let mut preserve_times = false;
@@ -1294,6 +1334,16 @@ impl Executor {
     }
 
     fn external_rm(&mut self, cmd: &CommandNode) -> Result<bool, ExecuteError> {
+        // rubash#1636 narrowing (2026-10-27 ruling): -i/-I/
+        // --interactive and --one-file-system are accepted by the
+        // parse below but never implemented — the files are deleted
+        // without the prompt GNU gives (a data-safety silent subset)
+        // or the filesystem boundary GNU honors. Those shapes
+        // decline to the real binary (rm_declines); the emulation
+        // keeps the forms it evaluates exactly.
+        if rm_declines(&cmd.words[1..]) {
+            return Ok(false);
+        }
         // GNU rm (coreutils rm.c): -r/-R/--recursive removes directories,
         // -d/--dir removes empty ones, and a directory operand without
         // either is an error — never an implicit recursion. -f ignores
@@ -1460,17 +1510,19 @@ impl Executor {
     }
 
     fn external_rmdir(&mut self, cmd: &CommandNode) -> Result<bool, ExecuteError> {
-        for path in &cmd.words[1..] {
-            // argv as-is — no second expand_word pass (issue #555, see
-            // external_mkdir): a quoted '$FIX/rd' must never remove the
-            // expanded neighbor.
-            let _ = fs::remove_dir(self.session_path(shell_path_to_windows(
-                path.as_str(),
-                &self.shell_state.env_vars,
-            )));
-        }
-        self.exit_code = 0;
-        Ok(true)
+        // rubash#1636 narrowing (2026-10-27 ruling): this emulation
+        // is a stub, not a subset — it treats every option as an
+        // operand, swallows every failure, and always exits 0, so
+        // `rmdir missing && ...` takes the success branch GNU never
+        // takes and `rmdir -p a/b/c` leaves the ancestors behind.
+        // There is no shape it evaluates exactly, so every invocation
+        // declines to the real binary (dispatch reaches this handler
+        // only when the name resolved in PATH, rubash#1545). The
+        // #555 invariant is preserved by construction: the operand
+        // text reaches the real rmdir exactly as expanded once by
+        // the simple-command executor.
+        let _ = cmd;
+        Ok(false)
     }
 
     fn external_cat(&mut self, cmd: &CommandNode) -> Result<bool, ExecuteError> {
@@ -2035,6 +2087,186 @@ impl Executor {
             Ok(true)
         }
     }
+}
+
+/// rubash#1636: whether an rm invocation carries an option shape
+/// the emulation accepts but does not implement — the interactive
+/// forms (-i/-I/--interactive, any `--interactive=WHEN`) and
+/// --one-file-system. The scan mirrors the handler's classification:
+/// options may appear anywhere before the `--` terminator (getopt
+/// permutation); words after it are operands, as is a bare `-`.
+fn rm_declines(words: &[String]) -> bool {
+    let mut no_more_options = false;
+    for word in words {
+        let arg = word.as_str();
+        if no_more_options {
+            continue;
+        }
+        if arg == "--" {
+            no_more_options = true;
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let name = long.split('=').next().unwrap_or(long);
+            if matches!(name, "interactive" | "one-file-system") {
+                return true;
+            }
+            continue;
+        }
+        if arg.len() > 1
+            && arg.starts_with('-')
+            && arg[1..].chars().any(|ch| ch == 'i' || ch == 'I')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// rubash#1636: whether a mkdir invocation uses any option shape
+/// other than the two the emulation implements exactly (-p and
+/// --parents). The handler's parse consumes every other `-`-word as
+/// a flag and drops it, so the declined class is "any option word in
+/// flag position" (before the `--` terminator): -m/--mode in every
+/// form, -v/--verbose, -Z/--context, bundles carrying them, unknown
+/// options, and the --help/--version info requests.
+fn mkdir_declines(words: &[String]) -> bool {
+    let mut no_more_flags = false;
+    for word in words {
+        let arg = word.as_str();
+        if no_more_flags {
+            continue;
+        }
+        if arg == "--" {
+            no_more_flags = true;
+            continue;
+        }
+        if arg.len() > 1 && arg.starts_with('-') && arg != "-p" && arg != "--parents" {
+            return true;
+        }
+    }
+    false
+}
+
+/// rubash#1636: whether a touch invocation declines — it carries
+/// -h/--no-dereference (parsed as a no-op; the stamp would land on
+/// the symlink target instead of the link), or it has no operands at
+/// all (the emulation exited 0 silently; GNU reports a missing file
+/// operand). The walk mirrors the handler's option grammar so value
+/// words for -t/-d/-r/--date/--reference/--time are never mistaken
+/// for operands or options.
+fn touch_declines(words: &[String]) -> bool {
+    let mut operands = 0usize;
+    let mut no_more_options = false;
+    let mut index = 0;
+    while index < words.len() {
+        let arg = words[index].as_str();
+        index += 1;
+        if no_more_options || !arg.starts_with('-') || arg == "-" {
+            operands += 1;
+            continue;
+        }
+        if arg == "--" {
+            no_more_options = true;
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, attached) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            match name {
+                "no-dereference" => return true,
+                "date" | "reference" | "time" => {
+                    if attached.is_none() {
+                        index += 1;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let shorts = &arg[1..];
+        let mut position = 0;
+        let mut cluster_done = false;
+        while position < shorts.len() && !cluster_done {
+            let flag = shorts[position..].chars().next().unwrap_or('\0');
+            position += flag.len_utf8();
+            match flag {
+                'h' => return true,
+                't' | 'd' | 'r' => {
+                    if position >= shorts.len() {
+                        index += 1;
+                    }
+                    cluster_done = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    operands == 0
+}
+
+/// rubash#1636: whether a cp invocation uses an option shape the
+/// emulation accepts but does not implement — link creation
+/// (-l/--link, -s/--symbolic-link: both produced a plain copy), the
+/// no-dereference policy (-d/-P/--no-dereference: the copy always
+/// follows symlinks), --parents, the backup machinery (--backup,
+/// -S/--suffix), -Z/--context, -f/--force (the unlink-and-retry
+/// semantics are not modeled), the --help/--version info requests
+/// (--help printed the emulation's own short text to stderr), and
+/// --update values other than the implemented `older` semantics
+/// (any value, `all` included, was read as `older`; a bare --update
+/// is `older` on the coreutils oracle and stays). The walk mirrors
+/// the handler's grammar (notably -t consuming the next word).
+fn cp_declines(words: &[String]) -> bool {
+    let mut no_more_flags = false;
+    let mut index = 0;
+    while index < words.len() {
+        let arg = words[index].as_str();
+        index += 1;
+        if no_more_flags || arg == "-" || !arg.starts_with('-') {
+            continue;
+        }
+        if arg == "--" {
+            no_more_flags = true;
+            continue;
+        }
+        if let Some(rest) = arg.strip_prefix("--") {
+            let (name, value) = match rest.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (rest, None),
+            };
+            match name {
+                "link" | "symbolic-link" | "parents" | "backup" | "context" | "force" | "help"
+                | "version" | "no-dereference" | "suffix" => return true,
+                "update" => {
+                    if !matches!(value, None | Some("older")) {
+                        return true;
+                    }
+                }
+                "target-directory" | "target-dir" => {
+                    if value.is_none() {
+                        index += 1;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        for ch in arg[1..].chars() {
+            match ch {
+                'l' | 's' | 'd' | 'P' | 'Z' | 'f' | 'S' => return true,
+                't' => {
+                    // The handler takes the next word as -t's value.
+                    index += 1;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 /// cp's help text, scoped to the forms this implementation honours.

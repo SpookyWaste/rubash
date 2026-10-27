@@ -21,8 +21,13 @@
 //! `rmdir: failed to remove '$FIX/rd': ...`, `zz/rd` survives; unquoted
 //! `$FIX/t` still expands and creates `zz/t`. rubash's own wrapper
 //! leniencies (mkdir's create_dir_all implies -p, rmdir swallows errors)
-//! are pre-existing wrapper contracts, NOT this issue, and the assertions
-//! below pin the re-expansion invariant within those contracts.
+//! were pre-existing wrapper contracts, NOT this issue, and the assertions
+//! below originally pinned the re-expansion invariant within those
+//! contracts. The rmdir leniency has since been abolished by the
+//! 2026-10-27 narrowing ruling (rubash#1636): the emulation declines
+//! entirely, so the rmdir rows now pin the GNU shape above — the real
+//! (winuxcmd) rmdir answers with rc 1 and a diagnostic naming the
+//! literal operand — while the survival invariant is unchanged.
 //!
 //! Windows-only rows (literal $FIX\d paths) carry #[cfg(windows)]; the rest pin portable no-re-expansion on every host.
 //!
@@ -98,8 +103,8 @@ fn run_in_fixture_dir(script: &str, tag: &str) -> (Output, PathBuf) {
 /// (mkdir/touch/cp). `literal_created`, when set, is a fixture-relative
 /// path that PROVES the operand was applied to the literal text.
 /// `stderr_contains` pins the literal operand name in the diagnostic
-/// (None for wrappers that are silent on this path, i.e. rmdir, and for
-/// succeeding mkdir runs).
+/// (None for wrappers that are silent on this path and for succeeding
+/// mkdir runs).
 struct Case {
     builtin: &'static str,
     tag: &'static str,
@@ -214,8 +219,11 @@ fn quoted_cases() -> Vec<Case> {
             script: "FIX=zz; rmdir '$FIX/rd'",
             guard: r"zz\rd",
             guard_survives: true,
-            expect_status: 0, // the wrapper swallows per-operand errors (pre-existing)
-            stderr_contains: None,
+            // rubash#1636: the wrapper no longer swallows errors (it
+            // declines entirely); the real rmdir reports the missing
+            // literal directory with status 1, naming the operand.
+            expect_status: 1,
+            stderr_contains: Some("$FIX/rd"),
             literal_created: None,
         },
     ]
@@ -488,8 +496,10 @@ fn rm_failing_quoted_operand_does_not_stop_later_operands() {
 }
 
 /// rmdir: `rmdir '$FIX/rd'` must never remove the re-expanded neighbor
-/// `zz/rd` (the wrapper swallows per-operand errors and exits 0 — its
-/// pre-existing contract; the survival invariant is this test).
+/// `zz/rd`. The wrapper used to swallow per-operand errors and exit 0;
+/// since the rubash#1636 narrowing it declines entirely, so the real
+/// rmdir answers with status 1 and a diagnostic naming the literal
+/// operand — the survival invariant is unchanged.
 #[cfg(windows)]
 #[test]
 fn rmdir_single_quoted_variable_operand_is_not_re_expanded() {
@@ -499,8 +509,8 @@ fn rmdir_single_quoted_variable_operand_is_not_re_expanded() {
         script: "FIX=zz; rmdir '$FIX/rd'",
         guard: r"zz\rd",
         guard_survives: true,
-        expect_status: 0,
-        stderr_contains: None,
+        expect_status: 1,
+        stderr_contains: Some("$FIX/rd"),
         literal_created: None,
     });
 }
@@ -515,8 +525,8 @@ fn rmdir_escaped_dollar_operand_is_literal() {
         script: r"FIX=zz; rmdir \$FIX/rd",
         guard: r"zz\rd",
         guard_survives: true,
-        expect_status: 0,
-        stderr_contains: None,
+        expect_status: 1,
+        stderr_contains: Some("$FIX/rd"),
         literal_created: None,
     });
 }
@@ -532,14 +542,17 @@ fn rmdir_unset_variable_operand_stays_unexpanded() {
         script: "rmdir '$NOSUCHVAR555/rd'",
         guard: r"zz\rd",
         guard_survives: true,
-        expect_status: 0,
-        stderr_contains: None,
+        expect_status: 1,
+        stderr_contains: Some("$NOSUCHVAR555/rd"),
         literal_created: None,
     });
 }
 
 /// Quote fidelity must not swallow live expansions: every wrapper still
-/// honors the unquoted `$VAR` form (GNU parity both ways).
+/// honors the unquoted `$VAR` form (GNU parity both ways). Since the
+/// rubash#1636 narrowing the rmdir leg is served by the resolved PATH
+/// binary (winuxcmd on product hosts), whose success on the existing
+/// empty `zz\rd` is what leaves status 0 here.
 #[cfg(windows)]
 #[test]
 fn unquoted_operands_still_expand_for_the_whole_family() {
@@ -575,11 +588,19 @@ fn unquoted_operands_still_expand_for_the_whole_family() {
 
 /// The command-substitution dispatch shares the same wrappers: a quoted
 /// operand inside `$()` stays literal there too (mirrors the #511
-/// comsub-cat test).
+/// comsub-cat test). The script creates the literal parent first:
+/// since rubash#1372 the emulation's mkdir is single-level without
+/// -p (GNU mkdir(2) semantics), so `mkdir '$FIX/d'` alone fails on
+/// the missing parent — the pin's original create-the-whole-chain
+/// expectation predates that fix and failed identically on pristine
+/// master (verified 2026-10-27); the literal-operand invariant this
+/// test exists for is unaffected.
 #[test]
 fn command_substitution_mkdir_honors_single_quotes() {
-    let (out, dir) =
-        run_in_fixture_dir("FIX=zz; d=$(mkdir '$FIX/d'); echo \"[$d]\"", "comsub-mkdir");
+    let (out, dir) = run_in_fixture_dir(
+        "FIX=zz; mkdir '$FIX'; d=$(mkdir '$FIX/d'); echo \"[$d]\"",
+        "comsub-mkdir",
+    );
     let zz_d = dir.join("zz").join("d").exists();
     let literal = dir.join("$FIX").join("d").exists();
     let _ = std::fs::remove_dir_all(&dir);
