@@ -20,7 +20,9 @@
 //!
 //! Fake-binary rows are unix-only (they need a `#!/bin/sh` stand-in).
 
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 
 #[cfg(unix)]
