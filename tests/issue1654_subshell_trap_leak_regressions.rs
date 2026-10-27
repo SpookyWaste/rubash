@@ -95,5 +95,14 @@ fn issue1654_exit_trap_runs_on_parent_signal_death() {
 fn issue1654_plain_self_kill_control_unchanged() {
     let (stdout, _stderr, code) = rubash("kill -s TERM $$; echo survived");
     assert_eq!(stdout, "", "stdout: {stdout}");
-    assert_eq!(code, Some(143));
+    // Process-level expectation (GATE-READJUDICATION A2): the shell
+    // process dies BY SIGTERM itself — under the same probe GNU's
+    // returncode is -15 (signal death), and Rust's
+    // ExitStatus::code() is None for a signal death. 143 is the
+    // shell-layer wait status (128+15), not a process exit code;
+    // the original pin's Some(143) could only pass if rubash
+    // synthesized exit(143), which would diverge from GNU's
+    // signal-death shape. (The deferred-death shapes in this file
+    // DO synthesize Some(143) and keep their pins.)
+    assert_eq!(code, None);
 }
