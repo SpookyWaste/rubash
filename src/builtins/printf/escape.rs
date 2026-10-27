@@ -88,24 +88,6 @@ where
     }
 }
 
-fn format_escape_codepoint(
-    value: Option<u32>,
-    fallback: &str,
-    diagnostic: &str,
-) -> (String, Option<String>) {
-    // GNU printf.def:1121-1140: \uNNNN/\UNNNNNNNN convert through u32cconv,
-    // which encodes every value <= 0x7fffffff (surrogates and the 5/6-byte
-    // UTF-8 forms included) and emits nothing for larger values. A missing
-    // digit run is the only fallback case.
-    match value {
-        Some(value) => (
-            crate::executor::substitution_metadata::u32cconv_utf8_text(value),
-            None,
-        ),
-        None => (fallback.to_string(), Some(format!("printf: {diagnostic}"))),
-    }
-}
-
 fn format_unicode_escape(
     value: Option<(u32, String)>,
     prefix: &str,
