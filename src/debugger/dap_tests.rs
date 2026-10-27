@@ -36,7 +36,10 @@ impl Read for PipeReader {
                 Some(limit) => match self.rx.recv_timeout(limit) {
                     Ok(chunk) => chunk,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        panic!("DAP conversation stalled (no bytes within {limit:?})")
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!("no bytes within {limit:?}"),
+                        ));
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
                 },
@@ -134,7 +137,12 @@ impl Client {
                 return message;
             }
             let mut chunk = [0u8; 16384];
-            let n = self.reader.read(&mut chunk).expect("client read");
+            let n = self.reader.read(&mut chunk).unwrap_or_else(|error| {
+                panic!(
+                    "DAP conversation stalled ({error}); transcript so far: {:?}",
+                    self.log
+                )
+            });
             assert!(
                 n > 0,
                 "DAP stream closed while a message was owed; transcript: {:?}",
@@ -338,7 +346,9 @@ fn handshake(client: &mut Client, program: &str, extra: Vec<(&str, Json)>) {
 fn canonical_string(path: &str) -> String {
     let resolved = std::fs::canonicalize(path).expect("fixture path canonicalizes");
     let text = resolved.to_string_lossy().into_owned();
-    text.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(text)
+    text.strip_prefix(r"\\?\")
+        .map(str::to_string)
+        .unwrap_or(text)
 }
 
 /// Field shortcuts for assertions.
@@ -528,8 +538,10 @@ fn dap_breakpoint_in_sourced_file_pending_then_verified() {
         s(&entries[0], "message")
     );
     client.ok("configurationDone", Json::obj(vec![]));
+    eprintln!("checkpoint: configurationDone answered; awaiting breakpoint event");
     // The resolution flip is reported before the stop.
     let changed = client.take_event("breakpoint");
+    eprintln!("checkpoint: breakpoint event received: {changed}");
     assert_eq!(s(&changed, "reason"), "changed");
     let entry = changed.get("breakpoint").expect("breakpoint object");
     assert_eq!(b(entry, "verified"), true);
