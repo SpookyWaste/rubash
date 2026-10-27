@@ -23,7 +23,6 @@ fn tempdir(tag: &str) -> PathBuf {
 }
 
 #[test]
-#[ignore = "issue#1275 drift on master ec279df1: a child running a SCRIPT FILE does not import BASH_FUNC_* at all (`f: command not found`, rc=127; -c children import fine), so the chain dies before re-export — reported in bf-w3-a REPORT.md as a suspected live bug"]
 fn imported_function_is_reexported_to_grandchildren() {
     let dir = tempdir("chain");
     std::fs::write(
