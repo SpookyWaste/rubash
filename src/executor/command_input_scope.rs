@@ -1248,18 +1248,27 @@ impl Executor {
         // so a missing name is CREATED by the open and never fails here
         // (rubash#264); a genuine open error (bad directory, permission)
         // still aborts the compound.
-        let probe = if redirect.kind == crate::parser::RedirectKind::ReadWrite {
+        // rubash#1820: the plain-input probe must not open a FIFO — the
+        // throwaway O_RDONLY open consumes the rendezvous pairing the
+        // real acquisition (the FUNCTION_STDIN slurp, or a live fd-0
+        // bind) needs, and blocks until a writer appears in its own
+        // right. An existing FIFO validates through access(2) instead
+        // (probe_input_redirect_gate), with the same errno surface.
+        let probe_error = if redirect.kind == crate::parser::RedirectKind::ReadWrite {
             OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .open(&path)
+                .err()
+        } else if super::shell_options::redirect_path_is_fifo(&path) {
+            super::shell_options::probe_input_redirect_gate(&path).err()
         } else {
-            std::fs::File::open(&path)
+            std::fs::File::open(&path).err()
         };
-        match probe {
-            Ok(_) => None,
-            Err(error) => Some(format!(
+        match probe_error {
+            None => None,
+            Some(error) => Some(format!(
                 "{}{target}: {}",
                 self.error_prefix(),
                 crate::posix_errors::message(&error)

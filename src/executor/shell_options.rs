@@ -265,6 +265,22 @@ impl Executor {
                 return File::open(&path).map_err(|e| crate::posix_errors::path_error(target, e));
             }
         }
+        // rubash#1820: a probe (consume == false) must not open a FIFO.
+        // The throwaway open consumes the rendezvous pairing the bind
+        // phase's one real open — GNU's only open (redir.c
+        // do_redirection_internal) — then waits for in vain; even a
+        // nonblocking probe open/close could release a writer parked
+        // in its own bind open and strand it readerless. Validate with
+        // access(2) instead: the same existence/permission verdict, no
+        // fd taken. Every probe caller drops the returned File unread,
+        // so the /dev/null stand-in is inert.
+        #[cfg(unix)]
+        if !consume && redirect_path_is_fifo(&win_path) {
+            if let Some(error) = redirect_fifo_access_error(&win_path, false) {
+                return Err(crate::posix_errors::path_error(target, error));
+            }
+            return File::open("/dev/null").map_err(|e| crate::posix_errors::path_error(target, e));
+        }
         File::open(win_path).map_err(|e| crate::posix_errors::path_error(target, e))
     }
 
@@ -609,6 +625,27 @@ impl Executor {
         target: &str,
         clobber: bool,
     ) -> io::Result<File> {
+        // rubash#1820: on a FIFO the prepare phase's create is a
+        // semantic no-op (O_TRUNC/O_CREAT do nothing to a fifo) whose
+        // blocking open consumes the rendezvous pairing the bind phase
+        // (open_compound_output_redirects) then waits for in vain.
+        // Skip the physical open — the bind performs GNU's single
+        // open — after the same write-access validation the create's
+        // failure would have surfaced. Every caller drops the returned
+        // File, so the /dev/null stand-in is inert.
+        #[cfg(unix)]
+        {
+            let path = self.session_path(shell_path_to_windows(
+                &self.redirect_output_path_target(target),
+                &self.shell_state.env_vars,
+            ));
+            if redirect_path_is_fifo(&path) {
+                if let Some(error) = redirect_fifo_access_error(&path, true) {
+                    return Err(crate::posix_errors::path_error(target, error));
+                }
+                return File::open("/dev/null");
+            }
+        }
         let file = self.create_redirect_output(target, clobber)?;
         if !clobber
             && crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "noclobber")
@@ -1537,30 +1574,44 @@ impl Executor {
             // (test.tests `t -t 0 < /dev/tty` hung via
             // function_call_stdin). Decline the text channel; the caller
             // binds the live fd for the command's duration instead.
-            {
-                #[cfg(unix)]
-                use std::os::unix::io::AsRawFd;
-                #[cfg(windows)]
-                use std::os::windows::io::AsRawHandle;
-                if let Ok(file) = File::open(&path) {
-                    #[cfg(windows)]
-                    let raw = file.as_raw_handle() as crate::fd::HANDLE;
-                    #[cfg(unix)]
-                    let raw = file.as_raw_fd() as crate::fd::HANDLE;
-                    if crate::fd::is_char_device_handle(raw) {
-                        return None;
-                    }
-                }
-            }
+            //
+            // rubash#1820: the device check and the slurp below must use
+            // ONE open. The check used to File::open the target and drop
+            // it, and fs::read_to_string then opened it again; on a FIFO
+            // the throwaway check open consumes the rendezvous pairing
+            // and the slurp open waits for a second writer (or reads
+            // EOF in the zero-writer gap), while GNU opens a redirect
+            // target exactly once (redir.c do_redirection_internal).
             // A `<(cmd)` temp path is a pipe carrier, not a file: reopening
             // it must resume at the shared offset, not replay the contents
             // (subst.c:7143 command_substitute / redir.c dup semantics).
+            // (Consulted before the open, as before: a carrier path need
+            // not be openable as a plain path at all.)
             if let Some(bytes) = self.procsub_stream_take(&path) {
                 return Some(crate::executor::substitution_metadata::bytes_to_shell_text(
                     &bytes,
                 ));
             }
-            return fs::read_to_string(path).ok();
+            let mut file = File::open(&path).ok()?;
+            {
+                #[cfg(unix)]
+                use std::os::unix::io::AsRawFd;
+                #[cfg(windows)]
+                use std::os::windows::io::AsRawHandle;
+                #[cfg(windows)]
+                let raw = file.as_raw_handle() as crate::fd::HANDLE;
+                #[cfg(unix)]
+                let raw = file.as_raw_fd() as crate::fd::HANDLE;
+                if crate::fd::is_char_device_handle(raw) {
+                    return None;
+                }
+            }
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf).ok()?;
+            // fs::read_to_string equivalence: invalid UTF-8 declines
+            // the text channel exactly as the two-open version did.
+            return String::from_utf8(buf).ok();
         }
 
         if let Some(input) = self.virtual_fd_stdin_remaining(0) {
@@ -2068,6 +2119,150 @@ pub(in crate::executor) fn write_pipeline_stream(
     match crate::fd::write_all(handle, output) {
         Ok(()) => Ok(()),
         Err(error) if is_broken_pipe_error(&error) => Err(ExecuteError::BrokenPipe),
+        Err(error) => Err(ExecuteError::IoError(error)),
+    }
+}
+
+/// True when `path` names an existing FIFO (unix). A FIFO open carries
+/// rendezvous semantics — a blocking open returns only when the peer
+/// side opens — so every throwaway probe/prepare open of a FIFO
+/// consumes a pairing the one real open needs (GNU opens a redirect
+/// target exactly once: redir.c do_redirection_internal). Windows has
+/// no filesystem FIFOs.
+pub(in crate::executor) fn redirect_path_is_fifo(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        return std::fs::metadata(path)
+            .map(|meta| meta.file_type().is_fifo())
+            .unwrap_or(false);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// The reject gate's `< word` validity probe (rubash#1820): a plain
+/// `File::open` is validation-pure for regular files, but on a FIFO the
+/// throwaway O_RDONLY open consumes the rendezvous pairing (and blocks
+/// until a writer appears), so an existing FIFO validates through
+/// access(2) — the same existence/permission verdict, no fd taken.
+pub(in crate::executor) fn probe_input_redirect_gate(
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if redirect_path_is_fifo(path) {
+        if let Some(error) = redirect_fifo_access_error(path, false) {
+            return Err(error);
+        }
+        return Ok(());
+    }
+    std::fs::File::open(path).map(|_| ())
+}
+
+/// access(2) validation for a FIFO redirect target whose real open is
+/// deferred to the bind phase (rubash#1820): proves existence and the
+/// requested access without taking an fd, so no rendezvous pairing is
+/// consumed. Returns the io error the corresponding open would have
+/// surfaced, or None when access is granted.
+#[cfg(unix)]
+pub(in crate::executor) fn redirect_fifo_access_error(
+    path: &std::path::Path,
+    write: bool,
+) -> Option<std::io::Error> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mode = if write { libc::W_OK } else { libc::R_OK };
+    if unsafe { libc::access(c_path.as_ptr(), mode) } == 0 {
+        None
+    } else {
+        Some(std::io::Error::last_os_error())
+    }
+}
+
+/// The setup walk's output probe (create/truncate side effect plus
+/// error surfacing) with the rubash#1820 FIFO carve-out: on a FIFO the
+/// create is a no-op whose blocking open consumes the bind open's
+/// rendezvous pairing, so validate write access only — the bind phase
+/// performs the one real open GNU performs.
+pub(in crate::executor) fn probe_output_redirect(
+    executor: &Executor,
+    target: &str,
+    clobber: bool,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let path = executor.session_path(shell_path_to_windows(
+            &executor.redirect_output_path_target(target),
+            &executor.shell_state.env_vars,
+        ));
+        if redirect_path_is_fifo(&path) {
+            if let Some(error) = redirect_fifo_access_error(&path, true) {
+                return Err(crate::posix_errors::path_error(target, error));
+            }
+            return Ok(());
+        }
+    }
+    executor.create_redirect_output(target, clobber).map(|_| ())
+}
+
+/// Append-arm twin of [`probe_output_redirect`].
+pub(in crate::executor) fn probe_output_redirect_append(
+    executor: &Executor,
+    target: &str,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let path = executor.session_path(shell_path_to_windows(
+            target,
+            &executor.shell_state.env_vars,
+        ));
+        if redirect_path_is_fifo(&path) {
+            if let Some(error) = redirect_fifo_access_error(&path, true) {
+                return Err(crate::posix_errors::path_error(target, error));
+            }
+            return Ok(());
+        }
+    }
+    crate::executor::execution_misc::open_redirect_append(&executor.session_path(
+        shell_path_to_windows(target, &executor.shell_state.env_vars),
+    ))
+    .map(|_| ())
+    .map_err(|e| crate::posix_errors::path_error(target, e))
+}
+
+/// Feed a spawned child's stdin pipe with the shell's virtual-stdin
+/// payload (heredoc / here-string / FUNCTION_STDIN text materialized by
+/// the in-process model). GNU has no such post-spawn feed: the element's
+/// fd 0 IS the pipe or file (execute_cmd.c:2620 execute_pipeline binds
+/// the fildes; redirections are applied inside the child by
+/// do_redirection_internal), so a consumer that exits without reading
+/// simply leaves the bytes in the pipe and its own exit status governs.
+/// The feed is therefore a transport detail of this port, and its two
+/// failure faces must not leak into the command's result:
+///
+/// - a broken pipe means the child closed stdin (in practice it already
+///   exited) — the feed just ends, exactly like the writer-thread feed
+///   sites swallow it (pipeline member spawn, background spawn);
+/// - SIGPIPE is SIG_DFL process-wide (rubash#1333), so an unguarded
+///   feed on a non-pipeline executor thread would kill the SHELL when
+///   the child wins the exit race (`cmd <<< x` with a fast-exiting
+///   `cmd`) — hold the scoped block across the write so the race can
+///   only ever surface as the swallowed EPIPE above.
+///
+/// Any other io error is a genuine environment failure and propagates
+/// (rubash#1822).
+pub(in crate::executor) fn feed_child_stdin(
+    stdin: &mut impl std::io::Write,
+    payload: &[u8],
+) -> Result<(), ExecuteError> {
+    #[cfg(unix)]
+    let _sigpipe_block = crate::builtins::kill::sigpipe_block_guard();
+    match stdin.write_all(payload) {
+        Ok(()) => Ok(()),
+        Err(error) if is_broken_pipe_error(&error) => Ok(()),
         Err(error) => Err(ExecuteError::IoError(error)),
     }
 }

@@ -2969,7 +2969,10 @@ impl Executor {
                 );
             }
             if !stage0_input.is_empty() {
-                stdin.write_all(
+                // Same feed contract as the host path: a member that
+                // already exited must not fail the pipeline (rubash#1822).
+                crate::executor::shell_options::feed_child_stdin(
+                    &mut stdin,
                     &crate::executor::substitution_metadata::shell_text_to_raw_bytes(&stage0_input),
                 )?;
             }
@@ -3697,7 +3700,10 @@ impl Executor {
                     (base + stage0_input.len()).to_string(),
                 );
             }
-            stdin.write_all(
+            // Same feed contract as the host path: a member that
+            // already exited must not fail the pipeline (rubash#1822).
+            crate::executor::shell_options::feed_child_stdin(
+                &mut stdin,
                 &crate::executor::substitution_metadata::shell_text_to_raw_bytes(&stage0_input),
             )?;
         }
@@ -4514,6 +4520,43 @@ impl Executor {
             self.xtrace_write(&trace);
         }
 
+        // GNU execute_simple_command classifies a pipeline element exactly
+        // like a top-level command: special builtins first
+        // (execute_cmd.c:4657-4663), then func = find_function
+        // (execute_cmd.c:4674-4677) — a user-defined function shadows every
+        // ordinary builtin — and only when BOTH lookups miss does
+        // execute_from_filesystem (execute_cmd.c:4919-4925
+        // execute_disk_command) search $PATH. execute_pipeline
+        // (execute_cmd.c:2620) routes every element through that same
+        // execute_command, so `date(){ echo FAKE; }; date | cat` runs the
+        // function (WSL GNU 5.3.0: FAKE). The hardcoded ordinary-builtin
+        // arms below and execute_builtin_pipeline_stage classify by name
+        // alone and never consult the function table, and the concurrent
+        // native pipelines fall back to the sequential loop for them, so
+        // function-named members previously fell through to the disk
+        // command (issue #587: the real date(1) ran; `t(){ ...; }; t git
+        // log | wc -l` silently executed a PATH stub). Route function-named
+        // elements to the function stage first, keeping
+        // execute_function_command_invocation's posix special-builtin
+        // exception (command_prepare.rs; GNU: in posix mode a special
+        // builtin precludes find_function, execute_cmd.c:4657-4663).
+        // Classification precedes the fd-0 redirect routing below:
+        // GNU's find_function runs in the element's forked child
+        // regardless of the element's own redirections, which the
+        // chosen execution path then applies internally
+        // (execute_function's do_redirections, execute_cmd.c:5606).
+        // Routing a function-named element with `< file` straight to
+        // the external spawner skipped the function table entirely
+        // and reported the function as `command not found`
+        // (rubash#1823).
+        if let Some(word) = command.words.first() {
+            let function_shadows = !(self.posix_mode_enabled() && is_posix_special_builtin(word))
+                && self.function_name_for_command_word(word).is_some();
+            if function_shadows {
+                return self.execute_function_pipeline_stage(command, input);
+            }
+        }
+
         // GNU forks every pipeline element and applies the ELEMENT'S OWN
         // redirections in the forked child (execute_cmd.c:4617
         // execute_simple_command -> redir.c do_redirection_internal), so a
@@ -4556,34 +4599,6 @@ impl Executor {
                 .is_some_and(|expanded| self.routes_as_builtin(&expanded));
             if !builtin_stage {
                 return self.execute_external_pipeline_stage(command, input, stdin_inherit);
-            }
-        }
-
-        // GNU execute_simple_command classifies a pipeline element exactly
-        // like a top-level command: special builtins first
-        // (execute_cmd.c:4657-4663), then func = find_function
-        // (execute_cmd.c:4674-4677) — a user-defined function shadows every
-        // ordinary builtin — and only when BOTH lookups miss does
-        // execute_from_filesystem (execute_cmd.c:4919-4925
-        // execute_disk_command) search $PATH. execute_pipeline
-        // (execute_cmd.c:2620) routes every element through that same
-        // execute_command, so `date(){ echo FAKE; }; date | cat` runs the
-        // function (WSL GNU 5.3.0: FAKE). The hardcoded ordinary-builtin
-        // arms below and execute_builtin_pipeline_stage classify by name
-        // alone and never consult the function table, and the concurrent
-        // native pipelines fall back to the sequential loop for them, so
-        // function-named members previously fell through to the disk
-        // command (issue #587: the real date(1) ran; `t(){ ...; }; t git
-        // log | wc -l` silently executed a PATH stub). Route function-named
-        // elements to the function stage first, keeping
-        // execute_function_command_invocation's posix special-builtin
-        // exception (command_prepare.rs; GNU: in posix mode a special
-        // builtin precludes find_function, execute_cmd.c:4657-4663).
-        if let Some(word) = command.words.first() {
-            let function_shadows = !(self.posix_mode_enabled() && is_posix_special_builtin(word))
-                && self.function_name_for_command_word(word).is_some();
-            if function_shadows {
-                return self.execute_function_pipeline_stage(command, input);
             }
         }
 

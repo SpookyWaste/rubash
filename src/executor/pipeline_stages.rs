@@ -597,6 +597,45 @@ impl Executor {
             )));
         }
 
+        // rubash#1835: the stderr file redirects join redirect_out/append
+        // under the driver's sole ownership. The clone used to keep them,
+        // so the builtin's immediate-channel diagnostics were written to
+        // the file DURING the stage — and the driver's
+        // route_pipeline_stage_streams then re-applied the same redirect,
+        // its truncating setup open erasing the bytes it was about to
+        // route (the captured stderr was empty: it had never entered the
+        // capture). With the clone stripped, diagnostics land in the
+        // stage's stderr capture exactly like a stage without its own
+        // `2>`, and the driver applies the redirect once (GNU applies a
+        // pipeline element's redirections once, in the element's
+        // subshell: execute_cmd.c:2620 execute_pipeline). The preflight
+        // above already validated the unstripped list (failing dups keep
+        // their in-pipe diagnostics). Fd-2 dup entries (`2>&1`) are
+        // stripped too: applied in-clone they merge the diagnostics
+        // into the stdout capture before the driver can resolve the
+        // dup against the ordered list — `2>&1 >f` then wrongly lands
+        // in f, and `>f 2>&1` loses the text between the clone's file
+        // write and the driver's truncating setup. The driver's walk
+        // resolves the dup in list order against the original command,
+        // which is exactly GNU's ordering.
+        call.redirect_err = None;
+        call.redirect_err_append = None;
+        call.redirects.retain(|redirect| {
+            redirect.fd_var.is_some()
+                || !(matches!(
+                    redirect.kind,
+                    crate::parser::RedirectKind::CombinedOutput
+                        | crate::parser::RedirectKind::CombinedAppend
+                ) || (matches!(
+                    redirect.kind,
+                    crate::parser::RedirectKind::Output
+                        | crate::parser::RedirectKind::Append
+                        | crate::parser::RedirectKind::ClobberOutput
+                        | crate::parser::RedirectKind::DuplicateOutput
+                        | crate::parser::RedirectKind::DuplicateInput
+                ) && redirect.fd == Some(2)))
+        });
+
         let mut subshell = self.command_substitution_executor();
         // A pipeline member runs in a subshell: caught signal traps reset to
         // the inherited disposition (execute_cmd.c subshell trap reset), so
