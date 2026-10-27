@@ -183,19 +183,19 @@ fn typed_csb1_lookalike_prints_verbatim() {
     );
 }
 
-/// The #802 reserved-string stance is unchanged by the #824 sweep: the
-/// compound-assignment carrier is consumed on the visible-text boundary
-/// (`a__RUBASH_CA1__b` renders as `ab`), which diverges from GNU's literal
-/// `a__RUBASH_CA1__b` by design — user-typed CA1 text is indistinguishable
-/// from the parser's carrier there, the same reserved-string trade GNU
-/// makes for its own CTLESC byte. Pinned so the stance stays a decision.
+/// The #802 reserved-string stance for CA1 was retired by the #1634
+/// protocol revision: the compound-assignment carrier moved from the
+/// typeable ASCII string `__RUBASH_CA1__` to the registry-zone char
+/// U+E31A (the #840 CSB1 precedent), so typed CA1 text is user data and
+/// `declare -p` renders it verbatim, exactly as GNU does. (Under the
+/// old stance this printed `ab` — the marker was consumed mid-word.)
 #[test]
-fn ca1_reserved_string_stance_unchanged() {
+fn issue1634_ca1_ascii_text_is_data_on_declare_p() {
     let run = run("x=a__RUBASH_CA1__b; declare -p x\n");
     assert_clean(&run, "CA1 declare -p");
     assert_eq!(
         run.stdout,
-        b"declare -- x=\"ab\"\n".to_vec(),
-        "the #802 consume is untouched (GNU would print the literal text)"
+        b"declare -- x=\"a__RUBASH_CA1__b\"\n".to_vec(),
+        "GNU oracle: the typed CA1 text is literal data after #1634"
     );
 }

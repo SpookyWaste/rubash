@@ -49,10 +49,11 @@ fn decode_is_idempotent_on_plain_text() {
 /// `name=(...)` words is a whitelisted carrier of the public decoder. The
 /// interactive line editor decodes every AST word BETWEEN parse and
 /// execution (host `decoded_words`: easter-egg routing, this-shell
-/// dispatch), and that transport text carries `__RUBASH_CA1__` by
-/// contract — a debug build used to panic on the leak assertion
-/// (locale.rs) the moment the three typed lines of
-/// `declare -A name=(...)` completed.
+/// dispatch), and that transport text carries the carrier by contract —
+/// a debug build used to panic on the leak assertion (locale.rs) the
+/// moment the three typed lines of `declare -A name=(...)` completed.
+/// Since the #1634 protocol revision the carrier is the registry-zone
+/// char U+E31A, not the typeable ASCII string `__RUBASH_CA1__`.
 #[test]
 fn compound_assignment_carrier_word_decodes_to_visible_text() {
     let script = "declare -A name=(\n[中国]=\"北京\"\n)\n";
@@ -60,7 +61,7 @@ fn compound_assignment_carrier_word_decodes_to_visible_text() {
     let word = ast.commands[0]
         .words
         .iter()
-        .find(|word| word.contains("__RUBASH_CA1__"))
+        .find(|word| word.contains('\u{E31A}'))
         .expect("parser tags the compound assignment word with the carrier");
     assert_eq!(
         decode_to_visible_text(word),
@@ -69,21 +70,36 @@ fn compound_assignment_carrier_word_decodes_to_visible_text() {
     );
 }
 
-/// The carrier may sit mid-word and in user data; the decoder consumes the
-/// reserved string everywhere on the visible-text boundary (same reserved
-/// stance the assignment boundary takes for a leading occurrence:
-/// `x=__RUBASH_CA1__` already stores an empty value on master, so the
-/// decoded word shape `x=` is what a display consumer must see).
+/// The carrier may sit mid-word in transport text; the decoder consumes
+/// the bare codepoint everywhere on the visible-text boundary. Its
+/// retired ASCII spelling and E400-escaped user instances of the
+/// codepoint itself are user data and pass through as themselves
+/// (#1634: the reserved-string stance is retired — typed text is
+/// indistinguishable from data now because it IS data).
 #[test]
 fn compound_assignment_carrier_is_consumed_wherever_it_rides() {
-    assert_eq!(decode_to_visible_text("__RUBASH_CA1__(a b)"), "(a b)");
-    assert_eq!(decode_to_visible_text("a__RUBASH_CA1__b"), "ab");
+    assert_eq!(decode_to_visible_text("\u{E31A}(a b)"), "(a b)");
+    assert_eq!(decode_to_visible_text("a\u{E31A}b"), "ab");
     assert_eq!(
-        decode_to_visible_text("x=__RUBASH_CA1__"),
+        decode_to_visible_text("x=\u{E31A}"),
         "x=",
         "a leading carrier after `=` decodes to the stored-empty word shape"
     );
     assert_eq!(decode_to_visible_text("x="), "x=");
+    assert_eq!(
+        decode_to_visible_text("\u{E400}\u{E31A}"),
+        "\u{E31A}",
+        "an E400-escaped user instance of the codepoint restores verbatim"
+    );
+    assert_eq!(
+        decode_to_visible_text("__RUBASH_CA1__(a b)"),
+        "__RUBASH_CA1__(a b)",
+        "the retired ASCII spelling is plain user text now"
+    );
+    assert_eq!(
+        decode_to_visible_text("a__RUBASH_CA1__b"),
+        "a__RUBASH_CA1__b"
+    );
     assert_eq!(
         decode_to_visible_text("__RUBASH_CA1_nearly__"),
         "__RUBASH_CA1_nearly__",

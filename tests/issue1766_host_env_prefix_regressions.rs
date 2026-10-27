@@ -74,7 +74,7 @@ fn only(script: &str) -> HashMap<String, String> {
 fn assert_no_marker(env: &HashMap<String, String>) {
     for (key, value) in env {
         assert!(
-            !value.contains("__RUBASH_CA1__"),
+            !value.contains("__RUBASH_CA1__") && !value.contains('\u{E31A}'),
             "carrier marker leaked into host env: {key}={value}"
         );
     }

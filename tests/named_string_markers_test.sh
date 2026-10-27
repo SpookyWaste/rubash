@@ -28,8 +28,10 @@ else
 fi
 
 echo "Test 3: No COMPOUND_ASSIGNMENT_MARKER in compound assignment"
+# Since rubash#1634 the carrier is the registry-zone char U+E31A (the
+# ASCII spelling below is user data now and may legitimately appear).
 output=$("$THIS_SH" -c 'arr=(a b c); echo "${arr[@]}"')
-if printf "%s" "$output" | grep -q '__RUBASH_CA1__'; then
+if printf "%s" "$output" | grep -q "$(printf '\uE31A')"; then
     echo "FAIL: COMPOUND_ASSIGNMENT_MARKER leaked to stdout"
     exit 1
 else

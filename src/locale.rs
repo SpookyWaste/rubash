@@ -943,16 +943,17 @@ pub fn init_locale() {
 /// | `U+E400` + `c` | literal-char escape (markers::push_literal_char) | `c` |
 /// | `U+E301`..=`U+E308` | assignment DATA_* sentinels (quote/backtick/backslash data) | the data char |
 /// | `U+E309` | COMPOUND_EXPANSION_WS_TAG (field-splitting glue) | nothing |
-/// | `__RUBASH_CA1__` | COMPOUND_ASSIGNMENT_MARKER (named-string compound
-/// assignment tag; whitelisted carrier — the interactive line-editing
-/// boundary delivers it inside pre-execution AST words, #802) | nothing |
-/// | `__RUBASH_HD1__`/`__RUBASH_CSB1_` | QUOTED_HEREDOC_MARKER and the
-/// retired (pre-#840) ASCII comsub payload prefix — the live payload
-/// introducer is the U+E319 sentinel | passes through verbatim — plain
-/// typeable ASCII with no entry-side encoding; HD1's live tag is consumed
-/// at its execution boundary before anything is displayed, and CSB1 has
-/// no live producer at all, so an occurrence here is user data (#824,
-/// #840) |
+/// | `U+E31A` | COMPOUND_ASSIGNMENT_MARKER (compound assignment tag;
+/// whitelisted carrier — the interactive line-editing boundary delivers
+/// it inside pre-execution AST words, #802) | nothing |
+/// | `__RUBASH_CA1__`/`__RUBASH_HD1__`/`__RUBASH_CSB1_` | the retired
+/// (pre-#1634) ASCII compound-assignment prefix, QUOTED_HEREDOC_MARKER
+/// and the retired (pre-#840) ASCII comsub payload prefix — the live
+/// introducers are the U+E31A and U+E319 sentinels | passes through
+/// verbatim — plain typeable ASCII with no entry-side encoding; HD1's
+/// live tag is consumed at its execution boundary before anything is
+/// displayed, and CA1/CSB1 have no live producer at all, so an
+/// occurrence here is user data (#824, #840, #1634) |
 /// | `U+E100`..=`U+E1FF` | conditional-pattern byte-chars | byte `(cp - E100)` as char |
 ///
 /// Ordering follows the storage-boundary contract documented in
@@ -972,7 +973,6 @@ pub fn decode_to_visible_text(text: &str) -> String {
     use crate::executor::substitution_metadata::{
         RAW_BYTE_MARKER_ESCAPE, RAW_BYTE_MARKER_FIRST, RAW_BYTE_MARKER_LAST,
     };
-    use crate::executor::types::COMPOUND_ASSIGNMENT_MARKER;
     use crate::executor::types::DEFERRED_COMPOUND_BODY;
     use crate::lexer::{ANSI_C_DQUOTE_MARKER, ANSI_C_QUOTE_MARKER, PARAM_NAME_END_MARKER};
 
@@ -993,41 +993,22 @@ pub fn decode_to_visible_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars();
     while let Some(ch) = chars.next() {
-        // #802 entry-inventory whitelist: the named-string compound
-        // assignment carrier (`__RUBASH_CA1__`) is a legal resident of
-        // transport text on the interactive line-editing boundary. The
-        // parser pushes it into compound-assignment words
-        // (parser/token_actions.rs) and the assignment boundary consumes it
-        // before a value is stored (assignment_dispatch.rs /
-        // command_words.rs / execution_misc.rs strip it on every
-        // post-expansion display path), but hosts inspect AST words
-        // BETWEEN parse and execution — the interactive REPL decodes each
-        // command word for its easter-egg routing and this-shell dispatch
-        // (niubash shell.rs decoded_words). That text legitimately still
-        // carries the marker, so the decoder consumes it instead of
-        // rejecting it; every other named-string carrier (heredoc,
-        // comsub payload) reaching this boundary is user-typed data by
-        // contract — the output-side leak assertions that used to live
-        // below were removed as unsound (#824: every asserted code point
-        // has a legal user-data path). Gated on the leading `_` so
-        // the probe costs nothing for marker-free words.
-        if ch == '_' {
-            let mut probe = chars.clone();
-            let mut matched = true;
-            for expected in COMPOUND_ASSIGNMENT_MARKER.chars().skip(1) {
-                match probe.next() {
-                    Some(next) if next == expected => {}
-                    _ => {
-                        matched = false;
-                        break;
-                    }
-                }
-            }
-            if matched {
-                chars = probe;
-                continue;
-            }
-        }
+        // #802 entry-inventory whitelist: the compound assignment carrier
+        // is a legal resident of transport text on the interactive
+        // line-editing boundary. The parser pushes it into
+        // compound-assignment words (parser/token_actions.rs) and the
+        // assignment boundary consumes it before a value is stored
+        // (assignment_dispatch.rs / command_words.rs / execution_misc.rs
+        // strip it on every post-expansion display path), but hosts
+        // inspect AST words BETWEEN parse and execution — the interactive
+        // REPL decodes each command word for its easter-egg routing and
+        // this-shell dispatch (niubash shell.rs decoded_words). That text
+        // legitimately still carries the marker, so the decoder consumes
+        // it instead of rejecting it. Since the #1634 protocol revision
+        // the carrier is the single registry-zone char U+E31A (the former
+        // ASCII spelling `__RUBASH_CA1__` was typeable user text and is
+        // now plain data here, like every other retired named-string
+        // carrier — #824, #840); the drop arm sits in the match below.
         match ch {
             CTLESC => {
                 if let Some(data) = chars.next() {
@@ -1060,6 +1041,7 @@ pub fn decode_to_visible_text(text: &str) -> String {
             DEFERRED_COMPOUND_BODY
             | PARAM_NAME_END_MARKER
             | QUOTED_NULL_MARKER
+            | crate::executor::markers::COMPOUND_ASSIGNMENT_MARKER_CHAR
             | COMPOUND_EXPANSION_WS_TAG
             | crate::executor::markers::QUOTED_WORD_PREFIX
             | crate::executor::markers::IFS_GLUE
@@ -1119,15 +1101,15 @@ pub fn decode_to_visible_text(text: &str) -> String {
     //     bare guard sentinel cannot survive the scan (the guard arm above
     //     consumes each guard with its next char), so a guard codepoint in
     //     `out` is restored user data, never a live guard.
-    //   - Named ASCII markers: `__RUBASH_HD1__` / `__RUBASH_CSB1_` are
-    //     simply typeable text with no entry-side encoding to tell them
-    //     apart; HD1's live producer is consumed at the heredoc-body
-    //     execution boundary and CSB1 is the retired (pre-#840) payload
-    //     prefix whose introducer moved to the U+E319 sentinel, so an
+    //   - Named ASCII markers: `__RUBASH_HD1__` / `__RUBASH_CSB1_` /
+    //     `__RUBASH_CA1__` are simply typeable text with no entry-side
+    //     encoding to tell them apart; HD1's live producer is consumed at
+    //     the heredoc-body execution boundary, CSB1 is the retired
+    //     (pre-#840) payload prefix whose introducer moved to the U+E319
+    //     sentinel, and CA1 is the retired (pre-#1634) compound prefix
+    //     whose introducer moved to the U+E31A sentinel — so an
     //     occurrence on this boundary is user data by contract — GNU
-    //     prints it verbatim, and so do the
-    //     scan's `_`-fallthrough arms. (`__RUBASH_CA1__` is the one reserved
-    //     exception: consumed by the probe above, the #802 stance.)
+    //     prints it verbatim, and so do the scan's fallthrough arms.
     // Output-side debug_asserts over these codepoints could therefore only
     // ever fire on well-formed user data — each had a two-to-three-line
     // user-literal repro through `declare -p` or xtrace in a debug build

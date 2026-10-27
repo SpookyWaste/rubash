@@ -92,4 +92,7 @@ a=1; a+=(9) /usr/bin/env
     assert!(out.contains("r=1(9)\n"), "{out}");
     assert!(out.contains("A=([j]=3)\n"), "{out}");
     assert!(!out.contains("__RUBASH_CA1__"), "{out}");
+    // The live carrier spelling since #1634 is U+E31A; it must not leak
+    // into a child's environment either.
+    assert!(!out.contains('\u{E31A}'), "{out}");
 }

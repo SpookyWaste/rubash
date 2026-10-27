@@ -3244,7 +3244,7 @@ mod assignment_tests {
 
     // wt33 (#373): the lexer now emits `name=(...)` as ONE atomic Assignment
     // token, so the AST records compound assignments via the assignment map
-    // under the `__RUBASH_CA1__` marker (executor/markers.rs
+    // under the `\u{E31A}` marker (executor/markers.rs
     // COMPOUND_ASSIGNMENT_MARKER) instead of the compound_assignments vec.
     // Behavior is GNU-verified: WSL GNU Bash 5.3.0 script-file probe
     // target/issue-suites/results/wt33-373/run/A09_compound_array:
@@ -3259,7 +3259,7 @@ mod assignment_tests {
         assert_eq!(ast.commands.len(), 1);
         assert_eq!(
             ast.commands[0].get_assignment("arr").unwrap(),
-            "__RUBASH_CA1__(one \"two words\")"
+            "\u{E31A}(one \"two words\")"
         );
         assert!(ast.commands[0].compound_assignments.is_empty());
     }
@@ -3272,7 +3272,7 @@ mod assignment_tests {
         assert_eq!(ast.commands.len(), 1);
         assert_eq!(
             ast.commands[0].get_assignment("arr+").unwrap(),
-            "__RUBASH_CA1__(three four)"
+            "\u{E31A}(three four)"
         );
         assert!(ast.commands[0].compound_assignments.is_empty());
     }
@@ -3288,7 +3288,7 @@ mod assignment_tests {
         // -> `<more><plain><two>` on both shells (a[2]=two lands at index 2).
         assert_eq!(
             ast.commands[0].get_assignment("arr").unwrap(),
-            "__RUBASH_CA1__([2]=two [name]+=more plain)"
+            "\u{E31A}([2]=two [name]+=more plain)"
         );
         assert!(ast.commands[0].compound_assignments.is_empty());
     }
@@ -3301,7 +3301,7 @@ mod assignment_tests {
         assert_eq!(ast.commands.len(), 1);
         assert_eq!(
             ast.commands[0].get_assignment("arr").unwrap(),
-            "__RUBASH_CA1__([empty]= [more]+=)"
+            "\u{E31A}([empty]= [more]+=)"
         );
         assert!(ast.commands[0].compound_assignments.is_empty());
     }
@@ -3316,7 +3316,7 @@ mod assignment_tests {
         // element parser honors the quoting (issue #369 regression suite).
         assert_eq!(
             ast.commands[0].get_assignment("arr").unwrap(),
-            "__RUBASH_CA1__([\"a]=b\"]=value [\"c]+=d\"]+=more)"
+            "\u{E31A}([\"a]=b\"]=value [\"c]+=d\"]+=more)"
         );
         assert!(ast.commands[0].compound_assignments.is_empty());
     }
@@ -3336,7 +3336,7 @@ mod assignment_tests {
         // records the raw RHS behind the marker.
         assert_eq!(
             ast.commands[0].get_assignment("arr").unwrap(),
-            "__RUBASH_CA1__([ \"a]=b\" ] = value [ \"c]+=d\" ] += more [ empty ] =)"
+            "\u{E31A}([ \"a]=b\" ] = value [ \"c]+=d\" ] += more [ empty ] =)"
         );
         assert!(ast.commands[0].compound_assignments.is_empty());
     }
@@ -3349,7 +3349,7 @@ mod assignment_tests {
         assert_eq!(ast.commands.len(), 1);
         assert_eq!(
             ast.commands[0].get_assignment("arr").unwrap(),
-            "__RUBASH_CA1__(if done [case]=esac [then]+=fi)"
+            "\u{E31A}(if done [case]=esac [then]+=fi)"
         );
         assert!(ast.commands[0].compound_assignments.is_empty());
     }
@@ -3362,7 +3362,7 @@ mod assignment_tests {
         assert_eq!(ast.commands.len(), 1);
         assert_eq!(
             ast.commands[0].get_assignment("arr").unwrap(),
-            "__RUBASH_CA1__(pre{a,b})"
+            "\u{E31A}(pre{a,b})"
         );
         assert!(ast.commands[0].compound_assignments.is_empty());
     }
@@ -3422,7 +3422,7 @@ mod assignment_tests {
         assert_eq!(ast.commands.len(), 1);
         assert_eq!(
             ast.commands[0].get_assignment("arr").unwrap(),
-            "__RUBASH_CA1__(*.rs [src]=src/[ab]? **/*.txt)"
+            "\u{E31A}(*.rs [src]=src/[ab]? **/*.txt)"
         );
         assert!(ast.commands[0].compound_assignments.is_empty());
     }
@@ -3440,7 +3440,7 @@ mod assignment_tests {
         // environment noise, not parser behavior).
         assert_eq!(
             ast.commands[0].get_assignment("arr").unwrap(),
-            "__RUBASH_CA1__(~/src [home]=~+/bin \"two words\" 'line two')"
+            "\u{E31A}(~/src [home]=~+/bin \"two words\" 'line two')"
         );
         assert!(ast.commands[0].compound_assignments.is_empty());
     }
@@ -3456,7 +3456,7 @@ mod assignment_tests {
         //   -> <value><next><plain> on both shells.
         assert_eq!(
             ast.commands[0].get_assignment("arr").unwrap(),
-            "__RUBASH_CA1__([${key:-fallback}]=value [$((i+1))]+=next [pre{a,b}]=brace plain)"
+            "\u{E31A}([${key:-fallback}]=value [$((i+1))]+=next [pre{a,b}]=brace plain)"
         );
         assert!(ast.commands[0].compound_assignments.is_empty());
     }
@@ -3470,7 +3470,7 @@ mod assignment_tests {
         assert_eq!(ast.commands.len(), 1);
         assert_eq!(
             ast.commands[0].get_assignment("arr").unwrap(),
-            "__RUBASH_CA1__([\"{a,b}\"]=quoted [{c,d}]=plain [ \"{e,f}\" ] = spaced [ {g,h} ] = open)"
+            "\u{E31A}([\"{a,b}\"]=quoted [{c,d}]=plain [ \"{e,f}\" ] = spaced [ {g,h} ] = open)"
         );
         assert!(ast.commands[0].compound_assignments.is_empty());
     }
@@ -3485,7 +3485,7 @@ mod assignment_tests {
         // compound assignments; the raw RHS keeps them verbatim.
         assert_eq!(
             ast.commands[0].get_assignment("arr").unwrap(),
-            "__RUBASH_CA1__(<(:) >(:) [two]=<(:))"
+            "\u{E31A}(<(:) >(:) [two]=<(:))"
         );
         assert!(ast.commands[0].compound_assignments.is_empty());
     }
@@ -3500,7 +3500,7 @@ mod assignment_tests {
         //   arr=('one two' [key]='value here' plain) -> <one two><value here><plain>
         assert_eq!(
             ast.commands[0].get_assignment("arr").unwrap(),
-            "__RUBASH_CA1__('one two' [key]='value here' plain)"
+            "\u{E31A}('one two' [key]='value here' plain)"
         );
         assert!(ast.commands[0].compound_assignments.is_empty());
     }
@@ -3513,7 +3513,7 @@ mod assignment_tests {
         assert_eq!(ast.commands.len(), 1);
         assert_eq!(
             ast.commands[0].get_assignment("arr").unwrap(),
-            "__RUBASH_CA1__($(printf \"a b\") ${value:-five six} $[count + 1])"
+            "\u{E31A}($(printf \"a b\") ${value:-five six} $[count + 1])"
         );
         assert!(ast.commands[0].compound_assignments.is_empty());
     }
@@ -4774,7 +4774,7 @@ mod quote_removal {
             vec![
                 "declare",
                 "-A",
-                "assoc=__RUBASH_CA1__(one \"two words\" three \"four words\")"
+                "assoc=\u{E31A}(one \"two words\" three \"four words\")"
             ]
         );
         assert!(ast.commands[0].compound_assignments.is_empty());
@@ -4790,14 +4790,16 @@ mod quote_removal {
             vec![
                 "declare",
                 "-A",
-                "assoc=__RUBASH_CA1__([\"two words\"]=\"value here\")"
+                "assoc=\u{E31A}([\"two words\"]=\"value here\")"
             ]
         );
     }
 
     // wt33 (#373): the old \x1e compound carrier was replaced by the
-    // `__RUBASH_CA1__` marker; the bracket words without assignment
-    // operators stay verbatim in the raw RHS.
+    // compound-assignment marker (the retired ASCII `__RUBASH_CA1__`
+    // spelling; since #1634 the single registry-zone char U+E31A);
+    // the bracket words without assignment operators stay verbatim
+    // in the raw RHS.
     #[test]
     fn test_declare_assoc_compound_keeps_bracket_words_without_assignment_operator() {
         let input = "declare -A assoc=([x] one [y] two)";
@@ -4805,7 +4807,7 @@ mod quote_removal {
         let ast = parse(&tokens);
         assert_eq!(
             ast.commands[0].words,
-            vec!["declare", "-A", "assoc=__RUBASH_CA1__([x] one [y] two)"]
+            vec!["declare", "-A", "assoc=\u{E31A}([x] one [y] two)"]
         );
         assert!(ast.commands[0].compound_assignments.is_empty());
     }

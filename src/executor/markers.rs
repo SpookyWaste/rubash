@@ -31,7 +31,7 @@
 //! | Output | `crate::locale::decode_to_visible_text` — the one sanctioned transport→visible decoder (echo paths additionally run `substitution_metadata::decode_raw_byte_markers` because echo input is already expansion-decoded text that can still carry raw-byte pairs) | `builtins/echo.rs`, `declare` printing, xtrace, `bad_substitution_display`, host `dump-strings` |
 //! | Display value rendering (#824 audit) | stored values feed the Output decoder on the `declare -p` path (`builtins/declare/storage.rs` `display_text` / `quote_array_element_value`) | user-literal `__RUBASH_HD1__`/`__RUBASH_CSB1_` ASCII, `$'\uE3xx'` registry-zone chars (E400-escaped at entry, #735) and raw C0 bytes (raw-byte pairs) all decode to themselves there — whitelist: the decoder carries no output-side leak asserts; a registry codepoint in decoded output is restored user data by contract |
 //! | Display xtrace rendering (#824 audit) | expanded words feed the same Output decoder (`prompt_expansion.rs` xtrace arms) | same whitelist: `set -x; v=$'\uE314Z'; echo "$v"` traces the U+E314 char, and literal `__RUBASH_*` text traces verbatim — both byte-identical to GNU bash 5.3.0 |
-//! | Host AST inspection | hosts decode AST words BETWEEN parse and execution on the interactive line-editor path (`decoded_words`: easter-egg routing, this-shell dispatch, positional params); those words legitimately carry the named-string COMPOUND_ASSIGNMENT_MARKER the parser pushed (parser/token_actions.rs), so the decoder whitelists it instead of asserting it away (#802) | host `decoded_words`, `decode_to_visible_text` |
+//! | Host AST inspection | hosts decode AST words BETWEEN parse and execution on the interactive line-editor path (`decoded_words`: easter-egg routing, this-shell dispatch, positional params); those words legitimately carry the COMPOUND_ASSIGNMENT_MARKER (U+E31A since the #1634 protocol revision) the parser pushed (parser/token_actions.rs), so the decoder whitelists it instead of asserting it away (#802) | host `decoded_words`, `decode_to_visible_text` |
 //! | Storage | values reaching `env_vars`/array stores are already data bytes — the encoder side is `substitution_metadata` (`bytes_to_assignment_shell_text`, `push_escaped_text_with_carriers`) which pair-encodes every `user_reachable` byte at entry so storage never confuses a user byte with a carrier | variable/array assignment paths |
 //! | Patsub replacement (rubash#843) | replacement-side literal chars are E400-escaped IN FLIGHT by the scan pass (`expand_braced_replacement.rs` `push_replacement_literal` / ANSI-C body collection), and `finish_patsub_replacement` copies E400/E000 pairs verbatim before resolving the PATSUB markers — a bare E310..=E313 in the marked text is pipeline protocol, an escaped pair is user data (`${v/b/$'\uE312x'}` emits U+E312, GNU-verified) | `${var/pat/rep}` replacement text |
 //! | Reparse | marker bytes are the lexer's own protocol: text re-fed through `eval`, alias bodies and command-substitution bodies re-lex with markers intact; user bytes inside reparsed text were pair-encoded at the original entry so they decode as data, never as carriers | `eval`, alias expansion, comsub reparse |
@@ -408,7 +408,22 @@ pub(crate) const COMSUB_PAYLOAD_SENTINEL: char = '\u{E319}';
 pub(crate) const COMSUB_PAYLOAD_SENTINEL_STR: &str = "\u{E319}";
 
 /// `( ... )` compound-assignment operand marker (types.rs).
-pub(crate) const COMPOUND_ASSIGNMENT_MARKER: &str = "__RUBASH_CA1__";
+///
+/// The introducer is a registry-zone PUA char, NOT the former ASCII
+/// `__RUBASH_CA1__` prefix: the ASCII form was plain typeable text, so a
+/// user value whose text merely started with it — a quoted literal, a
+/// command-substitution result, a `read` line — was re-parsed as a
+/// compound assignment at every storage boundary (type change, marker
+/// deletion; rubash#1634). A bare U+E31A in transport is always
+/// protocol — user zone chars ride the E400 literal-char escape at
+/// every entry (push_literal_char, the same contract as
+/// COMSUB_PAYLOAD_SENTINEL, rubash#840), so typed `$'\uE31A'` data is
+/// never claimed, and typed `__RUBASH_CA1__` text is now pure user data
+/// everywhere (the #802/#824 reserved-string stance for this marker is
+/// retired by the protocol revision).
+pub(crate) const COMPOUND_ASSIGNMENT_MARKER: &str = "\u{E31A}";
+/// `char` companion of COMPOUND_ASSIGNMENT_MARKER.
+pub(crate) const COMPOUND_ASSIGNMENT_MARKER_CHAR: char = '\u{E31A}';
 
 /// Injected tag marking a group-command redirect that the executor added
 /// (support_names.rs) — `\x1e`-prefixed so it sorts into the carrier family.
@@ -844,9 +859,9 @@ pub(crate) const MARKERS: &[MarkerInfo] = &[
     },
     MarkerInfo {
         name: "COMPOUND_ASSIGNMENT_MARKER",
-        code: 0x5F,
-        boundaries: &[Boundary::Storage],
-        user_reachable: false,
+        code: COMPOUND_ASSIGNMENT_MARKER_CHAR as u32,
+        boundaries: &[Boundary::Output, Boundary::Storage],
+        user_reachable: true,
     },
     MarkerInfo {
         name: "GROUP_REDIRECT_INJECTED_MARK",
@@ -1388,8 +1403,14 @@ mod tests {
         );
         let mut failures = Vec::new();
         for (name, literal) in &declared {
+            // A companion const (the `&str` twin of a `char` marker or,
+            // since #1634, the `char` twin of an `&str` marker) is
+            // covered by the canonical const's row.
+            let companion_base = name
+                .strip_suffix("_STR")
+                .or_else(|| name.strip_suffix("_CHAR"));
             let registered = row_names.contains(&name.as_str())
-                || (name.ends_with("_STR") && row_names.contains(&name.trim_end_matches("_STR")));
+                || companion_base.is_some_and(|base| row_names.contains(&base));
             let bound = NON_MARKER_BOUNDS.contains(&name.as_str());
             if !registered && !bound {
                 failures.push(format!("{name} = {literal} is not a MARKERS row"));
