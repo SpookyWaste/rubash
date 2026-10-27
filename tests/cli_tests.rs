@@ -3267,7 +3267,7 @@ fn xtrace_declaration_compound_assignment_matches_gnu_shape() {
         );
     }
     assert!(
-        !stderr.contains("__RUBASH_CA1__"),
+        !stderr.contains("__RUBASH_CA1__") && !stderr.contains('\u{E31A}'),
         "COMPOUND_ASSIGNMENT_MARKER leaked to xtrace: {stderr:?}"
     );
     assert!(

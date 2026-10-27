@@ -95,7 +95,7 @@ impl Executor {
             // string with internal quoting already removed; GNU has no
             // in-band carriers. Rubash's parse-time word for a
             // compound-assignment operand (`w=()`) still carries the
-            // COMPOUND_ASSIGNMENT_MARKER flag (`w=__RUBASH_CA1__()`), which
+            // COMPOUND_ASSIGNMENT_MARKER flag (`w=\u{E31A}()`), which
             // must never reach a variable cell: `declare`'s full listing
             // renders `$_` verbatim and the marker would leak into output
             // (bashdb `info variables` runs a bare `declare` inside a process

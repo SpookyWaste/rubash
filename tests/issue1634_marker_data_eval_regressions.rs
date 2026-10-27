@@ -1,20 +1,23 @@
-//! Issue rubash#1634 (eval face): user data that happens to contain the
-//! internal marker strings `__RUBASH_CA1__` / `__RUBASH_HD1__` was
-//! deleted from eval input — eval_source_for_reparse blanket-replaced
-//! both ASCII markers over the whole joined argument text, which is pure
-//! runtime data (the only caller is execute_eval; the compound-operand
-//! producers for eval are kept in source form by the gates in
-//! command_prepare). The blanket replaces are removed; the C0/PUA
-//! carrier restores in the same function are untouched.
+//! Issue rubash#1634: user data that happens to contain the internal
+//! marker strings `__RUBASH_CA1__` / `__RUBASH_HD1__` was consumed as
+//! protocol. Two faces:
 //!
-//! The storage faces of #1634 (a value whose text starts with the CA1
-//! marker being re-parsed as a compound assignment by the assignment
-//! funnel and the declare/local paths) are NOT fixed here: the marker is
-//! an in-band ASCII flag on plain (name, String) values, so runtime data
-//! and transport values are indistinguishable at every consumption
-//! boundary. They are pinned below as #[ignore]d GNU-expectation tests
-//! for the marker-protocol work (entry-encoding the named markers, the
-//! audit's RW-10 recommendation).
+//! - Eval face (fixed by the carrier cluster): eval_source_for_reparse
+//!   blanket-replaced both ASCII markers over the whole joined argument
+//!   text, which is pure runtime data (the only caller is execute_eval;
+//!   the compound-operand producers for eval are kept in source form by
+//!   the gates in command_prepare). The blanket replaces are removed;
+//!   the C0/PUA carrier restores in the same function are untouched.
+//! - Storage faces (fixed by the protocol revision): a value whose text
+//!   started with the CA1 marker was re-parsed as a compound assignment
+//!   by the assignment funnel and the declare/local paths, because the
+//!   marker was an in-band ASCII flag on plain (name, String) values —
+//!   runtime data and transport values were indistinguishable at every
+//!   consumption boundary. The marker now rides the registry-zone char
+//!   U+E31A (the #840 CSB1->PUA precedent): user zone chars are
+//!   E400-escaped at every entry, so a bare U+E31A in transport is
+//!   always protocol and typed marker text — ASCII or the codepoint
+//!   itself — is data.
 //!
 //! Expectations are the literal GNU bash 5.3.20 outputs.
 #![cfg(unix)]
@@ -72,7 +75,6 @@ echo body
 }
 
 #[test]
-#[ignore = "diagnosed in fix7/carrier REPORT: funnel re-sniffs the in-band CA1 marker; needs the marker-protocol change (RW-10)"]
 fn issue1634_quoted_assignment_keeps_scalar_type() {
     let out = run(r#"
 w='__RUBASH_CA1__(a b)'; echo "n=${#w[@]} s=[$w]"
@@ -85,7 +87,6 @@ w="__RUBASH_CA1__(a b)"; echo "n=${#w[@]} s=[$w]"
 }
 
 #[test]
-#[ignore = "diagnosed in fix7/carrier REPORT: funnel re-sniffs the in-band CA1 marker; needs the marker-protocol change (RW-10)"]
 fn issue1634_runtime_channels_keep_marker_data() {
     let out = run(r#"
 w=$(printf '__RUBASH_CA1__(r s)'); echo "comsub n=${#w[@]} s=[$w]"
@@ -97,5 +98,29 @@ v='__RUBASH_CA1__'; w=$v'(a b)'; echo "dollarv n=${#w[@]} s=[$w]"
         "comsub n=1 s=[__RUBASH_CA1__(r s)]\n\
          read n=1 s=[__RUBASH_CA1__(t u)]\n\
          dollarv n=1 s=[__RUBASH_CA1__(a b)]\n"
+    );
+}
+
+#[test]
+fn issue1634_user_data_with_live_codepoint_stays_scalar() {
+    // Forge attempt against the revised protocol itself: the live
+    // carrier is U+E31A, so user data carrying that very codepoint must
+    // still be data — entry escaping (E400 pairs) is what tells it
+    // apart from a parser-produced carrier. GNU treats the codepoint
+    // as an ordinary character everywhere.
+    let m = '\u{E31A}';
+    let script = format!(
+        "w='{m}(a b)'; echo \"lit n=${{#w[@]}} s=[$w]\"\n\
+         w=$(printf '{m}(r s)'); echo \"comsub n=${{#w[@]}} s=[$w]\"\n\
+         read -r w <<< '{m}(t u)'; echo \"read n=${{#w[@]}} s=[$w]\"\n"
+    );
+    let out = run(&script);
+    assert_eq!(
+        out,
+        format!(
+            "lit n=1 s=[{m}(a b)]\n\
+             comsub n=1 s=[{m}(r s)]\n\
+             read n=1 s=[{m}(t u)]\n"
+        )
     );
 }
