@@ -18,10 +18,11 @@ use std::collections::HashSet;
 use std::fmt;
 
 use super::breakpoints::BreakpointId;
+use super::evaluation::EvaluationRequest;
 use super::session::{DebugSession, StepArming};
 
 /// What the stop loop decided while the debuggee was parked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopLoopOutcome {
     /// Resume the debuggee under this arming.
     Resume(StepArming),
@@ -37,6 +38,14 @@ pub enum StopLoopOutcome {
     /// End the session's attachment: the gate is disarmed and the
     /// driver is dropped; the debuggee runs on unattached.
     Detach,
+    /// Evaluate this request in the stopped frame (design
+    /// 7.4/7.5; WP-7): the executor runs it through the
+    /// evaluation machinery in `super::evaluation`, installs the
+    /// outcome on the session as its last evaluation, refreshes
+    /// the stop's inspection snapshot (an explicit evaluation may
+    /// have written state), and serves the same stop again — the
+    /// debuggee stays parked.
+    Evaluate(EvaluationRequest),
 }
 
 /// The frontend's half of a stop: serve one parked session.
@@ -45,7 +54,10 @@ pub enum StopLoopOutcome {
 /// state, set or clear breakpoints, and drain events — and must
 /// return how the debuggee continues. They never see the executor:
 /// evaluation in the stopped frame is the consult's own machinery
-/// (the section 5.3 condition path), not the stop loop's.
+/// (the section 5.3 condition path, WP-7's evaluation path), which
+/// the stop loop reaches only by asking for it with
+/// [`StopLoopOutcome::Evaluate`] and reading the outcome the
+/// executor installs on the session.
 pub trait StopLoop {
     /// Serve one stop. Called with the session already in the
     /// stopped state; return the outcome to apply.

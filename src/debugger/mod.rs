@@ -22,6 +22,7 @@
 
 pub mod breakpoints;
 pub mod driver;
+pub mod evaluation;
 pub mod event;
 pub mod gate;
 pub mod inspect;
@@ -44,6 +45,12 @@ pub use breakpoints::{
 #[allow(unused_imports)]
 pub use driver::{SessionDriver, StopLoop, StopLoopOutcome};
 #[allow(unused_imports)]
+pub use evaluation::{
+    check_implicit, parse_failure, single_expansion_word, DiagnosticKind, EvaluationDiagnostic,
+    EvaluationOutcome, EvaluationRequest, EvaluationResult, PowerMode, RejectionKind,
+    WhitelistRejection,
+};
+#[allow(unused_imports)]
 pub use event::{
     DebugEvent, ExceptionKind, ExceptionSite, FrameReturn, OutputStream, ReturnRoute, SeamKind,
     SourceLocation, StopInfo, StopReason, SynthesizedFrameKind, WatchChange,
@@ -60,6 +67,8 @@ pub use session::{DebugSession, SessionError, SessionState, StepArming, Terminat
 #[allow(unused_imports)]
 pub use stepping::{arming_stops_at_frame_return, arming_stops_at_seam};
 
+#[cfg(test)]
+mod evaluation_tests;
 #[cfg(test)]
 mod stepping_tests;
 #[cfg(test)]

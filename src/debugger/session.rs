@@ -32,6 +32,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::breakpoints::BreakpointTable;
+use super::evaluation::EvaluationOutcome;
 use super::event::{DebugEvent, StopInfo};
 use super::gate::SESSION_ACTIVE;
 use crate::api::views::InspectionSnapshot;
@@ -143,6 +144,12 @@ pub struct DebugSession {
     termination: Option<Termination>,
     pending_events: VecDeque<DebugEvent>,
     inspection: Option<InspectionSnapshot>,
+    /// The most recent evaluation's outcome (design 7.4/7.5;
+    /// WP-7): the executor installs it when the stop loop asks
+    /// for an evaluation, and the frontend renders it. It belongs
+    /// to the stop at which it was produced; a later stop's
+    /// evaluations replace it.
+    last_evaluation: Option<EvaluationOutcome>,
     /// Breakpoint resolution knowledge (design 5.1/5.2; WP-8):
     /// the syntax view of every file the engine has parsed a unit
     /// of, keyed by the engine's own file identity. The
@@ -174,6 +181,7 @@ impl DebugSession {
             termination: None,
             pending_events: VecDeque::new(),
             inspection: None,
+            last_evaluation: None,
             syntax_views: std::collections::HashMap::new(),
             defined_functions: std::collections::HashSet::new(),
         };
@@ -241,6 +249,21 @@ impl DebugSession {
     /// [`DebugSession::inspection`].
     pub fn set_inspection(&mut self, inspection: InspectionSnapshot) {
         self.inspection = Some(inspection);
+    }
+
+    /// The most recent evaluation's outcome at this stop (design
+    /// 7.4/7.5; WP-7), if the stop loop has asked for one.
+    pub fn last_evaluation(&self) -> Option<&EvaluationOutcome> {
+        self.last_evaluation.as_ref()
+    }
+
+    /// Install an evaluation outcome. Executor-side only: the
+    /// outcome is produced by the consult's evaluation machinery
+    /// when the stop loop asks through
+    /// [`super::driver::StopLoopOutcome::Evaluate`]; frontends
+    /// read through [`DebugSession::last_evaluation`].
+    pub fn set_last_evaluation(&mut self, outcome: EvaluationOutcome) {
+        self.last_evaluation = Some(outcome);
     }
 
     /// The arming installed by the most recent resume.

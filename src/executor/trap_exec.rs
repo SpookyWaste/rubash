@@ -5387,16 +5387,43 @@ impl Executor {
         if let Some(driver) = self.debug_driver.as_mut() {
             driver.session_mut().set_inspection(inspection);
         }
-        let outcome = match self.debug_driver.as_mut() {
-            Some(driver) => driver.serve_stop(),
-            None => return Ok(()),
-        };
-        match outcome {
+        // The serve loop: an evaluation outcome (WP-7) runs the
+        // request through the consult's own evaluation machinery,
+        // installs the outcome on the session, and serves the
+        // same stop again — the debuggee stays parked. Every
+        // other outcome is applied once, below, and ends the
+        // serve.
+        loop {
+            let outcome = match self.debug_driver.as_mut() {
+                Some(driver) => driver.serve_stop(),
+                None => return Ok(()),
+            };
+            match outcome {
+                crate::debugger::StopLoopOutcome::Evaluate(request) => {
+                    let frame_count = self.debug_driver.as_ref().and_then(|driver| {
+                        driver
+                            .session()
+                            .inspection()
+                            .map(|snapshot| snapshot.frames.len())
+                    });
+                    let evaluation = self.debugger_evaluate(&request, frame_count)?;
+                    if let Some(driver) = self.debug_driver.as_mut() {
+                        driver.session_mut().set_last_evaluation(evaluation);
+                    }
+                    // An explicit evaluation may have written
+                    // state (design 7.6): refresh the stop's
+                    // snapshot so the frontend renders the state
+                    // the debuggee is now stopped in.
+                    let inspection = self.capture_inspection();
+                    if let Some(driver) = self.debug_driver.as_mut() {
+                        driver.session_mut().set_inspection(inspection);
+                    }
+                }
             crate::debugger::StopLoopOutcome::Resume(arming) => {
                 let Some(driver) = self.debug_driver.as_mut() else {
                     return Ok(());
                 };
-                match driver.session_mut().resume(arming) {
+                return match driver.session_mut().resume(arming) {
                     Ok(()) => Ok(()),
                     Err(_) => {
                         // The stop loop ended the session while
@@ -5464,7 +5491,7 @@ impl Executor {
                         max_depth: function_depth,
                     }
                 };
-                match driver.session_mut().resume(arming) {
+                return match driver.session_mut().resume(arming) {
                     Ok(()) => Err(ExecuteError::Return(forced_status)),
                     Err(_) => Err(ExecuteError::ExitCode(
                         driver
@@ -5475,11 +5502,12 @@ impl Executor {
                     )),
                 }
             }
-            crate::debugger::StopLoopOutcome::Detach => {
-                if let Some(driver) = self.debug_driver.take() {
-                    driver.session().deactivate();
+                crate::debugger::StopLoopOutcome::Detach => {
+                    if let Some(driver) = self.debug_driver.take() {
+                        driver.session().deactivate();
+                    }
+                    return Ok(());
                 }
-                Ok(())
             }
         }
     }
@@ -5513,6 +5541,33 @@ impl Executor {
     /// resumes from the same seam. `command_text` is the funnel's
     /// own frozen text — never reconstructed here (note 8).
     fn debugger_consult(
+        &mut self,
+        seam: crate::debugger::SeamKind,
+        command_text: &str,
+    ) -> Result<(), ExecuteError> {
+        // $BASH_COMMAND at a stop is the about-to-run command
+        // (design 7.3; the section 4.2 ordering sets it before
+        // the consult): for the duration of the consult — the
+        // condition evaluations and any stop it decides, whose
+        // inspection snapshot reads the dynamic face through the
+        // row-6 views — the engine's BASH_COMMAND cell holds
+        // this seam's frozen text. The previous value is restored
+        // on every exit, including a forced return's unwind, so
+        // the trap-action freeze semantics (rubash#546) and the
+        // post-command fallback reads are exactly as they were
+        // outside the consult window. (150-views REPORT section
+        // 5, note 1: the dynamic read used to lag one command,
+        // reporting the last command that had *begun*.)
+        let saved_trap_command = self.shell_state.debug_trap_command.borrow().clone();
+        *self.shell_state.debug_trap_command.borrow_mut() = Some(command_text.to_string());
+        let result = self.debugger_consult_at_seam(seam, command_text);
+        *self.shell_state.debug_trap_command.borrow_mut() = saved_trap_command;
+        result
+    }
+
+    /// The consult body proper; [`Executor::debugger_consult`]
+    /// wraps it with the stop-time `$BASH_COMMAND` refresh.
+    fn debugger_consult_at_seam(
         &mut self,
         seam: crate::debugger::SeamKind,
         command_text: &str,
@@ -5680,6 +5735,131 @@ impl Executor {
         match result {
             Ok(()) => Ok(status == 0),
             Err(_) => Err(()),
+        }
+    }
+
+    /// WP-7 (design 7.4/7.5/7.6): run one evaluation the stop
+    /// loop asked for through [`crate::debugger::StopLoopOutcome::Evaluate`].
+    /// The classification is `crate::debugger::evaluation`'s —
+    /// the single owner of the power rules; this path only
+    /// executes what the classification admits:
+    ///
+    /// - Implicit: the whitelist decides; an admitted word is
+    ///   expanded by the engine's own word expansion, a rejected
+    ///   form is never executed — its diagnostic is the outcome.
+    /// - Explicit, one expansion: expanded the same way, at full
+    ///   power (an expansion that assigns or substitutes is the
+    ///   user's own act against their own script, design 5.3).
+    /// - Explicit, anything else: executed as commands in the
+    ///   stopped frame through the engine's own execution, with
+    ///   the DEBUG path suppressed for its duration, exactly as
+    ///   conditions run. This is also the only write-back path
+    ///   (7.6): `x=5`, `arr[2]=v`, `local y=1` are assignments
+    ///   because the real assignment machinery runs them, with
+    ///   its attributes, scope and refusal semantics — there is
+    ///   no debugger-private write channel.
+    ///
+    /// Dynamic faces (`$?`, PIPESTATUS, `$BASH_COMMAND`) read
+    /// through the engine's own dynamic reads — the same getters
+    /// the row-6 views snapshot — never a shadow copy. `frame`
+    /// is validated against the stop's captured frame count;
+    /// execution touches the live frame context, which under the
+    /// shell's dynamic scoping is what stopped-frame evaluation
+    /// can mean (see [`crate::debugger::EvaluationRequest`]).
+    ///
+    /// A control unwind the user deliberately typed (`exit`,
+    /// `return`, `break`, `continue` in an `eval`) propagates as
+    /// the debuggee's own flow, like the same command typed in
+    /// the script; any other execution error becomes a Failed
+    /// outcome carrying the engine's diagnostic and status, and
+    /// the session stays parked.
+    fn debugger_evaluate(
+        &mut self,
+        request: &crate::debugger::EvaluationRequest,
+        frame_count: Option<usize>,
+    ) -> Result<crate::debugger::EvaluationOutcome, ExecuteError> {
+        use crate::debugger::{
+            DiagnosticKind, EvaluationDiagnostic, EvaluationOutcome, EvaluationResult, PowerMode,
+        };
+        let outcome = |result: EvaluationResult| EvaluationOutcome {
+            text: request.text.clone(),
+            mode: request.mode,
+            result,
+        };
+        if let Some(frame) = request.frame {
+            let valid = frame_count.is_some_and(|count| frame < count);
+            if !valid {
+                return Ok(outcome(EvaluationResult::Failed(EvaluationDiagnostic {
+                    kind: DiagnosticKind::Runtime,
+                    message: format!("no frame {frame} at this stop"),
+                    source_name: None,
+                    line: None,
+                    status: None,
+                })));
+            }
+        }
+        let tokens = crate::lexer::tokenize(&request.text);
+        let ast = crate::parser::parse(&tokens);
+        if let Some(diagnostic) = crate::debugger::parse_failure(&ast) {
+            return Ok(outcome(EvaluationResult::Failed(diagnostic)));
+        }
+        match request.mode {
+            PowerMode::Implicit => match crate::debugger::check_implicit(&ast, &request.text) {
+                Ok(word) => {
+                    let word = word.to_string();
+                    Ok(outcome(EvaluationResult::Value(self.expand_word(&word))))
+                }
+                Err(rejection) => Ok(outcome(EvaluationResult::Rejected(rejection.diagnostic()))),
+            },
+            PowerMode::Explicit => {
+                if let Some(word) = crate::debugger::single_expansion_word(&ast) {
+                    let word = word.to_string();
+                    return Ok(outcome(EvaluationResult::Value(self.expand_word(&word))));
+                }
+                match self.debugger_execute_evaluation(&ast)? {
+                    (status, None) => Ok(outcome(EvaluationResult::Status(status))),
+                    (status, Some(message)) => {
+                        Ok(outcome(EvaluationResult::Failed(EvaluationDiagnostic {
+                            kind: DiagnosticKind::Runtime,
+                            message,
+                            source_name: None,
+                            line: None,
+                            status: Some(status),
+                        })))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Execute an explicit evaluation's command list under the
+    /// funnel's re-entrancy guard (restored afterwards), so
+    /// neither the DEBUG trap nor the consult fires for the
+    /// evaluation's own commands. Unlike conditions, `$?` is NOT
+    /// preserved: the executed commands are the user's own, and
+    /// their status is the evaluation's result.
+    ///
+    /// Returns the run's `(status, error)`: `error` is the
+    /// engine's diagnostic text when execution failed without a
+    /// control unwind. A control unwind the user deliberately
+    /// typed (`exit`, `return`, `break`, `continue`) propagates
+    /// as `Err` — the debuggee's own flow, not an outcome.
+    fn debugger_execute_evaluation(
+        &mut self,
+        ast: &crate::parser::Ast,
+    ) -> Result<(i32, Option<String>), ExecuteError> {
+        let saved_trap_running = std::mem::replace(&mut self.debug_trap_running, true);
+        let result = self.execute_ast(ast);
+        self.debug_trap_running = saved_trap_running;
+        match result {
+            Ok(()) => Ok((self.exit_code, None)),
+            Err(
+                error @ (ExecuteError::ExitCode(_)
+                | ExecuteError::Return(_)
+                | ExecuteError::Break(_)
+                | ExecuteError::Continue(_)),
+            ) => Err(error),
+            Err(error) => Ok((self.exit_code, Some(error.to_string()))),
         }
     }
 
