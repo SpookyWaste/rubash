@@ -39,8 +39,8 @@ struct AnsiLexLocaleGuard {
 
 impl AnsiLexLocaleGuard {
     fn new(locale: &str) -> Self {
-        let previous = ANSI_LEX_LOCALE_OVERRIDE
-            .with(|cell| cell.borrow_mut().replace(locale.to_string()));
+        let previous =
+            ANSI_LEX_LOCALE_OVERRIDE.with(|cell| cell.borrow_mut().replace(locale.to_string()));
         AnsiLexLocaleGuard { previous }
     }
 }
@@ -100,10 +100,8 @@ pub struct ShellLocaleGuard {
 
 impl ShellLocaleGuard {
     pub fn new(env_vars: &std::collections::HashMap<String, String>) -> Self {
-        let previous = SHELL_LOCALE_OVERRIDE.with(|cell| {
-            cell.borrow_mut()
-                .replace(locale_name_from_vars(env_vars))
-        });
+        let previous = SHELL_LOCALE_OVERRIDE
+            .with(|cell| cell.borrow_mut().replace(locale_name_from_vars(env_vars)));
         ShellLocaleGuard { previous }
     }
 }
