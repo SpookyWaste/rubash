@@ -1706,11 +1706,16 @@ fn command_completion_candidates(
     // (`compgen -A command echo` prints echo for the builtin and again
     // for each PATH hit) (rubash#1089). Interactive callers sort/dedup
     // the merged candidate list themselves.
+    // The source order is bashline.c:2005 command_word_completion_
+    // function's mapping: case 0 aliases, case 1 shell reserved words
+    // (word_token_alist order), case 2 function names, case 3 shell
+    // builtins (shell_builtins table order), then the PATH walk
+    // (rubash#1795).
     let mut candidates = Vec::new();
-    candidates.extend(SHELL_BUILTINS.iter().map(|name| (*name).to_string()));
-    candidates.extend(SHELL_KEYWORDS.iter().map(|name| (*name).to_string()));
     candidates.extend(aliases.keys().cloned());
+    candidates.extend(SHELL_KEYWORDS.iter().map(|name| (*name).to_string()));
     candidates.extend(function_names.iter().cloned());
+    candidates.extend(SHELL_BUILTINS.iter().map(|name| (*name).to_string()));
     candidates.extend(path_command_completion_candidates(env_vars));
     candidates
 }
