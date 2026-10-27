@@ -1086,6 +1086,16 @@ impl Executor {
             return Err(ExecuteError::IoError(std::io::Error::new(kind, message)));
         }
         if state.redirect_failed {
+            // rubash#1871: a failed redirection fails the command in
+            // GNU (redir.c do_redirections error → the builtin never
+            // runs, status 1). The walk already printed the diagnostic
+            // and set exit_code, but wrappers whose dispatch assigns
+            // the builtin's own return value afterwards (printf, pwd)
+            // would overwrite it with the nominal status — fold the
+            // failure into the same merge flag the sh_chkwrite flush
+            // failure uses (take_builtin_write_failed) so those
+            // wrappers return 1 too.
+            self.last_builtin_write_failed.set(true);
             return Ok(true);
         }
 
@@ -1387,9 +1397,21 @@ impl Executor {
                     // never a dup — it must reach
                     // open_command_output_target, which owns the reopen
                     // semantics (rubash#1373).
-                    if let Some(source_fd) = redirect_target_fd(&target)
-                        .filter(|_| !self.dev_stdio_target_reopens_disk(&target, state))
-                    {
+                    // rubash#1871: a path-spelled target whose fd has
+                    // NO binding at all (the walk state is seeded from
+                    // the whole fd table, so absence means the fd is
+                    // dead — e.g. a procsub fd closed with its owning
+                    // command) is likewise a filename open: GNU fails
+                    // it ENOENT at open(). The dup shortcut would
+                    // report it with the raw word and the dup2 EBADF
+                    // reason instead.
+                    let dead_path_spelled_fd =
+                        crate::executor::execution_misc::dev_stdio_redirect_fd(&target).is_some()
+                            && redirect_target_fd(&target)
+                                .is_some_and(|source_fd| state.fd_target(source_fd).is_none());
+                    if let Some(source_fd) = redirect_target_fd(&target).filter(|_| {
+                        !self.dev_stdio_target_reopens_disk(&target, state) && !dead_path_spelled_fd
+                    }) {
                         let Some(source_target) = state.fd_target(source_fd).cloned() else {
                             self.write_bad_fd_redirect_diagnostic(
                                 state,
@@ -1672,7 +1694,15 @@ impl Executor {
                         .insert(fd, OutputTarget::SharedFile(file_fd.clone()));
                 }
                 _ => {
-                    self.write_bad_fd_redirect_diagnostic(state, &redirect.target_metadata.raw)?;
+                    // rubash#1871: the diagnostic names the EXPANDED
+                    // target — this arm is an open() failure on the
+                    // /dev/fd/N filename (GNU redirection_error prints
+                    // the expanded word with the open errno, ENOENT;
+                    // niubash#118), not a dup2 failure on the raw
+                    // spelling. Passing target_metadata.raw printed
+                    // the unexpanded `"$p"` and picked the EBADF
+                    // reason for a /dev/fd target.
+                    self.write_bad_fd_redirect_diagnostic(state, target)?;
                     self.exit_code = 1;
                     state.redirect_failed = true;
                     return Ok(());

@@ -1043,10 +1043,10 @@ impl Executor {
         // rubash#355: the recorded key is the `/dev/fd/N` word form; the
         // bytes live in the fd's ProcessSubstitution write carrier (its
         // temp path), not at the word itself.
-        let path = if let Some(fd) = target
+        let word_fd = target
             .strip_prefix("/dev/fd/")
-            .and_then(|fd| fd.parse::<u32>().ok())
-        {
+            .and_then(|fd| fd.parse::<u32>().ok());
+        let path = if let Some(fd) = word_fd {
             match self.fd_table.output_endpoint(fd) {
                 Some(FdWriteEndpoint::ProcessSubstitution { path, .. }) => path,
                 _ => return Ok(()),
@@ -1062,6 +1062,18 @@ impl Executor {
         // itself prints still go out on its own stderr.
         let _ = self.execute_persistent_output_process_substitution(&source, input, None);
         let _ = fs::remove_file(path);
+        // rubash#1871: the fd dies with the assignment command, exactly
+        // like the input side's command-scoped close (#545 cell 2/3,
+        // #1691): GNU closes a command's process-substitution fds when
+        // the command finishes, so the stored `/dev/fd/N` word dangles
+        // from the next command on and an open by that name fails
+        // ENOENT. Leaving the fd-table entry behind let a later
+        // `printf ... > "$p"` resolve in-shell to the dead carrier and
+        // silently swallow the write (the carrier file recreated by
+        // the flush open, the consumer never re-run).
+        if let Some(fd) = word_fd {
+            self.fd_table.entries.remove(&fd);
+        }
         Ok(())
     }
 
