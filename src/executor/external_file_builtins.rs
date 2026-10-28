@@ -1863,7 +1863,7 @@ impl Executor {
                 }
                 // Q11 /proc P1 (docs/proc-vfs-plan.md hook B2): synthetic
                 // files are served before the filesystem.
-                if let Some(bytes) = crate::proc_vfs::proc_file_content(&target) {
+                if let Some(bytes) = crate::special_paths::synthetic_proc_content(&target) {
                     output.extend(bytes);
                     continue;
                 }

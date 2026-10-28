@@ -16,6 +16,10 @@
 
 /// Synthetic content for a /proc pseudo-file, or None when `path` is not one
 /// of the emulated files. Each call generates a fresh snapshot.
+///
+/// This module owns *generation*; the consumer-facing entry is the
+/// special-path registry ([`crate::special_paths::synthetic_proc_content`],
+/// vfs audit §4.5 slice S1), which is where open points and probes ask.
 #[cfg(windows)]
 pub fn proc_file_content(path: &str) -> Option<Vec<u8>> {
     let rest = path.strip_prefix("/proc/")?;

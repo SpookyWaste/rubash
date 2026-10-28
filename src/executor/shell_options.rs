@@ -98,16 +98,6 @@ impl Executor {
             .open(&path)
     }
 
-    /// rubash#1026: GNU redir.c netopen — `/dev/tcp/host/port` and
-    /// `/dev/udp/host/port` are not filesystem paths: opening one
-    /// connects a socket (TCP connect(2); UDP bind+connect, which
-    /// succeeds even with no listener). Host may be a name (resolved by
-    /// the OS) or an address; the port may be numeric or a service name
-    /// resolved through /etc/services (getservbyname).
-    pub(in crate::executor) fn is_net_redirect_target(&self, target: &str) -> bool {
-        target.starts_with("/dev/tcp/") || target.starts_with("/dev/udp/")
-    }
-
     /// Formatted variant: the returned error already carries the
     /// `<target>: <strerror>` shape (posix_errors::path_error), matching
     /// the other open paths in this module.
@@ -178,7 +168,7 @@ impl Executor {
     fn open_input_redirect_impl(&self, target: &str, consume: bool) -> io::Result<File> {
         // rubash#1026: /dev/tcp|udp targets connect a socket, never a
         // filesystem open (see open_net_redirect).
-        if self.is_net_redirect_target(target) {
+        if crate::special_paths::is_net_redirect_target(target) {
             return self.open_net_redirect(target);
         }
         if is_null_device(target) {
@@ -212,7 +202,7 @@ impl Executor {
         // Q11 /proc P1 (docs/proc-vfs-plan.md hook B): synthetic /proc files
         // serve as a pre-filled pipe converted to a File; reads hit EOF at
         // content end, matching procfs static-snapshot semantics.
-        if let Some(content) = crate::proc_vfs::proc_file_content(target) {
+        if let Some(content) = crate::special_paths::synthetic_proc_content(target) {
             use std::io::Write as _;
             let (reader, mut writer) = std::io::pipe()?;
             writer
@@ -563,7 +553,7 @@ impl Executor {
     ) -> io::Result<File> {
         // rubash#1026: /dev/tcp|udp targets connect a socket (see
         // open_net_redirect); noclobber has no meaning for them.
-        if self.is_net_redirect_target(target) {
+        if crate::special_paths::is_net_redirect_target(target) {
             return self.open_net_redirect(target);
         }
         if is_null_device(target) {
@@ -1556,7 +1546,7 @@ impl Executor {
             }
             // Q11 /proc P1 (docs/proc-vfs-plan.md hook B): synthetic files
             // are served before the filesystem (read/cat/heredoc stdin path).
-            if let Some(bytes) = crate::proc_vfs::proc_file_content(&target) {
+            if let Some(bytes) = crate::special_paths::synthetic_proc_content(&target) {
                 return Some(crate::executor::substitution_metadata::bytes_to_shell_text(
                     &bytes,
                 ));

@@ -159,7 +159,7 @@ impl Executor {
     ) -> std::io::Result<()> {
         // rubash#1026: `N<>/dev/tcp/host/port` binds the connected
         // socket (one descriptor, both directions — redir.c netopen).
-        if self.is_net_redirect_target(target) {
+        if crate::special_paths::is_net_redirect_target(target) {
             // Raw error: every caller of this function applies
             // posix_errors::path_error itself.
             let file = self.open_net_redirect_raw(target)?;
@@ -211,7 +211,7 @@ impl Executor {
     ) -> std::io::Result<()> {
         // rubash#1026: `N>/dev/tcp/host/port` binds the connected
         // socket, not a filesystem path (redir.c netopen).
-        if self.is_net_redirect_target(&target) {
+        if crate::special_paths::is_net_redirect_target(&target) {
             let file = self.open_net_redirect(&target)?;
             let file_fd = FileFd::from_file(file, target.clone().into());
             self.fd_table
@@ -3436,7 +3436,7 @@ impl Executor {
                     if redirect.operator.ends_with("<>") {
                         self.set_fd_readwrite_file(fd, &target, fd != 0)
                             .map_err(|e| crate::posix_errors::path_error(&target, e))?;
-                    } else if self.is_net_redirect_target(&target) {
+                    } else if crate::special_paths::is_net_redirect_target(&target) {
                         // rubash#1026: `N</dev/tcp/host/port` also
                         // connects (redir.c netopen serves both
                         // directions); the socket binds as the read end.

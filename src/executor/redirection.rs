@@ -725,7 +725,7 @@ impl Executor {
             if redirect.kind == crate::parser::RedirectKind::ReadWrite
                 && !is_null_device(&target)
                 && dev_stdio_redirect_fd(&target).is_none()
-                && !self.is_net_redirect_target(&target)
+                && !crate::special_paths::is_net_redirect_target(&target)
                 && !target.starts_with("<(")
             {
                 let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
@@ -753,7 +753,7 @@ impl Executor {
             if redirect.kind == crate::parser::RedirectKind::Input
                 && !is_null_device(&target)
                 && dev_stdio_redirect_fd(&target).is_none()
-                && !self.is_net_redirect_target(&target)
+                && !crate::special_paths::is_net_redirect_target(&target)
                 && !target.starts_with("<(")
                 && redirect_target_fd(&target).is_none()
             {

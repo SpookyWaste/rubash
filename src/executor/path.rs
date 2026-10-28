@@ -3590,10 +3590,10 @@ pub(crate) fn resolve_shell_path_from_env(
     shell_path_to_windows(path, env_vars)
 }
 
-pub(crate) fn is_shell_null_device(path: &str) -> bool {
-    let normalized = path.replace('\\', "/");
-    normalized == "/dev/null" || (cfg!(windows) && normalized.eq_ignore_ascii_case("NUL"))
-}
+/// The null-device judgment now lives in the special-path registry
+/// (vfs audit §4.5 slice S1); this re-export keeps existing call
+/// sites pointed at the one definition.
+pub(crate) use crate::special_paths::is_shell_null_device;
 
 /// Base directory backing the shell-visible `/tmp` on Windows. Prefers the
 /// executor's TMPDIR value; a TMPDIR that is empty or points back into the
