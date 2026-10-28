@@ -416,7 +416,7 @@ impl Executor {
                     )
             })
             .is_some_and(|r| matches!(r.kind, crate::parser::RedirectKind::HereString));
-        let fd0_self_dup = cmd.redirect_in.as_ref().is_some_and(|redirect| {
+        let fd0_self_dup = cmd.redirect_in.as_deref().is_some_and(|redirect| {
             redirect.fd_var.is_none()
                 && redirect.fd.unwrap_or(0) == 0
                 && matches!(
@@ -426,7 +426,7 @@ impl Executor {
         });
         if let Some(redirect) = cmd
             .redirect_in
-            .as_ref()
+            .as_deref()
             .filter(|_| !fd0_self_dup && !last_stdin_is_herestring)
         {
             if redirect.fd.unwrap_or(0) != 0 {

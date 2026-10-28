@@ -2915,10 +2915,10 @@ impl Executor {
         // apply_command_output_redirects splices into the body only for a
         // stdio-slot redirect; with neither, the stored slice runs as-is.
         let redirect_needs_ps_rewrite = [
-            cmd.redirect_out.as_ref(),
-            cmd.append.as_ref(),
-            cmd.redirect_err.as_ref(),
-            cmd.redirect_err_append.as_ref(),
+            cmd.redirect_out.as_deref(),
+            cmd.append.as_deref(),
+            cmd.redirect_err.as_deref(),
+            cmd.redirect_err_append.as_deref(),
         ]
         .into_iter()
         .flatten()
@@ -2967,31 +2967,35 @@ impl Executor {
         };
         if stdio_redirect_cmd
             .redirect_in
-            .as_ref()
+            .as_deref()
             .is_some_and(is_numbered)
         {
             stdio_redirect_cmd.redirect_in = None;
         }
         if stdio_redirect_cmd
             .redirect_out
-            .as_ref()
+            .as_deref()
             .is_some_and(is_numbered)
         {
             stdio_redirect_cmd.redirect_out = None;
         }
-        if stdio_redirect_cmd.append.as_ref().is_some_and(is_numbered) {
+        if stdio_redirect_cmd
+            .append
+            .as_deref()
+            .is_some_and(is_numbered)
+        {
             stdio_redirect_cmd.append = None;
         }
         if stdio_redirect_cmd
             .redirect_err
-            .as_ref()
+            .as_deref()
             .is_some_and(is_numbered)
         {
             stdio_redirect_cmd.redirect_err = None;
         }
         if stdio_redirect_cmd
             .redirect_err_append
-            .as_ref()
+            .as_deref()
             .is_some_and(is_numbered)
         {
             stdio_redirect_cmd.redirect_err_append = None;
@@ -4123,14 +4127,14 @@ impl Executor {
         }
         if body_stdin.is_none() {
             if let Some(redirect) = &cmd.redirect_in {
-            if redirect.fd.unwrap_or(0) == 0 {
-                let target = self.expand_redirect_target(redirect);
-                if is_closed_redirect_target(&target) {
-                    child.stdin(Stdio::null());
-                } else if redirect_target_fd(&target).is_none() {
-                    child.stdin(Stdio::from(self.open_input_redirect(&target)?));
+                if redirect.fd.unwrap_or(0) == 0 {
+                    let target = self.expand_redirect_target(redirect);
+                    if is_closed_redirect_target(&target) {
+                        child.stdin(Stdio::null());
+                    } else if redirect_target_fd(&target).is_none() {
+                        child.stdin(Stdio::from(self.open_input_redirect(&target)?));
+                    }
                 }
-            }
             }
         }
 
@@ -4543,7 +4547,7 @@ impl Executor {
     ) -> Result<(), ExecuteError> {
         if let Some(redirect) = cmd
             .redirect_out
-            .as_ref()
+            .as_deref()
             .filter(|r| is_stdout_splice_redirect(cmd, r))
         {
             let target = self.expand_redirect_target(redirect);
@@ -4557,7 +4561,11 @@ impl Executor {
             for clause in &mut case_command.clauses {
                 apply_stdout_append_redirect(&mut clause.body, &append_redirect);
             }
-        } else if let Some(redirect) = cmd.append.as_ref().filter(|r| is_stdout_write_redirect(r)) {
+        } else if let Some(redirect) = cmd
+            .append
+            .as_deref()
+            .filter(|r| is_stdout_write_redirect(r))
+        {
             let mut append_redirect = redirect.clone();
             append_redirect.target = self.expand_redirect_target(redirect);
             for clause in &mut case_command.clauses {
@@ -4567,7 +4575,7 @@ impl Executor {
 
         if let Some(redirect) = cmd
             .redirect_err
-            .as_ref()
+            .as_deref()
             .filter(|r| is_stderr_splice_redirect(cmd, r))
         {
             let target = self.expand_redirect_target(redirect);
@@ -4583,7 +4591,7 @@ impl Executor {
             }
         } else if let Some(redirect) = cmd
             .redirect_err_append
-            .as_ref()
+            .as_deref()
             .filter(|r| is_stderr_splice_redirect(cmd, r))
         {
             let mut append_redirect = redirect.clone();
@@ -4638,14 +4646,8 @@ fn if_condition_is_side_effect_free(condition: &[CommandNode]) -> bool {
         && command.compound_assignments.is_empty()
         && command.array_element_assignments.is_empty()
         && command.process_substitutions.is_empty()
-        && command.command_substitutions.is_empty()
-        && command.arithmetic_expansions.is_empty()
-        && command.parameter_expansions.is_empty()
-        && command.brace_expansions.is_empty()
         && command.extglob_patterns.is_empty()
-        && command.tilde_expansions.is_empty()
         && command.pathname_patterns.is_empty()
-        && command.word_quotes.is_empty()
         && command.redirects.is_empty()
         && command.redirect_in.is_none()
         && command.redirect_out.is_none()
@@ -4701,14 +4703,8 @@ fn for_body_is_bare_colon(body: &[CommandNode]) -> Option<&CommandNode> {
         && command.compound_assignments.is_empty()
         && command.array_element_assignments.is_empty()
         && command.process_substitutions.is_empty()
-        && command.command_substitutions.is_empty()
-        && command.arithmetic_expansions.is_empty()
-        && command.parameter_expansions.is_empty()
-        && command.brace_expansions.is_empty()
         && command.extglob_patterns.is_empty()
-        && command.tilde_expansions.is_empty()
         && command.pathname_patterns.is_empty()
-        && command.word_quotes.is_empty()
         && command.redirects.is_empty()
         && command.redirect_in.is_none()
         && command.redirect_out.is_none()

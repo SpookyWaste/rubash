@@ -530,10 +530,10 @@ impl Executor {
             // is impossible, and a redirect-free group (the common case)
             // skips both clones.
             let redirect_needs_ps_rewrite = [
-                command.redirect_out.as_ref(),
-                command.append.as_ref(),
-                command.redirect_err.as_ref(),
-                command.redirect_err_append.as_ref(),
+                command.redirect_out.as_deref(),
+                command.append.as_deref(),
+                command.redirect_err.as_deref(),
+                command.redirect_err_append.as_deref(),
             ]
             .into_iter()
             .flatten()
@@ -551,19 +551,19 @@ impl Executor {
             };
             let brace_splice_needed = command
                 .redirect_out
-                .as_ref()
+                .as_deref()
                 .is_some_and(|r| r.fd.unwrap_or(1) == 1)
                 || command
                     .append
-                    .as_ref()
+                    .as_deref()
                     .is_some_and(|r| r.fd.unwrap_or(1) == 1)
                 || command
                     .redirect_err
-                    .as_ref()
+                    .as_deref()
                     .is_some_and(|r| r.fd.unwrap_or(2) == 2)
                 || command
                     .redirect_err_append
-                    .as_ref()
+                    .as_deref()
                     .is_some_and(|r| r.fd.unwrap_or(2) == 2);
             let mut body_owned;
             let body: &[CommandNode] = if brace_splice_needed {
@@ -708,12 +708,12 @@ impl Executor {
     ) -> Result<Vec<(PathBuf, String)>, ExecuteError> {
         let mut outputs = Vec::new();
         if let Some(source) = shared_combined_output_process_substitution(
-            command.redirect_out.as_ref(),
-            command.redirect_err_append.as_ref(),
+            command.redirect_out.as_deref(),
+            command.redirect_err_append.as_deref(),
         ) {
             let original = command
                 .redirect_out
-                .as_ref()
+                .as_deref()
                 .map(|redirect| redirect.target.clone())
                 .unwrap_or_default();
             let path = self.empty_process_substitution_temp()?;
@@ -728,12 +728,12 @@ impl Executor {
             outputs.push((path, source));
         }
         if let Some(source) = shared_combined_output_process_substitution(
-            command.append.as_ref(),
-            command.redirect_err_append.as_ref(),
+            command.append.as_deref(),
+            command.redirect_err_append.as_deref(),
         ) {
             let original = command
                 .append
-                .as_ref()
+                .as_deref()
                 .map(|redirect| redirect.target.clone())
                 .unwrap_or_default();
             let path = self.empty_process_substitution_temp()?;
@@ -789,7 +789,7 @@ impl Executor {
 
     fn materialize_compound_output_redirect(
         &mut self,
-        redirect: &mut Option<Redirect>,
+        redirect: &mut Option<Box<Redirect>>,
     ) -> Result<Option<(PathBuf, String)>, ExecuteError> {
         let Some(redirect) = redirect else {
             return Ok(None);
@@ -5889,11 +5889,11 @@ fn command_has_pipeline_process_substitution(command: &CommandNode) -> bool {
             .iter()
             .any(|redirect| redirect.target.starts_with("<(") || redirect.target.starts_with(">("))
         || [
-            command.redirect_in.as_ref(),
-            command.redirect_out.as_ref(),
-            command.append.as_ref(),
-            command.redirect_err.as_ref(),
-            command.redirect_err_append.as_ref(),
+            command.redirect_in.as_deref(),
+            command.redirect_out.as_deref(),
+            command.append.as_deref(),
+            command.redirect_err.as_deref(),
+            command.redirect_err_append.as_deref(),
         ]
         .into_iter()
         .flatten()
@@ -5916,7 +5916,7 @@ fn node_merges_stderr_into_stdout(node: &CommandNode) -> bool {
             && redirect.target == "&1"
     };
     node.redirects.iter().any(is_stdout_dup)
-        || node.redirect_err.as_ref().is_some_and(is_stdout_dup)
+        || node.redirect_err.as_deref().is_some_and(is_stdout_dup)
 }
 
 /// Whether the timed pipeline element's fd 2 is dup'd onto the pipe:
@@ -6044,7 +6044,7 @@ fn normalize_pipeerr_stage(command: &CommandNode) -> CommandNode {
         clobber: false,
     };
     normalized.redirects.push(dup.clone());
-    normalized.redirect_err = Some(dup);
+    normalized.redirect_err = Some(Box::new(dup));
     normalized
 }
 

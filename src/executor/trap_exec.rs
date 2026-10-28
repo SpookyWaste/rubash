@@ -2129,7 +2129,11 @@ impl Executor {
         ast: &mut Ast,
         prepare_targets: bool,
     ) -> Result<(), ExecuteError> {
-        if let Some(redirect) = cmd.redirect_out.as_ref().filter(|r| r.fd.unwrap_or(1) == 1) {
+        if let Some(redirect) = cmd
+            .redirect_out
+            .as_deref()
+            .filter(|r| r.fd.unwrap_or(1) == 1)
+        {
             // GNU do_redirections opens the expanded word once, relative to
             // the cwd in force when the compound command starts; the
             // diagnostic reports that word (redir.c report_error on
@@ -2183,7 +2187,7 @@ impl Executor {
         ast: &mut Ast,
         _prepare_targets: bool,
     ) -> Result<(), ExecuteError> {
-        if let Some(redirect) = cmd.append.as_ref().filter(|r| r.fd.unwrap_or(1) == 1) {
+        if let Some(redirect) = cmd.append.as_deref().filter(|r| r.fd.unwrap_or(1) == 1) {
             let expanded = self.expand_redirect_target(redirect);
             // subst.c:12663-12668 failglob: abort before anchoring.
             if self.redirect_failglob_aborted() {
@@ -2216,7 +2220,11 @@ impl Executor {
         ast: &mut Ast,
         prepare_targets: bool,
     ) -> Result<(), ExecuteError> {
-        if let Some(redirect) = cmd.redirect_err.as_ref().filter(|r| r.fd.unwrap_or(2) == 2) {
+        if let Some(redirect) = cmd
+            .redirect_err
+            .as_deref()
+            .filter(|r| r.fd.unwrap_or(2) == 2)
+        {
             let expanded = self.expand_redirect_target(redirect);
             // subst.c:12663-12668 failglob: abort before the target is
             // created/anchored (see the redirect_out arm above).
@@ -2273,7 +2281,7 @@ impl Executor {
     ) -> Result<(), ExecuteError> {
         if let Some(redirect) = cmd
             .redirect_err_append
-            .as_ref()
+            .as_deref()
             .filter(|r| r.fd.unwrap_or(2) == 2)
         {
             let expanded = self.expand_redirect_target(redirect);
@@ -5256,25 +5264,25 @@ fn compound_stdio_arms_in_parse_order(command: &CommandNode) -> Vec<CompoundStdi
         (
             command
                 .redirect_out
-                .as_ref()
+                .as_deref()
                 .filter(|r| r.fd.unwrap_or(1) == 1),
             CompoundStdioArm::Out,
         ),
         (
-            command.append.as_ref().filter(|r| r.fd.unwrap_or(1) == 1),
+            command.append.as_deref().filter(|r| r.fd.unwrap_or(1) == 1),
             CompoundStdioArm::Append,
         ),
         (
             command
                 .redirect_err
-                .as_ref()
+                .as_deref()
                 .filter(|r| r.fd.unwrap_or(2) == 2),
             CompoundStdioArm::Err,
         ),
         (
             command
                 .redirect_err_append
-                .as_ref()
+                .as_deref()
                 .filter(|r| r.fd.unwrap_or(2) == 2),
             CompoundStdioArm::ErrAppend,
         ),

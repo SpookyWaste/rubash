@@ -539,7 +539,7 @@ impl Executor {
         // dups the file (shared offset). Install a real File endpoint on
         // fd 0 for plain file redirects; text sources (heredoc/here-string)
         // keep the FUNCTION_STDIN channel.
-        let file_stdin = cmd.redirect_in.as_ref().and_then(|redirect| {
+        let file_stdin = cmd.redirect_in.as_deref().and_then(|redirect| {
             if redirect.fd.unwrap_or(0) != 0 {
                 return None;
             }
