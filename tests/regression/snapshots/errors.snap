@@ -56,9 +56,6 @@ invalid numeric argument
 after exit: 2
 after shift: 2
 after return: 2
-after exit: 2
-after shift: 2
-after return: 2
 after history: 2
 after history: 2
 too many arguments
