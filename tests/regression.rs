@@ -3684,3 +3684,62 @@ mod win_face_fd_history {
         );
     }
 }
+
+/// rubash#1904 (vfs audit D11): the command-substitution quick-read
+/// ladder behind `$(<file)` skipped the synthetic-/proc and net steps
+/// the input redirect ladder has, so `$(</proc/meminfo)` read a
+/// mapped pseudo-path that does not exist on Windows (silently
+/// empty) and `$(</dev/tcp/…)` failed the same way. GNU read_comsub
+/// (subst.c) collects the bytes from the descriptor the redirect
+/// open produced, whatever class the target belongs to. Expectations
+/// below are GNU's; the proc pin's Windows face is the point (on
+/// Linux the real procfs file answers), and the net pin fails
+/// pre-fix on every platform.
+mod issue_1904 {
+    use super::*;
+
+    fn run(dir: &Path, code: &str) -> (String, String, Option<i32>) {
+        let out = run_rubash_in(dir, &["-c", code], Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    #[test]
+    fn issue1904_comsub_quick_read_proc_content() {
+        let dir = case_scratch("1904-proc");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "x=$(</proc/meminfo); case $x in *MemTotal:*) echo PROC-OK;; *) echo PROC-BAD;; esac",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "PROC-OK", "stderr:\n{stderr}");
+    }
+
+    #[test]
+    fn issue1904_comsub_quick_read_dev_null_is_empty() {
+        let dir = case_scratch("1904-null");
+        let (stdout, stderr, status) = run(&dir, "x=$(</dev/null); echo \"len=${#x}\"");
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "len=0", "stderr:\n{stderr}");
+    }
+
+    #[test]
+    fn issue1904_comsub_quick_read_dev_tcp_loopback() {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream.write_all(b"hello1904\n").expect("write payload");
+        });
+        let dir = case_scratch("1904-tcp");
+        let code = format!("x=$(</dev/tcp/127.0.0.1/{port}); echo \"GOT:$x\"");
+        let (stdout, stderr, status) = run(&dir, &code);
+        server.join().expect("server thread");
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "GOT:hello1904", "stderr:\n{stderr}");
+    }
+}

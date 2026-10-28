@@ -416,7 +416,7 @@ impl Executor {
         }
         // Q11 /proc P1 (docs/proc-vfs-plan.md hook B): loop stdin redirect
         // reads synthetic /proc files before the filesystem.
-        if let Some(bytes) = crate::proc_vfs::proc_file_content(&target) {
+        if let Some(bytes) = crate::special_paths::synthetic_proc_content(&target) {
             return Some(bytes_to_shell_text(&bytes));
         }
         fs::read_to_string(path).ok()

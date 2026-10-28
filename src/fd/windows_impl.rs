@@ -206,8 +206,12 @@ impl FdTable {
         // materialize through an anonymous pipe so downstream reads (and any
         // inherited-handle child) see ordinary byte-stream semantics. The
         // write side is closed immediately: a pipe reports EOF once drained,
-        // which is exactly the procfs "static snapshot file" behavior.
-        if let Some(content) = crate::proc_vfs::proc_file_content(path) {
+        // which is exactly the procfs "static snapshot file" behavior. The
+        // class judgment and bytes come from the special-path registry
+        // (vfs audit §4.5 slice S1/S2), the same entry open_file_read
+        // below asks; only the input shape differs (POSIX spelling here,
+        // an already-translated Path there).
+        if let Some(content) = crate::special_paths::synthetic_proc_content(path) {
             return self.install_read_bytes(slot, &content);
         }
         let wide = to_wide(path);
@@ -478,9 +482,13 @@ fn create_file(
 pub fn open_file_read(path: &std::path::Path) -> std::io::Result<HANDLE> {
     // Q11 /proc P1 (docs/proc-vfs-plan.md hook B): every redirect-read path
     // funnels through here (FileFd::open_read), so the synthetic /proc files
-    // materialize as a drained pipe handle at this single choke point.
+    // materialize as a drained pipe handle at this single choke point. The
+    // class judgment and bytes come from the special-path registry (vfs
+    // audit §4.5 slice S1/S2) — the same entry FdTable::open_read asks;
+    // the Path-to-POSIX-text conversion below is only this entry's input
+    // adaptation, since callers here hold an already-translated Path.
     let posix_text = path.to_string_lossy().replace('\\', "/");
-    if let Some(content) = crate::proc_vfs::proc_file_content(&posix_text) {
+    if let Some(content) = crate::special_paths::synthetic_proc_content(&posix_text) {
         return install_bytes_read_pipe(&content);
     }
     create_file(path, GENERIC_READ, OPEN_EXISTING)
