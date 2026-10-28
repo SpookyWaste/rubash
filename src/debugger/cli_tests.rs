@@ -551,3 +551,230 @@ continue
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------
+// rubash#1962: breakpoint-condition defects (RC audit phase 2,
+// cell group ②). Line 2 of ISSUE1962_SCRIPT is inside the loop
+// (three consults), line 4 is after it (one consult). The three
+// confirmed cells get pins asserting the debugger-side report,
+// the consult line in the quoted diagnostic, the debuggee's
+// survival, and the session status; the three overturned cells
+// get parity pins so the fix cannot regress them.
+
+const ISSUE1962_SCRIPT: &str = "\
+for i in 1 2 3; do
+  echo \"iter $i\"
+done
+echo after-loop
+";
+
+#[test]
+fn issue1962_condition_break_in_loop_reports_once_and_debuggee_survives() {
+    let _span = GateTestSpan::new();
+    let (dir, program) = program_file("condbreak", ISSUE1962_SCRIPT);
+    let (status, transcript) = run_cli(&program, "break 2 if break\nbreak 4\ncontinue\ncontinue\n");
+    assert_eq!(status, 0, "{transcript}");
+    // The in-loop `break` unwinds inside the evaluation: a failed
+    // condition (design 5.3) — reported exactly once for the
+    // three consults, not folded silently and not per hit.
+    assert_eq!(
+        transcript
+            .matches("breakpoint 1: condition 'break' failed at <PROG>:2, treated as false")
+            .count(),
+        1,
+        "{transcript}"
+    );
+    // The debuggee was not disturbed: it reaches the line-4
+    // breakpoint after the loop.
+    assert!(
+        transcript.contains("Stopped (breakpoint 2) at <PROG>:4"),
+        "{transcript}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn issue1962_condition_numeric_error_reports_once_at_the_consult_line() {
+    let _span = GateTestSpan::new();
+    let (dir, program) = program_file("condnum", ISSUE1962_SCRIPT);
+    let (status, transcript) = run_cli(&program, "break 2 if break 2x\ncontinue\n");
+    assert_eq!(status, 0, "{transcript}");
+    assert_eq!(
+        transcript
+            .matches("breakpoint 1: condition 'break 2x' failed at <PROG>:2, treated as false")
+            .count(),
+        1,
+        "{transcript}"
+    );
+    // The engine diagnostic appears exactly once — inside the
+    // report, quoted — and carries the consult line (the
+    // debuggee's line 2), not the condition text's own line 1.
+    assert_eq!(
+        transcript.matches("numeric argument required").count(),
+        1,
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("  <PROG>: line 2: break: 2x: numeric argument required"),
+        "{transcript}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn issue1962_condition_too_many_arguments_cannot_kill_the_debuggee() {
+    let _span = GateTestSpan::new();
+    let (dir, program) = program_file("condtoomany", ISSUE1962_SCRIPT);
+    let (status, transcript) = run_cli(
+        &program,
+        "break 2 if break 1 2\nbreak 4\ncontinue\ncontinue\n",
+    );
+    assert_eq!(status, 0, "{transcript}");
+    assert_eq!(
+        transcript
+            .matches("breakpoint 1: condition 'break 1 2' failed at <PROG>:2, treated as false")
+            .count(),
+        1,
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("  <PROG>: line 2: break: too many arguments"),
+        "{transcript}"
+    );
+    // The too-many-arguments DISCARD the condition armed died
+    // with the evaluation: the debuggee lives to stop at line 4.
+    assert!(
+        transcript.contains("Stopped (breakpoint 2) at <PROG>:4"),
+        "{transcript}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn issue1962_condition_break_outside_the_loop_commits_its_stop() {
+    let _span = GateTestSpan::new();
+    let (dir, program) = program_file("condoutside", ISSUE1962_SCRIPT);
+    let (status, transcript) = run_cli(&program, "break 4 if break\ncontinue\ncontinue\n");
+    assert_eq!(status, 0, "{transcript}");
+    // An out-of-loop `break` is status 0 in GNU, so the verdict
+    // is true and the stop commits — and a true verdict is not
+    // reported as a failure.
+    assert!(
+        transcript.contains("Stopped (breakpoint 1) at <PROG>:4"),
+        "{transcript}"
+    );
+    assert!(
+        !transcript.contains("condition 'break' failed"),
+        "{transcript}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn issue1962_condition_true_in_loop_stops_exactly_once() {
+    let _span = GateTestSpan::new();
+    let (dir, program) = program_file("condtruein", ISSUE1962_SCRIPT);
+    let (status, transcript) = run_cli(&program, "break 2 if [[ $i == 2 ]]\ncontinue\ncontinue\n");
+    assert_eq!(status, 0, "{transcript}");
+    assert_eq!(
+        transcript.matches("Stopped (breakpoint 1)").count(),
+        1,
+        "{transcript}"
+    );
+    assert!(!transcript.contains("failed"), "{transcript}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn issue1962_condition_true_outside_stops_exactly_once() {
+    let _span = GateTestSpan::new();
+    let (dir, program) = program_file("condtrueout", ISSUE1962_SCRIPT);
+    let (status, transcript) = run_cli(&program, "break 4 if [[ $i == 3 ]]\ncontinue\ncontinue\n");
+    assert_eq!(status, 0, "{transcript}");
+    assert_eq!(
+        transcript.matches("Stopped (breakpoint 1)").count(),
+        1,
+        "{transcript}"
+    );
+    assert!(!transcript.contains("failed"), "{transcript}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn issue1962_condition_command_substitution_runs_once_per_consult() {
+    let _span = GateTestSpan::new();
+    let (dir, program) = program_file("condcomsub", ISSUE1962_SCRIPT);
+    let ticks = dir.join("ticks");
+    let ticks = ticks.to_string_lossy().into_owned();
+    // A false condition whose substitution appends one tick per
+    // evaluation: three consults, exactly three ticks, no stop.
+    let commands = format!("break 2 if [[ $(echo tick >> {ticks}; echo $i) == 99 ]]\ncontinue\n");
+    let (status, transcript) = run_cli(&program, &commands);
+    assert_eq!(status, 0, "{transcript}");
+    assert!(!transcript.contains("Stopped (breakpoint"), "{transcript}");
+    let recorded = std::fs::read_to_string(&ticks).expect("ticks recorded");
+    assert_eq!(
+        recorded.lines().count(),
+        3,
+        "one tick per consult: {recorded}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn issue1962_source_command_file_drives_the_session() {
+    let _span = GateTestSpan::new();
+    let (dir, program) = program_file("sourcecmds", ISSUE1962_SCRIPT);
+    let cmds = dir.join("session.cmds");
+    std::fs::write(&cmds, "break 4\ncontinue\n").expect("write command file");
+    let commands = format!("source {}\ncontinue\n", cmds.to_string_lossy());
+    let (status, transcript) = run_cli(&program, &commands);
+    assert_eq!(status, 0, "{transcript}");
+    assert!(
+        transcript.contains("Stopped (breakpoint 1) at <PROG>:4"),
+        "{transcript}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn issue1962_source_nested_file_preempts_the_sourcer() {
+    let _span = GateTestSpan::new();
+    let (dir, program) = program_file("sourcenested", ISSUE1962_SCRIPT);
+    let inner = dir.join("inner.cmds");
+    std::fs::write(&inner, "continue\n").expect("write inner file");
+    let outer = dir.join("outer.cmds");
+    std::fs::write(
+        &outer,
+        format!("source {}\nbreak 4\n", inner.to_string_lossy()),
+    )
+    .expect("write outer file");
+    // The nested file's `continue` runs before the outer file's
+    // remaining `break 4` line: the resume spends the serve with
+    // no breakpoint set, so nothing ever stops.
+    let commands = format!("source {}\n", outer.to_string_lossy());
+    let (status, transcript) = run_cli(&program, &commands);
+    assert_eq!(status, 0, "{transcript}");
+    assert!(!transcript.contains("Stopped (breakpoint"), "{transcript}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn issue1962_source_missing_file_reports_and_the_session_lives() {
+    let _span = GateTestSpan::new();
+    let (dir, program) = program_file("sourcemissing", ISSUE1962_SCRIPT);
+    let (status, transcript) = run_cli(
+        &program,
+        "source /nonexistent-1962/nope.cmds\nbreak 4\ncontinue\ncontinue\n",
+    );
+    assert_eq!(status, 0, "{transcript}");
+    assert!(
+        transcript.contains("source: cannot read '/nonexistent-1962/nope.cmds'"),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("Stopped (breakpoint 1) at <PROG>:4"),
+        "{transcript}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
