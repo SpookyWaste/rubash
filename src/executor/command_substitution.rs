@@ -2049,9 +2049,8 @@ impl Executor {
         // Linux open(2) reports — posix_errors.rs), so it is the whole
         // internal_error payload; the substitution is empty, rc 1.
         let fail = |file_word: &str, error: std::io::Error| -> String {
-            let payload = crate::posix_errors::message(&crate::posix_errors::path_error(
-                file_word, error,
-            ));
+            let payload =
+                crate::posix_errors::message(&crate::posix_errors::path_error(file_word, error));
             let diagnostic = format!("{}{}\n", self.diagnostic_prefix(), payload);
             self.write_diagnostic_fd2(diagnostic.as_bytes());
             self.last_command_substitution_status.set(Some(1));

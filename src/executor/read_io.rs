@@ -670,7 +670,9 @@ impl Executor {
             // dropping the whole record at this boundary.
             // Q11 /proc P1: synthetic files are served before the filesystem
             // (docs/proc-vfs-plan.md hook B).
-            let input = if let Some(bytes) = crate::special_paths::synthetic_proc_content(&expanded_target) {
+            let input = if let Some(bytes) =
+                crate::special_paths::synthetic_proc_content(&expanded_target)
+            {
                 crate::executor::substitution_metadata::bytes_to_shell_text(&bytes)
             } else if let Some((bytes, _, _)) = procsub_taken {
                 // `<(cmd)` carrier path: the word names a draining
