@@ -3813,3 +3813,46 @@ mod issue_1917 {
         assert_eq!(stdout, "root:111\nself:111\npids:many", "stderr:\n{stderr}");
     }
 }
+
+/// rubash#1918: /proc/<pid>/status PPid was fabricated (self answered
+/// 0, every other pid answered the shell's own pid) while the ToolHelp
+/// snapshot's real parent field was discarded. The pin builds a KNOWN
+/// parent/child pair — this shell and a child shell it spawns — and
+/// requires the child's self-reported PPid to equal this shell's $$,
+/// plus this shell's own PPid to be a real third party (nonzero, not
+/// itself). Holds on Linux too (real procfs truth), so it guards both.
+mod issue_1918 {
+    use super::*;
+
+    fn run(dir: &Path, code: &str) -> (String, String, Option<i32>) {
+        let out = run_rubash_in(dir, &["-c", code], Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    #[test]
+    fn issue1918_a3_ppid_known_parent_child() {
+        let dir = case_scratch("1918-a3");
+        std::fs::write(
+            dir.join("child.sh"),
+            "while IFS= read -r line; do\n\
+             case $line in\n\
+             PPid:*) set -- ${line#PPid:}; echo \"$1\"; break;;\n\
+             esac\n\
+             done < /proc/self/status\n",
+        )
+        .expect("write child.sh");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "child=$(\"${THIS_SH}\" ./child.sh); \
+             if [ \"$child\" = \"$$\" ]; then echo CHILD-OK; else echo \"CHILD-BAD:$child/$$\"; fi; \
+             while IFS= read -r line; do case $line in PPid:*) set -- ${line#PPid:}; mine=$1;; esac; done < /proc/self/status; \
+             if [ -n \"$mine\" ] && [ \"$mine\" != 0 ] && [ \"$mine\" != \"$$\" ]; then echo SELF-OK; else echo \"SELF-BAD:$mine\"; fi",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "CHILD-OK\nSELF-OK", "stderr:\n{stderr}");
+    }
+}

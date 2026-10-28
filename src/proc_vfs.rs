@@ -122,7 +122,7 @@ fn parse_pid_spelling(path: &str) -> Option<(PidRef, &str)> {
 fn pid_ref_alive(pid_ref: PidRef) -> bool {
     match pid_ref {
         PidRef::SelfPid => true,
-        PidRef::Pid(pid) => pid != 0 && snapshot_identity(pid).is_some(),
+        PidRef::Pid(pid) => pid != 0 && snapshot_entry(pid).is_some(),
     }
 }
 
@@ -219,37 +219,165 @@ fn proc_pid_file(pid: u32, tail: &str) -> Option<Vec<u8>> {
     if pid == 0 {
         return None;
     }
+    // rubash#1917 §4.2: the self face never pays for a system-wide
+    // ToolHelp snapshot — every self entry is a direct self query.
+    if pid == std::process::id() {
+        return proc_self_file(tail);
+    }
     // Unknown pid: the directory probe (tail == "") must report missing, and
     // so must any file under it -- procfs dirs vanish when the process does.
-    let Some((image, mut cmdline)) = pid_identity(pid) else {
-        return None;
-    };
+    let entry = snapshot_entry(pid)?;
     match tail {
         // NUL-separated argv, per procfs; the reader splits on '\0'.
-        "cmdline" => {
-            if cmdline.is_empty() {
-                cmdline = image.clone().into_bytes();
-                cmdline.push(0);
-            }
-            Some(cmdline)
-        }
-        "status" => Some(pid_status(pid, &image).into_bytes()),
+        "cmdline" => Some(pid_cmdline(pid, &entry)),
+        "status" => Some(pid_status(pid, &entry.image, entry.parent_pid).into_bytes()),
         "" => Some(Vec::new()),
         _ => None,
     }
 }
 
-/// Image name + command line for `pid` via the ToolHelp snapshot. The
-/// snapshot only knows the image name, so cmdline is the image NUL-terminated.
+/// The /proc/self face: direct self queries only, zero ToolHelp
+/// snapshots (rubash#1917 §4.2 budget, pinned by unit test).
 #[cfg(windows)]
-fn pid_identity(pid: u32) -> Option<(String, Vec<u8>)> {
-    snapshot_identity(pid)
+fn proc_self_file(tail: &str) -> Option<Vec<u8>> {
+    match tail {
+        "" => Some(Vec::new()),
+        "status" => {
+            let own = std::process::id();
+            match self_image_name() {
+                Some(image) => Some(pid_status(own, &image, own_parent_pid()).into_bytes()),
+                None => snapshot_entry(own)
+                    .map(|entry| pid_status(own, &entry.image, entry.parent_pid).into_bytes()),
+            }
+        }
+        "cmdline" => Some(self_cmdline()),
+        _ => None,
+    }
 }
 
-/// ToolHelp snapshot: the process's image name as argv[0] (NUL-terminated),
-/// or None when the pid does not exist.
+/// The shell process's own image (base) name, from the module path —
+/// no snapshot needed.
 #[cfg(windows)]
-fn snapshot_identity(pid: u32) -> Option<(String, Vec<u8>)> {
+fn self_image_name() -> Option<String> {
+    std::env::current_exe()
+        .ok()?
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+/// The shell process's own parent pid, asked once and cached: the
+/// kernel records it at process creation, so it cannot change over
+/// the process's life. The query is NtQueryInformationProcess on the
+/// current process (the same technique the executor's $PPID binding
+/// uses, support_names.rs) with the ToolHelp snapshot as fallback —
+/// never a fabricated value (rubash#1918).
+#[cfg(windows)]
+fn own_parent_pid() -> u32 {
+    static CACHE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        nt_own_parent_pid()
+            .or_else(|| snapshot_entry(std::process::id()).map(|entry| entry.parent_pid))
+            .unwrap_or(0)
+    })
+}
+
+#[cfg(windows)]
+fn nt_own_parent_pid() -> Option<u32> {
+    use std::ffi::c_void;
+
+    // Field layout mirrors the PROCESS_BASIC_INFORMATION the executor's
+    // $PPID path already relies on (support_names.rs): the two-word
+    // affinity slot also covers BasePriority, so UniqueProcessId and
+    // InheritedFromUniqueProcessId land at their true offsets.
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct ProcessBasicInformation {
+        ExitStatus: *mut c_void,
+        PebBaseAddress: *mut c_void,
+        AffinityMask: [*mut c_void; 2],
+        UniqueProcessId: usize,
+        InheritedFromUniqueProcessId: usize,
+    }
+
+    extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn NtQueryInformationProcess(
+            process: *mut c_void,
+            process_information_class: u32,
+            process_information: *mut c_void,
+            process_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+    }
+
+    const PROCESS_BASIC_INFORMATION: u32 = 0;
+    let mut info = unsafe { std::mem::zeroed::<ProcessBasicInformation>() };
+    let mut returned = 0u32;
+    let status = unsafe {
+        NtQueryInformationProcess(
+            GetCurrentProcess(),
+            PROCESS_BASIC_INFORMATION,
+            &mut info as *mut _ as *mut c_void,
+            std::mem::size_of::<ProcessBasicInformation>() as u32,
+            &mut returned,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    u32::try_from(info.InheritedFromUniqueProcessId)
+        .ok()
+        .filter(|pid| *pid != 0)
+}
+
+/// The fallback cmdline shape: the image name, NUL-terminated (the
+/// only argv the ToolHelp snapshot knows). Used wherever the true
+/// command line cannot be read; the SHAPE never changes, only the
+/// content's fidelity (rubash#1917 §3.1).
+#[cfg(windows)]
+fn image_cmdline_fallback(image: &str) -> Vec<u8> {
+    let mut cmdline = image.as_bytes().to_vec();
+    cmdline.push(0);
+    cmdline
+}
+
+/// Another process's cmdline bytes. (The PEB true-argv read lands in
+/// the rubash#1917 cmdline slice; until then, and as its failure
+/// fallback after, this is the snapshot shape.)
+#[cfg(windows)]
+fn pid_cmdline(_pid: u32, entry: &SnapshotEntry) -> Vec<u8> {
+    image_cmdline_fallback(&entry.image)
+}
+
+/// The shell's own cmdline bytes. (The GetCommandLineW true-argv read
+/// lands in the rubash#1917 cmdline slice; until then, and as its
+/// failure fallback after, this is the snapshot shape — sourced from
+/// the module path so the self face stays snapshot-free.)
+#[cfg(windows)]
+fn self_cmdline() -> Vec<u8> {
+    match self_image_name() {
+        Some(image) => image_cmdline_fallback(&image),
+        None => snapshot_entry(std::process::id())
+            .map(|entry| image_cmdline_fallback(&entry.image))
+            .unwrap_or_default(),
+    }
+}
+
+/// One process's ToolHelp snapshot record: image name and the REAL
+/// parent pid the kernel recorded at its creation
+/// (PROCESSENTRY32W.th32ParentProcessID — rubash#1918: this field was
+/// previously read by the walk and thrown away, while pid_status
+/// fabricated a PPid).
+#[cfg(windows)]
+struct SnapshotEntry {
+    image: String,
+    parent_pid: u32,
+}
+
+/// ToolHelp snapshot walk for one pid, or None when the pid does not
+/// exist.
+#[cfg(windows)]
+fn snapshot_entry(pid: u32) -> Option<SnapshotEntry> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -266,7 +394,10 @@ fn snapshot_identity(pid: u32) -> Option<(String, Vec<u8>)> {
             loop {
                 if entry.th32ProcessID == pid {
                     let len = entry.szExeFile.iter().position(|c| *c == 0).unwrap_or(0);
-                    found = Some(String::from_utf16_lossy(&entry.szExeFile[..len]));
+                    found = Some(SnapshotEntry {
+                        image: String::from_utf16_lossy(&entry.szExeFile[..len]),
+                        parent_pid: entry.th32ParentProcessID,
+                    });
                     break;
                 }
                 if Process32NextW(snapshot, &mut entry) == 0 {
@@ -276,21 +407,16 @@ fn snapshot_identity(pid: u32) -> Option<(String, Vec<u8>)> {
         }
         CloseHandle(snapshot);
     }
-    found.map(|image| {
-        let mut cmdline = image.clone().into_bytes();
-        cmdline.push(0);
-        (image, cmdline)
-    })
+    found
 }
 
 /// Linux /proc/<pid>/status field set (name/state/pid/ppid/threads...).
+/// The PPid is the snapshot's recorded creator pid, passed in by the
+/// caller — this function invents nothing (rubash#1918: the previous
+/// body answered 0 for self and the shell's own pid for everyone else,
+/// while the true value sat unused in the same snapshot record).
 #[cfg(windows)]
-fn pid_status(pid: u32, image: &str) -> String {
-    let ppid = if pid == std::process::id() {
-        0
-    } else {
-        std::process::id()
-    };
+fn pid_status(pid: u32, image: &str, ppid: u32) -> String {
     format!(
         "Name:\t{image}\n\
          State:\tS (sleeping)\n\
@@ -793,6 +919,53 @@ mod tests {
             assert_eq!(toolhelp_snapshot_count(), 0, "self dir enumeration");
             let _ = proc_dir_entries("/proc");
             assert_eq!(toolhelp_snapshot_count(), 1, "root enumeration");
+        }
+    }
+
+    /// rubash#1917 §4.2 budget, self leg: after the one-time own-parent
+    /// cache is warm, every /proc/self face is served with zero
+    /// ToolHelp snapshots.
+    #[test]
+    fn self_face_uses_no_snapshot() {
+        if cfg!(windows) {
+            let _ = proc_file_content("/proc/self/status"); // warm the parent cache
+            reset_toolhelp_snapshot_count();
+            let _ = proc_file_content("/proc/self/status");
+            let _ = proc_file_content("/proc/self/cmdline");
+            let _ = proc_file_content("/proc/self");
+            assert_eq!(toolhelp_snapshot_count(), 0);
+        }
+    }
+
+    fn ppid_field(status_text: &str) -> u32 {
+        status_text
+            .lines()
+            .find(|line| line.starts_with("PPid:"))
+            .and_then(|line| line["PPid:".len()..].trim().parse().ok())
+            .expect("status carries a numeric PPid")
+    }
+
+    /// rubash#1918: the status PPid is the snapshot's recorded creator
+    /// pid — for self AND for another live pid (pre-fix, self answered
+    /// the fabricated 0 and every other pid answered the shell's own
+    /// pid; both shapes fail the exact-equality checks below).
+    /// (Attribute-gated rather than `if cfg!`: it calls the
+    /// Windows-only snapshot walk directly.)
+    #[cfg(windows)]
+    #[test]
+    fn status_ppid_is_snapshot_truth() {
+        {
+            let own = std::process::id();
+            let own_entry = snapshot_entry(own).expect("own snapshot entry");
+            assert_eq!(ppid_field(&text("/proc/self/status")), own_entry.parent_pid);
+            assert_ne!(own_entry.parent_pid, 0);
+            let parent = own_entry.parent_pid;
+            let parent_entry = snapshot_entry(parent).expect("parent snapshot entry");
+            assert_eq!(
+                ppid_field(&text(&format!("/proc/{parent}/status"))),
+                parent_entry.parent_pid,
+                "another pid's PPid must be ITS parent, not the shell's pid"
+            );
         }
     }
 }
