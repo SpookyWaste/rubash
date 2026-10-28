@@ -2053,6 +2053,9 @@ impl Executor {
         // fragment's subscript side effects run once (GNU param_expand).
         // The word-context id keys the fragment sites for this word.
         let _xpass = crate::executor::expand_braced_indices::SubXpassFrame::new();
+        // R2: one memo scope for the pure word-text scans of this pass
+        // (word_scan_memo) — same lifetime as the subscript memo above.
+        let _scan_memo = crate::executor::word_scan_memo::WordScanMemoFrame::new();
         let _wctx = crate::executor::expand_braced_indices::WordCtxGuard::new(
             crate::executor::expand_braced_indices::next_word_ctx(),
         );
@@ -2514,8 +2517,8 @@ impl Executor {
         // without one, expand_braces returns the single-word vec, so the
         // `.contains('{')` admission is equivalence-preserving and keeps the
         // Vec+String allocation off words that can never brace-expand.
-        let raw_has_braces = raw
-            .is_some_and(|r| r.contains('{') && crate::expand::braces::expand_braces(r).len() > 1);
+        let raw_has_braces =
+            raw.is_some_and(|r| r.contains('{') && expand_braces_memoized(r).len() > 1);
         if (!quoted_whole_word || raw_has_braces) && raw.is_some() && self.is_brace_expand_enabled()
         // GNU runs brace expansion before parameter expansion, so a
         // dollar-brace in the word does not suppress it: the dollar-brace
@@ -4058,49 +4061,12 @@ fn compound_assignment_operand_word(cmd: &CommandNode, index: usize, word: &str)
 }
 
 fn raw_word_contains_process_substitution(raw: Option<&str>) -> bool {
-    let Some(raw) = raw else {
-        return false;
-    };
-    // Whitelist admission (rubash#117 discipline): the DFA below only
-    // reports `<(`/`>(` outside quotes. Without either byte pair no arm
-    // can fire, so skip the char-collect + scan. A present pair runs the
-    // full quote-aware scan unchanged.
-    if !raw.contains("<(") && !raw.contains(">(") {
-        return false;
-    }
-    let chars = raw.chars().collect::<Vec<_>>();
-    let mut index = 0usize;
-    let mut single = false;
-    let mut double = false;
-    let mut escaped = false;
-    while index < chars.len() {
-        let ch = chars[index];
-        if escaped {
-            escaped = false;
-            index += 1;
-            continue;
-        }
-        if ch == '\\' && !single {
-            escaped = true;
-            index += 1;
-            continue;
-        }
-        if ch == '\'' && !double {
-            single = !single;
-            index += 1;
-            continue;
-        }
-        if ch == '"' && !single {
-            double = !double;
-            index += 1;
-            continue;
-        }
-        if !single && !double && matches!(ch, '<' | '>') && chars.get(index + 1) == Some(&'(') {
-            return true;
-        }
-        index += 1;
-    }
-    false
+    // Sole implementation: the parser's quote-aware DFA (subst.c:11349-
+    // 11378 `expand_word_internal` cases '<' and '>'). This Option adapter
+    // and the external_setup call sites used to carry verbatim copies of
+    // the same scan; all of them now delegate to the one implementation so
+    // the answers can never drift apart.
+    raw.is_some_and(crate::parser::raw_word_has_unquoted_process_substitution)
 }
 
 /// Whether the raw source of an associative element-assignment word
@@ -4149,13 +4115,28 @@ fn expanded_word_has_process_substitution(word: &str) -> bool {
         .is_empty()
 }
 
+/// `expand_braces` under the per-word-pass memo (word_scan_memo): the
+/// admission trial in `expand_command_word` runs a full brace expansion
+/// of the raw text, and the real pass below used to run it again (plus
+/// once more on the cooked word). `expand_braces` is a pure textual
+/// rewrite (braces.c brace_expand consults no shell state), so the
+/// cached result is the same result.
+fn expand_braces_memoized(text: &str) -> std::rc::Rc<Vec<String>> {
+    if let Some(memoized) = crate::executor::word_scan_memo::memo_brace_expansion(text) {
+        return memoized;
+    }
+    let expansion = std::rc::Rc::new(crate::expand::braces::expand_braces(text));
+    crate::executor::word_scan_memo::memo_store_brace_expansion(text, expansion.clone());
+    expansion
+}
+
 pub(in crate::executor) fn expand_braces_with_optional_raw(
     word: &str,
     raw: Option<&str>,
 ) -> Vec<String> {
     if let Some(raw) = raw {
         if raw != word {
-            let braced = crate::expand::braces::expand_braces(raw);
+            let braced = expand_braces_memoized(raw);
             // GNU braces.c brace_expand is a textual rewrite of the word;
             // when it returns the raw word byte-identical there IS no
             // expansion product, so the pass must be transparent: the word
@@ -4179,21 +4160,21 @@ pub(in crate::executor) fn expand_braces_with_optional_raw(
                 // render literally, matching GNU bash, while real brace
                 // expansion still yields multiple words.
                 let mut stripped: Vec<String> = Vec::new();
-                for item in braced {
-                    stripped.push(crate::lexer::remove_shell_quotes(&item));
+                for item in braced.iter() {
+                    stripped.push(crate::lexer::remove_shell_quotes(item));
                 }
                 return stripped;
             }
             // When raw has escaped braces that prevent expansion,
             // but word has lost the escapes and would expand, preserve the
             // raw result to avoid incorrect brace expansion.
-            if crate::expand::braces::expand_braces(word).len() > 1 {
+            if expand_braces_memoized(word).len() > 1 {
                 return vec![word.to_string()];
             }
         }
     }
 
-    let braced = crate::expand::braces::expand_braces(word);
+    let braced = expand_braces_memoized(word);
     // GNU bash runs brace expansion on the raw word (backslash escapes
     // intact) and applies quote removal to each result word afterwards
     // (subst.c brace expansion runs before the quote-removal pass on the
@@ -4202,22 +4183,33 @@ pub(in crate::executor) fn expand_braces_with_optional_raw(
     // \{a,b} must yield {a,b} once no expansion is possible.
     if braced.len() > 1 {
         braced
-            .into_iter()
-            .map(|item| crate::lexer::remove_shell_quotes(&item))
+            .iter()
+            .map(|item| crate::lexer::remove_shell_quotes(item))
             .collect()
     } else if word_contains_brace_group(word) {
         // A brace group can be syntactically present without producing
         // multiple words; quote removal still applies to its escaped text.
         braced
-            .into_iter()
-            .map(|item| crate::lexer::remove_shell_quotes(&item))
+            .iter()
+            .map(|item| crate::lexer::remove_shell_quotes(item))
             .collect()
     } else {
-        braced
+        (*braced).clone()
     }
 }
 
 fn word_contains_brace_group(word: &str) -> bool {
+    // R2 memo (word_scan_memo): pure function of the text; the brace pass
+    // asks it of the raw and then the cooked word in sequence.
+    if let Some(memoized) = crate::executor::word_scan_memo::memo_word_contains_brace_group(word) {
+        return memoized;
+    }
+    let contains = word_contains_brace_group_scan(word);
+    crate::executor::word_scan_memo::memo_store_word_contains_brace_group(word, contains);
+    contains
+}
+
+fn word_contains_brace_group_scan(word: &str) -> bool {
     // GNU braces.c brace_expand: braces inside a `${...}`/`$(...)` body are
     // expansion syntax, not brace-expansion candidates -- `a${u-{x,y}}z`
     // renders literally and `declare a=("${x[@]}" "y")` must not be dequoted
@@ -4621,6 +4613,18 @@ pub(in crate::executor) fn raw_word_is_quoted(raw: Option<&str>) -> bool {
     let Some(raw) = raw else {
         return false;
     };
+    // R2 memo (word_scan_memo): the answer is a pure function of the raw
+    // text, and one word pass asks it at the `$@` / `$*` / `${*}` gates,
+    // the braced-alternate gate and the backtick gate in sequence.
+    if let Some(memoized) = crate::executor::word_scan_memo::memo_raw_word_is_quoted(raw) {
+        return memoized;
+    }
+    let quoted = raw_word_is_quoted_scan(raw);
+    crate::executor::word_scan_memo::memo_store_raw_word_is_quoted(raw, quoted);
+    quoted
+}
+
+fn raw_word_is_quoted_scan(raw: &str) -> bool {
     // Fast reject (rubash#437): the answer can only be true when the word
     // contains a quote byte or a `$`/backtick that could introduce a quoted
     // span. Loop bodies are dominated by plain `$i`/`$((...))`/`[` words

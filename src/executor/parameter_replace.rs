@@ -902,6 +902,8 @@ fn ansic_quote_bytes(bytes: &[u8]) -> String {
 }
 
 fn push_ansic_escaped_chars(output: &mut String, chars: impl Iterator<Item = char>) {
+    // R8: one locale read per walk, not per character.
+    let utf8 = crate::locale::is_utf8();
     for ch in chars {
         match ch {
             crate::executor::markers::QUOTED_WORD_PREFIX => output.push_str("\\E"),
@@ -914,7 +916,7 @@ fn push_ansic_escaped_chars(output: &mut String, chars: impl Iterator<Item = cha
             '\t' => output.push_str("\\t"),
             '\\' => output.push_str("\\\\"),
             '\'' => output.push_str("\\'"),
-            c if is_ansic_printable(c) => output.push(c),
+            c if is_ansic_printable(c, utf8) => output.push(c),
             c => {
                 let mut buffer = [0u8; 4];
                 for byte in c.encode_utf8(&mut buffer).as_bytes() {
@@ -929,10 +931,12 @@ fn push_ansic_escaped_chars(output: &mut String, chars: impl Iterator<Item = cha
 /// the string contains any character that is not printable in the locale
 /// (ISPRINT for ASCII bytes, iswprint for the rest).
 fn ansic_should_quote_value(value: &str) -> bool {
-    value.chars().any(|ch| !is_ansic_printable(ch))
+    // R8: one locale read per walk, not per character.
+    let utf8 = crate::locale::is_utf8();
+    value.chars().any(|ch| !is_ansic_printable(ch, utf8))
 }
 
-fn is_ansic_printable(ch: char) -> bool {
+fn is_ansic_printable(ch: char, utf8: bool) -> bool {
     if ch.is_ascii() {
         (0x20..=0x7e).contains(&(ch as u8))
     } else {
@@ -942,7 +946,7 @@ fn is_ansic_printable(ch: char) -> bool {
         // (strtrans.c:266-282) is the UTF-8-locale branch, and under
         // LC_ALL=C every byte >= 0x80 is escaped octal instead
         // (rubash#1464).
-        crate::locale::is_utf8() && !ch.is_control()
+        utf8 && !ch.is_control()
     }
 }
 
@@ -951,6 +955,8 @@ fn is_ansic_printable(ch: char) -> bool {
 /// copied verbatim, and every other byte rendered as a 3-digit octal escape.
 fn ansic_quote_value(value: &str) -> String {
     let mut output = String::from("$'");
+    // R8: one locale read per walk, not per character.
+    let utf8 = crate::locale::is_utf8();
     for ch in value.chars() {
         match ch {
             crate::executor::markers::QUOTED_WORD_PREFIX => output.push_str("\\E"),
@@ -963,7 +969,7 @@ fn ansic_quote_value(value: &str) -> String {
             '\t' => output.push_str("\\t"),
             '\\' => output.push_str("\\\\"),
             '\'' => output.push_str("\\'"),
-            c if is_ansic_printable(c) => output.push(c),
+            c if is_ansic_printable(c, utf8) => output.push(c),
             c => {
                 // GNU walks unsigned bytes; each non-printable byte becomes
                 // \NNN, so encode the UTF-8 byte sequence byte-for-byte.

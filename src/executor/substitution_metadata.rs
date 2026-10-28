@@ -835,6 +835,22 @@ pub(in crate::executor) struct SubstitutionSpan {
 
 #[allow(dead_code)]
 pub(in crate::executor) fn scan_substitution_spans(raw: &str) -> Vec<SubstitutionSpan> {
+    // R2 memo (word_scan_memo): the span set is a pure function of the
+    // raw text, and one word pass asks for it in the fragment-split path
+    // and again in the quote-context derivation.
+    if let Some(memoized) = crate::executor::word_scan_memo::memo_substitution_spans(raw) {
+        return (*memoized).clone();
+    }
+    let spans = scan_substitution_spans_scan(raw);
+    crate::executor::word_scan_memo::memo_store_substitution_spans(
+        raw,
+        std::rc::Rc::new(spans.clone()),
+    );
+    spans
+}
+
+#[allow(dead_code)]
+fn scan_substitution_spans_scan(raw: &str) -> Vec<SubstitutionSpan> {
     // Whitelist admission (rubash#117 discipline): a span can only open on
     // `$(` or a backtick (the quote arms below only skip). With neither
     // byte present the scan provably finds nothing, so skip the

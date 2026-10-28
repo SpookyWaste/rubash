@@ -52,6 +52,9 @@ impl Executor {
         // expansions reaching here inside an enclosing word keep that
         // word's context so their nested sites stay under its path.
         let _xpass = crate::executor::expand_braced_indices::SubXpassFrame::new();
+        // R2: one memo scope for the pure word-text scans of this pass
+        // (word_scan_memo) — same lifetime as the subscript memo above.
+        let _scan_memo = crate::executor::word_scan_memo::WordScanMemoFrame::new();
         let _wctx = crate::executor::expand_braced_indices::WordCtxGuard::new_if_absent();
         self.apply_parameter_assignment_expansions_in_word(word);
 

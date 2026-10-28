@@ -179,6 +179,7 @@ mod type_functions;
 mod unset_arrays;
 mod variable_state;
 mod windows_drive;
+mod word_scan_memo;
 
 mod alias_helpers;
 pub(crate) mod assignment_helpers;
