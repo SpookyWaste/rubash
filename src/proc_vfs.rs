@@ -1418,12 +1418,14 @@ mod tests {
             argv0.ends_with(&image),
             "argv[0] {argv0:?} should end with the image name {image:?}"
         );
-        // The test binary is invoked with arguments by the harness, so
-        // a true argv has more than the lone image-name field the
-        // snapshot fallback produces.
+        // The fallback shape is the BARE image name as the only
+        // field; the true read yields argv[0] as invoked — a full
+        // path. (The harness may invoke the test binary with no
+        // arguments at all, so a field-count premise would be wrong;
+        // path-vs-bare-name is the discriminator that always holds.)
         assert!(
-            fields.len() > 1,
-            "true argv has the harness's arguments, got {fields:?}"
+            argv0 != image && argv0.contains('\\'),
+            "true argv[0] is the invocation path, not the bare-name fallback: {argv0:?}"
         );
         let entry = snapshot_entry(std::process::id()).expect("own snapshot entry");
         assert_eq!(pid_cmdline(std::process::id(), &entry), self_cmdline());
