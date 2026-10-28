@@ -1176,7 +1176,7 @@ impl Executor {
                 escape_aware,
                 raw,
             ) {
-                if let Some((_, offset)) = self.fd_table.input_snapshot(fd) {
+                if let Some(offset) = self.fd_table.input_offset(fd) {
                     self.shell_state
                         .env_vars
                         .insert(fd_stdin_offset_key(fd), offset.to_string());

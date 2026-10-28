@@ -186,7 +186,7 @@ impl Executor {
             .env_vars
             .contains_key("__RUBASH_SCRIPT_NAME")
             && !self.shell_state.env_vars.contains_key(FUNCTION_STDIN)
-            && self.fd_table.input_snapshot(0).is_none()
+            && self.fd_table.input_offset(0).is_none()
             && !expanded_is_this_shell
         {
             return Ok(false);
