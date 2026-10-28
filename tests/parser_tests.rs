@@ -2408,13 +2408,6 @@ mod conditional_tests {
             .unwrap()
             .extglob_patterns
             .is_empty());
-        assert!(regex
-            .expression
-            .pattern_operand
-            .as_ref()
-            .unwrap()
-            .brace_expansions
-            .is_empty());
         assert_eq!(capture.expression.kind, ConditionalExpressionKind::Binary);
         assert_eq!(capture.expression.operator.as_deref(), Some("=~"));
         assert_eq!(capture.expression.operands, ["2:bad", "^([0-9]+):(.*)"]);

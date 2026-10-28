@@ -316,9 +316,9 @@ pub struct ConditionalPatternOperand {
     pub kind: ConditionalPatternKind,
     pub operators: Vec<String>,
     pub extglob_patterns: Vec<ExtglobPattern>,
-    pub brace_expansions: Vec<BraceExpansion>,
-    pub parameter_expansions: Vec<ParameterExpansion>,
-    pub arithmetic_expansions: Vec<ArithmeticExpansion>,
+    // The brace / parameter / arithmetic operand records are removed
+    // (redundancy R4): empty on every instance, zero readers in
+    // either repo — the executor re-derives them from the text.
     pub has_glob: bool,
     pub has_extglob: bool,
 }
@@ -339,15 +339,10 @@ impl ConditionalPatternOperand {
         } else {
             Vec::new()
         };
-        // wt44/parse4: the brace / parameter / arithmetic operand records
-        // have zero readers (see WordMetadata::new) and stay empty.
         Self {
             has_glob: case_pattern_has_glob(&operators),
             has_extglob: case_pattern_has_extglob(&operators),
             extglob_patterns,
-            brace_expansions: Vec::new(),
-            parameter_expansions: Vec::new(),
-            arithmetic_expansions: Vec::new(),
             text,
             kind,
             operators,
@@ -864,9 +859,9 @@ pub struct CasePattern {
     pub operators: Vec<String>,
     pub operator_metadata: Vec<WordMetadata>,
     pub extglob_patterns: Vec<ExtglobPattern>,
-    pub brace_expansions: Vec<BraceExpansion>,
-    pub parameter_expansions: Vec<ParameterExpansion>,
-    pub arithmetic_expansions: Vec<ArithmeticExpansion>,
+    // The brace / parameter / arithmetic records are removed
+    // (redundancy R4): empty on every instance, zero readers in
+    // either repo.
     pub clause_index: usize,
     pub pattern_index: usize,
     pub has_glob: bool,
@@ -897,11 +892,6 @@ impl CasePattern {
             operators,
             operator_metadata,
             extglob_patterns: super::extglob_patterns_in_word_with_raw(&text, &raw_text),
-            // wt44/parse4: zero-reader records stay empty (see
-            // WordMetadata::new).
-            brace_expansions: Vec::new(),
-            parameter_expansions: Vec::new(),
-            arithmetic_expansions: Vec::new(),
             raw_text,
             text,
             clause_index,
