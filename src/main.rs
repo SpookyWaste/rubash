@@ -72,7 +72,7 @@ fn run_main() -> i32 {
     // process as a handshake consumer, which licenses the wrapper spawn
     // site to attach the argv flag to respawns; host CLIs that never call
     // this get env-only respawns and never see the niu-specific flag.
-    rubash::builtins::kill::consume_background_wrapper_handshake(&mut args);
+    rubash::script_driver::consume_background_wrapper_handshake(&mut args);
     // rubash#1035: an asynchronous-job respawn starts with SIGINT/SIGQUIT
     // ignored (GNU execute_cmd.c setup_async_signals, job_control == 0).
     // Consume the spawn-site marker here — before the executor seeds the
