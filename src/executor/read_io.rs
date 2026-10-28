@@ -570,13 +570,54 @@ impl Executor {
                 );
             }
 
+            // rubash#1917/#1900: synthetic /proc targets are judged by
+            // the registry on their SHELL spelling, before any path
+            // translation. The translated path's metadata never exists
+            // for them on Windows, so the gate below misrouted them
+            // into the device branch and the read failed (or read
+            // empty) — the same ladder-skip family as rubash#1904's
+            // $(<file) face. Content slurps here, exactly as the serve
+            // further down does; a link resolves to its native target
+            // and continues through the ordinary file flow with it
+            // (the session cwd answers for self/cwd, per G-02).
+            if let Some(bytes) = crate::special_paths::synthetic_proc_content(&expanded_target) {
+                let input = crate::executor::substitution_metadata::bytes_to_shell_text(&bytes);
+                if input.is_empty() {
+                    return None;
+                }
+                self.read_eof_no_delimiter |= slurped_record_eof_no_delimiter(
+                    &input,
+                    delimiter,
+                    char_limit,
+                    exact_char_limit,
+                    escape_aware,
+                    raw,
+                );
+                return Some(trim_read_input(
+                    input,
+                    delimiter,
+                    char_limit,
+                    exact_char_limit,
+                    escape_aware,
+                    raw,
+                ));
+            }
+            let link_native = crate::special_paths::synthetic_link_target(
+                &expanded_target,
+                Some(&crate::proc_vfs::self_cwd_forms(self.session_cwd())),
+            )
+            .map(|link| link.native);
+
             // niubash#177: same operand resolution as open_input_redirect —
             // a virtual-root input operand may exist only under its `.exe`
             // spelling on disk.
-            let path = self.session_path(crate::executor::path::windows_operand_file_path(
-                shell_path_to_windows(&expanded_target, &self.shell_state.env_vars),
-                &self.shell_state.env_vars,
-            ));
+            let path = match &link_native {
+                Some(native) => std::path::PathBuf::from(native),
+                None => self.session_path(crate::executor::path::windows_operand_file_path(
+                    shell_path_to_windows(&expanded_target, &self.shell_state.env_vars),
+                    &self.shell_state.env_vars,
+                )),
+            };
             if redirect.append {
                 let _ = OpenOptions::new()
                     .create(true)

@@ -4113,3 +4113,322 @@ mod issue_1911 {
         );
     }
 }
+
+/// rubash#1917 A period (/proc fidelity & completion, design
+/// ~/workspace/vfs-1917-design/DESIGN.md §6.2): the synthetic /proc is
+/// a userland value-add layer, NOT a GNU contract surface — the
+/// expectations are the Linux procfs shapes downstream tools consume,
+/// checked against the real procfs on Linux and the simulation on
+/// Windows (the Windows face is the point of every pin here; where a
+/// pin also holds on Linux it guards both).
+mod issue_1917 {
+    use super::*;
+
+    fn run(dir: &Path, code: &str) -> (String, String, Option<i32>) {
+        let out = run_rubash_in(dir, &["-c", code], Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    /// A-1: /proc/version keeps its Linux shape (main-session ruling
+    /// 2026-10-28: the string stays Linux-form; corpus consumers key
+    /// on the prefix).
+    #[test]
+    fn issue1917_a1_version_shape() {
+        let dir = case_scratch("1917-a1");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "read -r line < /proc/version; case $line in 'Linux version '*) echo VER-OK;; *) echo VER-BAD;; esac",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "VER-OK", "stderr:\n{stderr}");
+    }
+
+    /// A-1b: the read faces of synthetic content, one vehicle per
+    /// invocation so a failure names its face. (Added when A-1's
+    /// simple-read vehicle failed on Windows CI while the comsub
+    /// quick-read of the same content passed — the faces do not share
+    /// one resolution path, so they are pinned separately.)
+    #[test]
+    fn issue1917_a1b_read_faces() {
+        let dir = case_scratch("1917-a1b");
+        let faces: &[(&str, &str, &str)] = &[
+            (
+                "simple-read-top",
+                "read -r l < /proc/meminfo; case $l in MemTotal:*) echo OK;; *) echo \"BAD:[$l]\";; esac",
+                "OK",
+            ),
+            (
+                "simple-read-pid",
+                "read -r l < /proc/self/status; case $l in Name:*) echo OK;; *) echo \"BAD:[$l]\";; esac",
+                "OK",
+            ),
+            (
+                "cat-face",
+                "x=$(cat /proc/version); case $x in 'Linux version '*) echo OK;; *) echo \"BAD:[$x]\";; esac",
+                "OK",
+            ),
+            (
+                "exec-fd-face",
+                "exec 9</proc/version; read -r l <&9; case $l in 'Linux version '*) echo OK;; *) echo \"BAD:[$l]\";; esac",
+                "OK",
+            ),
+            (
+                "compound-face",
+                "while read -r l; do case $l in 'Linux version '*) echo OK; break;; *) echo \"BAD:[$l]\"; break;; esac; done < /proc/version",
+                "OK",
+            ),
+        ];
+        for (name, code, expected) in faces {
+            let (stdout, stderr, status) = run(&dir, code);
+            assert_eq!(
+                stdout, *expected,
+                "face {name}: status={status:?} stderr:\n{stderr}"
+            );
+        }
+    }
+
+    /// A-1c: the comsub `cat` shortcuts consult the registry — the
+    /// plain shortcut (A-1b's cat-face root cause: it fs::read the
+    /// mapped path directly and reported every synthetic file ENOENT
+    /// on Windows) and its timed sibling (`$(time cat …)`, whose arm
+    /// read the filesystem the same way and silently swallowed the
+    /// miss). The mixed face puts a SyntheticLink operand first:
+    /// /proc/self/cwd resolves through the registry to the session
+    /// directory, whose read fails (rc 1, as GNU's EISDIR read does),
+    /// and the following content operand must still land — pre-fix on
+    /// Windows both operands missed and the capture was empty. (A
+    /// direct /proc/self/exe capture face is deliberately absent:
+    /// capturing the whole running image through a substitution takes
+    /// ~40s for a debug binary, over the harness timeout; exe link
+    /// reading end to end is A-4's pin, and the shortcut's link branch
+    /// uses the same registry entry as external_cat.) On Linux the
+    /// real procfs masks both defects, exactly as for A-1/A-4;
+    /// Windows CI is the proof.
+    #[test]
+    fn issue1917_a1c_comsub_cat_registry_faces() {
+        let dir = case_scratch("1917-a1c");
+        let faces: &[(&str, &str, &str)] = &[
+            (
+                "comsub-cat-link-then-content",
+                "x=$(cat /proc/self/cwd /proc/version); rc=$?; case $x in 'Linux version '*) echo \"OK:$rc\";; *) echo \"BAD:[$x]:$rc\";; esac",
+                "OK:1",
+            ),
+            (
+                "timed-comsub-cat-content",
+                "x=$(time cat /proc/version); case $x in 'Linux version '*) echo OK;; *) echo \"BAD:[$x]\";; esac",
+                "OK",
+            ),
+            (
+                "timed-comsub-cat-status",
+                "x=$(time cat /proc/version); echo \"rc:$?\"",
+                "rc:0",
+            ),
+        ];
+        for (name, code, expected) in faces {
+            let (stdout, stderr, status) = run(&dir, code);
+            assert_eq!(
+                stdout, *expected,
+                "face {name}: status={status:?} stderr:\n{stderr}"
+            );
+        }
+    }
+
+    /// A-2: /proc/self/cmdline carries the TRUE argv — a known marker
+    /// argument placed on the shell's own command line must appear as
+    /// a NUL-separated field. Pre-fix on Windows the file contained
+    /// only the image name (the ToolHelp snapshot knows nothing else),
+    /// so the marker and the `-c` field were both absent.
+    #[test]
+    fn issue1917_a2_cmdline_true_argv() {
+        let dir = case_scratch("1917-a2");
+        let out = run_rubash_in(
+            &dir,
+            &[
+                "-c",
+                "while IFS= read -r -d '' a; do printf '%s|' \"$a\"; done < /proc/self/cmdline; echo END",
+                "rubash",
+                "MARKER1917A2",
+            ],
+            Duration::from_secs(30),
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.code, Some(0), "stderr:\n{stderr}");
+        assert!(
+            stdout.contains("MARKER1917A2"),
+            "known argv marker missing from cmdline:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("-c|"),
+            "the -c field of the true argv is missing:\n{stdout}"
+        );
+    }
+
+    /// A-7: an exited pid's /proc directory vanishes — files under it
+    /// fail like ENOENT and test -e answers false (procfs semantics,
+    /// both platforms).
+    #[test]
+    fn issue1917_a7_dead_pid_vanishes() {
+        let dir = case_scratch("1917-a7");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "\"${THIS_SH}\" -c 'exit 0' & p=$!; wait $p; \
+             if test -e /proc/$p/status; then echo STILL-THERE; else echo GONE-OK; fi; \
+             cat /proc/$p/status 2>/dev/null; echo catrc=$?",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "GONE-OK\ncatrc=1", "stderr:\n{stderr}");
+    }
+
+    /// A3: glob over /proc enumerates the synthetic root (file table +
+    /// self + live pids) and per-pid directories (entry table). Pre-fix
+    /// on Windows the pattern matched nothing and echoed literally.
+    #[test]
+    fn issue1917_a3_glob_proc_enumeration() {
+        let dir = case_scratch("1917-a3");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "hit_mem=; hit_self=; hit_pid=; \
+             for e in /proc/*; do case $e in /proc/meminfo) hit_mem=1;; /proc/self) hit_self=1;; /proc/$$) hit_pid=1;; esac; done; \
+             echo \"root:$hit_mem$hit_self$hit_pid\"; \
+             hit_exe=; hit_cwd=; hit_status=; \
+             for e in /proc/self/*; do case $e in /proc/self/exe) hit_exe=1;; /proc/self/cwd) hit_cwd=1;; /proc/self/status) hit_status=1;; esac; done; \
+             echo \"self:$hit_exe$hit_cwd$hit_status\"; \
+             set -- /proc/*/status; if [ $# -ge 2 ]; then echo pids:many; else echo pids:few; fi",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "root:111\nself:111\npids:many", "stderr:\n{stderr}");
+    }
+}
+
+/// rubash#1900: /proc/<pid>/exe and /proc/<pid>/cwd were not
+/// simulated at all — every face (open, test, glob) fell through to a
+/// filesystem that has no such names on Windows. The pins assert the
+/// link semantics end to end: test -e/-L/-f/-d from registry facts,
+/// and reading /proc/self/exe yields the running image's own magic
+/// bytes (MZ on Windows, ELF on Linux's real procfs).
+mod issue_1900 {
+    use super::*;
+
+    fn run(dir: &Path, code: &str) -> (Vec<u8>, String, Option<i32>) {
+        let out = run_rubash_in(dir, &["-c", code], Duration::from_secs(30));
+        (
+            out.stdout,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    #[test]
+    fn issue1900_a4_exe_cwd_links() {
+        let dir = case_scratch("1900-a4");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "test -e /proc/self/exe && test -L /proc/self/exe && test -f /proc/self/exe \
+             && test -e /proc/self/cwd && test -d /proc/self/cwd && echo A4-OK; \
+             IFS= read -r -N 2 magic < /proc/self/exe; echo \"len:${#magic}\"; printf '%s' \"$magic\"",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        let text = String::from_utf8_lossy(&stdout).into_owned();
+        assert!(text.contains("A4-OK"), "link tests failed:\n{text}");
+        assert!(text.contains("len:2"), "short read of exe:\n{text}");
+        if cfg!(windows) {
+            assert!(stdout.windows(2).any(|w| w == b"MZ"), "exe magic:\n{text}");
+        } else {
+            assert!(
+                stdout.windows(2).any(|w| w == [0x7f, b'E']),
+                "exe magic:\n{text}"
+            );
+        }
+    }
+
+    /// A-5: /proc/self/cwd tracks the SESSION cwd — after `cd` into a
+    /// subdirectory it still answers as an existing directory (its
+    /// target text equality with the session cwd is pinned at the
+    /// proc_vfs unit level, where the session value is injected).
+    #[test]
+    fn issue1900_a5_self_cwd_tracks_session() {
+        let dir = case_scratch("1900-a5");
+        std::fs::create_dir(dir.join("sub")).expect("create subdir");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "cd sub && test -d /proc/self/cwd && test -e /proc/self/cwd && echo A5-OK",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        let text = String::from_utf8_lossy(&stdout).into_owned();
+        assert_eq!(text.trim(), "A5-OK");
+    }
+}
+
+/// rubash#1918: /proc/<pid>/status PPid was fabricated (self answered
+/// 0, every other pid answered the shell's own pid) while the ToolHelp
+/// snapshot's real parent field was discarded. The pin spawns a child
+/// shell and reads status through it: the reported PPid must never be
+/// the fabricated 0, and this shell's own PPid must be a real third
+/// party (nonzero, not itself). No parentage equality is asserted —
+/// rubash's spawn architecture interposes on both platforms
+/// (in-process THIS_SH children on Linux; an interposed spawn process
+/// on Windows). The exact-value property against ground truth is
+/// proven in proc_vfs's unit pins (rendered PPid == snapshot record,
+/// for self and for another live pid).
+mod issue_1918 {
+    use super::*;
+
+    fn run(dir: &Path, code: &str) -> (String, String, Option<i32>) {
+        let out = run_rubash_in(dir, &["-c", code], Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    #[test]
+    fn issue1918_a3_ppid_known_parent_child() {
+        let dir = case_scratch("1918-a3");
+        std::fs::write(
+            dir.join("child.sh"),
+            "while IFS= read -r line; do\n\
+             case $line in\n\
+             PPid:*) set -- ${line#PPid:}; echo \"$1\"; break;;\n\
+             esac\n\
+             done < /proc/self/status\n",
+        )
+        .expect("write child.sh");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "child=$(\"${THIS_SH}\" ./child.sh); echo \"CHILD:$child\"; echo \"ME:$$\"; \
+             while IFS= read -r line; do case $line in PPid:*) set -- ${line#PPid:}; mine=$1;; esac; done < /proc/self/status; \
+             if [ -n \"$mine\" ] && [ \"$mine\" != 0 ] && [ \"$mine\" != \"$$\" ]; then echo SELF-OK; else echo \"SELF-BAD:$mine\"; fi",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert!(stdout.contains("SELF-OK"), "own PPid truth:\n{stdout}");
+        let field = |name: &str| -> u32 {
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or_else(|| panic!("{name} field missing:\n{stdout}"))
+        };
+        let (child_ppid, _me) = (field("CHILD:"), field("ME:"));
+        // The fabricated shape is dead on every platform: a process's
+        // PPid is never 0 (pre-fix Windows answered exactly that
+        // fiction for every self read).
+        assert_ne!(child_ppid, 0, "fabricated zero:\n{stdout}");
+        // No script-level parentage equality is asserted, on any
+        // platform: rubash's spawn architecture gives the "child" a
+        // different immediate creator than the invoking shell on both
+        // — on Linux a THIS_SH child of the shell's own binary runs
+        // IN-PROCESS (verified with ps: a single OS process; the
+        // status it reads is the shell's own, whose PPid is the
+        // shell's parent), and on Windows a real child process is
+        // created through an interposed spawn process (CI-observed
+        // PPid 8404 vs the shell's $$ 2344). PPid truth means "the
+        // real creator per the OS record", which the proc_vfs unit
+        // pin proves value-for-value against the snapshot record.
+    }
+}

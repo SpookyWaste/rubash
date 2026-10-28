@@ -1015,12 +1015,31 @@ impl Executor {
                 // substitution capture, and GNU read_comsub discards NUL
                 // bytes while reading the child pipe (substitution_metadata
                 // SubstitutionOutput::readback), so drop NUL first.
-                match fs::read(
-                    self.session_path(crate::executor::path::windows_operand_file_path(
-                        shell_path_to_windows(&path, &self.shell_state.env_vars),
-                        &self.shell_state.env_vars,
-                    )),
-                ) {
+                // Registry first, in the quick-read / external_cat order
+                // (rubash#1917 cat-face): synthetic /proc content has no
+                // filesystem file behind the mapped path on Windows, so
+                // reading the mapped path directly reported a live
+                // /proc file as ENOENT; a SyntheticLink operand
+                // (rubash#1900) resolves through the registry to its
+                // native target and reads that (the session cwd answers
+                // for self/cwd, per the open ladder / read_io).
+                let read_result =
+                    if let Some(bytes) = crate::special_paths::synthetic_proc_content(&path) {
+                        Ok(bytes)
+                    } else if let Some(link) = crate::special_paths::synthetic_link_target(
+                        &path,
+                        Some(&crate::proc_vfs::self_cwd_forms(self.session_cwd())),
+                    ) {
+                        fs::read(&link.native)
+                    } else {
+                        fs::read(self.session_path(
+                            crate::executor::path::windows_operand_file_path(
+                                shell_path_to_windows(&path, &self.shell_state.env_vars),
+                                &self.shell_state.env_vars,
+                            ),
+                        ))
+                    };
+                match read_result {
                     Ok(mut bytes) => {
                         bytes.retain(|byte| *byte != 0);
                         output.push_str(&bytes_to_shell_text(&bytes));

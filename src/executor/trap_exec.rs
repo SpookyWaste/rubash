@@ -3460,6 +3460,30 @@ impl Executor {
                         let file = self.open_net_redirect(&target)?;
                         let file_fd = FileFd::from_file(file, target.clone().into());
                         self.set_fd_input_file(fd, file_fd, fd != 0);
+                    } else if let Some(bytes) =
+                        crate::special_paths::synthetic_proc_content(&target)
+                    {
+                        // Registry first (rubash#1917 exec-fd face): a
+                        // synthetic /proc file has no filesystem file
+                        // behind the mapped path on Windows, so the
+                        // plain open below reported it ENOENT and the
+                        // descriptor never bound. Serve the generated
+                        // snapshot bytes through the fd byte channel —
+                        // procfs static-snapshot semantics, the same
+                        // shape the process-substitution fallback above
+                        // binds.
+                        self.set_fd_input_bytes(fd, bytes, fd != 0);
+                    } else if let Some(link) = crate::special_paths::synthetic_link_target(
+                        &target,
+                        Some(&crate::proc_vfs::self_cwd_forms(self.session_cwd())),
+                    ) {
+                        // SyntheticLink (rubash#1900): the open goes
+                        // to the resolved native target (the session
+                        // cwd answers for self/cwd), exactly as the
+                        // open ladder binds it.
+                        let file = FileFd::open_read(std::path::PathBuf::from(&link.native))
+                            .map_err(|e| crate::posix_errors::path_error(&target, e))?;
+                        self.set_fd_input_file(fd, file, fd != 0);
                     } else {
                         // G-02 session-cwd anchor (rubash#1887): see
                         // set_fd_readwrite_file — without it `exec

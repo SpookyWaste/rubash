@@ -506,6 +506,9 @@ fn eval_unary(
     if let Some(result) = fd_pipe_test(op, operand, env_vars) {
         return Ok(result);
     }
+    if let Some(result) = proc_unary_test(op, operand) {
+        return Ok(result);
+    }
 
     match op {
         "-z" => Ok(operand.is_empty()),
@@ -649,6 +652,25 @@ fn virtual_device_test(op: &str, operand: &str) -> Option<bool> {
 /// pipe-like descriptor in the executor's fd table (process
 /// substitution, coproc, text feeds). The executor mirrors those
 /// descriptors into __RUBASH_FD_PIPE_<fd> before the builtin runs
+/// Synthetic /proc paths (rubash#1900): the facts come from the
+/// registry tables plus pid liveness in `proc_vfs::proc_unary_facts` —
+/// this face previously fell to `virtual_device_test`'s constant table
+/// (rubash#1902) or to a filesystem that has no such names. Only the
+/// ops whose truth the facts determine are answered here; the rest
+/// fall through to the filesystem faces.
+fn proc_unary_test(op: &str, operand: &str) -> Option<bool> {
+    let facts = crate::proc_vfs::proc_unary_facts(operand)?;
+    Some(match op {
+        "-e" | "-a" => true,
+        "-d" => facts.is_dir || (facts.is_link && facts.link_target_is_dir),
+        "-f" => facts.is_file || (facts.is_link && !facts.link_target_is_dir),
+        "-h" | "-L" => facts.is_link,
+        "-r" => true,
+        "-s" => facts.is_file || (facts.is_link && !facts.link_target_is_dir),
+        _ => return None,
+    })
+}
+
 /// (sync_fd_pipe_marks), because the paths are virtual here and stat()
 /// on them would interrogate the host process's unrelated fd N. The
 /// verdict matrix is the probe-verified one the [[ ]] path uses

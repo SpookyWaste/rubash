@@ -16,10 +16,10 @@
 //!   session-cwd anchoring, consume/probe discipline);
 //! - the per-class query functions ([`is_net_redirect_target`],
 //!   [`is_shell_null_device`], [`fd_alias_target`],
-//!   [`synthetic_proc_content`]) are the same judgments in the shapes
-//!   existing consumers already ask; they are defined here once, from
-//!   the same bodies, so a query answer and a classification can never
-//!   drift apart.
+//!   [`synthetic_proc_content`], [`is_synthetic_link_path`]) are the
+//!   same judgments in the shapes existing consumers already ask; they
+//!   are defined here once, from the same bodies, so a query answer
+//!   and a classification can never drift apart.
 //!
 //! Boundary (audit §4.2): the classification *semantics* here are the
 //! shell's own on every platform (GNU invents /dev/tcp, /dev/fd and
@@ -53,6 +53,19 @@ pub(crate) enum SpecialPathClass {
     /// A synthetic /proc file whose bytes the engine generates
     /// (Windows-only simulation; the class is empty off Windows).
     SyntheticProc,
+    /// A synthetic /proc LINK entry (`/proc/self/exe`, `/proc/<pid>/cwd`):
+    /// the entry has no bytes of its own; it resolves to a target path
+    /// elsewhere in the filesystem (rubash#1900). Resolution is
+    /// `proc_vfs::proc_link_target`; this class is the classification of
+    /// the spelling plus the named process being alive, so a dead
+    /// pid's entries classify as plain filesystem paths and fail
+    /// loudly there, exactly like a vanished procfs directory.
+    /// Windows-only simulation, like SyntheticProc. Admission
+    /// self-check (the two-criteria rule): the /proc entry-name set is
+    /// defined by the kernel's procfs — a CLOSED universe — and a miss
+    /// falls back to the real filesystem, i.e. a loud ENOENT, never a
+    /// silent wrong answer.
+    SyntheticLink,
     /// Not special: an ordinary filesystem path (the path mapper and
     /// the filesystem own it from here).
     Filesystem,
@@ -73,6 +86,12 @@ pub(crate) fn classify_special_path(target: &str) -> SpecialPathClass {
         SpecialPathClass::NullDevice
     } else if let Some(fd) = fd_alias_target(target) {
         SpecialPathClass::FdAlias(fd)
+    } else if is_synthetic_link_path(target) {
+        // Link spellings and content spellings are disjoint (exe/cwd
+        // generate no bytes), so this arm's position ahead of the
+        // content check is for definition completeness, per the #1917
+        // design's canonical order: fd alias, link, content.
+        SpecialPathClass::SyntheticLink
     } else if synthetic_proc_content(target).is_some() {
         SpecialPathClass::SyntheticProc
     } else {
@@ -130,6 +149,41 @@ pub(crate) fn synthetic_proc_content(target: &str) -> Option<Vec<u8>> {
     crate::proc_vfs::proc_file_content(target)
 }
 
+/// The registry's classification query for the synthetic-link class:
+/// whether `target` names a synthetic /proc link entry whose process
+/// is alive. Resolution to the target path is a separate question
+/// (`proc_vfs::proc_link_target`) because one entry
+/// (`/proc/self/cwd`) resolves through the caller's session state,
+/// which classification must not need.
+pub(crate) fn is_synthetic_link_path(target: &str) -> bool {
+    crate::proc_vfs::proc_is_link_path(target)
+}
+
+/// Resolve a synthetic-link path to its target (rubash#1900): both
+/// spellings — the OS-native one for opens/metadata and the
+/// shell-namespace display one for readlink-style answers. The
+/// caller supplies the session cwd's forms for the self/cwd entry.
+/// None when the path is not a live synthetic link or its target
+/// cannot be resolved (dead pid, protected process).
+pub(crate) fn synthetic_link_target(
+    target: &str,
+    self_cwd: Option<&crate::proc_vfs::ProcSelfCwd>,
+) -> Option<crate::proc_vfs::ProcLinkTarget> {
+    if !is_synthetic_link_path(target) {
+        return None;
+    }
+    crate::proc_vfs::proc_link_target(target, self_cwd)
+}
+
+/// The registry's enumeration face for synthetic /proc directories:
+/// the entry names of `/proc`, `/proc/self`, or a live `/proc/<pid>`,
+/// from the one enumeration source in [`crate::proc_vfs`]. Glob and
+/// (later) completion ask here so the names a user can complete are
+/// exactly the names the content and link faces serve.
+pub(crate) fn synthetic_proc_dir_entries(target: &str) -> Option<Vec<String>> {
+    crate::proc_vfs::proc_dir_entries(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +233,14 @@ mod tests {
         }
     }
 
+    fn expected_link() -> SpecialPathClass {
+        if cfg!(windows) {
+            SpecialPathClass::SyntheticLink
+        } else {
+            SpecialPathClass::Filesystem
+        }
+    }
+
     #[test]
     fn classify_battery_matches_legacy_judgments() {
         use SpecialPathClass::*;
@@ -217,8 +279,19 @@ mod tests {
             ("/proc/meminfo", expected_proc()),
             ("/proc/cpuinfo", expected_proc()),
             ("/proc/self/cmdline", expected_proc()),
+            ("/proc/self/status", expected_proc()),
             ("/proc/definitely-not-a-file", Filesystem),
             ("/proc/self/fd/abc", Filesystem),
+            // Synthetic links (rubash#1900): the self spellings are
+            // live by definition; a pid outside the allocatable range
+            // is dead on every machine, so its entries fall through to
+            // the filesystem and fail loudly there.
+            ("/proc/self/exe", expected_link()),
+            ("/proc/self/cwd", expected_link()),
+            ("/proc/4294967294/exe", Filesystem),
+            ("/proc/4294967294/cwd", Filesystem),
+            ("/proc/self/exe/child", Filesystem),
+            ("/proc/self/status/child", Filesystem),
             // The one overlap family: the fd-alias reading wins over
             // the /proc reading on every platform.
             ("/proc/self/fd/0", FdAlias(0)),
@@ -273,6 +346,28 @@ mod tests {
                 class == SyntheticProc,
                 "proc query vs classify for {target:?}"
             );
+            assert_eq!(
+                is_synthetic_link_path(target),
+                class == SyntheticLink,
+                "link query vs classify for {target:?}"
+            );
         }
+    }
+
+    /// rubash#1900: resolution answers exactly for the link class —
+    /// self/cwd passes the caller's session-cwd forms through
+    /// untouched, and non-link spellings resolve to None.
+    #[test]
+    fn link_target_resolution_matches_classification() {
+        if cfg!(windows) {
+            let cwd = crate::proc_vfs::self_cwd_forms(std::path::Path::new("C:\\session"));
+            let target = synthetic_link_target("/proc/self/cwd", Some(&cwd))
+                .expect("self/cwd resolves through the session forms");
+            assert_eq!(target.native, "C:\\session");
+            assert_eq!(target.display, cwd.display);
+            assert!(synthetic_link_target("/proc/self/exe", None).is_some());
+        }
+        assert!(synthetic_link_target("/proc/self/status", None).is_none());
+        assert!(synthetic_link_target("/etc/passwd", None).is_none());
     }
 }

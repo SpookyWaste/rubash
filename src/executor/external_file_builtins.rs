@@ -1867,6 +1867,28 @@ impl Executor {
                     output.extend(bytes);
                     continue;
                 }
+                // SyntheticLink (rubash#1900): exe/cwd operands read
+                // through the resolved target (session cwd for
+                // self/cwd, per the G-02 anchoring); errors keep the
+                // bare GNU cat diagnostic shape used below.
+                if let Some(link) = crate::special_paths::synthetic_link_target(
+                    &target,
+                    Some(&crate::proc_vfs::self_cwd_forms(self.session_cwd())),
+                ) {
+                    match fs::read(&link.native) {
+                        Ok(bytes) => output.extend(bytes),
+                        Err(error) => {
+                            writeln!(
+                                &mut diagnostics,
+                                "cat: {}: {}",
+                                target,
+                                crate::posix_errors::message(&error)
+                            )?;
+                            status = 1;
+                        }
+                    }
+                    continue;
+                }
                 // niubash#177: resolve through the operand form so a
                 // virtual-root file operand that exists only under its
                 // `.exe` spelling (`/usr/bin/seq`) opens here exactly as it
