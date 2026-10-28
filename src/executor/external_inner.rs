@@ -1990,7 +1990,7 @@ impl Executor {
                 return None;
             }
         }
-        if check_binary_file(&sample) {
+        if crate::script_driver::check_binary_file(&sample) {
             return Some((
                 format!(
                     "bash: {}: cannot execute binary file",
@@ -2299,38 +2299,10 @@ fn file_has_exec_bit(metadata: &std::fs::Metadata) -> bool {
     }
 }
 
-/// check_binary_file (general.c:718-741): ELF magic is always binary;
-/// otherwise the first line (two lines when the sample starts with a #!
-/// interpreter specifier) must be NUL-free.
-fn check_binary_file(sample: &[u8]) -> bool {
-    if sample.len() >= 4
-        && sample[0] == 0x7f
-        && sample[1] == b'E'
-        && sample[2] == b'L'
-        && sample[3] == b'F'
-    {
-        return true;
-    }
-    if sample.is_empty() {
-        return false;
-    }
-    let mut lines_left = if sample.len() >= 2 && sample[0] == b'#' && sample[1] == b'!' {
-        2
-    } else {
-        1
-    };
-    for &byte in sample {
-        if byte == b'\n' {
-            lines_left -= 1;
-            if lines_left == 0 {
-                return false;
-            }
-        } else if byte == 0 {
-            return true;
-        }
-    }
-    false
-}
+/// The binary-file gate itself is `crate::script_driver::check_binary_file`
+/// (general.c:718-741) — one shared implementation for the script-entry
+/// and external-command gates (redundancy R9: the two copies were
+/// byte-identical logic and could only drift apart).
 
 #[derive(Default)]
 struct EnvCommandConfig {
