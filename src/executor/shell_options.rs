@@ -165,17 +165,28 @@ impl Executor {
         Ok(file)
     }
 
-    fn open_input_redirect_impl(&self, target: &str, consume: bool) -> io::Result<File> {
+    /// The canonical special-path dispatch for input opens (vfs audit
+    /// §3.3 ladder convergence, §4.5 slice S2): walk the special-path
+    /// registry in canonical order — net, null, fd alias, synthetic
+    /// content — and construct the read endpoint for the target's
+    /// class. Returns `None` when the target is an ordinary filesystem
+    /// path, and also for a closed fd alias, whose legacy fall-through
+    /// to the caller's literal open (reporting GNU's ENOENT for a
+    /// dangling alias) the caller performs; returns `Some` with the
+    /// open result for every other special class. Constructing each
+    /// class's endpoint lives here exactly once; open points keep
+    /// only their semantic pre-steps.
+    fn open_classified_input(&self, target: &str) -> Option<io::Result<File>> {
         // rubash#1026: /dev/tcp|udp targets connect a socket, never a
         // filesystem open (see open_net_redirect).
         if crate::special_paths::is_net_redirect_target(target) {
-            return self.open_net_redirect(target);
+            return Some(self.open_net_redirect(target));
         }
         if is_null_device(target) {
-            return File::open(shell_path_to_windows(
+            return Some(File::open(shell_path_to_windows(
                 "/dev/null",
                 &self.shell_state.env_vars,
-            ));
+            )));
         }
         // GNU redir.c resolves /dev/std*, /dev/fd/N, /proc/self/fd/N through
         // the OS fd-alias layer — a dup of fd N, not a filesystem path.
@@ -196,31 +207,46 @@ impl Executor {
                 .get(&fd)
                 .is_some_and(|entry| !entry.closed)
             {
-                return self.open_fd_read_endpoint(fd, target);
+                return Some(self.open_fd_read_endpoint(fd, target));
             }
+            return None;
         }
         // Q11 /proc P1 (docs/proc-vfs-plan.md hook B): synthetic /proc files
         // serve as a pre-filled pipe converted to a File; reads hit EOF at
         // content end, matching procfs static-snapshot semantics.
         if let Some(content) = crate::special_paths::synthetic_proc_content(target) {
-            use std::io::Write as _;
-            let (reader, mut writer) = std::io::pipe()?;
-            writer
-                .write_all(&content)
-                .map_err(|e| crate::posix_errors::path_error(target, e))?;
-            drop(writer); // close write side: reader sees EOF after content
-            #[cfg(windows)]
-            {
-                use std::os::windows::io::{FromRawHandle as _, IntoRawHandle as _};
-                let handle = reader.into_raw_handle();
-                return Ok(unsafe { File::from_raw_handle(handle) });
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::io::{FromRawFd as _, IntoRawFd as _};
-                let fd = reader.into_raw_fd();
-                return Ok(unsafe { File::from_raw_fd(fd) });
-            }
+            return Some(Self::synthetic_content_file(target, &content));
+        }
+        None
+    }
+
+    /// Materialize synthetic content as a readable File: a pre-filled
+    /// pipe whose write side is already closed, so reads hit EOF at
+    /// content end.
+    fn synthetic_content_file(target: &str, content: &[u8]) -> io::Result<File> {
+        use std::io::Write as _;
+        let (reader, mut writer) = std::io::pipe()?;
+        writer
+            .write_all(content)
+            .map_err(|e| crate::posix_errors::path_error(target, e))?;
+        drop(writer); // close write side: reader sees EOF after content
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::{FromRawHandle as _, IntoRawHandle as _};
+            let handle = reader.into_raw_handle();
+            Ok(unsafe { File::from_raw_handle(handle) })
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::{FromRawFd as _, IntoRawFd as _};
+            let fd = reader.into_raw_fd();
+            Ok(unsafe { File::from_raw_fd(fd) })
+        }
+    }
+
+    fn open_input_redirect_impl(&self, target: &str, consume: bool) -> io::Result<File> {
+        if let Some(opened) = self.open_classified_input(target) {
+            return opened;
         }
         // niubash#177: an input operand under the virtual system root may
         // exist only under its Windows executable spelling (`/usr/bin/seq`
@@ -1534,6 +1560,17 @@ impl Executor {
                         &buf,
                     ));
                 }
+                return None;
+            }
+            // The string channel never slurps a socket (vfs audit
+            // §3.3, slice S2): a net target's bytes exist only as the
+            // command reads them, and a connected UDP socket has no
+            // EOF to slurp to. Decline by registry class — the bind
+            // machinery performs the netopen itself and surfaces its
+            // errors there. (Before the registry, this decline
+            // happened only by accident, when the mapped pseudo-path
+            // failed to open as a file.)
+            if crate::special_paths::is_net_redirect_target(&target) {
                 return None;
             }
             let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
