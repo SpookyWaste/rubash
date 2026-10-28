@@ -466,6 +466,13 @@ pub struct CompoundAssignment {
 }
 
 /// Represents one element inside a `name=(...)` compound assignment.
+///
+/// The per-element expansion/quote record vectors are gone
+/// (redundancy R4): the brace/parameter/arithmetic/tilde records were
+/// empty on every instance and the extglob/pathname/word-quote scans
+/// were written per element with zero readers in either repo — the
+/// executor re-derives everything from the element text, as it does
+/// for words (see WordMetadata::new).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompoundAssignmentElement {
     pub subscript: Option<String>,
@@ -473,16 +480,6 @@ pub struct CompoundAssignmentElement {
     pub operator: Option<String>,
     pub append: bool,
     pub element_index: usize,
-    pub subscript_brace_expansions: Vec<BraceExpansion>,
-    pub subscript_parameter_expansions: Vec<ParameterExpansion>,
-    pub subscript_arithmetic_expansions: Vec<ArithmeticExpansion>,
-    pub brace_expansions: Vec<BraceExpansion>,
-    pub parameter_expansions: Vec<ParameterExpansion>,
-    pub arithmetic_expansions: Vec<ArithmeticExpansion>,
-    pub extglob_patterns: Vec<ExtglobPattern>,
-    pub pathname_patterns: Vec<PathnamePattern>,
-    pub tilde_expansions: Vec<TildeExpansion>,
-    pub word_quotes: Vec<WordQuote>,
 }
 
 /// Represents a parsed `name[subscript]=value` or `name[subscript]+=value` word.
@@ -506,15 +503,11 @@ pub struct ArrayElementAssignment {
     pub operator_metadata: Box<WordMetadata>,
     pub append: bool,
     pub word_index: Option<usize>,
-    pub subscript_brace_expansions: Vec<BraceExpansion>,
-    pub subscript_parameter_expansions: Vec<ParameterExpansion>,
-    pub subscript_arithmetic_expansions: Vec<ArithmeticExpansion>,
-    pub brace_expansions: Vec<BraceExpansion>,
-    pub parameter_expansions: Vec<ParameterExpansion>,
-    pub arithmetic_expansions: Vec<ArithmeticExpansion>,
-    pub extglob_patterns: Vec<ExtglobPattern>,
-    pub pathname_patterns: Vec<PathnamePattern>,
-    pub tilde_expansions: Vec<TildeExpansion>,
+    // The always-empty expansion record vectors and the per-element
+    // extglob/pathname scans are removed (redundancy R4, zero readers
+    // in either repo). word_quotes STAYS: it is written by a real scan
+    // and read by the executor's compound-list shape check
+    // (array_assignment_exec) — a live record, not a dead one.
     pub word_quotes: Vec<WordQuote>,
 }
 
