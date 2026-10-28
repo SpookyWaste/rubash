@@ -725,10 +725,12 @@ pub struct WordMetadata {
     // every scan that fed them (the executor re-derives all of them
     // from the word text at consumption time), so the vectors were
     // empty on every instance — their storage is removed (perf F4
-    // node diet). Only the three record kinds with live consumers
-    // remain, plus word_quotes below.
+    // node diet). Only the two record kinds with live consumers
+    // remain, plus word_quotes below. The per-word extglob record
+    // went the same way (redundancy R4): no production reader in
+    // either repo — the live store is the CommandNode aggregate,
+    // which push_command_word fills from WordScans directly.
     pub process_substitutions: Vec<ProcessSubstitution>,
-    pub extglob_patterns: Vec<ExtglobPattern>,
     pub pathname_patterns: Vec<PathnamePattern>,
     /// Word-quote records: always empty (wt44/parse4 — the executor
     /// re-derives quoting from the raw word at consumption time), but
@@ -753,7 +755,6 @@ impl WordMetadata {
             value,
             raw,
             process_substitutions: Vec::new(),
-            extglob_patterns: Vec::new(),
             pathname_patterns: Vec::new(),
             word_quotes: Vec::new(),
             lex_locale: None,
@@ -781,7 +782,6 @@ impl WordMetadata {
             // pretty-print rendering re-scans the word, the conditional
             // `=~` check re-scans the raw).
             process_substitutions,
-            extglob_patterns: super::extglob_patterns_in_word_with_raw(&value, &raw),
             pathname_patterns: super::pathname_patterns_in_word(&value, &raw),
             word_quotes: Vec::new(),
             lex_locale: if crate::lexer::raw_has_ansi_u_escape(&raw) {
@@ -808,7 +808,6 @@ impl WordMetadata {
         value: String,
         raw: String,
         process_substitutions: Vec<ProcessSubstitution>,
-        extglob_patterns: Vec<ExtglobPattern>,
         pathname_patterns: Vec<PathnamePattern>,
     ) -> Self {
         let process_substitutions = process_substitutions
@@ -822,7 +821,6 @@ impl WordMetadata {
             word_index,
             // See `new` for why the non-live kinds stay empty (wt44/parse4).
             process_substitutions,
-            extglob_patterns,
             pathname_patterns,
             word_quotes: Vec::new(),
             lex_locale: if crate::lexer::raw_has_ansi_u_escape(&raw) {

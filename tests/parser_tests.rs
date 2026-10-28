@@ -1349,14 +1349,6 @@ mod command_body_kind_tests {
         assert_eq!(select_command.variable_metadata.value, "x");
         assert_eq!(select_command.variable_metadata.raw, "x");
         assert_eq!(select_command.word_metadata.len(), 3);
-        assert_eq!(
-            select_command.word_metadata[1].extglob_patterns[0].operator,
-            '@'
-        );
-        assert_eq!(
-            select_command.word_metadata[1].extglob_patterns[0].alternatives,
-            ["yes", "no"]
-        );
     }
 
     #[test]
