@@ -2342,8 +2342,16 @@ impl Executor {
         // with *okp = 1 — the evaluation is skipped, not failed.
         let init_skipped = if self.debug_trap_in_scope() && !arithmetic.init.trim().is_empty() {
             restore_for_line(self);
-            self.run_debug_trap(crate::debugger::SeamKind::ArithForInit, &arithmetic.init)?
-                .is_some()
+            // An Err here unwinds past the loop: balance the ENTRY
+            // increment before returning (single-exit invariant,
+            // execute_cmd.c:3296; see the body match below, #1911).
+            match self.run_debug_trap(crate::debugger::SeamKind::ArithForInit, &arithmetic.init) {
+                Ok(outcome) => outcome.is_some(),
+                Err(error) => {
+                    self.shell_state.loop_depth -= 1;
+                    return Err(error);
+                }
+            }
         } else {
             false
         };
@@ -2401,9 +2409,16 @@ impl Executor {
                 && ((debug_may_fire && self.debug_trap_in_scope()) || self.debugger_session_here())
             {
                 restore_for_line(self);
-                test_skipped = self
-                    .run_debug_trap(crate::debugger::SeamKind::ArithForTest, &arithmetic.test)?
-                    .is_some();
+                // Balance the ENTRY increment on an unwinding Err
+                // (single-exit invariant, execute_cmd.c:3296; #1911).
+                match self.run_debug_trap(crate::debugger::SeamKind::ArithForTest, &arithmetic.test)
+                {
+                    Ok(outcome) => test_skipped = outcome.is_some(),
+                    Err(error) => {
+                        self.shell_state.loop_depth -= 1;
+                        return Err(error);
+                    }
+                }
             }
             if test_skipped {
                 break;
@@ -2472,7 +2487,24 @@ impl Executor {
                     self.shell_state.loop_depth -= 1;
                     return Err(ExecuteError::Continue(level - 1));
                 }
-                Err(error) => return Err(error),
+                // Any other unwind crossing this loop (an expansion
+                // failure from the body, an exit/return jump, ...):
+                // balance the ENTRY increment before returning, like
+                // the Break/Continue arms above. GNU
+                // execute_arith_for_command (execute_cmd.c:3219) has a
+                // single exit whose loop_level-- (execute_cmd.c:3296)
+                // runs unconditionally — the body result there is a
+                // status, never an escape past the frame. Leaving the
+                // depth raised here defeats the enclosing list walk's
+                // DISCARD absorption, whose guard reads
+                // loop_depth == 0: an evalerror raised in the body
+                // (expr.c evalerror -> jump_to_top_level (DISCARD))
+                // then escapes as a script-fatal error instead of
+                // discarding just this for command (rubash#1911).
+                Err(error) => {
+                    self.shell_state.loop_depth -= 1;
+                    return Err(error);
+                }
             }
 
             // execute_cmd.c:3191-3199: the skipped update evaluates as 0 —
@@ -2488,11 +2520,18 @@ impl Executor {
                 && ((debug_may_fire && self.debug_trap_in_scope()) || self.debugger_session_here())
             {
                 restore_for_line(self);
-                self.run_debug_trap(
+                // Balance the ENTRY increment on an unwinding Err
+                // (single-exit invariant, execute_cmd.c:3296; #1911).
+                match self.run_debug_trap(
                     crate::debugger::SeamKind::ArithForUpdate,
                     &arithmetic.update,
-                )?
-                .is_some()
+                ) {
+                    Ok(outcome) => outcome.is_some(),
+                    Err(error) => {
+                        self.shell_state.loop_depth -= 1;
+                        return Err(error);
+                    }
+                }
             } else {
                 false
             };
