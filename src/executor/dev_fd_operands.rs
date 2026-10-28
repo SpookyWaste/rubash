@@ -323,6 +323,17 @@ impl Executor {
                 let Some(entry) = self.fd_table.entries.get(&fd).filter(|e| !e.closed) else {
                     continue;
                 };
+                // rubash#1952: a File read endpoint (a streamed
+                // procsub's pipe, an exec-bound file) is a real
+                // descriptor in THIS process only — the child does
+                // not inherit it by default, so pin a dup at the
+                // operand's number like the buffered arms below.
+                // The descriptor is shared, not consumed: the child
+                // reads advance the same offset, as under GNU.
+                if let Some(FdReadEndpoint::File(file)) = &entry.read {
+                    m.unix_fd_attach.push((fd, file.handle));
+                    continue;
+                }
                 let buffered = match &entry.read {
                     Some(FdReadEndpoint::Text(_) | FdReadEndpoint::ProcessSubstitution(_)) => self
                         .fd_table

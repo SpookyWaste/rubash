@@ -2144,6 +2144,16 @@ impl Executor {
                             .to_string();
                     }
                 }
+                // rubash#1952: a streamed procsub binds a live File
+                // endpoint instead of a buffered one — drain it
+                // through the shared handle (reads to EOF, the
+                // quick-read's defining semantics).
+                if let Some(content) = self.fd_table.read_file_endpoint_bytes(fd) {
+                    self.last_command_substitution_status.set(Some(0));
+                    return bytes_to_shell_text(&content)
+                        .trim_capture_terminator()
+                        .to_string();
+                }
             }
         }
         // The canonical ladder steps this quick-read ladder used to
