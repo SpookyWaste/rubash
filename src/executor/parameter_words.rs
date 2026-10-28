@@ -178,6 +178,31 @@ fn parameter_assignment_target(inner: &str) -> Option<String> {
     }
 }
 
+/// Whether `name` — the left-hand side of a top-level `=`/`:=` split of
+/// a `${...}` body — is syntactically an assignment target: a plain shell
+/// name, a subscripted name (`name[sub]`, the admission
+/// apply_array_element_parameter_assignment itself uses), or either form
+/// behind the `!` indirect prefix. GNU parameter_brace_expand
+/// (subst.c:9777) extracts the parameter name first and dispatches on the
+/// FIRST operator character (subst.c:9886-9917), so an `=`/`:=` that sits
+/// inside another operator's word is word text, never an assignment
+/// operator: in `${a:-x=...}` the body's operator is `:-` and the `x=`
+/// segment is literal default-word text. The pre-scan's split finds that
+/// `=` anyway; without this form check it expanded the split's "value" —
+/// the rest of the default word, nested fragment included — as if
+/// applying a bind, then discarded it when every apply arm rejected the
+/// name. That phantom evaluation ran side effects GNU never runs (the
+/// word expands only when its operator selects it, subst.c:7663
+/// parameter_brace_expand_word) and recurred at every nesting level,
+/// multiplying the inner expansion into the rubash#1953 exponential.
+fn parameter_assignment_target_form(name: &str) -> bool {
+    let bare = name.strip_prefix('!').unwrap_or(name);
+    if is_shell_name(bare) {
+        return true;
+    }
+    matches!(parse_array_subscript(bare), Some((base, _)) if is_shell_name(base))
+}
+
 /// Whether a `${...}` body is side-effect-free to evaluate during the
 /// assignment pre-scan: no command substitution and no backticks, and
 /// not a bad-substitution shape whose diagnostic must stay with the
@@ -1586,6 +1611,14 @@ impl Executor {
         if let Some((name, value)) =
             super::expand_braced_ops::split_once_outside_subscript_str(inner, ":=")
         {
+            // rubash#1953: the split names an assignment only when its
+            // left-hand side is an assignment target; otherwise the
+            // `:=` sits inside another operator's word and the split's
+            // "value" is that word's text, which must not be expanded
+            // here (see parameter_assignment_target_form).
+            if !parameter_assignment_target_form(name) {
+                return;
+            }
             if self
                 .parameter_operator_value(name)
                 .is_some_and(|value| !value.is_empty())
@@ -1660,6 +1693,12 @@ impl Executor {
         if let Some((name, value)) =
             super::expand_braced_ops::split_once_outside_subscript(inner, '=')
         {
+            // rubash#1953: same target-form gate as the `:=` arm above —
+            // an `=` inside another operator's word (`${a:-x=...}`) is
+            // word text, not this fragment's assignment operator.
+            if !parameter_assignment_target_form(name) {
+                return;
+            }
             if self.parameter_operator_value(name).is_some() {
                 return;
             }
