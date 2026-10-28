@@ -189,13 +189,15 @@ where
     // in one step: canonicalize resolves `.`/`..`/symlinks exactly like
     // the post-chdir getcwd did, and its failures carry the same OS
     // error codes chdir reported (ENOENT for a missing target, ENOTDIR
-    // through a file prefix).
+    // through a file prefix). The probe goes through
+    // canonicalize_native so the stored form is the getcwd form, not
+    // canonicalize's extended-length verbatim form (unixwin/niubash#659).
     let native_target = if target.path.is_absolute() {
         target.path.clone()
     } else {
         cwd.join(&target.path)
     };
-    let probed = match native_target.canonicalize() {
+    let probed = match crate::executor::path::canonicalize_native(&native_target) {
         Ok(path) if path.is_dir() => Ok(path),
         Ok(_) => Err(not_a_directory_error()),
         Err(error) => Err(error),
