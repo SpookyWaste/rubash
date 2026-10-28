@@ -1250,7 +1250,7 @@ impl Executor {
         {
             return None;
         }
-        if crate::proc_vfs::proc_file_content(&target).is_some() {
+        if crate::special_paths::synthetic_proc_content(&target).is_some() {
             return None;
         }
         // niubash#177: same operand resolution as open_input_redirect so
@@ -1348,7 +1348,7 @@ impl Executor {
         if redirect.append {
             return None;
         }
-        if crate::proc_vfs::proc_file_content(&target).is_some() {
+        if crate::special_paths::synthetic_proc_content(&target).is_some() {
             return None;
         }
         // niubash#177: same operand resolution as open_input_redirect —

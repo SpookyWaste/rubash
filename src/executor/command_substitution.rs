@@ -2043,6 +2043,19 @@ impl Executor {
             self.last_command_substitution_status.set(Some(1));
             String::new()
         };
+        // A failed read reports exactly like the plain filesystem arm
+        // below: path_error already formats "<word>: <strerror>" (and
+        // maps the Windows wildcard-path EINVAL to the ENOENT text
+        // Linux open(2) reports — posix_errors.rs), so it is the whole
+        // internal_error payload; the substitution is empty, rc 1.
+        let fail = |file_word: &str, error: std::io::Error| -> String {
+            let payload =
+                crate::posix_errors::message(&crate::posix_errors::path_error(file_word, error));
+            let diagnostic = format!("{}{}\n", self.diagnostic_prefix(), payload);
+            self.write_diagnostic_fd2(diagnostic.as_bytes());
+            self.last_command_substitution_status.set(Some(1));
+            String::new()
+        };
         // redirection_expand materializes a process-substitution operand
         // as /dev/fd/N (subst.c process_substitute); the cat then reads the
         // substitution's output. Mirror that by running the substitution
@@ -2112,6 +2125,50 @@ impl Executor {
                 }
             }
         }
+        // The canonical ladder steps this quick-read ladder used to
+        // skip (vfs audit §3.3; rubash#1904): the special classes
+        // resolve through the registry before the plain filesystem
+        // read, in the input ladder's order. A net target connects
+        // and reads to EOF — the bytes GNU's read_comsub (subst.c)
+        // collects from the descriptor the netopen produced; before,
+        // the mapped pseudo-path simply failed to open and the
+        // substitution came back empty with a spurious diagnostic.
+        if crate::special_paths::is_net_redirect_target(file_word) {
+            // Read through the native socket form, not the
+            // handle-adopted File: std File reads on an adopted
+            // overlapped socket fail on Windows
+            // (ERROR_INVALID_PARAMETER). See connect_net_stream.
+            return match self.connect_net_stream(file_word) {
+                Ok(mut stream) => {
+                    use std::io::Read as _;
+                    let mut buf = Vec::new();
+                    match stream.read_to_end(&mut buf) {
+                        Ok(_) => {
+                            self.last_command_substitution_status.set(Some(0));
+                            bytes_to_shell_text(&buf)
+                                .trim_capture_terminator()
+                                .to_string()
+                        }
+                        Err(error) => fail(file_word, error),
+                    }
+                }
+                Err(error) => fail(file_word, error),
+            };
+        }
+        // The null device reads as immediate EOF: empty, rc 0.
+        if is_null_device(file_word) {
+            self.last_command_substitution_status.set(Some(0));
+            return String::new();
+        }
+        // Synthetic /proc content (registry-served snapshot bytes).
+        // Before, Windows had no /proc file for the mapped path to
+        // land on, so `$(</proc/meminfo)` silently read empty.
+        if let Some(bytes) = crate::special_paths::synthetic_proc_content(file_word) {
+            self.last_command_substitution_status.set(Some(0));
+            return bytes_to_shell_text(&bytes)
+                .trim_capture_terminator()
+                .to_string();
+        }
         if read_path.is_dir() {
             self.last_command_substitution_status.set(Some(0));
             return String::new();
@@ -2121,19 +2178,7 @@ impl Executor {
                 self.last_command_substitution_status.set(Some(0));
                 value.trim_capture_terminator().to_string()
             }
-            Err(error) => {
-                // path_error already formats "<word>: <strerror>" (and maps
-                // the Windows wildcard-path EINVAL to the ENOENT text
-                // Linux open(2) reports — posix_errors.rs), so it is the
-                // whole internal_error payload.
-                let payload = crate::posix_errors::message(&crate::posix_errors::path_error(
-                    file_word, error,
-                ));
-                let diagnostic = format!("{}{}\n", self.diagnostic_prefix(), payload);
-                self.write_diagnostic_fd2(diagnostic.as_bytes());
-                self.last_command_substitution_status.set(Some(1));
-                String::new()
-            }
+            Err(error) => fail(file_word, error),
         }
     }
 }

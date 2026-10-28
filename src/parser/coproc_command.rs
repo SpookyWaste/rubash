@@ -1,3 +1,4 @@
+use super::parse_loop::offending_line_text;
 use super::*;
 use crate::lexer::{Token, TokenKind};
 
@@ -30,12 +31,30 @@ pub(super) fn parse_coproc_command(tokens: &[Token], start: usize) -> Option<(Co
             // and the fds bind as COPROC). A builtin-name allowlist
             // here stole the first word of the simple command as a
             // name (rubash#1153).
-            if !lookahead.value.starts_with('-') && next_is_compound {
+            if !lookahead.value.starts_with('-')
+                && !is_keyword(tokens, i, "!")
+                && next_is_compound
+            {
                 name = Some((lookahead.value.clone(), lookahead.raw.clone()));
                 i += 1; // consume the name
             }
             // Otherwise: no name, the token is part of the simple command
         }
+    }
+
+    // rubash#1652: GNU parse.y:1125-1175 coproc grammar is `COPROC
+    // [WORD] shell_command`, and `!` is a pipeline modifier, not a
+    // shell_command — so `coproc ! ...` is a syntax error, never a
+    // name and never a simple-command word. Without this, the `!`
+    // fell into the simple-command word list and the coproc ran
+    // with the negation silently applied inside the child.
+    // Note the name gate above excludes the `!` keyword too:
+    // `coproc ! { ...; }` must hit this error, not the runtime
+    // "not a valid identifier" path (a QUOTED "!" is a real word
+    // and still takes the name path, matching GNU's identifier
+    // error for `coproc "!" { ...; }`).
+    if is_keyword(tokens, i, "!") {
+        return Some(coproc_bang_error(tokens, start, i));
     }
 
     // Parse the body
@@ -153,6 +172,19 @@ pub(super) fn parse_coproc_command(tokens: &[Token], start: usize) -> Option<(Co
     let mut words = Vec::new();
     let mut word_metadata = Vec::new();
     while i < tokens.len() {
+        // rubash#1652 (continued): GNU also rejects `!` as the
+        // SECOND word of the coproc's simple command (`coproc a !
+        // ...`, `coproc NAME ! ...`): after COPROC WORD the parser
+        // commits to the named form and demands a shell_command,
+        // so a `!` there is a syntax error — while a `!` after two
+        // or more words is a plain word (`coproc a b ! c` parses).
+        // The body-position check above covers index 0; this
+        // covers index 1. (A quoted "!" is a real word and never
+        // reaches this arm: is_keyword only matches the bare
+        // keyword token.)
+        if words.len() == 1 && is_keyword(tokens, i, "!") {
+            return Some(coproc_bang_error(tokens, start, i));
+        }
         if let Some((word, next_i)) = collect_compound_or_keyword_word_value(tokens, i) {
             let raw = if next_i == i + 1 {
                 tokens[i].raw.as_str()
@@ -183,6 +215,36 @@ pub(super) fn parse_coproc_command(tokens: &[Token], start: usize) -> Option<(Co
         None,
     ));
     Some(finish_coproc_command(command, tokens, i))
+}
+
+/// The parse-error node GNU reports for a `!` where the coproc
+/// grammar admits no pipeline modifier (body position, or second
+/// word of the simple command). The executor reports it as
+/// `syntax error near unexpected token `!'` and aborts with
+/// status 2. The rest of the offending construct (up to the next
+/// command boundary) is swallowed so parsing resumes cleanly at
+/// the next command.
+fn coproc_bang_error(tokens: &[Token], start: usize, bang: usize) -> (CommandNode, usize) {
+    let mut command = CommandNode::new();
+    command.line = tokens.get(start).map(|t| t.position);
+    command.logical_line = tokens.get(start).map(|t| t.logical_line);
+    command.insert_assignment(
+        "__RUBASH_PARSE_ERROR_NEAR__".to_string(),
+        format!(
+            "!{}{}",
+            crate::executor::markers::PARSE_ERROR_FIELD_SEP,
+            tokens[bang].position,
+        ),
+    );
+    command.insert_assignment(
+        "__RUBASH_PARSE_SOURCE__".to_string(),
+        offending_line_text(tokens, bang, None, 0),
+    );
+    let mut end = bang;
+    while end < tokens.len() && tokens[end].kind != TokenKind::Semicolon {
+        end += 1;
+    }
+    finish_coproc_command(command, tokens, end)
 }
 
 fn finish_coproc_command(

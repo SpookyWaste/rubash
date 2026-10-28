@@ -325,27 +325,11 @@ pub(in crate::executor) fn command_is_shell_control_structure(cmd: &CommandNode)
         || cmd.function_command.is_some()
 }
 
-/// GNU redir.c opens `/dev/stdin`/`/dev/stdout`/`/dev/stderr`,
-/// `/dev/fd/N`, and `/proc/self/fd/N` through the OS's fd-alias device
-/// files, which the kernel resolves to a dup of fd N — behaviorally the
-/// same as `>&N`/`<&N`. Windows has no such filesystem, so the names are
-/// recognized here and flow through the same fd-dup machinery (niubash#118:
-/// `>> /dev/stdout` used to land on the CONOUT$ device path and fail with
-/// Permission denied).
-pub(in crate::executor) fn dev_stdio_redirect_fd(target: &str) -> Option<u32> {
-    match target {
-        "/dev/stdin" => return Some(0),
-        "/dev/stdout" => return Some(1),
-        "/dev/stderr" => return Some(2),
-        _ => {}
-    }
-    let fd = target
-        .strip_prefix("/dev/fd/")
-        .or_else(|| target.strip_prefix("/proc/self/fd/"))?;
-    (!fd.is_empty() && fd.chars().all(|ch| ch.is_ascii_digit()))
-        .then(|| fd.parse::<u32>().ok())
-        .flatten()
-}
+/// The fd-alias judgment now lives in the special-path registry
+/// (vfs audit §4.5 slice S1); this re-export keeps the executor's
+/// existing call sites pointed at the one definition. See
+/// [`crate::special_paths::fd_alias_target`] for the GNU rationale.
+pub(in crate::executor) use crate::special_paths::fd_alias_target as dev_stdio_redirect_fd;
 
 /// GNU redir.c:298 redirection_expand → subst.c expand_words_no_vars: a
 /// redirect word whose expansion is EMPTY still counts as one field when
