@@ -329,9 +329,6 @@ pub(in crate::executor) fn frozen_fragment_lookup(key: &(SubSite, String)) -> Op
 
 /// Record one frozen fragment result (rubash#1169).
 pub(in crate::executor) fn frozen_fragment_store(key: (SubSite, String), resolved: String) {
-    // A freeze witnesses an apply in flight: pre-scan dedup marks derived
-    // under the pre-bind environment are no longer trusted.
-    prescan_invalidate();
     FROZEN_FRAGMENTS.with(|map| {
         map.borrow_mut().insert(key, resolved);
     });
@@ -344,9 +341,6 @@ pub(in crate::executor) fn assign_applied_lookup(key: &(SubSite, String)) -> Opt
 
 /// Record one applied `:=` fragment (resolved alternate value).
 pub(in crate::executor) fn assign_applied_store(key: (SubSite, String), resolved: String) {
-    // A bind can flip another pending fragment's set-check outcome, so
-    // every pre-scan dedup mark is invalidated (see PRESCANNED_WORDS).
-    prescan_invalidate();
     ASSIGN_APPLIED.with(|map| map.borrow_mut().insert(key, resolved));
 }
 
@@ -355,49 +349,6 @@ pub(in crate::executor) fn assign_applied_store(key: (SubSite, String), resolved
 pub(in crate::executor) fn assign_applied_clear() {
     ASSIGN_APPLIED.with(|map| map.borrow_mut().clear());
     FROZEN_FRAGMENTS.with(|map| map.borrow_mut().clear());
-    PRESCANNED_WORDS.with(|set| set.borrow_mut().clear());
-}
-
-thread_local! {
-    /// Words whose `:=`/`=` pre-scan walk has completed under the current
-    /// word context (R2 dedup). The walk's observable effects are exactly
-    /// the ASSIGN_APPLIED binds, the FROZEN_FRAGMENTS stores and the
-    /// failure latch; every apply is memo-guarded and every freeze is
-    /// store-once, so a second walk of the same text under the same
-    /// context is a no-op and the layered passes (expand_command_word's
-    /// pre-scan, then the walker's own at expand_word_mut) run it once.
-    /// Any apply or freeze event invalidates ALL marks: a bind can change
-    /// a not-yet-applied fragment's set-check outcome, so a mark is only
-    /// trusted while the environment it was derived under is untouched.
-    /// Same lifecycle as ASSIGN_APPLIED: cleared when a fresh outermost
-    /// word context installs, so sibling words and loop iterations never
-    /// share marks.
-    static PRESCANNED_WORDS: std::cell::RefCell<std::collections::HashSet<(u64, String)>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
-}
-
-/// The word-context id currently installed (0 = no word context).
-pub(in crate::executor) fn current_word_ctx() -> u64 {
-    CURRENT_WORD_CTX.with(|current| current.get())
-}
-
-/// Whether `word`'s assignment pre-scan already ran under context `ctx`
-/// with no intervening apply/freeze (see PRESCANNED_WORDS).
-pub(in crate::executor) fn prescan_lookup(ctx: u64, word: &str) -> bool {
-    PRESCANNED_WORDS.with(|set| set.borrow().contains(&(ctx, word.to_string())))
-}
-
-/// Record `word`'s assignment pre-scan as completed under context `ctx`.
-pub(in crate::executor) fn prescan_store(ctx: u64, word: &str) {
-    PRESCANNED_WORDS.with(|set| {
-        set.borrow_mut().insert((ctx, word.to_string()));
-    });
-}
-
-/// Drop every pre-scan dedup mark (an apply/freeze just changed the
-/// environment the marks were derived under).
-pub(in crate::executor) fn prescan_invalidate() {
-    PRESCANNED_WORDS.with(|set| set.borrow_mut().clear());
 }
 
 pub(in crate::executor) fn sub_idx_lookup(

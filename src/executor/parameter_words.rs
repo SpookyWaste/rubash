@@ -1397,19 +1397,6 @@ impl Executor {
         &mut self,
         word: &str,
     ) {
-        // R2 dedup (expand_braced_indices PRESCANNED_WORDS): this walk's
-        // observable effects are the memo-guarded applies and the
-        // store-once freezes, so under an untouched environment a repeat
-        // walk of the same word in the same word context is a no-op; the
-        // layered passes (expand_command_word, then expand_word_mut) run
-        // it once. Any apply/freeze since the mark was stored invalidates
-        // it — a bind can flip a later fragment's set-check.
-        let prescan_ctx = crate::executor::expand_braced_indices::current_word_ctx();
-        if prescan_ctx != 0
-            && crate::executor::expand_braced_indices::prescan_lookup(prescan_ctx, word)
-        {
-            return;
-        }
         // Admission (rubash#117 whitelist discipline, same shape as the
         // parameter_errors perf6 gate): both applied arms below split their
         // `${...}` body on `=` / `:=`, so a word carrying no `=` anywhere
@@ -1419,9 +1406,6 @@ impl Executor {
         // on EVERY command word / assignment RHS; one scan-and-quit beats
         // the per-fragment quote-state walk that finds nothing.
         if !word.contains('=') {
-            if prescan_ctx != 0 {
-                crate::executor::expand_braced_indices::prescan_store(prescan_ctx, word);
-            }
             return;
         }
         // Assignment alternates are quote-removed with the quote rules of
@@ -1522,9 +1506,6 @@ impl Executor {
                 earlier_fragments.push((inner.to_string(), this_frag));
             }
             consumed = body_start + end + 1;
-        }
-        if prescan_ctx != 0 {
-            crate::executor::expand_braced_indices::prescan_store(prescan_ctx, word);
         }
     }
 
