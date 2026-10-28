@@ -471,6 +471,21 @@ impl Executor {
             if redirect.kind == crate::parser::RedirectKind::ReadWrite {
                 self.set_fd_readwrite_file(fd, &target, true)
                     .map_err(|e| crate::posix_errors::path_error(&target, e))?;
+            } else if let Some(bytes) = crate::special_paths::synthetic_proc_content(&target) {
+                // Registry first (rubash#1917, same ladder-skip family
+                // as the exec-fd face): synthetic /proc content has no
+                // filesystem file behind the mapped path on Windows;
+                // serve the snapshot bytes through the fd byte channel.
+                self.set_fd_input_bytes(fd, bytes, true);
+            } else if let Some(link) = crate::special_paths::synthetic_link_target(
+                &target,
+                Some(&crate::proc_vfs::self_cwd_forms(self.session_cwd())),
+            ) {
+                // SyntheticLink (rubash#1900): open the resolved
+                // native target (session cwd answers for self/cwd).
+                let file = FileFd::open_read(std::path::PathBuf::from(&link.native))
+                    .map_err(|error| crate::posix_errors::path_error(&target, error))?;
+                self.set_fd_input_file(fd, file, true);
             } else {
                 // niubash#177: same operand resolution as
                 // open_input_redirect — a virtual-root input operand may
