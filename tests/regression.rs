@@ -4982,3 +4982,95 @@ mod issue_1952 {
         assert_eq!(stdout, "probe-r3\ncatrc:1\n", "stderr:\n{stderr}");
     }
 }
+
+/// rubash#1976: the bidirectional netopen face (`exec 3<>/dev/tcp/host/port`)
+/// opened the connection but every fd-3 read AND write failed with
+/// `Invalid argument`. GNU netopen returns ONE connected socket descriptor
+/// that serves both directions of any `/dev/tcp|udp` face (redir.c:660
+/// redir_open calls netopen for RF_DEVTCP/RF_DEVUDP whatever the `<`/`>`/`<>`
+/// spelling; lib/sh/netopen.c:282 netopen → socket + connect at :178
+/// _netopen4, then plain read(2)/write(2) on that fd). Rubash adopts the
+/// socket as the fd slot's raw handle, and the handle byte primitives used
+/// to serve it through ReadFile/WriteFile with a NULL OVERLAPPED — rejected
+/// with ERROR_INVALID_PARAMETER on an overlapped socket handle, so the peer
+/// only ever saw the connection close (EOF). The fd layer now routes socket
+/// handles through the socket API (recv/send, select for bounded waits).
+///
+/// Expectations hand-measured against WSL GNU Bash 5.3.20
+/// (/usr/local/bin/bash, 2026-10-28): the TCP round trip below and the
+/// bounded read on a silent endpoint (`read -t 2 -u 3` → `rc=142`, variable
+/// empty). Complements the issue1026 pin in
+/// tests/issue1025_1026_1068_1103_1359_redirect_fd_regressions.rs (which
+/// stays byte-identical — it is PR #1970's acceptance gate), driven from
+/// script files.
+///
+/// Known follow-up (verified 2026-10-28, out of this issue's handle-shape
+/// scope): a `read -u 3` record off a DATAGRAM (`/dev/udp`) fd still cannot
+/// be served by the byte-wise record loop — GNU routes a socket through the
+/// buffered zreadc chunk reader (read.def:668: a socket is neither tty nor
+/// fd_ispipe, so unbuffered_read stays 0) and zsyncfd keeps the overage
+/// when its rewind lseek fails (lib/sh/zread.c:294-309), while winsock's
+/// recv DISCARDS a datagram larger than the receive buffer entirely
+/// (WSAEMSGSIZE). Serving datagram records needs the chunked keep-overage
+/// reader, a read-builtin buffering-profile change of its own.
+mod issue_1976 {
+    use super::*;
+
+    fn run(dir: &Path, script: &str) -> (String, String, Option<i32>) {
+        let path = dir.join("case.sh");
+        std::fs::write(&path, script).expect("write probe script");
+        let out = run_rubash_in(
+            dir,
+            &[path.to_str().expect("utf8 scratch path")],
+            Duration::from_secs(30),
+        );
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    #[test]
+    fn issue1976_dev_tcp_readwrite_fd_round_trips() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 5];
+            stream.read_exact(&mut buf).expect("read ping");
+            assert_eq!(&buf, b"ping\n");
+            stream.write_all(b"pong\n").expect("write pong");
+        });
+        let dir = case_scratch("1976-tcp");
+        let script = format!(
+            "exec 3<>/dev/tcp/127.0.0.1/{port}\necho ping >&3\nread -u 3 line\necho \"got=[$line]\"\n"
+        );
+        let (stdout, stderr, status) = run(&dir, &script);
+        server.join().expect("server thread");
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "got=[pong]\n", "stderr:\n{stderr}");
+        assert_eq!(stderr, "", "stderr:\n{stderr}");
+    }
+
+    #[test]
+    fn issue1976_read_t_timeout_on_quiet_socket_fd() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        // Accept and stay silent past the read deadline, GNU-side.
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            std::thread::sleep(Duration::from_secs(4));
+            drop(stream);
+        });
+        let dir = case_scratch("1976-quiet");
+        let script = format!(
+            "exec 3<>/dev/tcp/127.0.0.1/{port}\nread -t 2 -u 3 line\necho \"rc=$?\"\necho \"line=[$line]\"\n"
+        );
+        let (stdout, stderr, status) = run(&dir, &script);
+        server.join().expect("server thread");
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "rc=142\nline=[]\n", "stderr:\n{stderr}");
+    }
+}
