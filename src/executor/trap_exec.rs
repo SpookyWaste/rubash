@@ -3450,10 +3450,13 @@ impl Executor {
                         }
                     }
 
-                    if matches!(
-                        target.as_str(),
-                        "/dev/stdin" | "/proc/self/fd/0" | "/dev/fd/0"
-                    ) {
+                    // The fd-0 spelling judgment is the registry's (issue
+                    // rubash#1973): `fd_alias_target == Some(0)` carries
+                    // exactly the canonical spellings the literal table
+                    // matched — GNU rejects the leading-zero family on
+                    // every face, so `exec 0</dev/fd/00` falls through to
+                    // the filesystem open and fails ENOENT there.
+                    if crate::special_paths::fd_alias_target(&target) == Some(0) {
                         self.fd_table.open_input(
                             fd,
                             FdReadEndpoint::InheritedProcessStdin,
@@ -5380,6 +5383,18 @@ fn compound_stdio_arms_in_parse_order(command: &CommandNode) -> Vec<CompoundStdi
 // frame (DE-12's model belongs to a later work package).
 // ---------------------------------------------------------------------
 
+/// The verdict of one breakpoint-condition evaluation (design
+/// 5.3): the condition's exit status decides true/false, and a
+/// failed evaluation — an execution error, or a fatal arm the
+/// condition raised against its own list — counts as false and
+/// is reported once per breakpoint. The failure's captured
+/// diagnostic (possibly empty) rides along for that report.
+enum DebugConditionVerdict {
+    True,
+    False,
+    Failed(String),
+}
+
 impl Executor {
     /// Is a debug session attached to THIS executor? The process
     /// gate is consulted first (the zero-cost rule of design 4.4);
@@ -6015,8 +6030,8 @@ impl Executor {
                 let Some(text) = text else {
                     return Ok(());
                 };
-                match self.evaluate_debug_condition(&text) {
-                    Ok(true) => {
+                match self.evaluate_debug_condition(&text, location.as_ref().map(|loc| loc.line)) {
+                    DebugConditionVerdict::True => {
                         // Committing the stop is what consumes a
                         // one-shot entry (design 5.3).
                         if let Some(driver) = self.debug_driver.as_mut() {
@@ -6033,13 +6048,30 @@ impl Executor {
                             command_text: Some(command_text.to_string()),
                         })
                     }
-                    Ok(false) => Ok(()),
-                    Err(()) => {
+                    DebugConditionVerdict::False => Ok(()),
+                    DebugConditionVerdict::Failed(diagnostic) => {
                         // Design 5.3: a failed evaluation counts as
-                        // false and is reported once per breakpoint;
-                        // the driver keeps the report record.
+                        // false and is reported once per breakpoint.
+                        // The report is the debugger speaking (the
+                        // captured engine diagnostic rides along,
+                        // indented, quoted as the debuggee-context
+                        // output it is); the driver owns the
+                        // once-per-breakpoint record and the
+                        // announcement.
                         if let Some(driver) = self.debug_driver.as_mut() {
-                            driver.note_condition_error(id);
+                            let mut report =
+                                format!("breakpoint {}: condition '{text}' failed", id.number());
+                            if let Some(loc) = &location {
+                                report.push_str(&format!(" at {}:{}", loc.file, loc.line));
+                            }
+                            report.push_str(", treated as false");
+                            if !diagnostic.is_empty() {
+                                for line in diagnostic.lines() {
+                                    report.push_str("\n  ");
+                                    report.push_str(line);
+                                }
+                            }
+                            driver.announce_condition_error(id, &report);
                         }
                         Ok(())
                     }
@@ -6055,20 +6087,122 @@ impl Executor {
     /// so neither the DEBUG trap nor the consult fires for the
     /// evaluation's own commands — the fire that led here counts
     /// as in progress. `$?` is preserved across the evaluation,
-    /// like across a trap firing. `Err(())` is a failed evaluation
-    /// (execution error), which the caller counts as false.
-    fn evaluate_debug_condition(&mut self, text: &str) -> Result<bool, ()> {
-        let tokens = crate::lexer::tokenize(text);
-        let ast = crate::parser::parse(&tokens);
+    /// like across a trap firing.
+    ///
+    /// rubash#1962: the evaluation is a guest in the debuggee's
+    /// executor, and three guest disciplines keep it from
+    /// disturbing the host run:
+    ///
+    /// - *Fatal state is snapshot-cloned, never inherited.* The
+    ///   evalerror family and the nounset DISCARD latch are
+    ///   process-of-the-run state: a condition that trips one
+    ///   (`break 1 2` arming the too-many-arguments DISCARD,
+    ///   expansion fatals) must not leave it armed for the
+    ///   debuggee's own abandon checks to consume — that leak
+    ///   silently terminated the debuggee. The whole family is
+    ///   saved on entry and restored on exit; an arm raised
+    ///   *during* the evaluation reclassifies it as failed
+    ///   (design 5.3's error bucket), never as a verdict.
+    /// - *Diagnostics are captured, then placed by the caller.*
+    ///   The evaluation's stderr goes to the executor's capture
+    ///   for its duration (the pipeline-stage mechanism). A
+    ///   verdict's captured bytes are replayed untouched; a
+    ///   failure's ride along in the once-per-breakpoint report
+    ///   instead of spraying per hit, misattributed to the
+    ///   debuggee.
+    /// - *Lines belong to the consult site.* The condition text
+    ///   is re-parsed with the consult line as its base — the
+    ///   evalstring convention (execute_eval_source_inner) — so
+    ///   a diagnostic raised inside the condition reads with the
+    ///   debuggee's file at the line whose consult raised it,
+    ///   not at the condition text's own line 1.
+    fn evaluate_debug_condition(
+        &mut self,
+        text: &str,
+        consult_line: Option<u32>,
+    ) -> DebugConditionVerdict {
+        let line_offset = consult_line.map(|line| line.saturating_sub(1)).unwrap_or(0);
+        let mut tokens = crate::lexer::tokenize(text);
+        if line_offset > 0 {
+            for token in tokens.iter_mut() {
+                token.position += line_offset as usize;
+            }
+        }
+        let ast = crate::parser::parse_with_options(
+            &tokens,
+            crate::parser::ParseLoopOptions {
+                source_line_offset: line_offset as usize,
+                ..Default::default()
+            },
+        );
         let saved_exit_code = self.exit_code;
         let saved_trap_running = std::mem::replace(&mut self.debug_trap_running, true);
+        // The fatal-state family (see the doc comment): snapshot
+        // every latch the evaluation could arm, so the restore
+        // below is exact whatever the condition ran.
+        let saved_evalerror_pending = self.evalerror_pending.get();
+        let saved_evalerror_subscript_pending = self.evalerror_subscript_pending.get();
+        let saved_evalerror_failglob_pending = self.evalerror_failglob_pending.get();
+        let saved_evalerror_arith_pending = self.evalerror_arith_pending.get();
+        let saved_evalerror_exit_toomany_pending = self.evalerror_exit_toomany_pending.get();
+        let saved_evalerror_line = self.evalerror_line.get();
+        let saved_nounset_force_eof = self.nounset_force_eof.get();
+        let saved_break_failure_status = self.break_failure_status.take();
+        // The evaluation's diagnostics are captured for its
+        // duration (the outer capture, if any, is restored after).
+        let saved_stderr_capture = self.stderr_capture.take();
+        self.stderr_capture = Some(Vec::new());
         let result = self.execute_ast(&ast);
-        self.debug_trap_running = saved_trap_running;
         let status = self.exit_code;
+        let captured = self.stderr_capture.take().unwrap_or_default();
+        self.stderr_capture = saved_stderr_capture;
+        // A fatal arm raised by the evaluation itself (one that
+        // was not already armed on entry) is an evaluation error,
+        // not a verdict: GNU raised it to discard or exit the
+        // *condition's* list, and the debuggee must never see it.
+        let fatal_armed = (self.evalerror_pending.get() && !saved_evalerror_pending)
+            || (self.evalerror_subscript_pending.get() && !saved_evalerror_subscript_pending)
+            || (self.evalerror_failglob_pending.get() && !saved_evalerror_failglob_pending)
+            || (self.evalerror_arith_pending.get() && !saved_evalerror_arith_pending)
+            || (self.evalerror_exit_toomany_pending.get() && !saved_evalerror_exit_toomany_pending)
+            || (self.nounset_force_eof.get() && !saved_nounset_force_eof);
+        self.evalerror_pending.set(saved_evalerror_pending);
+        self.evalerror_subscript_pending
+            .set(saved_evalerror_subscript_pending);
+        self.evalerror_failglob_pending
+            .set(saved_evalerror_failglob_pending);
+        self.evalerror_arith_pending
+            .set(saved_evalerror_arith_pending);
+        self.evalerror_exit_toomany_pending
+            .set(saved_evalerror_exit_toomany_pending);
+        self.evalerror_line.set(saved_evalerror_line);
+        self.nounset_force_eof.set(saved_nounset_force_eof);
+        self.break_failure_status.set(saved_break_failure_status);
+        self.debug_trap_running = saved_trap_running;
         self.exit_code = saved_exit_code;
         match result {
-            Ok(()) => Ok(status == 0),
-            Err(_) => Err(()),
+            Ok(()) if !fatal_armed => {
+                // A verdict: the captured stderr was ordinary
+                // debuggee-context output of the user's own
+                // command — replay it where it would have gone
+                // (into an outer capture when one owns the
+                // stream, else the process stderr).
+                if !captured.is_empty() {
+                    if let Some(capture) = self.stderr_capture.as_mut() {
+                        capture.extend_from_slice(&captured);
+                    } else {
+                        let _ = super::shell_options::write_stderr_bytes(&captured);
+                    }
+                }
+                if status == 0 {
+                    DebugConditionVerdict::True
+                } else {
+                    DebugConditionVerdict::False
+                }
+            }
+            _ => {
+                DebugConditionVerdict::Failed(String::from_utf8_lossy(&captured).trim().to_string())
+            }
         }
     }
 

@@ -170,11 +170,17 @@ fn golden_nvm_load() {
     nvm_load_timing_gate();
 }
 
-/// One timed `source ./nvm.sh` run in the gate scratch dir; None when
-/// the run fails, times out, or the program cannot be spawned.
-fn nvm_load_timed_run(program: &Path, dir: &Path, limit: Duration) -> Option<Duration> {
+/// One timed run of an arbitrary `-c` script in the gate scratch dir;
+/// None when the run fails, times out, or the program cannot be
+/// spawned.
+fn nvm_load_timed_run_script(
+    program: &Path,
+    dir: &Path,
+    script: &str,
+    limit: Duration,
+) -> Option<Duration> {
     let mut cmd = Command::new(program);
-    cmd.args(["-c", ". ./nvm.sh"])
+    cmd.args(["-c", script])
         .current_dir(dir)
         .env_clear()
         .env("PATH", minimal_path())
@@ -220,17 +226,6 @@ fn gnu_bash_oracle() -> Option<PathBuf> {
 }
 
 fn nvm_load_timing_gate() {
-    // Ratio asserted below, calibrated on the post-#1940-fix tree
-    // (debug build, loaded 2-core dev box): rubash best-of-5 ~0.9 s
-    // vs GNU best-of-5 ~0.035 s, a ~26x gap. The bound keeps ~2x
-    // headroom over that while still failing the pre-fix tree
-    // (~114x). The absolute slack absorbs oracle startup noise on
-    // fast machines where the GNU run is only a few tens of
-    // milliseconds.
-    const MAX_RATIO: f64 = 50.0;
-    const SLACK: Duration = Duration::from_millis(250);
-    const REPS: usize = 5;
-
     let _guard = heavy_lock();
     let Some(oracle) = gnu_bash_oracle() else {
         eprintln!("golden_nvm_load timing gate: no GNU bash oracle found; skipped");
@@ -243,36 +238,67 @@ fn nvm_load_timing_gate() {
     std::fs::copy(root.join(CORPUS_DIR).join("nvm/nvm.sh"), dir.join("nvm.sh"))
         .expect("copy nvm corpus");
 
+    nvm_load_timing_gate_script(&oracle, &dir, ". ./nvm.sh", "plain");
+    // rubash#1961 alias-arm variant: the SAME load with one alias
+    // preset and expand_aliases on. The alias never occurs in nvm.sh,
+    // so the sourced bytes are identical — only the reader arm differs
+    // (pre-#1961 that arm re-derived group completeness per candidate
+    // line and hung past 120 s where the plain arm took ~1 s). The
+    // trailing `ll` command is the non-vacuity tripwire: the run only
+    // exits 0 when alias expansion was actually live for the driver,
+    // so the timing below cannot pass by silently taking the plain
+    // arm. Newlines separate the driver lines because an alias defined
+    // on the same line as its use is not yet in effect (parse.y reads
+    // one command at a time).
+    nvm_load_timing_gate_script(
+        &oracle,
+        &dir,
+        "alias ll='echo alias-live'\nshopt -s expand_aliases\n. ./nvm.sh\nll >/dev/null",
+        "alias-arm",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn nvm_load_timing_gate_script(oracle: &Path, dir: &Path, script: &str, label: &str) {
+    // Ratio asserted below, calibrated on the post-#1940-fix tree
+    // (debug build, loaded 2-core dev box): rubash best-of-5 ~0.9 s
+    // vs GNU best-of-5 ~0.035 s, a ~26x gap. The bound keeps ~2x
+    // headroom over that while still failing the pre-fix tree
+    // (~114x). The absolute slack absorbs oracle startup noise on
+    // fast machines where the GNU run is only a few tens of
+    // milliseconds.
+    const MAX_RATIO: f64 = 50.0;
+    const SLACK: Duration = Duration::from_millis(250);
+    const REPS: usize = 5;
+
     let rubash = PathBuf::from(env!("CARGO_BIN_EXE_rubash"));
     let mut oracle_runs = Vec::new();
     for _ in 0..REPS {
-        match nvm_load_timed_run(&oracle, &dir, Duration::from_secs(60)) {
+        match nvm_load_timed_run_script(oracle, dir, script, Duration::from_secs(60)) {
             Some(d) => oracle_runs.push(d),
             None => {
                 eprintln!(
-                    "golden_nvm_load timing gate: oracle {} failed to source nvm.sh; skipped",
+                    "golden_nvm_load timing gate ({label}): oracle {} failed the run; skipped",
                     oracle.display()
                 );
-                let _ = std::fs::remove_dir_all(&dir);
                 return;
             }
         }
     }
     let mut rubash_runs = Vec::new();
     for _ in 0..REPS {
-        let d = nvm_load_timed_run(&rubash, &dir, Duration::from_secs(120))
+        let d = nvm_load_timed_run_script(&rubash, dir, script, Duration::from_secs(120))
             .expect("rubash must source nvm.sh inside the timing gate");
         rubash_runs.push(d);
     }
-    let _ = std::fs::remove_dir_all(&dir);
     let oracle_best = best_duration(oracle_runs);
     let rubash_best = best_duration(rubash_runs);
     let budget = oracle_best.mul_f64(MAX_RATIO) + SLACK;
     assert!(
         rubash_best <= budget,
-        "nvm.sh load timing gate: rubash best-of-{REPS} {rubash_best:.2?} exceeds \
+        "nvm.sh load timing gate ({label}): rubash best-of-{REPS} {rubash_best:.2?} exceeds \
          {MAX_RATIO}x GNU best-of-{REPS} {oracle_best:.2?} + {SLACK:.2?} slack \
-         (budget {budget:.2?}); rubash#1940 regression class"
+         (budget {budget:.2?}); rubash#1940/#1961 regression class"
     );
 }
 golden_fixture!(golden_redir_operand_battery => "redir-operand-battery", timeout 60, corpus []);
@@ -3773,12 +3799,17 @@ mod win_face_fd_history {
     ///
     /// The assertion is the #1888 projection of the output — the two
     /// history lines, in order, and no "after history: 1" anywhere —
-    /// not the full byte stream: the file's POSIX-mode `-c` children
-    /// print their "after" lines where GNU's posix shell dies on the
-    /// special-builtin error, a separate pre-existing divergence the
-    /// committed errors.snap golden has absorbed (the golden is a
-    /// rubash-recorded snapshot; the two history lines are the part
-    /// the GNU 5.3.20 oracle adjudicated for this issue).
+    /// plus, since the RC audit phase-1 finding ④ fix, the errors10
+    /// numeric segment itself: the file's POSIX-mode `-c` children used
+    /// to print a second set of "after exit/shift/return" lines where
+    /// GNU's posix shell dies on the special-builtin error (EX_USAGE >
+    /// EX_SHERRBASE, execute_cmd.c:4886-4888 + :1004-1017), a
+    /// divergence the committed errors.snap golden had absorbed. The
+    /// product now converts the failure at the dispatch gate (and, for
+    /// `return`, in execute_return per builtins/return.def:62-65), the
+    /// golden was re-recorded from the GNU 5.3.20 oracle's output, and
+    /// the segment below pins the POSIX trio's absence: the
+    /// default-mode trio is followed DIRECTLY by the history lines.
     #[test]
     fn issue_1888_errors10_sub_verbatim() {
         let sub =
@@ -3802,6 +3833,195 @@ mod win_face_fd_history {
         assert!(
             !stdout.contains("after history: 1"),
             "history status folded to 1:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains(
+                "invalid numeric argument\nafter exit: 2\nafter shift: 2\nafter return: 2\nafter history: 2\n"
+            ),
+            "errors10 numeric segment diverged (the POSIX-mode trio must \
+             be absent — GNU's posix shell dies on the error):\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// RC audit phase-1 finding ④ (errors10): in POSIX mode, a special
+/// builtin's EX_USAGE-class failure (numeric-argument error, `--help`)
+/// is FATAL to a non-interactive shell — GNU returns EX_USAGE (258 >
+/// EX_SHERRBASE) from the builtin, execute_simple_command marks
+/// special_builtin_failed (execute_cmd.c:4886-4888), and the command's
+/// frame exits (execute_cmd.c:1004-1017) unless the context is tested
+/// (ignore_return / invert) or the builtin ran under `command`.
+/// rubash used to report the error and run the next command; the
+/// committed errors.snap golden had absorbed the non-fatal bytes.
+/// Expectations are the GNU bash 5.3.20 oracle's, byte for byte
+/// (stdout / stderr / exit status); see the fix-errors10 REPORT for
+/// the full two-mode classification matrix.
+mod errors10_posix_fatal {
+    use super::*;
+
+    fn run(args: &[&str]) -> (String, String, Option<i32>) {
+        let dir = case_scratch("errors10");
+        let out = run_rubash_in(&dir, args, Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    #[test]
+    fn errors10_posix_exit_numeric_is_fatal() {
+        let (stdout, stderr, code) = run(&["-o", "posix", "-c", "exit abcde; echo AFTER:$?"]);
+        assert_eq!(code, Some(2), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(stdout, "", "stderr:\n{stderr}");
+        assert_eq!(
+            stderr,
+            "bash: line 1: exit: abcde: numeric argument required\n"
+        );
+    }
+
+    #[test]
+    fn errors10_posix_shift_numeric_is_fatal() {
+        let (stdout, stderr, code) = run(&[
+            "-o",
+            "posix",
+            "-c",
+            "set -- a b c; shift abcde; echo AFTER:$?",
+        ]);
+        assert_eq!(code, Some(2), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(stdout, "", "stderr:\n{stderr}");
+        assert_eq!(
+            stderr,
+            "bash: line 1: shift: abcde: numeric argument required\n"
+        );
+    }
+
+    #[test]
+    fn errors10_posix_return_numeric_is_fatal() {
+        let (stdout, stderr, code) = run(&[
+            "-o",
+            "posix",
+            "-c",
+            "f(){ return abcde; echo INFUNC; }; f; echo AFTER:$?",
+        ]);
+        assert_eq!(code, Some(2), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(stdout, "", "stderr:\n{stderr}");
+        assert_eq!(
+            stderr,
+            "bash: line 1: return: abcde: numeric argument required\n"
+        );
+    }
+
+    #[test]
+    fn errors10_posix_exit_help_is_fatal() {
+        let (stdout, _stderr, code) =
+            run(&["-o", "posix", "-c", "exit --help >/dev/null; echo AFTER:$?"]);
+        assert_eq!(code, Some(2), "stdout:\n{stdout}");
+        assert_eq!(stdout, "");
+    }
+
+    #[test]
+    fn errors10_posix_shift_help_is_fatal() {
+        let (stdout, _stderr, code) = run(&[
+            "-o",
+            "posix",
+            "-c",
+            "set -- a b c; shift --help >/dev/null; echo AFTER:$?",
+        ]);
+        assert_eq!(code, Some(2), "stdout:\n{stdout}");
+        assert_eq!(stdout, "");
+    }
+
+    #[test]
+    fn errors10_posix_return_help_is_fatal() {
+        let (stdout, _stderr, code) = run(&[
+            "-o",
+            "posix",
+            "-c",
+            "f(){ return --help >/dev/null; echo INFUNC:$?; }; f; echo AFTER:$?",
+        ]);
+        assert_eq!(code, Some(2), "stdout:\n{stdout}");
+        assert_eq!(stdout, "");
+    }
+
+    /// GNU return.def:62-65's other arm: in a TESTED context the posix
+    /// builtin returns EX_USAGE without unwinding, so the function body
+    /// runs on and the call's status is the body's last status.
+    #[test]
+    fn errors10_posix_tested_return_numeric_body_continues() {
+        let (stdout, stderr, code) = run(&[
+            "-o",
+            "posix",
+            "-c",
+            "f(){ return abcde; echo INFUNC; }; f || echo OR:$?; echo DONE:$?",
+        ]);
+        assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(stdout, "INFUNC\nDONE:0\n", "stderr:\n{stderr}");
+    }
+
+    #[test]
+    fn errors10_default_exit_numeric_continues() {
+        let (stdout, stderr, code) = run(&["-c", "exit abcde; echo AFTER:$?"]);
+        assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(stdout, "AFTER:2\n", "stderr:\n{stderr}");
+    }
+
+    #[test]
+    fn errors10_posix_command_exit_numeric_continues() {
+        let (stdout, stderr, code) =
+            run(&["-o", "posix", "-c", "command exit abcde; echo AFTER:$?"]);
+        assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(stdout, "AFTER:2\n", "stderr:\n{stderr}");
+    }
+
+    #[test]
+    fn errors10_posix_if_exit_numeric_is_tested() {
+        let (stdout, stderr, code) = run(&[
+            "-o",
+            "posix",
+            "-c",
+            "if exit abcde; then echo T; else echo E:$?; fi; echo DONE",
+        ]);
+        assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(stdout, "E:2\nDONE\n", "stderr:\n{stderr}");
+    }
+
+    /// Sibling branch: shift's negative / out-of-range counts are
+    /// EXECUTION_FAILURE (never > EX_SHERRBASE), so they stay non-fatal
+    /// in POSIX mode; the out-of-range diagnostic prints because
+    /// posix_initialize sets print_shift_error (general.c:112).
+    #[test]
+    fn errors10_posix_shift_out_of_range_continues() {
+        let (stdout, stderr, code) =
+            run(&["-o", "posix", "-c", "set -- a b c; shift 99; echo AFTER:$?"]);
+        assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(stdout, "AFTER:1\n", "stderr:\n{stderr}");
+        assert_eq!(
+            stderr,
+            "bash: line 1: shift: 99: shift count out of range\n"
+        );
+    }
+
+    /// The too-many-arguments class is no_args DISCARD (mode
+    /// independent, NOT the special-builtin fatality channel): in
+    /// script-file form the failing line is abandoned, the function
+    /// (for `return`) unwinds, and the NEXT line runs with $?=2 —
+    /// exactly the errors10.sub tail segments.
+    #[test]
+    fn errors10_posix_too_many_script_form_continues() {
+        let dir = case_scratch("errors10-toomany");
+        std::fs::write(
+            dir.join("fg.sh"),
+            "set -- a b c\nexit 1 2\necho \"after exit: $?\"\nshift 1 2\necho \"after shift: $?\"\nf(){ return 1 2; echo INFUNC; }\nf\necho \"after return: $?\"\n",
+        )
+        .expect("write fg.sh");
+        let out = run_rubash_in(&dir, &["-o", "posix", "fg.sh"], Duration::from_secs(30));
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(
+            stdout, "after exit: 2\nafter shift: 2\nafter return: 2\n",
+            "stderr:\n{stderr}"
         );
     }
 }
@@ -4678,5 +4898,205 @@ mod issue_1952 {
         );
         assert_eq!(status, Some(0), "stderr:\n{stderr}");
         assert_eq!(stdout, "wait:3\nkill0:1\n", "stderr:\n{stderr}");
+    }
+
+    /// R3/D6: the comsub quick-read used to strip only the `/dev/fd/`
+    /// prefix itself, so `$(</proc/self/fd/N)` missed the fd table and
+    /// fell to the filesystem (ENOENT on Windows). GNU reads the fd
+    /// (subst.c read_comsub opens the spelling; procfs resolves it).
+    #[test]
+    fn r3_comsub_quick_read_proc_self_fd_spelling() {
+        let dir = case_scratch("r3-comsub-self");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "printf 'probe-r3\\n' > in.txt\n\
+             exec 3<in.txt\n\
+             x=$(</proc/self/fd/3)\n\
+             echo \"got:[$x]\"\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "got:[probe-r3]\n", "stderr:\n{stderr}");
+    }
+
+    /// R3/D6: `/dev/fd/+3` is not an fd spelling anywhere in GNU — the
+    /// literal open fails ENOENT on every face (oracle-verified), so
+    /// the quick-read must not serve fd 3's bytes for it. Before the
+    /// convergence this face's own parse accepted the sign and did.
+    #[test]
+    fn r3_comsub_quick_read_plus_fd_spelling_rejected() {
+        let dir = case_scratch("r3-comsub-plus");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "printf 'probe-r3\\n' > in.txt\n\
+             exec 3<in.txt\n\
+             x=$(</dev/fd/+3)\n\
+             echo \"got:[$x]\"\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "got:[]\n", "stderr:\n{stderr}");
+    }
+
+    /// R3/D4: `test -p` on a live pipe fd answers through the pipe-mark
+    /// matrix; the `+3` spelling used to parse to fd 3 and inherit its
+    /// mark. GNU: `/dev/fd/+3` stats ENOENT, so -p is false, while the
+    /// canonical spelling of the same pipe stays true.
+    #[test]
+    fn r3_test_pipe_plus_fd_spelling_rejected() {
+        let dir = case_scratch("r3-test-plus");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "exec 3< <(printf 'x\\n')\n\
+             if [ -p /dev/fd/3 ]; then echo canon-pipe; else echo canon-not-pipe; fi\n\
+             if [ -p /dev/fd/+3 ]; then echo plus-pipe; else echo plus-not-pipe; fi\n\
+             exec 3<&-\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "canon-pipe\nplus-not-pipe\n", "stderr:\n{stderr}");
+    }
+
+    /// R3/D5 control: the pipe-into-source fast path now recognizes
+    /// every registry fd-0 spelling; the sourced output must stay the
+    /// pipe's text for each (the general path answered these before,
+    /// so this pins the fast path to the same result).
+    #[test]
+    fn r3_pipe_source_fd0_spellings() {
+        let dir = case_scratch("r3-pipe-source");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "echo \"echo via-dev-fd-0\" | . /dev/fd/0\n\
+             echo \"echo via-proc-fd-0\" | . /proc/self/fd/0\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "via-dev-fd-0\nvia-proc-fd-0\n", "stderr:\n{stderr}");
+    }
+
+    /// R3/D6: `source /dev/fd/+3` must fail like GNU's (ENOENT
+    /// diagnostic, nothing sourced); the fd's bytes sit in a Text
+    /// endpoint (herestring), the one shape the old parse-and-serve
+    /// fallback could reach. Canonical /dev/fd/3 sourcing is the
+    /// control in the same script family (oracle-verified pair).
+    #[test]
+    fn r3_source_plus_fd_spelling_rejected() {
+        let dir = case_scratch("r3-source-plus");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "exec 3<<< 'echo should-not-run'\n\
+             . /dev/fd/+3\n\
+             echo after-marker\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "after-marker\n", "stderr:\n{stderr}");
+    }
+
+    /// R3/D1: an external command's `/dev/fd/+3` operand is not an fd
+    /// operand — the word reaches the child literally and the open
+    /// fails in the child (GNU: cat reports ENOENT, rc 1). Before the
+    /// convergence the operand layer parsed the sign, materialized
+    /// fd 3, and cat read it successfully. Canonical /dev/fd/3 is the
+    /// control.
+    #[test]
+    fn r3_external_operand_plus_fd_spelling_rejected() {
+        let dir = case_scratch("r3-operand-plus");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "printf 'probe-r3\\n' > in.txt\n\
+             exec 3<in.txt\n\
+             cat /dev/fd/3\n\
+             cat /dev/fd/+3 2>/dev/null; echo \"catrc:$?\"\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "probe-r3\ncatrc:1\n", "stderr:\n{stderr}");
+    }
+}
+
+/// rubash#1976: the bidirectional netopen face (`exec 3<>/dev/tcp/host/port`)
+/// opened the connection but every fd-3 read AND write failed with
+/// `Invalid argument`. GNU netopen returns ONE connected socket descriptor
+/// that serves both directions of any `/dev/tcp|udp` face (redir.c:660
+/// redir_open calls netopen for RF_DEVTCP/RF_DEVUDP whatever the `<`/`>`/`<>`
+/// spelling; lib/sh/netopen.c:282 netopen → socket + connect at :178
+/// _netopen4, then plain read(2)/write(2) on that fd). Rubash adopts the
+/// socket as the fd slot's raw handle, and the handle byte primitives used
+/// to serve it through ReadFile/WriteFile with a NULL OVERLAPPED — rejected
+/// with ERROR_INVALID_PARAMETER on an overlapped socket handle, so the peer
+/// only ever saw the connection close (EOF). The fd layer now routes socket
+/// handles through the socket API (recv/send, select for bounded waits).
+///
+/// Expectations hand-measured against WSL GNU Bash 5.3.20
+/// (/usr/local/bin/bash, 2026-10-28): the TCP round trip below and the
+/// bounded read on a silent endpoint (`read -t 2 -u 3` → `rc=142`, variable
+/// empty). Complements the issue1026 pin in
+/// tests/issue1025_1026_1068_1103_1359_redirect_fd_regressions.rs (which
+/// stays byte-identical — it is PR #1970's acceptance gate), driven from
+/// script files.
+///
+/// Known follow-up (verified 2026-10-28, out of this issue's handle-shape
+/// scope): a `read -u 3` record off a DATAGRAM (`/dev/udp`) fd still cannot
+/// be served by the byte-wise record loop — GNU routes a socket through the
+/// buffered zreadc chunk reader (read.def:668: a socket is neither tty nor
+/// fd_ispipe, so unbuffered_read stays 0) and zsyncfd keeps the overage
+/// when its rewind lseek fails (lib/sh/zread.c:294-309), while winsock's
+/// recv DISCARDS a datagram larger than the receive buffer entirely
+/// (WSAEMSGSIZE). Serving datagram records needs the chunked keep-overage
+/// reader, a read-builtin buffering-profile change of its own.
+mod issue_1976 {
+    use super::*;
+
+    fn run(dir: &Path, script: &str) -> (String, String, Option<i32>) {
+        let path = dir.join("case.sh");
+        std::fs::write(&path, script).expect("write probe script");
+        let out = run_rubash_in(
+            dir,
+            &[path.to_str().expect("utf8 scratch path")],
+            Duration::from_secs(30),
+        );
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    #[test]
+    fn issue1976_dev_tcp_readwrite_fd_round_trips() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 5];
+            stream.read_exact(&mut buf).expect("read ping");
+            assert_eq!(&buf, b"ping\n");
+            stream.write_all(b"pong\n").expect("write pong");
+        });
+        let dir = case_scratch("1976-tcp");
+        let script = format!(
+            "exec 3<>/dev/tcp/127.0.0.1/{port}\necho ping >&3\nread -u 3 line\necho \"got=[$line]\"\n"
+        );
+        let (stdout, stderr, status) = run(&dir, &script);
+        server.join().expect("server thread");
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "got=[pong]\n", "stderr:\n{stderr}");
+        assert_eq!(stderr, "", "stderr:\n{stderr}");
+    }
+
+    #[test]
+    fn issue1976_read_t_timeout_on_quiet_socket_fd() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        // Accept and stay silent past the read deadline, GNU-side.
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            std::thread::sleep(Duration::from_secs(4));
+            drop(stream);
+        });
+        let dir = case_scratch("1976-quiet");
+        let script = format!(
+            "exec 3<>/dev/tcp/127.0.0.1/{port}\nread -t 2 -u 3 line\necho \"rc=$?\"\necho \"line=[$line]\"\n"
+        );
+        let (stdout, stderr, status) = run(&dir, &script);
+        server.join().expect("server thread");
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "rc=142\nline=[]\n", "stderr:\n{stderr}");
     }
 }

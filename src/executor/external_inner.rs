@@ -1169,7 +1169,15 @@ impl Executor {
             // shells keep SIG_DFL and die like GNU scripts do.
             let sigint_guard = ForegroundWaitSigintGuard::hold_if_interactive_untrapped(self);
             self.note_foreground_wait();
-            let status = child.wait().map_err(ExecuteError::IoError)?;
+            // rubash#1990: with the guard armed (interactive, untrapped),
+            // wait in slices so a recorded terminal SIGINT can be
+            // forwarded to a child the group delivery never reached;
+            // unarmed waits keep the plain blocking waitpid.
+            let status = if sigint_guard.is_armed() {
+                wait_fg_child_sliced(child, &sigint_guard)?
+            } else {
+                child.wait().map_err(ExecuteError::IoError)?
+            };
             // rubash#1639: the foreground job died by SIGINT in an
             // interactive reader session with SIGINT untrapped — GNU
             // jobs.c's waitchld tail (the job_control/IS_FOREGROUND/
@@ -1990,7 +1998,7 @@ impl Executor {
                 return None;
             }
         }
-        if check_binary_file(&sample) {
+        if crate::script_driver::check_binary_file(&sample) {
             return Some((
                 format!(
                     "bash: {}: cannot execute binary file",
@@ -2063,20 +2071,121 @@ impl Executor {
 /// entry-ignored SIGINT stays ignored.
 struct ForegroundWaitSigintGuard {
     armed: bool,
+    /// Kernel-SIGINT epoch snapshot taken when the wait starts
+    /// (rubash#1990): the sliced wait forwards the interrupt to the
+    /// child once the epoch moves past this value.
+    sigint_epoch_at_arm: u64,
 }
 
 #[cfg(unix)]
 impl ForegroundWaitSigintGuard {
     fn hold_if_interactive_untrapped(executor: &Executor) -> Self {
         if !foreground_sigint_needs_protection(executor) {
-            return Self { armed: false };
+            return Self {
+                armed: false,
+                sigint_epoch_at_arm: 0,
+            };
         }
         crate::builtins::kill::hold_fg_sigint();
-        Self { armed: true }
+        Self {
+            armed: true,
+            sigint_epoch_at_arm: crate::builtins::kill::sigint_kernel_epoch(),
+        }
     }
 
     pub(in crate::executor) fn is_armed(&self) -> bool {
         self.armed
+    }
+
+    pub(in crate::executor) fn sigint_epoch_at_arm(&self) -> u64 {
+        self.sigint_epoch_at_arm
+    }
+}
+
+/// rubash#1990: sliced form of the armed foreground wait. GNU never
+/// needs to forward: its children lead their own process groups and
+/// the terminal's group delivery reaches them directly, so wait_for
+/// (jobs.c:3064) only has to record the shell's own copy. rubash
+/// children share the shell's process group, so on a healthy terminal
+/// the same delivery reaches them too — but when the spawn
+/// arrangement leaves the child outside the terminal's foreground
+/// group (the Termux/Android PTY sessions behind rubash#1990, a child
+/// that re-sessions itself), the delivery reaches ONLY the shell: the
+/// plain blocking wait then sat until the child's natural end and the
+/// recorded interrupt was forgotten ($?=0), while the session had no
+/// way to make the current command die. Forwarding the recorded
+/// kernel SIGINT to the child restores the invariant the group
+/// delivery was supposed to provide: the foreground command dies on
+/// ^C, is reaped here, and the wait reports its SIGINT death to the
+/// #1639 unwind as usual. A child that catches or blocks SIGINT is
+/// forwarded to exactly once and then left alone — GNU's
+/// child_caught_sigint case (jobs.c waitchld cleanup): the wait
+/// completes with the child's own status.
+#[cfg(unix)]
+fn wait_fg_child_sliced(
+    child: &mut std::process::Child,
+    sigint_guard: &ForegroundWaitSigintGuard,
+) -> Result<std::process::ExitStatus, ExecuteError> {
+    const SLICE: std::time::Duration = std::time::Duration::from_millis(10);
+    let child_pid = child.id() as i32;
+    let mut forwarded = false;
+    loop {
+        if let Some(status) = child.try_wait().map_err(ExecuteError::IoError)? {
+            return Ok(status);
+        }
+        if !forwarded {
+            // Drain like ForegroundBuiltinSigintGuard::take_sigint_abort:
+            // arrivals move from the kernel backend into the pending
+            // queues (a kernel SIGINT advances the epoch). Everything
+            // is requeued for the command boundary EXCEPT the SIGINT
+            // that advanced the epoch: that arrival is THIS wait's
+            // interrupt, and the wait consumes it the way the builtin
+            // guard does — leaving it queued would re-adjudicate it
+            // against the NEXT input line (discarding that line as if
+            // it were the interrupted one). If the child survives the
+            // forward and exits normally, the consumed interrupt is
+            // forgotten with it, matching the child_caught_sigint
+            // outcome (see the fn comment).
+            let pending = crate::builtins::kill::take_pending_signals_now(std::process::id())
+                .unwrap_or_default();
+            let epoch_moved =
+                crate::builtins::kill::sigint_kernel_epoch() != sigint_guard.sigint_epoch_at_arm();
+            if !pending.is_empty() {
+                let rest: Vec<i32> = if epoch_moved {
+                    pending
+                        .into_iter()
+                        .filter(|&signal| signal != libc::SIGINT)
+                        .collect()
+                } else {
+                    pending
+                };
+                if !rest.is_empty() {
+                    crate::builtins::kill::requeue_pending_signals(rest);
+                }
+            }
+            if epoch_moved {
+                forward_sigint_to_fg_child(child_pid);
+                forwarded = true;
+            }
+        }
+        std::thread::sleep(SLICE);
+    }
+}
+
+/// Deliver the forwarded SIGINT for wait_fg_child_sliced: group form
+/// when the child made itself a process-group leader (the arrangement
+/// where it missed the terminal's group delivery), directed form
+/// otherwise — the group form against the shell's own group would
+/// interrupt the shell and every sibling in it.
+#[cfg(unix)]
+fn forward_sigint_to_fg_child(child_pid: i32) {
+    unsafe {
+        let pgid = libc::getpgid(child_pid);
+        if pgid > 0 && pgid == child_pid {
+            libc::kill(-pgid, libc::SIGINT);
+        } else {
+            libc::kill(child_pid, libc::SIGINT);
+        }
     }
 }
 
@@ -2299,38 +2408,10 @@ fn file_has_exec_bit(metadata: &std::fs::Metadata) -> bool {
     }
 }
 
-/// check_binary_file (general.c:718-741): ELF magic is always binary;
-/// otherwise the first line (two lines when the sample starts with a #!
-/// interpreter specifier) must be NUL-free.
-fn check_binary_file(sample: &[u8]) -> bool {
-    if sample.len() >= 4
-        && sample[0] == 0x7f
-        && sample[1] == b'E'
-        && sample[2] == b'L'
-        && sample[3] == b'F'
-    {
-        return true;
-    }
-    if sample.is_empty() {
-        return false;
-    }
-    let mut lines_left = if sample.len() >= 2 && sample[0] == b'#' && sample[1] == b'!' {
-        2
-    } else {
-        1
-    };
-    for &byte in sample {
-        if byte == b'\n' {
-            lines_left -= 1;
-            if lines_left == 0 {
-                return false;
-            }
-        } else if byte == 0 {
-            return true;
-        }
-    }
-    false
-}
+/// The binary-file gate itself is `crate::script_driver::check_binary_file`
+/// (general.c:718-741) — one shared implementation for the script-entry
+/// and external-command gates (redundancy R9: the two copies were
+/// byte-identical logic and could only drift apart).
 
 #[derive(Default)]
 struct EnvCommandConfig {

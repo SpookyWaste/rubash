@@ -972,74 +972,36 @@ impl Executor {
             let mut output = String::new();
             let mut status = 0;
             for word in &words[1..] {
-                // Process substitution `<(...)`: Bash materializes it to a
-                // temporary file holding the command's output, so `cat` reads
-                // that output. Run the inner command directly instead of
-                // treating the literal `<(...)` text as a file path.
-                if let Some(source) = word
-                    .strip_prefix("<(")
-                    .and_then(|rest| rest.strip_suffix(')'))
-                {
-                    let mut executor = self.command_substitution_executor();
-                    crate::builtins::trap::reset_for_subshell_child(
-                        &mut executor.shell_state.env_vars,
-                    );
-                    output.push_str(&executor.expand_command_substitution(source));
-                    continue;
-                }
+                // No `<(...)` operand arm here (redundancy R7): the
+                // triviality gate above admits only the byte set
+                // [A-Za-z0-9 \t_-+=.,/:@%^], which contains neither `<`
+                // nor `(`, so a procsub operand can never reach this
+                // loop — such bodies fall to full execution earlier.
                 let path = self.expand_word(word);
                 // `/dev/stdin`/`/dev/fd/0`/`/proc/self/fd/0` read fd 0 —
                 // the FUNCTION_STDIN cursor (the gate above already sent
-                // N>0 descriptors to full execution). Consuming fd 0 here
-                // writes the cursor back the way the external fast path
-                // does (comsub_stdin_writeback).
+                // N>0 descriptors to full execution).
                 if crate::executor::dev_fd_operands::dev_operand_fd(&path) == Some(0) {
-                    if let Some(text) = self.shell_state.env_vars.get(FUNCTION_STDIN) {
-                        self.comsub_stdin_writeback
-                            .set(Some((text.len(), Self::function_stdin_fingerprint(text))));
-                    }
-                    output.push_str(&self.function_stdin_remaining().unwrap_or_default());
+                    output.push_str(&self.comsub_cat_function_stdin_text());
                     continue;
                 }
-                // niubash#177: same operand resolution as the argv funnel —
-                // a virtual-root file operand may exist only under its
-                // `.exe` spelling on disk.
-                //
-                // Read bytes, not a decoded String: GNU cat.c reads the file
-                // as raw bytes (safe_read -> write), so a non-UTF-8 file is
-                // content, not an error. `read_to_string` rejected any
-                // invalid sequence as ENOENT and the shortcut then reported a
-                // file that plainly exists as "No such file" and returned an
-                // empty value (rubash#772). The bytes ride the same
-                // bytes_to_shell_text carrier contract as every other
-                // substitution capture, and GNU read_comsub discards NUL
-                // bytes while reading the child pipe (substitution_metadata
-                // SubstitutionOutput::readback), so drop NUL first.
-                // Registry first, in the quick-read / external_cat order
-                // (rubash#1917 cat-face): synthetic /proc content has no
-                // filesystem file behind the mapped path on Windows, so
-                // reading the mapped path directly reported a live
-                // /proc file as ENOENT; a SyntheticLink operand
-                // (rubash#1900) resolves through the registry to its
-                // native target and reads that (the session cwd answers
-                // for self/cwd, per the open ladder / read_io).
-                let read_result =
-                    if let Some(bytes) = crate::special_paths::synthetic_proc_content(&path) {
-                        Ok(bytes)
-                    } else if let Some(link) = crate::special_paths::synthetic_link_target(
-                        &path,
-                        Some(&crate::proc_vfs::self_cwd_forms(self.session_cwd())),
-                    ) {
-                        fs::read(&link.native)
-                    } else {
-                        fs::read(self.session_path(
-                            crate::executor::path::windows_operand_file_path(
-                                shell_path_to_windows(&path, &self.shell_state.env_vars),
-                                &self.shell_state.env_vars,
-                            ),
-                        ))
-                    };
-                match read_result {
+                // Byte source: the ladder shared with the timed cat arm
+                // (comsub_cat_operand_bytes). This arm's own policy is
+                // unchanged: read bytes, not a decoded String — GNU cat.c
+                // reads the file as raw bytes (safe_read -> write), so a
+                // non-UTF-8 file is content, not an error. `read_to_string`
+                // rejected any invalid sequence as ENOENT and the shortcut
+                // then reported a file that plainly exists as "No such
+                // file" and returned an empty value (rubash#772). The bytes
+                // ride the same bytes_to_shell_text carrier contract as
+                // every other substitution capture, and GNU read_comsub
+                // discards NUL bytes while reading the child pipe
+                // (substitution_metadata SubstitutionOutput::readback), so
+                // drop NUL first; a failed read diagnoses and sets status
+                // 1 — unlike the timed arm, which skips silently at
+                // status 0 (that fork is deliberate and stays unfused;
+                // see T2 in the redundancy audit).
+                match self.comsub_cat_operand_bytes(&path) {
                     Ok(mut bytes) => {
                         bytes.retain(|byte| *byte != 0);
                         output.push_str(&bytes_to_shell_text(&bytes));
@@ -1202,11 +1164,12 @@ impl Executor {
             return output;
         }
 
-        if words.first().map(String::as_str) == Some("mktemp") {
-            if let Some(path) = self.mktemp_command_substitution(&words) {
-                return path;
-            }
-        }
+        // No second mktemp dispatch here (redundancy R7): the in-process
+        // attempt above already ran with these exact words; its decline
+        // paths create nothing and are deterministic, and the external
+        // attempt just declined too (it returns None for mktemp whenever
+        // it must not claim the body), so a repeat call could only
+        // reproduce the first result.
 
         // Fallback: run the source through the real parser/executor in a
         // subshell and capture stdout (function calls, pipelines, compound
@@ -1790,6 +1753,7 @@ impl Executor {
             pipeline_stage_pre_traced: std::cell::Cell::new(false),
             pipeline_stage_restricted_refused: std::cell::Cell::new(false),
             last_heredoc_warning_source: RefCell::new(None),
+            heredoc_admission_declined_source: RefCell::new(None),
             comsub_leading_newlines: Cell::new(0),
             current_shell_substitution_exit: Cell::new(self.current_shell_substitution_exit.get()),
             last_command_substitution_parse_error: Cell::new(false),
@@ -2134,26 +2098,31 @@ impl Executor {
         // (subst.c process_substitute + move_to_high_fd): the bytes live in
         // the fd table's ProcessSubstitution endpoint, not on disk. Reading
         // the path with fs would fail with ENOENT where GNU reads the fd.
-        if let Some(fd_text) = file_word.strip_prefix("/dev/fd/") {
-            if let Ok(fd) = fd_text.parse::<u32>() {
-                if let Some((data, offset)) = self.fd_table.input_snapshot_bytes(fd) {
-                    if let Some(content) = data.get(offset..).map(<[u8]>::to_vec) {
-                        self.last_command_substitution_status.set(Some(0));
-                        return bytes_to_shell_text(&content)
-                            .trim_capture_terminator()
-                            .to_string();
-                    }
-                }
-                // rubash#1952: a streamed procsub binds a live File
-                // endpoint instead of a buffered one — drain it
-                // through the shared handle (reads to EOF, the
-                // quick-read's defining semantics).
-                if let Some(content) = self.fd_table.read_file_endpoint_bytes(fd) {
+        // The spelling judgment is the registry's fd-alias family
+        // (redundancy audit R3/D6): this face used to strip only the
+        // `/dev/fd/` prefix and parse the tail itself, so
+        // `$(</proc/self/fd/N)` missed the fd table and fell to the
+        // filesystem (ENOENT on Windows, where GNU reads the fd), while
+        // `/dev/fd/+3` was accepted here even though GNU rejects that
+        // spelling on every face.
+        if let Some(fd) = crate::special_paths::fd_alias_target(file_word) {
+            if let Some((data, offset)) = self.fd_table.input_snapshot_bytes(fd) {
+                if let Some(content) = data.get(offset..).map(<[u8]>::to_vec) {
                     self.last_command_substitution_status.set(Some(0));
                     return bytes_to_shell_text(&content)
                         .trim_capture_terminator()
                         .to_string();
                 }
+            }
+            // rubash#1952: a streamed procsub binds a live File
+            // endpoint instead of a buffered one — drain it
+            // through the shared handle (reads to EOF, the
+            // quick-read's defining semantics).
+            if let Some(content) = self.fd_table.read_file_endpoint_bytes(fd) {
+                self.last_command_substitution_status.set(Some(0));
+                return bytes_to_shell_text(&content)
+                    .trim_capture_terminator()
+                    .to_string();
             }
         }
         // The canonical ladder steps this quick-read ladder used to

@@ -186,6 +186,12 @@ struct CliStopLoop {
     pending_eval: Option<PendingEval>,
     /// Source text cache for `list`, by file identity.
     sources: std::collections::HashMap<String, Vec<String>>,
+    /// Queued command lines from `source` files (design 9.5/10):
+    /// the batch driver. Lines run before the terminal stream
+    /// resumes, and a nested `source` queues ahead of its
+    /// sourcer's remaining lines. The queue survives across
+    /// serves, so a sourced file may span several stops.
+    sourced: std::collections::VecDeque<String>,
 }
 
 impl CliStopLoop {
@@ -198,6 +204,7 @@ impl CliStopLoop {
             listsize: 10,
             pending_eval: None,
             sources: std::collections::HashMap::new(),
+            sourced: std::collections::VecDeque::new(),
         }
     }
 
@@ -375,6 +382,14 @@ impl CliStopLoop {
 }
 
 impl StopLoop for CliStopLoop {
+    /// A mid-run announcement (design 5.3's condition failure
+    /// report): the CLI's channel is its output stream, so the
+    /// report lands at the consult that produced it, ahead of
+    /// whatever the debuggee prints next.
+    fn announce(&mut self, _session: &DebugSession, text: &str) {
+        self.line(text);
+    }
+
     fn serve(&mut self, session: &mut DebugSession) -> StopLoopOutcome {
         // Re-entry after an evaluation: the same stop, still
         // parked; render the outcome and keep reading commands.
@@ -420,6 +435,7 @@ commands (design section 10, M1):
   exceptions <filter> on|off                           exception filters (WP-15)
   show listsize / set listsize N
   tty                                                  report the command stream
+  source <file>                                        run commands from a file
   help                                                 this text";
 
 impl CliStopLoop {
@@ -427,16 +443,24 @@ impl CliStopLoop {
         loop {
             let _ = write!(self.out, "(rubash-dbg) ");
             let _ = self.out.flush();
-            let mut raw = String::new();
-            match self.input.read_line(&mut raw) {
-                Ok(0) | Err(_) => {
-                    // EOF on the command stream is `quit`
-                    // (design 9.3).
-                    let _ = writeln!(self.out);
-                    return self.quit(session);
+            // `source`d lines are served before the terminal
+            // stream (design 9.5/10 batch driving).
+            let raw = match self.sourced.pop_front() {
+                Some(line) => line,
+                None => {
+                    let mut raw = String::new();
+                    match self.input.read_line(&mut raw) {
+                        Ok(0) | Err(_) => {
+                            // EOF on the command stream is `quit`
+                            // (design 9.3).
+                            let _ = writeln!(self.out);
+                            return self.quit(session);
+                        }
+                        _ => {}
+                    }
+                    raw
                 }
-                _ => {}
-            }
+            };
             let text = raw.trim();
             if text.is_empty() {
                 continue;
@@ -555,11 +579,37 @@ impl CliStopLoop {
             "tty" => {
                 self.line("tty: the debugger command stream (never the debuggee's stdin)");
             }
+            "source" => self.source_commands(rest),
             other => {
                 self.line(&format!("unknown command '{other}' — try 'help'"));
             }
         }
         None
+    }
+
+    /// `source <file>`: queue a file's lines as debugger
+    /// commands (design 9.5/10 — the batch driver for golden
+    /// sessions; command files come from files, not the
+    /// terminal). The file's lines run before anything already
+    /// queued, so a nested `source` completes before its
+    /// sourcer's remaining lines; when the queue drains, the
+    /// terminal stream resumes.
+    fn source_commands(&mut self, rest: &str) {
+        let path = rest.trim();
+        if path.is_empty() {
+            self.line("source: a command file path is required");
+            return;
+        }
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                for line in text.lines().rev() {
+                    self.sourced.push_front(line.to_string());
+                }
+            }
+            Err(error) => {
+                self.line(&format!("source: cannot read '{path}': {error}"));
+            }
+        }
     }
 
     fn set_breakpoint(&mut self, session: &mut DebugSession, rest: &str, one_shot: bool) {

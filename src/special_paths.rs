@@ -134,9 +134,29 @@ pub(crate) fn fd_alias_target(target: &str) -> Option<u32> {
     let fd = target
         .strip_prefix("/dev/fd/")
         .or_else(|| target.strip_prefix("/proc/self/fd/"))?;
-    (!fd.is_empty() && fd.chars().all(|ch| ch.is_ascii_digit()))
-        .then(|| fd.parse::<u32>().ok())
-        .flatten()
+    canonical_fd_number(fd)
+}
+
+/// The registry's numeric field is canonical decimal — exactly the
+/// spelling set the kernel's fd-alias names use: ASCII digits only, no
+/// sign, no whitespace, and no leading zero ("0" itself excepted).
+///
+/// GNU anchor: on the oracle platform (Linux) bash is built with
+/// HAVE_DEV_FD, so `_redir_special_filenames` (redir.c:601) does not
+/// intercept `/dev/fd/N` and the literal open decides — procfs serves
+/// only canonical names, so `/dev/fd/00`, `/dev/fd/03`, `/dev/fd/007`,
+/// `/proc/self/fd/00` fail ENOENT on every face (cat, redirect,
+/// `test -r`, `source`; issue rubash#1973 oracle probes, bash
+/// 5.3.20). The no-dev-fd fallback (`redir.c:630 redir_special_open`,
+/// `all_digits` general.c:233) likewise never parses a sign.
+fn canonical_fd_number(fd: &str) -> Option<u32> {
+    if !fd.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    if fd.len() > 1 && fd.starts_with('0') {
+        return None;
+    }
+    fd.parse::<u32>().ok()
 }
 
 /// The registry's entry for the synthetic-/proc class: the file's
@@ -212,9 +232,11 @@ mod tests {
         let fd = target
             .strip_prefix("/dev/fd/")
             .or_else(|| target.strip_prefix("/proc/self/fd/"))?;
-        (!fd.is_empty() && fd.chars().all(|ch| ch.is_ascii_digit()))
-            .then(|| fd.parse::<u32>().ok())
-            .flatten()
+        // Issue rubash#1973: the pre-registry body also accepted
+        // leading-zero spellings, which GNU rejects everywhere; the
+        // mirror carries the corrected canonical judgment so the
+        // battery below keeps tripping on any future drift.
+        canonical_fd_number(fd)
     }
 
     fn expected_proc() -> SpecialPathClass {
@@ -266,8 +288,24 @@ mod tests {
             ("/dev/stderr", FdAlias(2)),
             ("/dev/fd/0", FdAlias(0)),
             ("/dev/fd/63", FdAlias(63)),
-            ("/dev/fd/03", FdAlias(3)),
+            ("/dev/fd/10", FdAlias(10)),
             ("/proc/self/fd/2", FdAlias(2)),
+            // Issue rubash#1973: leading-zero fd spellings are NOT fd
+            // aliases — GNU 5.3.20 rejects them on every face (the
+            // oracle's procfs serves only canonical names), so they are
+            // plain filesystem paths that fail ENOENT there.
+            ("/dev/fd/00", Filesystem),
+            ("/dev/fd/01", Filesystem),
+            ("/dev/fd/03", Filesystem),
+            ("/dev/fd/007", Filesystem),
+            ("/dev/fd/000", Filesystem),
+            ("/proc/self/fd/00", Filesystem),
+            ("/proc/self/fd/03", Filesystem),
+            // GNU also rejects signs on every face (redir.c:630
+            // redir_special_open → all_digits); the registry has never
+            // accepted them — kept pinned.
+            ("/dev/fd/+3", Filesystem),
+            ("/proc/self/fd/+3", Filesystem),
             ("/dev/fd/", Filesystem),
             ("/dev/fd/3x", Filesystem),
             ("/dev/fd/-1", Filesystem),
@@ -350,6 +388,50 @@ mod tests {
                 is_synthetic_link_path(target),
                 class == SyntheticLink,
                 "link query vs classify for {target:?}"
+            );
+        }
+    }
+
+    /// Issue rubash#1973 regression pin: the leading-zero family fails
+    /// fd-alias recognition spelling by spelling (GNU 5.3.20 oracle:
+    /// cat ENOENT, redirect ENOENT, `test -r` false, `source` ENOENT —
+    /// procfs serves only canonical names, so even an OPEN fd 3 does
+    /// not make `/dev/fd/03` resolve), while "0" and the canonical
+    /// multi-digit forms keep their FdAlias answers.
+    #[test]
+    fn issue1973_leading_zero_fd_spellings_are_not_aliases() {
+        for spelling in [
+            "/dev/fd/00",
+            "/dev/fd/01",
+            "/dev/fd/03",
+            "/dev/fd/007",
+            "/dev/fd/000",
+            "/proc/self/fd/00",
+            "/proc/self/fd/03",
+            "/proc/self/fd/007",
+        ] {
+            assert_eq!(
+                fd_alias_target(spelling),
+                None,
+                "leading-zero spelling must not be an fd alias: {spelling:?}"
+            );
+            assert_eq!(
+                classify_special_path(spelling),
+                SpecialPathClass::Filesystem,
+                "leading-zero spelling must classify as filesystem: {spelling:?}"
+            );
+        }
+        for (spelling, fd) in [
+            ("/dev/fd/0", 0),
+            ("/dev/fd/10", 10),
+            ("/dev/fd/63", 63),
+            ("/proc/self/fd/0", 0),
+            ("/proc/self/fd/2", 2),
+        ] {
+            assert_eq!(
+                fd_alias_target(spelling),
+                Some(fd),
+                "canonical spelling must stay an fd alias: {spelling:?}"
             );
         }
     }
