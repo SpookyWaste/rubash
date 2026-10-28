@@ -2093,14 +2093,52 @@ impl Executor {
     /// att_* word) whitelists the shape; identical values skip both
     /// stores, otherwise both are written together so the #616/#618
     /// mirror-must-never-go-stale rule holds. None = fall through.
+    ///
+    /// F7 widening: admission is by attribute SHAPE plus a closed
+    /// registry of names whose bind semantics live INSIDE
+    /// apply_shell_assignment_inner itself.
+    /// - Attributes: only att_exported may be set. Every other bit makes
+    ///   the generic tail perform work this lane must not skip
+    ///   (att_integer -> variables.c:2937 make_variable_value evalexp;
+    ///   att_uppercase / att_lowercase / capcase -> the case conversion
+    ///   in the same function; att_nameref -> find_variable_nameref
+    ///   resolution; att_array / att_assoc -> arrayfunc.c storage
+    ///   machinery; att_readonly -> the readonly refusal;
+    ///   att_declared_unset -> the tail's DECLARED_UNSET unmark). An
+    ///   exported-only variable's generic tail is exactly this lane's
+    ///   dual store: children are served from the spawn env built off
+    ///   the EXPORTED mark (#916), and set_process_env is gated to the
+    ///   process-env name set, which is excluded separately below.
+    /// - The name registry below holds only names with an INNER bind
+    ///   arm in apply_shell_assignment_inner: dynamic write-back
+    ///   (SECONDS / RANDOM / SRANDOM), swallow dynamics and noassign
+    ///   arrays (BASHPID, BASH_SUBSHELL, FUNCNAME, LINENO, BASH_COMMAND,
+    ///   BASH_ARGC / BASH_ARGV, BASH_LINENO, BASH_SOURCE, PIPESTATUS),
+    ///   and the sv_ignoreeof option sync (IGNOREEOF / ignoreeof,
+    ///   variables.c:6205). OPTIND is deliberately NOT in it: its only
+    ///   inner act is dropping the __RUBASH_GETOPTS_OFFSET shadow, and
+    ///   the sv_optind hook (variables.c:5817) is carried by
+    ///   apply_shell_assignment's funnel, which drops BOTH getopts
+    ///   shadows after every bind attempt on every path — so the dual
+    ///   store here is the whole observable effect of an OPTIND bind.
+    ///   (The tempenv shadow gate keeps its own copy of the wider list
+    ///   for a different decision — whether a tempvar may shadow at
+    ///   all — and is not synced with this registry.)
+    /// - allexport no longer excludes: the generic tail's only extra
+    ///   act for this shape is applying att_exported after the store
+    ///   (GNU bind_variable_internal does the same under
+    ///   mark_modified_vars, variables.c:3170), which the lane performs
+    ///   on its success exits below.
     fn bind_marks_free_scalar(&mut self, base: &str, value: &str) -> Option<bool> {
+        // Attribute shape: no att_* bit other than att_exported.
+        let mut non_export_attrs = self.shell_state.env_vars.attr_of(base);
+        non_export_attrs.exported = false;
         if base.contains('[')
             || value.starts_with(COMPOUND_ASSIGNMENT_MARKER)
             || value.starts_with(STORAGE_WORD_PREFIX)
             || matches!(
                 base,
-                "OPTIND"
-                    | "IGNOREEOF"
+                "IGNOREEOF"
                     | "ignoreeof"
                     | "SECONDS"
                     | "RANDOM"
@@ -2117,12 +2155,13 @@ impl Executor {
                     | "PIPESTATUS"
             )
             || shell_assignment_needs_process_env(base)
-            || self.shell_state.env_vars.attr_of(base) != VarAttrs::default()
+            || non_export_attrs != VarAttrs::default()
             || is_marked_var(&self.shell_state.env_vars, CAPCASE_VARS, base)
-            || crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "allexport")
         {
             return None;
         }
+        let allexport =
+            crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "allexport");
         self.pending_scalar_assignment = false;
         // Identical rebinds skip both stores. The cell flag rides along:
         // a readonly rebind still falls through to the generic bind's
@@ -2135,6 +2174,9 @@ impl Executor {
             .is_some_and(|cur| cur == value)
             && matches!(self.shell_state.variables.get(base), Some(v) if !v.readonly && matches!(&v.value, crate::shell::ShellValue::Scalar(cur) if cur == value))
         {
+            if allexport {
+                self.mark_exported(base);
+            }
             return Some(true);
         }
         match self.shell_state.variables.get_mut(base) {
@@ -2171,6 +2213,9 @@ impl Executor {
             self.shell_state
                 .env_vars
                 .insert(base.to_string(), value.to_string());
+        }
+        if allexport {
+            self.mark_exported(base);
         }
         Some(true)
     }
