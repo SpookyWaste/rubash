@@ -727,6 +727,13 @@ impl Executor {
                 && dev_stdio_redirect_fd(&target).is_none()
                 && !crate::special_paths::is_net_redirect_target(&target)
                 && !target.starts_with("<(")
+                // Registry classes (rubash#1917/#1900): a synthetic
+                // /proc spelling's mapped path is not the file — the
+                // class's own open face owns its outcome, so this
+                // raw-path probe must not judge it (same skip class as
+                // the Input probe below).
+                && crate::special_paths::synthetic_proc_content(&target).is_none()
+                && !crate::special_paths::is_synthetic_link_path(&target)
             {
                 let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
                 if let Err(error) = FileFd::open_readwrite_pair(path) {
@@ -756,6 +763,16 @@ impl Executor {
                 && !crate::special_paths::is_net_redirect_target(&target)
                 && !target.starts_with("<(")
                 && redirect_target_fd(&target).is_none()
+                // Registry classes (rubash#1917/#1900): synthetic /proc
+                // content and links are validated by the open ladder
+                // that serves them (probe_input_redirect on the shell
+                // spelling). Their mapped Windows path never exists,
+                // so this raw-path probe condemned every live /proc
+                // target with a spurious ENOENT before the command
+                // ran — the reject-gate face of the ladder-skip family
+                // (cf. rubash#1904's comsub face).
+                && crate::special_paths::synthetic_proc_content(&target).is_none()
+                && !crate::special_paths::is_synthetic_link_path(&target)
             {
                 let path = self.session_path(crate::executor::path::windows_operand_file_path(
                     shell_path_to_windows(&target, &self.shell_state.env_vars),
