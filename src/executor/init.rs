@@ -438,6 +438,7 @@ impl Executor {
                 xtrace_fd_source: std::cell::RefCell::new(String::new()),
                 procsub_streams: std::cell::RefCell::new(HashMap::new()),
                 procsub_adhoc_carriers: std::cell::RefCell::new(Vec::new()),
+                fork_saved_process_umask: None,
             },
             fd_table: FdTable::new(),
             exit_code: 0,
