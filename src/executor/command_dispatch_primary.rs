@@ -311,6 +311,16 @@ impl Executor {
                     )?;
                     self.write_buffered_builtin_output(cmd, &[], &stderr)?;
                     self.exit_code = 2;
+                    // get_exitstat's failure return is EX_USAGE (258 >
+                    // EX_SHERRBASE=256): execute_simple_command marks
+                    // special_builtin_failed (execute_cmd.c:4886-4888), so
+                    // in POSIX non-interactive mode this failure is fatal
+                    // at this frame unless the context is tested — the
+                    // gate in execute_materialized_command converts
+                    // (execute_cmd.c:1004-1017). RC audit phase-1 finding
+                    // ④ / errors10: the committed errors.snap golden had
+                    // absorbed the non-fatal behavior.
+                    self.special_builtin_failed.set(true);
                     return Ok(Ok(()));
                 }
             }
@@ -353,6 +363,15 @@ impl Executor {
             }
             crate::builtins::exit::ExitAction::Continue(status) => {
                 self.exit_code = status;
+                // The only Continue outcome reachable past the intercept
+                // above is CHECK_HELPOPT's `--help` (builtins/exit.def:59),
+                // which RETURNS EX_USAGE from the builtin itself — the
+                // same special-builtin failure class as the numeric error
+                // (execute_cmd.c:4886-4888), fatal in POSIX
+                // non-interactive mode via the dispatch gate.
+                if status == crate::builtins::exit::EX_USAGE {
+                    self.special_builtin_failed.set(true);
+                }
                 Ok(())
             }
         })

@@ -404,9 +404,24 @@ impl Executor {
         // here would double it once the Ok result reaches them), and
         // maybe_run_error_trap's own gates (inverted / &&-|| context /
         // errtrace function depth) match the errexit conditions.
+        // The :1004 check is itself gated on `ignore_return == 0 &&
+        // invert == 0' (and the ERR-trap call at :993 shares that gate):
+        // a special builtin failing inside a tested context — an if/while
+        // condition, a non-final &&/|| member, a `!' inversion, or a
+        // function body reached from such a call — reports its status and
+        // execution continues. rubash's with_errexit_suppressed marks
+        // exactly those contexts (the executor's CMD_IGNORE_RETURN model:
+        // conditions, non-final list members and inverted commands are
+        // dispatched under it, and it stays raised across a tested
+        // function call), and the errexit branch at the bottom of this
+        // function already consults the same predicate, so the fatality
+        // channel reads it too. (RC audit phase-1 finding ④ / errors10:
+        // before this, failures already wired into the channel — the
+        // `set' family — died inside conditions where GNU continues.)
         let outcome = if result.is_ok()
             && self.special_builtin_failed.get()
             && self.command_builtin_depth == 0
+            && self.errexit_is_active()
             && self.posix_mode_enabled()
             && self
                 .shell_state
