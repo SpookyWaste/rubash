@@ -209,6 +209,32 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn issue659_physical_mode_strips_verbatim_cwd_prefix() {
+        // unixwin/niubash#659: the session cwd field can hold
+        // canonicalize's extended-length form (\\?\C:\...) when a probe
+        // result reaches it; `pwd -P` must still print the POSIX
+        // /<drive>/... getcwd form, never `//?/...`.
+        let native = env::temp_dir();
+        let verbatim = std::path::PathBuf::from(format!(r"\\?\{}", native.to_string_lossy()));
+        let env_vars = HashMap::new();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = execute_with_env_and_io(
+            ["-P"].iter().copied(),
+            &env_vars,
+            &verbatim,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+        assert_eq!(status, EXECUTION_SUCCESS);
+        let printed = String::from_utf8(stdout).unwrap();
+        assert!(!printed.contains('?'), "{printed}");
+        assert!(printed.starts_with('/'), "{printed}");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn physical_mode_reports_physical_cwd() {
         // Physical mode prints get_working_directory in the one canonical
         // POSIX /<drive>/... form (GNU pwd.def, rubash#537).

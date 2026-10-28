@@ -6847,6 +6847,55 @@ mod tests {
         clear_command_lookup_cache();
     }
 
+    // unixwin/niubash#659: std::fs::canonicalize on Windows returns
+    // extended-length verbatim paths (\\?\C:\..., \\?\UNC\...). GNU's
+    // physical path always comes from getcwd after a real chdir
+    // (builtins/common.c:592 get_working_directory), which never
+    // carries that prefix, so neither a session-cwd probe result nor
+    // the PWD display form may keep it (1.4.4 regression via G-02).
+    #[cfg(windows)]
+    #[test]
+    fn issue659_strip_verbatim_prefix_restores_getcwd_form() {
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:\Users\cmx\AppData\Local\Temp")),
+            PathBuf::from(r"C:\Users\cmx\AppData\Local\Temp")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\dir")),
+            PathBuf::from(r"\\server\share\dir")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"C:\plain\dir")),
+            PathBuf::from(r"C:\plain\dir")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\server\share")),
+            PathBuf::from(r"\\server\share")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue659_canonicalize_native_reports_getcwd_form() {
+        let resolved = canonicalize_native(&std::env::temp_dir()).unwrap();
+        let text = resolved.to_string_lossy();
+        assert!(!text.starts_with(r"\\?\"), "{text}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue659_pwd_display_of_verbatim_physical_path_is_posix() {
+        assert_eq!(
+            shell_pwd_display_path(r"\\?\C:\Users\cmx\AppData\Local\Temp"),
+            "/c/Users/cmx/AppData/Local/Temp"
+        );
+        assert_eq!(shell_pwd_display_path("//?/C:/Users/cmx"), "/c/Users/cmx");
+        assert_eq!(
+            shell_pwd_display_path(r"\\?\UNC\server\share\dir"),
+            "//server/share/dir"
+        );
+    }
+
     fn windows_shell_path(path: &Path) -> String {
         let value = path.to_string_lossy().replace('\\', "/");
         let bytes = value.as_bytes();
@@ -6866,6 +6915,39 @@ mod tests {
     }
 }
 
+/// Windows extended-length ("verbatim") prefixes are an artifact of
+/// `std::fs::canonicalize` (`\\?\C:\…`, `\\?\UNC\server\share\…`).
+/// GNU's physical path always comes from getcwd after a real chdir
+/// (builtins/common.c:592 `get_working_directory`; builtins/cd.def:146
+/// bindpwd, cd.def:486 pwd) and getcwd never reports the verbatim
+/// form. The G-02 session-cwd probes (cd/pushd/popd) replaced
+/// chdir+getcwd with canonicalize, so a probe result must be returned
+/// to the getcwd form here, or every consumer of the physical path —
+/// the session cwd field, `pwd -P`, cd -P's $PWD — leaks `//?/…`
+/// (unixwin/niubash#659).
+pub(crate) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    if !cfg!(windows) {
+        return path.to_path_buf();
+    }
+    let value = path.to_string_lossy();
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = value.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
+}
+
+/// `canonicalize` for the session-cwd probes: the same resolution and
+/// the same OS error codes chdir reported, with the result in the
+/// plain native form getcwd would have reported (see
+/// `strip_verbatim_prefix`).
+pub(crate) fn canonicalize_native(path: &Path) -> io::Result<PathBuf> {
+    path.canonicalize()
+        .map(|resolved| strip_verbatim_prefix(&resolved))
+}
+
 /// The canonical PWD display form: always the POSIX `/<drive>/…` spelling
 /// (`/d/…`) on Windows, exactly what GNU Bash on MSYS reports for `$PWD` /
 /// `pwd` / cd's bindpwd value (builtins/cd.def:136-175 bindpwd stores one
@@ -6877,6 +6959,22 @@ mod tests {
 /// WINUXSH_SHELL_PATH_STYLE native-spelling escape hatch is retired.
 pub fn shell_pwd_display_path(path: &str) -> String {
     let value = path.replace('\\', "/");
+    // unixwin/niubash#659: a canonicalize-derived physical path can
+    // still arrive at this exit in extended-length form (`//?/C:/…`,
+    // `//?/UNC/…`). The display form is a getcwd form, so the prefix
+    // goes here too — this is the one display exit every PWD producer
+    // (cd bindpwd, pwd, the startup PWD) shares.
+    let value = if cfg!(windows) {
+        if let Some(rest) = value.strip_prefix("//?/UNC/") {
+            format!("//{rest}")
+        } else if let Some(rest) = value.strip_prefix("//?/") {
+            rest.to_string()
+        } else {
+            value
+        }
+    } else {
+        value
+    };
     if cfg!(windows)
         && value.len() >= 3
         && value.as_bytes()[1] == b':'
