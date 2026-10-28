@@ -4191,6 +4191,52 @@ mod issue_1917 {
         }
     }
 
+    /// A-1c: the comsub `cat` shortcuts consult the registry — the
+    /// plain shortcut (A-1b's cat-face root cause: it fs::read the
+    /// mapped path directly and reported every synthetic file ENOENT
+    /// on Windows) and its timed sibling (`$(time cat …)`, whose arm
+    /// read the filesystem the same way and silently swallowed the
+    /// miss). The mixed face puts a SyntheticLink operand first:
+    /// /proc/self/cwd resolves through the registry to the session
+    /// directory, whose read fails (rc 1, as GNU's EISDIR read does),
+    /// and the following content operand must still land — pre-fix on
+    /// Windows both operands missed and the capture was empty. (A
+    /// direct /proc/self/exe capture face is deliberately absent:
+    /// capturing the whole running image through a substitution takes
+    /// ~40s for a debug binary, over the harness timeout; exe link
+    /// reading end to end is A-4's pin, and the shortcut's link branch
+    /// uses the same registry entry as external_cat.) On Linux the
+    /// real procfs masks both defects, exactly as for A-1/A-4;
+    /// Windows CI is the proof.
+    #[test]
+    fn issue1917_a1c_comsub_cat_registry_faces() {
+        let dir = case_scratch("1917-a1c");
+        let faces: &[(&str, &str, &str)] = &[
+            (
+                "comsub-cat-link-then-content",
+                "x=$(cat /proc/self/cwd /proc/version); rc=$?; case $x in 'Linux version '*) echo \"OK:$rc\";; *) echo \"BAD:[$x]:$rc\";; esac",
+                "OK:1",
+            ),
+            (
+                "timed-comsub-cat-content",
+                "x=$(time cat /proc/version); case $x in 'Linux version '*) echo OK;; *) echo \"BAD:[$x]\";; esac",
+                "OK",
+            ),
+            (
+                "timed-comsub-cat-status",
+                "x=$(time cat /proc/version); echo \"rc:$?\"",
+                "rc:0",
+            ),
+        ];
+        for (name, code, expected) in faces {
+            let (stdout, stderr, status) = run(&dir, code);
+            assert_eq!(
+                stdout, *expected,
+                "face {name}: status={status:?} stderr:\n{stderr}"
+            );
+        }
+    }
+
     /// A-2: /proc/self/cmdline carries the TRUE argv — a known marker
     /// argument placed on the shell's own command line must appear as
     /// a NUL-separated field. Pre-fix on Windows the file contained

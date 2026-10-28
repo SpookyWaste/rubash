@@ -677,15 +677,38 @@ impl Executor {
                         output.push_str(&self.function_stdin_remaining().unwrap_or_default());
                         continue;
                     }
-                    // niubash#177: same operand resolution as the argv
-                    // funnel — a virtual-root file operand may exist only
-                    // under its `.exe` spelling on disk.
-                    if let Ok(value) = fs::read_to_string(self.session_path(
-                        crate::executor::path::windows_operand_file_path(
-                            shell_path_to_windows(&path, &self.shell_state.env_vars),
-                            &self.shell_state.env_vars,
-                        ),
-                    )) {
+                    // Registry first, in the quick-read / external_cat
+                    // order (rubash#1917): synthetic /proc content has no
+                    // filesystem file behind the mapped path on Windows,
+                    // and a SyntheticLink operand (rubash#1900) resolves
+                    // through the registry to its native target (the
+                    // session cwd answers for self/cwd). Only the content
+                    // SOURCE changes here — this arm's existing semantics
+                    // (a failed read is silently skipped, status stays 0)
+                    // are preserved exactly.
+                    let read_result =
+                        if let Some(bytes) = crate::special_paths::synthetic_proc_content(&path) {
+                            String::from_utf8(bytes).map_err(|error| {
+                                std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                            })
+                        } else if let Some(link) = crate::special_paths::synthetic_link_target(
+                            &path,
+                            Some(&crate::proc_vfs::self_cwd_forms(self.session_cwd())),
+                        ) {
+                            fs::read_to_string(&link.native)
+                        } else {
+                            // niubash#177: same operand resolution as the
+                            // argv funnel — a virtual-root file operand
+                            // may exist only under its `.exe` spelling on
+                            // disk.
+                            fs::read_to_string(self.session_path(
+                                crate::executor::path::windows_operand_file_path(
+                                    shell_path_to_windows(&path, &self.shell_state.env_vars),
+                                    &self.shell_state.env_vars,
+                                ),
+                            ))
+                        };
+                    if let Ok(value) = read_result {
                         output.push_str(&value);
                     }
                 }
