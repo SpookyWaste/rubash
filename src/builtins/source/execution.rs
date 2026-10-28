@@ -81,7 +81,27 @@ fn run_source_groups(
         // A group that ran to EOF while still incomplete (unclosed quote,
         // unterminated compound) needs run_source_with_line_offset's
         // unclosed-input diagnostics and prefix execution.
-        if !index_complete_group(&exec_text, parse_posix) {
+        //
+        // rubash#1940: the completeness verdict is only re-derived here
+        // when the gatherer did not already certify THIS text complete.
+        // read_next_source_group returns feeder tokens only when its loop
+        // broke at a complete group in the non-alias arm (see its doc:
+        // `broke_complete && !extglob_toggled`), and in that arm
+        // expand_group_aliases is the identity, so `exec_text` below is
+        // byte-identical to the certified `pending`. Re-running
+        // index_complete_group then re-scans the whole group text twice
+        // more (has_unclosed_input_syntax_posix +
+        // stdin_source_needs_more_posix, the latter with a full re-lex)
+        // for a verdict the reader already reached incrementally — on
+        // nvm.sh's single 165 KB brace group that re-check cost ~3.7 s of
+        // the ~5.2 s source run (debug, instrumented). GNU's
+        // parse_and_execute (builtins/evalstring.c:348) trusts the
+        // reader's own complete-command boundary the same way; there is
+        // no second whole-text scan. Groups without certification
+        // (alias-live arm, extglob toggle, EOF-exhausted tail) keep the
+        // exact re-check and routing they had.
+        let gatherer_certified = feeder_tokens.is_some() && exec_text == pre_alias_text;
+        if !gatherer_certified && !index_complete_group(&exec_text, parse_posix) {
             // The incomplete group's text is still the output of
             // expand_group_aliases above — aliases already ran at stream
             // level (parse.y:3249 alias_expand_token fires while reading,

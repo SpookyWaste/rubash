@@ -153,7 +153,128 @@ golden_fixture!(golden_issue1350_pushd_notdir => "issue1350-pushd-notdir", timeo
 golden_fixture!(golden_issue1351_trap_syntax => "issue1351-trap-syntax", timeout 60, corpus []);
 golden_fixture!(golden_issue1352_nameref_dynamic => "issue1352-nameref-dynamic", timeout 60, corpus []);
 golden_fixture!(golden_nounset_exit_matrix => "nounset-exit-matrix", timeout 60, corpus []);
-golden_fixture!(golden_nvm_load => "nvm-load", timeout 180, corpus ["nvm/nvm.sh"]);
+// rubash#1940 dual gate: the nvm-load fixture keeps its byte contract
+// (run_golden_fixture below) AND gains a same-machine timing budget.
+// Before #1940 this fixture's 180 s timeout was the only bound, so a
+// ~100x load-time regression (4.2 s vs GNU 0.04 s on the same machine)
+// passed silently. The timing half times `source nvm.sh` under this
+// build's rubash and under a GNU bash found on the host, and asserts a
+// RATIO bound: machine speed cancels, only the engine gap counts.
+// The oracle is validated (it must actually source the corpus with
+// exit 0); lanes without a real GNU bash (the Windows lane's PATH
+// offers only the WSL launcher stub) skip the timing half instead of
+// failing on a stub. RUBASH_GNU_BASH pins an explicit oracle path.
+#[test]
+fn golden_nvm_load() {
+    run_golden_fixture("nvm-load", 180, &["nvm/nvm.sh"]);
+    nvm_load_timing_gate();
+}
+
+/// One timed `source ./nvm.sh` run in the gate scratch dir; None when
+/// the run fails, times out, or the program cannot be spawned.
+fn nvm_load_timed_run(program: &Path, dir: &Path, limit: Duration) -> Option<Duration> {
+    let mut cmd = Command::new(program);
+    cmd.args(["-c", ". ./nvm.sh"])
+        .current_dir(dir)
+        .env_clear()
+        .env("PATH", minimal_path())
+        .env("HOME", dir)
+        .env("NVM_DIR", dir.join("nvmdir"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let started = Instant::now();
+    let mut child = cmd.spawn().ok()?;
+    let out = wait_bounded(&mut child, limit);
+    if out.timed_out || out.code != Some(0) {
+        return None;
+    }
+    Some(started.elapsed())
+}
+
+/// Best-of-N estimator: on a shared CI box the minimum is the run
+/// least contaminated by foreign load, for both shells alike; a
+/// median would import the box's load ratio into the gate and flake
+/// (observed locally: wall medians 1.89 s vs 0.04 s under load, a
+/// ~47x ratio, vs ~26x on best-of-N for the same tree).
+fn best_duration(runs: Vec<Duration>) -> Duration {
+    runs.into_iter().min().expect("at least one run")
+}
+
+fn gnu_bash_oracle() -> Option<PathBuf> {
+    if let Ok(pinned) = std::env::var("RUBASH_GNU_BASH") {
+        let candidate = PathBuf::from(pinned);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    let own = PathBuf::from(env!("CARGO_BIN_EXE_rubash"));
+    let path = std::env::var("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(if cfg!(windows) { "bash.exe" } else { "bash" });
+        if candidate.is_file() && candidate != own {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn nvm_load_timing_gate() {
+    // Ratio asserted below, calibrated on the post-#1940-fix tree
+    // (debug build, loaded 2-core dev box): rubash best-of-5 ~0.9 s
+    // vs GNU best-of-5 ~0.035 s, a ~26x gap. The bound keeps ~2x
+    // headroom over that while still failing the pre-fix tree
+    // (~114x). The absolute slack absorbs oracle startup noise on
+    // fast machines where the GNU run is only a few tens of
+    // milliseconds.
+    const MAX_RATIO: f64 = 50.0;
+    const SLACK: Duration = Duration::from_millis(250);
+    const REPS: usize = 5;
+
+    let _guard = heavy_lock();
+    let Some(oracle) = gnu_bash_oracle() else {
+        eprintln!("golden_nvm_load timing gate: no GNU bash oracle found; skipped");
+        return;
+    };
+    let root = manifest_dir();
+    let dir = std::env::temp_dir().join(format!("rubash-nvm-timing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("nvmdir")).expect("create timing scratch");
+    std::fs::copy(root.join(CORPUS_DIR).join("nvm/nvm.sh"), dir.join("nvm.sh"))
+        .expect("copy nvm corpus");
+
+    let rubash = PathBuf::from(env!("CARGO_BIN_EXE_rubash"));
+    let mut oracle_runs = Vec::new();
+    for _ in 0..REPS {
+        match nvm_load_timed_run(&oracle, &dir, Duration::from_secs(60)) {
+            Some(d) => oracle_runs.push(d),
+            None => {
+                eprintln!(
+                    "golden_nvm_load timing gate: oracle {} failed to source nvm.sh; skipped",
+                    oracle.display()
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        }
+    }
+    let mut rubash_runs = Vec::new();
+    for _ in 0..REPS {
+        let d = nvm_load_timed_run(&rubash, &dir, Duration::from_secs(120))
+            .expect("rubash must source nvm.sh inside the timing gate");
+        rubash_runs.push(d);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let oracle_best = best_duration(oracle_runs);
+    let rubash_best = best_duration(rubash_runs);
+    let budget = oracle_best.mul_f64(MAX_RATIO) + SLACK;
+    assert!(
+        rubash_best <= budget,
+        "nvm.sh load timing gate: rubash best-of-{REPS} {rubash_best:.2?} exceeds \
+         {MAX_RATIO}x GNU best-of-{REPS} {oracle_best:.2?} + {SLACK:.2?} slack \
+         (budget {budget:.2?}); rubash#1940 regression class"
+    );
+}
 golden_fixture!(golden_redir_operand_battery => "redir-operand-battery", timeout 60, corpus []);
 golden_fixture!(golden_rustup_check_help => "rustup-check-help", timeout 60, corpus []);
 golden_fixture!(golden_trap_signal_matrix => "trap-signal-matrix", timeout 180, corpus []);
@@ -823,12 +944,18 @@ fn perf_canary_nvm_loader_parses_bounded() {
     std::fs::copy(root.join(CORPUS_DIR).join("nvm/nvm.sh"), dir.join("nvm.sh"))
         .expect("copy nvm corpus");
     let started = Instant::now();
-    let out = run_rubash_in(&dir, &["-n", "nvm.sh"], Duration::from_secs(240));
+    let out = run_rubash_in(&dir, &["-n", "nvm.sh"], Duration::from_secs(60));
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(out.code, Some(0), "bash -n nvm.sh must parse clean");
+    // rubash#1940: real budget, not just the blowup-class tripwire.
+    // Post-fix debug measurement on a loaded 2-core dev box: ~0.6 s.
+    // 10 s keeps >10x headroom for slow CI runners while failing the
+    // feeder re-lex regression class (defs-wrap shapes measure >= 10 s
+    // at this corpus scale when the join-resume machinery regresses)
+    // and the historical >300 s O(N^2) class alike.
     assert!(
-        started.elapsed() < Duration::from_secs(180),
-        "nvm.sh -n took {:.1}s (bound 180s; O(N^2) lexer regression class)",
+        started.elapsed() < Duration::from_secs(10),
+        "nvm.sh -n took {:.1}s (bound 10s; feeder re-lex / O(N^2) lexer regression class)",
         started.elapsed().as_secs_f32()
     );
 }
