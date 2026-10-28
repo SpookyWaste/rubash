@@ -3950,14 +3950,15 @@ mod issue_1900 {
 
 /// rubash#1918: /proc/<pid>/status PPid was fabricated (self answered
 /// 0, every other pid answered the shell's own pid) while the ToolHelp
-/// snapshot's real parent field was discarded. The pin builds a KNOWN
-/// parent/child pair — this shell and a child shell it spawns: the
-/// child's self-reported PPid must equal this shell's $$ where the
-/// spawn is direct (Unix fork/exec), must never be the fabricated 0
-/// anywhere, and this shell's own PPid must be a real third party
-/// (nonzero, not itself). The exact-value property against ground
-/// truth is proven in proc_vfs's unit pins (rendered PPid ==
-/// snapshot record, for self and for another live pid).
+/// snapshot's real parent field was discarded. The pin spawns a child
+/// shell and reads status through it: the reported PPid must never be
+/// the fabricated 0, and this shell's own PPid must be a real third
+/// party (nonzero, not itself). No parentage equality is asserted —
+/// rubash's spawn architecture interposes on both platforms
+/// (in-process THIS_SH children on Linux; an interposed spawn process
+/// on Windows). The exact-value property against ground truth is
+/// proven in proc_vfs's unit pins (rendered PPid == snapshot record,
+/// for self and for another live pid).
 mod issue_1918 {
     use super::*;
 
@@ -3997,20 +3998,21 @@ mod issue_1918 {
                 .and_then(|value| value.trim().parse().ok())
                 .unwrap_or_else(|| panic!("{name} field missing:\n{stdout}"))
         };
-        let (child_ppid, me) = (field("CHILD:"), field("ME:"));
+        let (child_ppid, _me) = (field("CHILD:"), field("ME:"));
         // The fabricated shape is dead on every platform: a process's
         // PPid is never 0 (pre-fix Windows answered exactly that
         // fiction for every self read).
         assert_ne!(child_ppid, 0, "fabricated zero:\n{stdout}");
-        if !cfg!(windows) {
-            // Unix: the child is a direct fork/exec child, so its
-            // creator IS this shell — exact equality must hold.
-            assert_eq!(child_ppid, me, "direct parentage:\n{stdout}");
-        }
-        // Windows: a command-substitution child shell's immediate
-        // creator is an interposed spawn process, so exact equality
-        // with $$ does not hold there — PPid truth means "the real
-        // creator's pid", which the proc_vfs unit pin proves
-        // value-for-value against the snapshot record itself.
+        // No script-level parentage equality is asserted, on any
+        // platform: rubash's spawn architecture gives the "child" a
+        // different immediate creator than the invoking shell on both
+        // — on Linux a THIS_SH child of the shell's own binary runs
+        // IN-PROCESS (verified with ps: a single OS process; the
+        // status it reads is the shell's own, whose PPid is the
+        // shell's parent), and on Windows a real child process is
+        // created through an interposed spawn process (CI-observed
+        // PPid 8404 vs the shell's $$ 2344). PPid truth means "the
+        // real creator per the OS record", which the proc_vfs unit
+        // pin proves value-for-value against the snapshot record.
     }
 }
