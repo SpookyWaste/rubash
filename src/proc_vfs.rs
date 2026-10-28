@@ -751,8 +751,15 @@ fn peb_strings(pid: u32) -> Option<PebStrings> {
 fn command_line_to_argv_bytes(command_line: &[u16]) -> Vec<u8> {
     use std::ffi::c_void;
 
+    // CommandLineToArgvW lives in shell32, outside the default link
+    // set — the #[link] attribute follows the tree's kernel32
+    // precedent (src/builtins/stty.rs).
+    #[link(name = "shell32")]
     extern "system" {
         fn CommandLineToArgvW(cmd_line: *const u16, num_args: *mut i32) -> *mut *mut u16;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
         fn LocalFree(mem: *mut c_void) -> *mut c_void;
     }
 
