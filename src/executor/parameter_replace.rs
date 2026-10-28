@@ -309,12 +309,28 @@ pub(in crate::executor) fn find_parameter_prefix_match(
             parameter_pattern_match(pattern, word, false, extglob)
         }
     };
-    value
+    // A star-free pattern matches at most pattern_match_length_bound
+    // chars (the invariant find_parameter_pattern_match documents), so
+    // candidate ends past that char distance cannot match and are not
+    // tested; extglob groups change the match width, so the prune is
+    // disabled for extglob patterns, exactly as in the scanning finder.
+    let bound = if extglob && pattern_uses_extglob_syntax(pattern) {
+        None
+    } else {
+        pattern_match_length_bound(pattern)
+    };
+    let indices: Vec<usize> = value
         .char_indices()
         .map(|(index, _)| index)
         .chain(std::iter::once(value.len()))
+        .collect();
+    indices
+        .iter()
+        .enumerate()
         .rev()
-        .find(|end| candidate_matches(&value[..*end]))
+        .filter(|(pos, _)| bound.map_or(true, |bound| *pos <= bound))
+        .find(|(_, end)| candidate_matches(&value[..**end]))
+        .map(|(_, end)| *end)
 }
 
 pub(in crate::executor) fn find_parameter_suffix_match(
@@ -334,11 +350,27 @@ pub(in crate::executor) fn find_parameter_suffix_match(
             parameter_pattern_match(pattern, word, false, extglob)
         }
     };
-    value
+    // Bound prune, twin of find_parameter_prefix_match: a star-free
+    // pattern matches at most pattern_match_length_bound chars, so
+    // candidate starts whose suffix is longer than the bound cannot
+    // match; disabled for extglob patterns.
+    let bound = if extglob && pattern_uses_extglob_syntax(pattern) {
+        None
+    } else {
+        pattern_match_length_bound(pattern)
+    };
+    let indices: Vec<usize> = value
         .char_indices()
         .map(|(index, _)| index)
         .chain(std::iter::once(value.len()))
-        .find(|start| candidate_matches(&value[*start..]))
+        .collect();
+    let total = indices.len() - 1;
+    indices
+        .iter()
+        .enumerate()
+        .filter(|(pos, _)| bound.map_or(true, |bound| total - *pos <= bound))
+        .find(|(_, start)| candidate_matches(&value[**start..]))
+        .map(|(_, start)| *start)
 }
 
 pub(in crate::executor) fn find_parameter_pattern_match(
