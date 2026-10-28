@@ -30,7 +30,7 @@ pub(crate) use continuation::{
 };
 pub(crate) use heredoc_scan::dequote_heredoc_delimiter;
 
-pub(crate) use alias_stream::{expand_aliases_in_source, AliasLookup};
+pub(crate) use alias_stream::{expand_aliases_in_source, AliasLookup, AliasStreamScanner};
 use brace_scan_cache::BraceScanCache;
 pub(crate) use continuation::has_unclosed_command_substitution;
 pub(crate) use continuation::line_ends_in_open_operator_process_substitution;
@@ -344,6 +344,7 @@ fn tokenize_with_heredocs(
 
 /// One here-document whose body lines have not all arrived yet: the parked
 /// remainder of the original pipeline's body-pull loop.
+#[derive(Clone)]
 struct AwaitingHeredocBody {
     delimiter: HereDocDelimiter,
     body: String,
@@ -469,6 +470,7 @@ impl ParamScanCheckpoint {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct GroupScanFeeder {
     initial_posix: bool,
     input_origin: InputOrigin,

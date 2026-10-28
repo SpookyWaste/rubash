@@ -170,11 +170,17 @@ fn golden_nvm_load() {
     nvm_load_timing_gate();
 }
 
-/// One timed `source ./nvm.sh` run in the gate scratch dir; None when
-/// the run fails, times out, or the program cannot be spawned.
-fn nvm_load_timed_run(program: &Path, dir: &Path, limit: Duration) -> Option<Duration> {
+/// One timed run of an arbitrary `-c` script in the gate scratch dir;
+/// None when the run fails, times out, or the program cannot be
+/// spawned.
+fn nvm_load_timed_run_script(
+    program: &Path,
+    dir: &Path,
+    script: &str,
+    limit: Duration,
+) -> Option<Duration> {
     let mut cmd = Command::new(program);
-    cmd.args(["-c", ". ./nvm.sh"])
+    cmd.args(["-c", script])
         .current_dir(dir)
         .env_clear()
         .env("PATH", minimal_path())
@@ -220,17 +226,6 @@ fn gnu_bash_oracle() -> Option<PathBuf> {
 }
 
 fn nvm_load_timing_gate() {
-    // Ratio asserted below, calibrated on the post-#1940-fix tree
-    // (debug build, loaded 2-core dev box): rubash best-of-5 ~0.9 s
-    // vs GNU best-of-5 ~0.035 s, a ~26x gap. The bound keeps ~2x
-    // headroom over that while still failing the pre-fix tree
-    // (~114x). The absolute slack absorbs oracle startup noise on
-    // fast machines where the GNU run is only a few tens of
-    // milliseconds.
-    const MAX_RATIO: f64 = 50.0;
-    const SLACK: Duration = Duration::from_millis(250);
-    const REPS: usize = 5;
-
     let _guard = heavy_lock();
     let Some(oracle) = gnu_bash_oracle() else {
         eprintln!("golden_nvm_load timing gate: no GNU bash oracle found; skipped");
@@ -243,36 +238,67 @@ fn nvm_load_timing_gate() {
     std::fs::copy(root.join(CORPUS_DIR).join("nvm/nvm.sh"), dir.join("nvm.sh"))
         .expect("copy nvm corpus");
 
+    nvm_load_timing_gate_script(&oracle, &dir, ". ./nvm.sh", "plain");
+    // rubash#1961 alias-arm variant: the SAME load with one alias
+    // preset and expand_aliases on. The alias never occurs in nvm.sh,
+    // so the sourced bytes are identical — only the reader arm differs
+    // (pre-#1961 that arm re-derived group completeness per candidate
+    // line and hung past 120 s where the plain arm took ~1 s). The
+    // trailing `ll` command is the non-vacuity tripwire: the run only
+    // exits 0 when alias expansion was actually live for the driver,
+    // so the timing below cannot pass by silently taking the plain
+    // arm. Newlines separate the driver lines because an alias defined
+    // on the same line as its use is not yet in effect (parse.y reads
+    // one command at a time).
+    nvm_load_timing_gate_script(
+        &oracle,
+        &dir,
+        "alias ll='echo alias-live'\nshopt -s expand_aliases\n. ./nvm.sh\nll >/dev/null",
+        "alias-arm",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn nvm_load_timing_gate_script(oracle: &Path, dir: &Path, script: &str, label: &str) {
+    // Ratio asserted below, calibrated on the post-#1940-fix tree
+    // (debug build, loaded 2-core dev box): rubash best-of-5 ~0.9 s
+    // vs GNU best-of-5 ~0.035 s, a ~26x gap. The bound keeps ~2x
+    // headroom over that while still failing the pre-fix tree
+    // (~114x). The absolute slack absorbs oracle startup noise on
+    // fast machines where the GNU run is only a few tens of
+    // milliseconds.
+    const MAX_RATIO: f64 = 50.0;
+    const SLACK: Duration = Duration::from_millis(250);
+    const REPS: usize = 5;
+
     let rubash = PathBuf::from(env!("CARGO_BIN_EXE_rubash"));
     let mut oracle_runs = Vec::new();
     for _ in 0..REPS {
-        match nvm_load_timed_run(&oracle, &dir, Duration::from_secs(60)) {
+        match nvm_load_timed_run_script(oracle, dir, script, Duration::from_secs(60)) {
             Some(d) => oracle_runs.push(d),
             None => {
                 eprintln!(
-                    "golden_nvm_load timing gate: oracle {} failed to source nvm.sh; skipped",
+                    "golden_nvm_load timing gate ({label}): oracle {} failed the run; skipped",
                     oracle.display()
                 );
-                let _ = std::fs::remove_dir_all(&dir);
                 return;
             }
         }
     }
     let mut rubash_runs = Vec::new();
     for _ in 0..REPS {
-        let d = nvm_load_timed_run(&rubash, &dir, Duration::from_secs(120))
+        let d = nvm_load_timed_run_script(&rubash, dir, script, Duration::from_secs(120))
             .expect("rubash must source nvm.sh inside the timing gate");
         rubash_runs.push(d);
     }
-    let _ = std::fs::remove_dir_all(&dir);
     let oracle_best = best_duration(oracle_runs);
     let rubash_best = best_duration(rubash_runs);
     let budget = oracle_best.mul_f64(MAX_RATIO) + SLACK;
     assert!(
         rubash_best <= budget,
-        "nvm.sh load timing gate: rubash best-of-{REPS} {rubash_best:.2?} exceeds \
+        "nvm.sh load timing gate ({label}): rubash best-of-{REPS} {rubash_best:.2?} exceeds \
          {MAX_RATIO}x GNU best-of-{REPS} {oracle_best:.2?} + {SLACK:.2?} slack \
-         (budget {budget:.2?}); rubash#1940 regression class"
+         (budget {budget:.2?}); rubash#1940/#1961 regression class"
     );
 }
 golden_fixture!(golden_redir_operand_battery => "redir-operand-battery", timeout 60, corpus []);
