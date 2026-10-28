@@ -721,15 +721,22 @@ pub struct WordMetadata {
     pub value: String,
     pub raw: String,
     // brace / command-substitution / parameter / arithmetic / tilde
-    // expansion records and word-quote records used to be stored here;
-    // wt44/parse4 stopped every scan that fed them (the executor
-    // re-derives all of them from the word text at consumption time), so
-    // the vectors were empty on every instance — their storage is
-    // removed (perf F4 node diet). Only the three record kinds with live
-    // consumers remain.
+    // expansion records used to be stored here; wt44/parse4 stopped
+    // every scan that fed them (the executor re-derives all of them
+    // from the word text at consumption time), so the vectors were
+    // empty on every instance — their storage is removed (perf F4
+    // node diet). Only the three record kinds with live consumers
+    // remain, plus word_quotes below.
     pub process_substitutions: Vec<ProcessSubstitution>,
     pub extglob_patterns: Vec<ExtglobPattern>,
     pub pathname_patterns: Vec<PathnamePattern>,
+    /// Word-quote records: always empty (wt44/parse4 — the executor
+    /// re-derives quoting from the raw word at consumption time), but
+    /// RETAINED for now because niubash-runtime's drive-letter
+    /// admission still reads it (niubash crates/niubash-runtime
+    /// shell.rs). Retire it together with that reader's cleanup,
+    /// coordinated with a niubash rubash-pin bump.
+    pub word_quotes: Vec<WordQuote>,
     /// The locale name under which this word's dollar-quoted backslash-u /
     /// backslash-U escapes were decoded at lex time - Some only for words
     /// whose raw carries such an escape (the one lex product whose value is
@@ -748,6 +755,7 @@ impl WordMetadata {
             process_substitutions: Vec::new(),
             extglob_patterns: Vec::new(),
             pathname_patterns: Vec::new(),
+            word_quotes: Vec::new(),
             lex_locale: None,
         }
     }
@@ -775,6 +783,7 @@ impl WordMetadata {
             process_substitutions,
             extglob_patterns: super::extglob_patterns_in_word_with_raw(&value, &raw),
             pathname_patterns: super::pathname_patterns_in_word(&value, &raw),
+            word_quotes: Vec::new(),
             lex_locale: if crate::lexer::raw_has_ansi_u_escape(&raw) {
                 Some(crate::locale::locale_name())
             } else {
@@ -815,6 +824,7 @@ impl WordMetadata {
             process_substitutions,
             extglob_patterns,
             pathname_patterns,
+            word_quotes: Vec::new(),
             lex_locale: if crate::lexer::raw_has_ansi_u_escape(&raw) {
                 Some(crate::locale::locale_name())
             } else {
@@ -1396,7 +1406,7 @@ mod node_size_budget_tests {
     // and word_metadata vectors pay sizeof(WordMetadata) per word. The
     // 2026-10-28 node diet (dead wt44/parse4 record vectors removed,
     // Redirect mirror slots and the if/loop/arithmetic payloads boxed)
-    // took CommandNode 2272 -> ~950 bytes and WordMetadata 296 -> 152.
+    // took CommandNode 2272 -> 1000 bytes and WordMetadata 296 -> 176.
     // These budgets keep the fat from silently growing back: a new
     // payload belongs behind a Box, and a new record vector needs a
     // live consumer (see the wt44/parse4 note in WordMetadata::new).
