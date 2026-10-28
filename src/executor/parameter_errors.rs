@@ -1061,17 +1061,33 @@ impl Executor {
         text: &'a str,
         spans: &[crate::parser::ProcessSubstitution],
     ) -> std::borrow::Cow<'a, str> {
-        if spans.is_empty() {
-            return std::borrow::Cow::Borrowed(text);
-        }
+        Self::mask_recorded_span_targets(
+            text,
+            spans
+                .iter()
+                .map(|substitution| substitution.target.as_str()),
+        )
+    }
+
+    /// The masking core behind `mask_recorded_process_substitutions`,
+    /// over bare span target texts: replace each recorded span — in
+    /// recorded order, one occurrence each — with a single space, so
+    /// the text a scan judges no longer contains the child body. The
+    /// `[[ ]]` nounset scans hold only the recorded targets (paired
+    /// with their word in `Executor::conditional_procsub_span_targets`)
+    /// and enter here directly.
+    pub(in crate::executor) fn mask_recorded_span_targets<'a, 't>(
+        text: &'a str,
+        targets: impl Iterator<Item = &'t str>,
+    ) -> std::borrow::Cow<'a, str> {
         let mut masked: Option<String> = None;
-        for substitution in spans {
-            if substitution.target.is_empty() {
+        for target in targets {
+            if target.is_empty() {
                 continue;
             }
             let current: &str = masked.as_deref().unwrap_or(text);
-            if current.contains(&substitution.target) {
-                masked = Some(current.replacen(&substitution.target, " ", 1));
+            if current.contains(target) {
+                masked = Some(current.replacen(target, " ", 1));
             }
         }
         masked.map_or(std::borrow::Cow::Borrowed(text), std::borrow::Cow::Owned)

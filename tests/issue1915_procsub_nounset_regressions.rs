@@ -21,6 +21,16 @@
 //! Verified against GNU Bash 5.3.20 (script-file probes): every
 //! `should_pass` shape below is byte-identical (stdout/stderr/rc) and
 //! every `still_fires` shape keeps its GNU fatal.
+//!
+//! The `[[ ]]` face (t7 group below): the conditional operand scans
+//! are separate scan points from the simple-command pre-scan —
+//! `expand_conditional_word`'s expansion-error scan (the `-n`/`-z`
+//! and binary operand path) and `regex_operands_nounset_fatal` (the
+//! `=~` operands). `execute_conditional_command` publishes the spans
+//! the parser recorded for each operand (its `arg_metadata`), and
+//! both scan points mask exactly the spans recorded for the word
+//! under scan before judging it — the same structural criterion, so
+//! a quoted look-alike span in a sibling operand still fires.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -235,6 +245,167 @@ fn issue1915_nounset_still_fires_for_fake_span_beside_real_span() {
     assert_eq!(code, Some(1));
     assert_eq!(stdout, "", "stderr: {stderr}");
     assert!(stderr.contains("$1: unbound variable"), "stderr: {stderr}");
+}
+
+#[test]
+fn issue1915_cond_nounset_span_operand_unary() {
+    // t7, the residual this group closes: a procsub span as a `[[ ]]`
+    // unary operand. GNU extracts the span verbatim and tests the
+    // resulting /dev/fd word; the body's `$1` is never a parent
+    // reference, so `-n` is true and the script runs on.
+    let (stdout, stderr, code) =
+        rubash_stdin("set -u\nif [[ -n <(awk '$1' <<< '10') ]]; then echo yes; fi\necho end\n");
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(stdout, "yes\nend\n", "stderr: {stderr}");
+    assert_eq!(stderr, "");
+
+    // `-z` of the same operand is false, still with no diagnostic.
+    let (stdout, stderr, code) = rubash_stdin(
+        "set -u\nif [[ -z <(awk '$1' <<< '10') ]]; then echo yes; else echo no; fi\necho end\n",
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(stdout, "no\nend\n", "stderr: {stderr}");
+    assert_eq!(stderr, "");
+
+    // An output span `>(...)` as the operand, same criterion.
+    let (stdout, stderr, code) =
+        rubash_stdin("set -u\nif [[ -n >(awk '{print $1}') ]]; then echo yes; fi\necho end\n");
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(stdout, "yes\nend\n", "stderr: {stderr}");
+    assert_eq!(stderr, "");
+}
+
+#[test]
+fn issue1915_cond_nounset_span_operand_regex_rhs() {
+    // The span as the `=~` right operand: the nounset scan of the
+    // pattern operand must not judge the body either. (GNU matches
+    // the subject against the materialized /dev/fd path; "abc" does
+    // not match it, so the observable verdict is `no`, rc 0.)
+    let (stdout, stderr, code) = rubash_stdin(
+        "set -u\nif [[ abc =~ <(awk '$1' <<< '10') ]]; then echo yes; else echo no; fi\necho end\n",
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(stdout, "no\nend\n", "stderr: {stderr}");
+    assert_eq!(stderr, "");
+}
+
+#[test]
+fn issue1915_cond_nounset_still_fires_for_unary_operand() {
+    // Guards: a bare unbound operand keeps its GNU fatal on both the
+    // `-n` and `-z` paths.
+    for op in ["-n", "-z"] {
+        let (stdout, stderr, code) = rubash_stdin(&format!(
+            "set -u\nif [[ {op} $NOPE ]]; then echo yes; fi\necho end\n"
+        ));
+        assert_eq!(code, Some(1), "op: {op}");
+        assert_eq!(stdout, "", "op: {op}, stderr: {stderr}");
+        assert!(
+            stderr.contains("NOPE: unbound variable"),
+            "op: {op}, stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn issue1915_cond_nounset_still_fires_for_regex_operands() {
+    // Guards: unbound references on either side of `=~` keep the
+    // fatal (subject side and pattern side, unquoted and quoted).
+    let (stdout, stderr, code) =
+        rubash_stdin("set -u\nx=abc\nif [[ $x =~ $NOPE ]]; then echo yes; fi\necho end\n");
+    assert_eq!(code, Some(1));
+    assert_eq!(stdout, "", "stderr: {stderr}");
+    assert!(
+        stderr.contains("NOPE: unbound variable"),
+        "stderr: {stderr}"
+    );
+
+    let (stdout, stderr, code) =
+        rubash_stdin("set -u\nif [[ $NOPE =~ x ]]; then echo yes; fi\necho end\n");
+    assert_eq!(code, Some(1));
+    assert_eq!(stdout, "", "stderr: {stderr}");
+    assert!(
+        stderr.contains("NOPE: unbound variable"),
+        "stderr: {stderr}"
+    );
+
+    let (stdout, stderr, code) =
+        rubash_stdin("set -u\nif [[ abc =~ \"$NOPE\" ]]; then echo yes; fi\necho end\n");
+    assert_eq!(code, Some(1));
+    assert_eq!(stdout, "", "stderr: {stderr}");
+    assert!(
+        stderr.contains("NOPE: unbound variable"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn issue1915_cond_nounset_still_fires_for_quoted_fake_span() {
+    // The q3 guard on the conditional face: `"<(awk '$NOPE')"` is
+    // not a process substitution — inside double quotes the `$NOPE`
+    // is a live parent reference, so GNU raises the fatal. Only the
+    // spans recorded for a word are masked; this operand recorded
+    // none.
+    let (stdout, stderr, code) =
+        rubash_stdin("set -u\nif [[ -n \"<(awk '$NOPE')\" ]]; then echo yes; fi\necho end\n");
+    assert_eq!(code, Some(1));
+    assert_eq!(stdout, "", "stderr: {stderr}");
+    assert!(
+        stderr.contains("NOPE: unbound variable"),
+        "stderr: {stderr}"
+    );
+
+    // The same precision across operands of one conditional: the
+    // quoted look-alike on the left records no span, so the fatal
+    // fires even though the right operand is a real span whose own
+    // body text is identical.
+    let (stdout, stderr, code) = rubash_stdin(
+        "set -u\nif [[ \"<(awk '$NOPE')\" == <(awk '$NOPE') ]]; then echo yes; fi\necho end\n",
+    );
+    assert_eq!(code, Some(1));
+    assert_eq!(stdout, "", "stderr: {stderr}");
+    assert!(
+        stderr.contains("NOPE: unbound variable"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn issue1915_cond_nounset_still_fires_beside_a_span() {
+    // Masking one word must not disarm the scan anywhere else: a
+    // live reference BEFORE a real span in the same word still
+    // fires...
+    let (stdout, stderr, code) = rubash_stdin(
+        "set -u\nif [[ -n $NOPE<(awk '$1' <<< '10') ]]; then echo yes; fi\necho end\n",
+    );
+    assert_eq!(code, Some(1));
+    assert_eq!(stdout, "", "stderr: {stderr}");
+    assert!(
+        stderr.contains("NOPE: unbound variable"),
+        "stderr: {stderr}"
+    );
+
+    // ...and a live reference in the NEXT term of the same
+    // conditional is the one reported (not the masked span's `$1`).
+    let (stdout, stderr, code) = rubash_stdin(
+        "set -u\nif [[ -n <(awk '$1' <<< '10') && -n $NOPE ]]; then echo yes; fi\necho end\n",
+    );
+    assert_eq!(code, Some(1));
+    assert_eq!(stdout, "", "stderr: {stderr}");
+    assert!(
+        stderr.contains("NOPE: unbound variable"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("$1"), "stderr: {stderr}");
+
+    // The file-test operand path keeps its pre-existing parity.
+    let (stdout, stderr, code) =
+        rubash_stdin("set -u\nif [[ -e $NOPE ]]; then echo yes; fi\necho end\n");
+    assert_eq!(code, Some(1));
+    assert_eq!(stdout, "", "stderr: {stderr}");
+    assert!(
+        stderr.contains("NOPE: unbound variable"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]

@@ -521,6 +521,7 @@ impl Executor {
             conditional_expansion_fatal: Cell::new(false),
             conditional_fatal_status: Cell::new(None),
             conditional_expansion_error_status: Cell::new(None),
+            conditional_procsub_span_targets: Vec::new(),
             evalerror_subscript_pending: Cell::new(false),
             evalerror_failglob_pending: Cell::new(false),
             evalerror_arith_pending: Cell::new(false),
