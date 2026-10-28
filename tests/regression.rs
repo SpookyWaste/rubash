@@ -3743,3 +3743,73 @@ mod issue_1904 {
         assert_eq!(stdout, "GOT:hello1904", "stderr:\n{stderr}");
     }
 }
+
+/// rubash#1917 A period (/proc fidelity & completion, design
+/// ~/workspace/vfs-1917-design/DESIGN.md §6.2): the synthetic /proc is
+/// a userland value-add layer, NOT a GNU contract surface — the
+/// expectations are the Linux procfs shapes downstream tools consume,
+/// checked against the real procfs on Linux and the simulation on
+/// Windows (the Windows face is the point of every pin here; where a
+/// pin also holds on Linux it guards both).
+mod issue_1917 {
+    use super::*;
+
+    fn run(dir: &Path, code: &str) -> (String, String, Option<i32>) {
+        let out = run_rubash_in(dir, &["-c", code], Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    /// A-1: /proc/version keeps its Linux shape (main-session ruling
+    /// 2026-10-28: the string stays Linux-form; corpus consumers key
+    /// on the prefix).
+    #[test]
+    fn issue1917_a1_version_shape() {
+        let dir = case_scratch("1917-a1");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "read -r line < /proc/version; case $line in 'Linux version '*) echo VER-OK;; *) echo VER-BAD;; esac",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "VER-OK", "stderr:\n{stderr}");
+    }
+
+    /// A-7: an exited pid's /proc directory vanishes — files under it
+    /// fail like ENOENT and test -e answers false (procfs semantics,
+    /// both platforms).
+    #[test]
+    fn issue1917_a7_dead_pid_vanishes() {
+        let dir = case_scratch("1917-a7");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "\"${THIS_SH}\" -c 'exit 0' & p=$!; wait $p; \
+             if test -e /proc/$p/status; then echo STILL-THERE; else echo GONE-OK; fi; \
+             cat /proc/$p/status 2>/dev/null; echo catrc=$?",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "GONE-OK\ncatrc=1", "stderr:\n{stderr}");
+    }
+
+    /// A3: glob over /proc enumerates the synthetic root (file table +
+    /// self + live pids) and per-pid directories (entry table). Pre-fix
+    /// on Windows the pattern matched nothing and echoed literally.
+    #[test]
+    fn issue1917_a3_glob_proc_enumeration() {
+        let dir = case_scratch("1917-a3");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "hit_mem=; hit_self=; hit_pid=; \
+             for e in /proc/*; do case $e in /proc/meminfo) hit_mem=1;; /proc/self) hit_self=1;; /proc/$$) hit_pid=1;; esac; done; \
+             echo \"root:$hit_mem$hit_self$hit_pid\"; \
+             hit_exe=; hit_cwd=; hit_status=; \
+             for e in /proc/self/*; do case $e in /proc/self/exe) hit_exe=1;; /proc/self/cwd) hit_cwd=1;; /proc/self/status) hit_status=1;; esac; done; \
+             echo \"self:$hit_exe$hit_cwd$hit_status\"; \
+             set -- /proc/*/status; if [ $# -ge 2 ]; then echo pids:many; else echo pids:few; fi",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "root:111\nself:111\npids:many", "stderr:\n{stderr}");
+    }
+}

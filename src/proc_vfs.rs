@@ -14,6 +14,167 @@
 //! procs_blocked/softirq, cpuinfo emits the standard per-CPU block, loadavg
 //! is five fields, uptime is two floats.
 
+/// Top-level synthetic file names (the /proc root's file face). The name
+/// table, the content generator below, and the directory enumeration
+/// ([`proc_dir_entries`]) are defined in this one module from this one
+/// table, so a name can never be enumerable-but-unreadable or
+/// readable-but-unenumerable (rubash#1917 A0: one table, three faces).
+#[allow(dead_code)] // table face consumed by the Windows generators and the cross-platform tests
+const TOP_LEVEL_FILES: [&str; 6] = ["cpuinfo", "loadavg", "meminfo", "stat", "uptime", "version"];
+
+/// Per-pid CONTENT entries (bytes generated on read).
+#[allow(dead_code)] // table face consumed by the Windows generators and the cross-platform tests
+const PID_CONTENT_FILES: [&str; 2] = ["cmdline", "status"];
+
+/// Per-pid LINK entries (readlink-type: the entry resolves to a target
+/// path elsewhere in the filesystem; see [`proc_link_target`]).
+#[allow(dead_code)] // table face consumed by the Windows generators and the cross-platform tests
+const PID_LINK_FILES: [&str; 2] = ["cwd", "exe"];
+
+/// Every per-pid directory entry name, content and link faces together
+/// (the `/proc/<pid>` and `/proc/self` enumeration face).
+#[allow(dead_code)] // table face consumed by the Windows generators and the cross-platform tests
+const PID_ENTRIES: [&str; 4] = ["cmdline", "cwd", "exe", "status"];
+
+/// Count of ToolHelp process snapshots taken by this module on the
+/// calling thread, so the rubash#1917 §4.2 call-count budget (self
+/// face: zero snapshots; one enumeration pass: at most one) is
+/// assertable in tests instead of by timing. The budget is a
+/// per-command-execution property, and a command executes on one
+/// thread, so the counter is thread-local; only the snapshot SITES in
+/// this module are counted.
+#[cfg(windows)]
+thread_local! {
+    static TOOLHELP_SNAPSHOTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(windows)]
+pub(crate) fn toolhelp_snapshot_count() -> usize {
+    TOOLHELP_SNAPSHOTS.with(|count| count.get())
+}
+
+#[cfg(windows)]
+pub(crate) fn reset_toolhelp_snapshot_count() {
+    TOOLHELP_SNAPSHOTS.with(|count| count.set(0));
+}
+
+#[cfg(not(windows))]
+pub(crate) fn toolhelp_snapshot_count() -> usize {
+    0
+}
+
+#[cfg(not(windows))]
+pub(crate) fn reset_toolhelp_snapshot_count() {}
+
+/// Take a ToolHelp process snapshot, counted (see TOOLHELP_SNAPSHOTS).
+/// Returns the raw handle, or None when the snapshot could not be taken;
+/// the caller owns the handle and must CloseHandle it.
+#[cfg(windows)]
+fn open_process_snapshot() -> Option<windows_sys::Win32::Foundation::HANDLE> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPPROCESS,
+    };
+    TOOLHELP_SNAPSHOTS.with(|count| count.set(count.get() + 1));
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    Some(snapshot)
+}
+
+/// Which pid a `/proc/<pid>/...` or `/proc/self/...` spelling names.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PidRef {
+    SelfPid,
+    Pid(u32),
+}
+
+/// Parse `/proc/<self|pid>/<tail>` into its pid reference and the tail
+/// after it ("" for the directory itself). Shared by the link and
+/// enumeration faces; the content face predates it and keeps its own
+/// parse (its `/proc/self` bare-spelling asymmetry is load-bearing for
+/// existing consumers — see the git history of proc_file_content).
+#[cfg(windows)]
+fn parse_pid_spelling(path: &str) -> Option<(PidRef, &str)> {
+    let rest = path.strip_prefix("/proc/")?;
+    if let Some(tail) = rest.strip_prefix("self") {
+        let tail = if tail.is_empty() {
+            ""
+        } else {
+            tail.strip_prefix('/')?
+        };
+        return Some((PidRef::SelfPid, tail));
+    }
+    let (head, tail) = match rest.split_once('/') {
+        Some((h, t)) => (h, t),
+        None => (rest, ""),
+    };
+    let pid: u32 = head.parse().ok()?;
+    Some((PidRef::Pid(pid), tail))
+}
+
+/// Whether the pid a spelling names is a live process. The shell's own
+/// pid is answered without a snapshot (rubash#1917 §4.2: the self face
+/// never pays for the system-wide table).
+#[cfg(windows)]
+fn pid_ref_alive(pid_ref: PidRef) -> bool {
+    match pid_ref {
+        PidRef::SelfPid => true,
+        PidRef::Pid(pid) => pid != 0 && snapshot_identity(pid).is_some(),
+    }
+}
+
+/// Whether `path` names a synthetic LINK entry (`/proc/self/exe`,
+/// `/proc/<pid>/cwd`, ...): the spelling is one of the link names AND
+/// the named process is alive. Classification only — resolution is
+/// [`proc_link_target`]. A dead pid's link entries do not exist, which
+/// is the procfs directory-vanish rule applied to the link face.
+#[cfg(windows)]
+pub fn proc_is_link_path(path: &str) -> bool {
+    let Some((pid_ref, tail)) = parse_pid_spelling(path) else {
+        return false;
+    };
+    PID_LINK_FILES.contains(&tail) && pid_ref_alive(pid_ref)
+}
+
+#[cfg(not(windows))]
+pub fn proc_is_link_path(_path: &str) -> bool {
+    false
+}
+
+/// Directory entries for a synthetic /proc directory: the root (the
+/// file table + `self` + every live pid, ascending) and per-pid
+/// directories (the entry table, for live pids). None when `path` is
+/// not a synthetic /proc directory — off Windows always None, where
+/// the real procfs lists itself. This is the single enumeration source
+/// the glob face and (later) the niu completion face ask (rubash#1917
+/// A3: `list_pids` gains its first consumer here).
+#[cfg(windows)]
+pub fn proc_dir_entries(path: &str) -> Option<Vec<String>> {
+    let trimmed = path.strip_suffix('/').unwrap_or(path);
+    if trimmed == "/proc" {
+        let mut names: Vec<String> = TOP_LEVEL_FILES
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        names.push("self".to_string());
+        names.extend(list_pids().into_iter().map(|pid| pid.to_string()));
+        return Some(names);
+    }
+    let (pid_ref, tail) = parse_pid_spelling(trimmed)?;
+    if !tail.is_empty() || !pid_ref_alive(pid_ref) {
+        return None;
+    }
+    Some(PID_ENTRIES.iter().map(|name| name.to_string()).collect())
+}
+
+#[cfg(not(windows))]
+pub fn proc_dir_entries(_path: &str) -> Option<Vec<String>> {
+    None
+}
+
 /// Synthetic content for a /proc pseudo-file, or None when `path` is not one
 /// of the emulated files. Each call generates a fresh snapshot.
 ///
@@ -89,15 +250,12 @@ fn pid_identity(pid: u32) -> Option<(String, Vec<u8>)> {
 /// or None when the pid does not exist.
 #[cfg(windows)]
 fn snapshot_identity(pid: u32) -> Option<(String, Vec<u8>)> {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-        TH32CS_SNAPPROCESS,
+        Process32FirstW, Process32NextW, PROCESSENTRY32W,
     };
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return None;
-    }
+    let snapshot = open_process_snapshot()?;
+
     let mut entry = PROCESSENTRY32W {
         dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
         ..unsafe { std::mem::zeroed() }
@@ -418,7 +576,9 @@ fn cpuid_identity() -> (&'static str, u32, u32, u32, String, u64) {
                 // Leaf 1 EDX+ECX flag bits, rendered as Linux flag names.
                 let ecx = leaf1.ecx;
                 let edx = leaf1.edx;
-                let mut flags = String::from("fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht");
+                let mut flags = String::from(
+                    "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht",
+                );
                 let extra: &[(u32, u32, &str)] = &[
                     (ecx, 0, "sse3"),
                     (ecx, 9, "ssse3"),
@@ -548,21 +708,106 @@ mod tests {
         assert!(proc_file_content("/proc/doesnotexist").is_none());
         assert!(proc_file_content("/etc/passwd").is_none());
     }
+
+    /// rubash#1917 A0: the name tables, the content generator, and the
+    /// link classification are three faces of one table — every table
+    /// name must be served by exactly its own face, and the faces must
+    /// not bleed into each other.
+    #[test]
+    fn entry_tables_agree_with_generators() {
+        if cfg!(windows) {
+            for name in TOP_LEVEL_FILES {
+                assert!(
+                    proc_file_content(&format!("/proc/{name}")).is_some(),
+                    "top-level table name {name} generates no content"
+                );
+            }
+            let own = std::process::id();
+            for name in PID_CONTENT_FILES {
+                assert!(
+                    proc_file_content(&format!("/proc/self/{name}")).is_some(),
+                    "content table name {name} generates no content"
+                );
+                assert!(
+                    !proc_is_link_path(&format!("/proc/self/{name}")),
+                    "content table name {name} classified as a link"
+                );
+            }
+            for name in PID_LINK_FILES {
+                assert!(
+                    proc_file_content(&format!("/proc/self/{name}")).is_none(),
+                    "link table name {name} generates content bytes"
+                );
+                assert!(
+                    proc_is_link_path(&format!("/proc/self/{name}")),
+                    "link table name {name} not classified as a link"
+                );
+                assert!(
+                    proc_is_link_path(&format!("/proc/{own}/{name}")),
+                    "link table name {name} not a link for the live self pid"
+                );
+            }
+            // The enumeration face lists exactly the union of the tables.
+            let self_entries = proc_dir_entries("/proc/self").expect("self dir enumerates");
+            let mut expected: Vec<&str> = Vec::new();
+            expected.extend(PID_CONTENT_FILES);
+            expected.extend(PID_LINK_FILES);
+            assert_eq!(self_entries.len(), expected.len());
+            for name in expected {
+                assert!(self_entries.iter().any(|e| e == name), "missing {name}");
+            }
+        }
+    }
+
+    /// rubash#1917 A3: root enumeration = file table + self + live pids;
+    /// a dead pid's directory does not enumerate (directory-vanish).
+    #[test]
+    fn dir_entries_root_and_dead_pid() {
+        if cfg!(windows) {
+            let root = proc_dir_entries("/proc").expect("root enumerates");
+            for name in TOP_LEVEL_FILES {
+                assert!(root.iter().any(|e| e == name), "root missing {name}");
+            }
+            assert!(root.iter().any(|e| e == "self"));
+            let own = std::process::id().to_string();
+            assert!(root.iter().any(|e| *e == own), "root missing own pid");
+            // 4294967294 cannot be a live pid (outside the pid space the
+            // allocator hands out), so its directory must not enumerate,
+            // its files must not generate, and its links must not classify.
+            assert!(proc_dir_entries("/proc/4294967294").is_none());
+            assert!(proc_file_content("/proc/4294967294/status").is_none());
+            assert!(!proc_is_link_path("/proc/4294967294/exe"));
+            assert!(proc_dir_entries("/proc/self/status").is_none());
+            assert!(proc_dir_entries("/etc").is_none());
+        }
+    }
+
+    /// rubash#1917 §4.2 budget, enumeration leg: one root enumeration
+    /// pass costs exactly one ToolHelp snapshot (the list_pids walk),
+    /// and enumerating the self directory costs none.
+    #[test]
+    fn enumeration_snapshot_budget() {
+        if cfg!(windows) {
+            reset_toolhelp_snapshot_count();
+            let _ = proc_dir_entries("/proc/self");
+            assert_eq!(toolhelp_snapshot_count(), 0, "self dir enumeration");
+            let _ = proc_dir_entries("/proc");
+            assert_eq!(toolhelp_snapshot_count(), 1, "root enumeration");
+        }
+    }
 }
 
 /// Pids to list for `/proc` enumeration (ToolHelp snapshot), ascending.
 /// Empty on non-Windows (the real procfs lists itself there).
 #[cfg(windows)]
 pub fn list_pids() -> Vec<u32> {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-        TH32CS_SNAPPROCESS,
+        Process32FirstW, Process32NextW, PROCESSENTRY32W,
     };
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
+    let Some(snapshot) = open_process_snapshot() else {
         return Vec::new();
-    }
+    };
     let mut entry = PROCESSENTRY32W {
         dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
         ..unsafe { std::mem::zeroed() }
