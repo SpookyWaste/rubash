@@ -540,33 +540,29 @@ impl Executor {
 
         // rubash#1548: the operand window follows parse.y
         // special_case_tokens — at most one `-p`, then at most one
-        // `--`, and nothing once a `!` intervenes; a `-p` beyond the
-        // window is the timed command's name and must not be skipped
-        // (or counted for the report format). Nested `time` words stay
-        // transparent, as before. These words were split from the
-        // substitution body text, so the reading is value-based.
+        // `--`; a `-p` beyond the window is the timed command's name
+        // and must not be skipped (or counted for the report format).
+        // Nested `time` words stay transparent, as before. These words
+        // were split from the substitution body text, so the reading
+        // is value-based. The window's `!` case has no arm here
+        // (redundancy R7): this shortcut's only caller sits behind
+        // command_substitution_body_is_trivial, whose byte set excludes
+        // `!`, so an inverted timed body always takes full execution.
         let mut index = 1;
-        let mut inverted = false;
         let mut posix_format = false;
         let mut seen_opt = false;
         let mut seen_ign = false;
-        let mut options_open = true;
         while let Some(word) = words.get(index).map(String::as_str) {
             match word {
                 "time" => index += 1,
-                "-p" if options_open && !seen_opt && !seen_ign => {
+                "-p" if !seen_opt && !seen_ign => {
                     seen_opt = true;
                     posix_format = true;
                     index += 1;
                 }
-                "--" if options_open && !seen_ign => {
+                "--" if !seen_ign => {
                     seen_ign = true;
                     posix_format = true;
-                    index += 1;
-                }
-                "!" => {
-                    inverted = !inverted;
-                    options_open = false;
                     index += 1;
                 }
                 _ => break,
@@ -581,11 +577,7 @@ impl Executor {
         // item-6 posix routing has no observable difference to close here.
         print_time(&self.shell_state.env_vars, posix_format, started);
         let status = self.last_command_substitution_status.get().unwrap_or(0);
-        self.last_command_substitution_status.set(Some(if inverted {
-            invert_exit_status(status)
-        } else {
-            status
-        }));
+        self.last_command_substitution_status.set(Some(status));
         Some(output)
     }
 
