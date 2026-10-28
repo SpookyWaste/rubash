@@ -616,7 +616,12 @@ fn virtual_device_test(op: &str, operand: &str) -> Option<bool> {
         });
     }
 
-    if matches!(operand, "/dev/stdin" | "/proc/self/fd/0" | "/dev/fd/0") {
+    // The fd-0 spelling judgment is the registry's (issue rubash#1973):
+    // `fd_alias_target == Some(0)` accepts exactly the canonical
+    // spellings the literal table carried — GNU rejects the
+    // leading-zero family on every face, so `test -e /dev/fd/00` falls
+    // through to the filesystem and fails there, like the oracle.
+    if crate::special_paths::fd_alias_target(operand) == Some(0) {
         return Some(match op {
             "-a" | "-e" | "-r" | "-c" => true,
             "-w" | "-x" | "-s" | "-b" | "-p" | "-S" | "-u" | "-g" | "-k" | "-h" | "-L" | "-O"
@@ -627,15 +632,12 @@ fn virtual_device_test(op: &str, operand: &str) -> Option<bool> {
 
     // stdout (fd 1) and stderr (fd 2) are writable virtual devices.
     // GNU test.c `unary_test` checks the actual fd via `sh_eaccess`; in
-    // the test-suite context these fds are open and writable.
+    // the test-suite context these fds are open and writable. Spelling
+    // via the registry (issue rubash#1973), same canonical set the
+    // literal table carried.
     if matches!(
-        operand,
-        "/dev/stdout"
-            | "/proc/self/fd/1"
-            | "/dev/fd/1"
-            | "/dev/stderr"
-            | "/proc/self/fd/2"
-            | "/dev/fd/2"
+        crate::special_paths::fd_alias_target(operand),
+        Some(1) | Some(2)
     ) {
         return Some(match op {
             "-a" | "-e" | "-w" => true,

@@ -3450,10 +3450,13 @@ impl Executor {
                         }
                     }
 
-                    if matches!(
-                        target.as_str(),
-                        "/dev/stdin" | "/proc/self/fd/0" | "/dev/fd/0"
-                    ) {
+                    // The fd-0 spelling judgment is the registry's (issue
+                    // rubash#1973): `fd_alias_target == Some(0)` carries
+                    // exactly the canonical spellings the literal table
+                    // matched — GNU rejects the leading-zero family on
+                    // every face, so `exec 0</dev/fd/00` falls through to
+                    // the filesystem open and fails ENOENT there.
+                    if crate::special_paths::fd_alias_target(&target) == Some(0) {
                         self.fd_table.open_input(
                             fd,
                             FdReadEndpoint::InheritedProcessStdin,
