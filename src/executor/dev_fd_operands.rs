@@ -176,21 +176,27 @@ fn split_dev_operand(arg: &str) -> Option<(&str, &str)> {
 /// names. `pub(in crate::executor)` so in-process file builtins (emulated
 /// `cat`, `sed`, ...) can resolve the same names against the fd table —
 /// they have no child descriptor table, so the endpoint itself is read.
+///
+/// The spelling judgment itself is the registry's
+/// (`special_paths::fd_alias_target`): this face used to re-parse the
+/// tail with `str::parse`, which also accepted `/dev/fd/+3` — a spelling
+/// GNU rejects on every face (the open fails ENOENT) — so the two
+/// answers drifted apart (redundancy audit R3/D1). One layer stays
+/// local: GNU also resolves the shell's own numeric-pid spelling
+/// (`/proc/$$/fd/3`) through procfs, and an operand has no other server
+/// for it on Windows, so that spelling is rewritten to the `self`
+/// spelling and the registry judges the fd part. Foreign pids stay
+/// plain filesystem paths.
 pub(in crate::executor) fn dev_operand_fd(value: &str) -> Option<u32> {
-    if let Some(rest) = value.strip_prefix("/dev/") {
-        return match rest {
-            "stdin" => Some(0),
-            "stdout" => Some(1),
-            "stderr" => Some(2),
-            _ => rest.strip_prefix("fd/")?.parse().ok(),
-        };
+    if let Some(fd) = crate::special_paths::fd_alias_target(value) {
+        return Some(fd);
     }
     let rest = value.strip_prefix("/proc/")?;
-    let rest = rest.strip_prefix("self/").or_else(|| {
-        let (pid, tail) = rest.split_once('/')?;
-        (pid.parse::<u32>().ok()? == std::process::id()).then_some(tail)
-    })?;
-    rest.strip_prefix("fd/")?.parse().ok()
+    let (pid, tail) = rest.split_once('/')?;
+    if pid.parse::<u32>().ok()? != std::process::id() {
+        return None;
+    }
+    crate::special_paths::fd_alias_target(&format!("/proc/self/{tail}"))
 }
 
 /// The resolved content of a `/dev/fd/N`-family operand together with the
@@ -804,5 +810,40 @@ impl Executor {
             }
         }
         captured
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dev_operand_fd;
+
+    /// Redundancy audit R3/D1: the spelling judgment is the registry's;
+    /// this face's own `str::parse` tail-parse used to accept the `+N`
+    /// spellings GNU rejects on every face (the literal open fails
+    /// ENOENT in procfs; redir.c's no-dev-fd fallback likewise requires
+    /// all_digits).
+    #[test]
+    fn r3_dev_operand_fd_spelling_verdicts() {
+        assert_eq!(dev_operand_fd("/dev/stdin"), Some(0));
+        assert_eq!(dev_operand_fd("/dev/stdout"), Some(1));
+        assert_eq!(dev_operand_fd("/dev/stderr"), Some(2));
+        assert_eq!(dev_operand_fd("/dev/fd/63"), Some(63));
+        assert_eq!(dev_operand_fd("/proc/self/fd/2"), Some(2));
+        assert_eq!(dev_operand_fd("/dev/fd/+3"), None);
+        assert_eq!(dev_operand_fd("/proc/self/fd/+3"), None);
+        assert_eq!(dev_operand_fd("/dev/null"), None);
+        assert_eq!(dev_operand_fd("/etc/passwd"), None);
+    }
+
+    /// The one layer that stays local: the shell's own numeric-pid
+    /// spelling rewrites to `self` (GNU resolves /proc/$$/fd/N through
+    /// procfs); foreign pids are plain filesystem paths.
+    #[test]
+    fn r3_dev_operand_fd_self_pid_layer() {
+        let own = format!("/proc/{}/fd/3", std::process::id());
+        assert_eq!(dev_operand_fd(&own), Some(3));
+        let own_plus = format!("/proc/{}/fd/+3", std::process::id());
+        assert_eq!(dev_operand_fd(&own_plus), None);
+        assert_eq!(dev_operand_fd("/proc/4294967294/fd/3"), None);
     }
 }

@@ -175,6 +175,82 @@ fn dup_process_std_handle(fd: u32) -> Option<std::fs::File> {
         .map(crate::fd::handle_to_file)
 }
 
+/// One side of a coproc child's stdio while the ordered output
+/// redirects are applied (rubash#1644, transplanted from PR #1695):
+/// a dup copies the current spec, so it must be cloneable without
+/// consuming it.
+enum CoprocFdSpec {
+    Null,
+    Pipe(std::io::PipeWriter),
+    File(std::fs::File),
+}
+
+impl CoprocFdSpec {
+    fn dup(&self) -> std::io::Result<Self> {
+        Ok(match self {
+            CoprocFdSpec::Null => CoprocFdSpec::Null,
+            CoprocFdSpec::Pipe(writer) => CoprocFdSpec::Pipe(writer.try_clone()?),
+            CoprocFdSpec::File(file) => CoprocFdSpec::File(file.try_clone()?),
+        })
+    }
+
+    fn into_stdio(self) -> Stdio {
+        match self {
+            CoprocFdSpec::Null => Stdio::null(),
+            CoprocFdSpec::Pipe(writer) => Stdio::from(writer),
+            CoprocFdSpec::File(file) => Stdio::from(file),
+        }
+    }
+}
+
+/// Seed for a coproc dup target (rubash#1644): a fresh owned handle
+/// duplicating the parent's process fd 1/2, so a `>&2` child stdout
+/// writes where the parent's stderr writes. Unlike
+/// dup_process_std_handle this reports failure (and maps a missing
+/// std handle to /dev/null / NUL) because the seed feeds the ordered
+/// redirect application, whose errors already have a reporting path.
+fn dup_coproc_process_fd(fd: u32) -> std::io::Result<std::fs::File> {
+    let handle = crate::fd::process_std_handle(fd);
+    if handle == 0 || handle == -1 {
+        return if cfg!(windows) {
+            std::fs::OpenOptions::new().write(true).open("NUL")
+        } else {
+            std::fs::File::create("/dev/null")
+        };
+    }
+    let dup = crate::fd::duplicate_handle(handle)?;
+    Ok(crate::fd::handle_to_file(dup))
+}
+
+/// rubash#1632 save-slot hand-back under the ordered redirect pass
+/// (rubash#1644): replacing the fd-1 spec must not drop the coproc
+/// pipe writer while the coproc lives — when the spec still holds
+/// it, the writer moves to the displaced slot (the caller keeps it
+/// alive for the coproc's lifetime) instead of closing here.
+fn replace_coproc_out_spec(
+    spec: &mut CoprocFdSpec,
+    replacement: CoprocFdSpec,
+    displaced: &mut Option<std::io::PipeWriter>,
+) {
+    let old = std::mem::replace(spec, replacement);
+    if let CoprocFdSpec::Pipe(writer) = old {
+        *displaced = Some(writer);
+    }
+}
+
+/// Outcome of applying a coproc command's own redirects at spawn.
+enum CoprocRedirectOutcome {
+    /// Spawn proceeds; carries the coproc pipe writer when an fd-1
+    /// redirect displaced it from the child's stdout (rubash#1632:
+    /// GNU's redirect save slot in the forked child, held by the
+    /// caller until the coproc retires).
+    Proceed(Option<std::io::PipeWriter>),
+    /// A redirect was declined after printing its diagnostic
+    /// (rubash#1644 `2>&word`): no coproc is created; the caller
+    /// fails the command with status 1 (#846 convention).
+    Declined,
+}
+
 /// Resolved stdio disposition for one of a background child's fds 0-2,
 /// tracking what GNU's do_redirections would leave the descriptor
 /// pointing at inside the forked subshell.
@@ -3746,16 +3822,30 @@ impl Executor {
             // coproc child's own redirect failure exits inverted and the
             // parent flips it back — net status 1, no flip. Mark it so an
             // enclosing `!` suppresses its flip.
-            let displaced_stdout_writer =
-                match self.apply_coproc_redirects(cmd, &mut child, stdout_writer) {
-                    Ok(writer) => writer,
-                    Err(error) => {
-                        if matches!(error, ExecuteError::IoError(_)) {
-                            self.note_compound_redirect_failure();
-                        }
-                        return Err(error);
+            let displaced_stdout_writer = match self.apply_coproc_redirects(
+                cmd,
+                &mut child,
+                stdout_writer,
+                &coproc_stderr_target,
+            ) {
+                Ok(CoprocRedirectOutcome::Proceed(writer)) => writer,
+                Ok(CoprocRedirectOutcome::Declined) => {
+                    // rubash#1644: the ordered pass declined a
+                    // redirect after printing its diagnostic
+                    // (`2>&word` ambiguous): no coproc is created,
+                    // the command fails with status 1 per the #846
+                    // coproc-failure convention, and the script
+                    // continues.
+                    self.exit_code = 1;
+                    return Ok(());
+                }
+                Err(error) => {
+                    if matches!(error, ExecuteError::IoError(_)) {
+                        self.note_compound_redirect_failure();
                     }
-                };
+                    return Err(error);
+                }
+            };
             // rubash#1632: a coproc-level `>file`/`>>file` (or `>&-`)
             // displaced the pipe writer from the child's stdout. GNU
             // applies the redirect in the forked child, where the
@@ -4117,12 +4207,19 @@ impl Executor {
         }
     }
 
+    /// Applies the coproc command's output redirects to the child
+    /// in list order, on top of its stdin body / input redirect.
+    /// Returns Proceed (carrying the displaced pipe writer, if any)
+    /// to continue to spawn, or Declined when a redirect was
+    /// refused after printing its diagnostic (no coproc is created;
+    /// the caller fails the command with status 1).
     fn apply_coproc_redirects(
         &mut self,
         cmd: &CommandNode,
         child: &mut Command,
         stdout_writer: std::io::PipeWriter,
-    ) -> Result<Option<std::io::PipeWriter>, ExecuteError> {
+        stderr_forward: &Option<CoprocStderrForwardTarget>,
+    ) -> Result<CoprocRedirectOutcome, ExecuteError> {
         // rubash#1651: a memory-backed stdin body (here-string,
         // heredoc) that wins fd 0 replaces the coproc pipe as the
         // child's stdin. GNU redir.c do_redirections binds fd 0
@@ -4177,62 +4274,230 @@ impl Executor {
             }
         }
 
-        // rubash#1632: the coproc command's own stdout redirections
-        // displace the pipe writer instead of replacing-and-dropping it:
-        // the writer is handed back to the caller, which keeps it alive
-        // for the coproc's lifetime (GNU's redirect save slot in the
-        // forked child) so the parent's read end cannot see EOF early.
-        // A dup target (`>&2`) replaces nothing — the pipe stays the
-        // child's stdout and the writer is consumed here as before.
-        let mut stdout_displaced = false;
-        if let Some(redirect) = &cmd.redirect_out {
-            let target = self.expand_redirect_target(redirect);
-            if is_closed_redirect_target(&target) {
-                child.stdout(Stdio::null());
-                stdout_displaced = true;
-            } else if redirect_target_fd(&target).is_none() {
-                child.stdout(Stdio::from(
-                    self.create_redirect_output(&target, redirect.clobber)?,
-                ));
-                stdout_displaced = true;
+        // rubash#1644/#1655 (transplanted from PR #1695 by
+        // a-rookie-of-C-language): the coproc command's OUTPUT
+        // redirects apply to the child in GNU's left-to-right order
+        // — redir.c do_redirections runs in the forked child after
+        // the coproc pipes are dup'd. The old code only handled the
+        // single-field file redirects and dropped every dup (`>&2`
+        // never reached the child: a simple command's output landed
+        // in the coproc pipe instead of the shell's stderr, and a
+        // named group's output sat in the pipe unread — lost
+        // entirely). The ordered loop below replaces the field
+        // blocks, which additionally misread `>file 2>&1` (the
+        // `2>&1` arrived as a bogus Append field). Input kinds are
+        // skipped here: stdin is handled above (redirect_in) and by
+        // the stdin body. A dup whose source is fd >= 3 is left
+        // unchanged: the spawned child inherits no extra fds in
+        // rubash's spawn model, so there is nothing faithful to dup
+        // to (pre-existing limitation, same as the old code).
+        //
+        // rubash#1632 interplay: the fd-1 spec starts as the coproc
+        // pipe writer; whenever a redirect replaces it,
+        // replace_coproc_out_spec hands the writer back as the
+        // displaced writer (kept alive by the caller for the
+        // coproc's lifetime, GNU's redirect save slot) instead of
+        // dropping it here.
+        let mut out_spec = CoprocFdSpec::Pipe(stdout_writer);
+        let mut displaced_writer: Option<std::io::PipeWriter> = None;
+        // The child's stderr target, for dup resolution only: the
+        // caller has already set child.stderr (the direct endpoint
+        // or the forwarder's pipe), so this spec mirrors where
+        // stderr WOULD go; it is applied to the child only when an
+        // err redirect touches fd 2.
+        let mut err_spec = match stderr_forward {
+            Some(CoprocStderrForwardTarget::Stdout) => {
+                CoprocFdSpec::File(dup_coproc_process_fd(1)?)
             }
-        } else if let Some(redirect) = &cmd.append {
+            Some(CoprocStderrForwardTarget::File(path)) => {
+                // The forwarder itself append-opens this path per
+                // chunk, so an append open here lands in the same
+                // file with the same semantics.
+                CoprocFdSpec::File(open_redirect_append(path)?)
+            }
+            None => self.coproc_stderr_direct_spec()?,
+        };
+        let mut err_touched = false;
+        for redirect in &cmd.redirects {
             let target = self.expand_redirect_target(redirect);
-            if is_closed_redirect_target(&target) {
-                child.stdout(Stdio::null());
-                stdout_displaced = true;
-            } else if redirect_target_fd(&target).is_none() {
-                child.stdout(Stdio::from(open_redirect_append(&self.session_path(
-                    shell_path_to_windows(&target, &self.shell_state.env_vars),
-                ))?));
-                stdout_displaced = true;
+            match redirect.kind {
+                crate::parser::RedirectKind::Output
+                | crate::parser::RedirectKind::ClobberOutput => {
+                    let file = self.create_redirect_output(&target, redirect.clobber)?;
+                    match redirect.fd.unwrap_or(1) {
+                        1 => replace_coproc_out_spec(
+                            &mut out_spec,
+                            CoprocFdSpec::File(file),
+                            &mut displaced_writer,
+                        ),
+                        2 => {
+                            err_spec = CoprocFdSpec::File(file);
+                            err_touched = true;
+                        }
+                        _ => {}
+                    }
+                }
+                crate::parser::RedirectKind::Append => {
+                    let file =
+                        open_redirect_append(&self.session_path(shell_path_to_windows(
+                            &target,
+                            &self.shell_state.env_vars,
+                        )))?;
+                    match redirect.fd.unwrap_or(1) {
+                        1 => replace_coproc_out_spec(
+                            &mut out_spec,
+                            CoprocFdSpec::File(file),
+                            &mut displaced_writer,
+                        ),
+                        2 => {
+                            err_spec = CoprocFdSpec::File(file);
+                            err_touched = true;
+                        }
+                        _ => {}
+                    }
+                }
+                crate::parser::RedirectKind::CombinedOutput => {
+                    let file = self.create_redirect_output(&target, redirect.clobber)?;
+                    let shared = file.try_clone()?;
+                    replace_coproc_out_spec(
+                        &mut out_spec,
+                        CoprocFdSpec::File(file),
+                        &mut displaced_writer,
+                    );
+                    err_spec = CoprocFdSpec::File(shared);
+                    err_touched = true;
+                }
+                crate::parser::RedirectKind::CombinedAppend => {
+                    let file =
+                        open_redirect_append(&self.session_path(shell_path_to_windows(
+                            &target,
+                            &self.shell_state.env_vars,
+                        )))?;
+                    let shared = file.try_clone()?;
+                    replace_coproc_out_spec(
+                        &mut out_spec,
+                        CoprocFdSpec::File(file),
+                        &mut displaced_writer,
+                    );
+                    err_spec = CoprocFdSpec::File(shared);
+                    err_touched = true;
+                }
+                crate::parser::RedirectKind::CloseOutput => match redirect.fd.unwrap_or(1) {
+                    1 => replace_coproc_out_spec(
+                        &mut out_spec,
+                        CoprocFdSpec::Null,
+                        &mut displaced_writer,
+                    ),
+                    2 => {
+                        err_spec = CoprocFdSpec::Null;
+                        err_touched = true;
+                    }
+                    _ => {}
+                },
+                crate::parser::RedirectKind::DuplicateOutput => {
+                    let fd = redirect.fd.unwrap_or(1);
+                    if fd != 1 && fd != 2 {
+                        continue;
+                    }
+                    if is_closed_redirect_target(&target) {
+                        match fd {
+                            1 => replace_coproc_out_spec(
+                                &mut out_spec,
+                                CoprocFdSpec::Null,
+                                &mut displaced_writer,
+                            ),
+                            _ => {
+                                err_spec = CoprocFdSpec::Null;
+                                err_touched = true;
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
+                        // A dup of an fd onto itself is a no-op in
+                        // GNU, and the move form's self-close is
+                        // excepted (rubash#1236): leave both specs
+                        // untouched.
+                        if source_fd == fd {
+                            continue;
+                        }
+                        let spec = match source_fd {
+                            1 => out_spec.dup()?,
+                            2 => err_spec.dup()?,
+                            _ => continue,
+                        };
+                        match fd {
+                            1 => {
+                                replace_coproc_out_spec(&mut out_spec, spec, &mut displaced_writer)
+                            }
+                            _ => {
+                                err_spec = spec;
+                                err_touched = true;
+                            }
+                        }
+                        // GNU `>&M-` moves: the source closes in
+                        // the child after the dup — except a
+                        // self-move, handled above (rubash#1236).
+                        if move_source {
+                            match source_fd {
+                                1 => replace_coproc_out_spec(
+                                    &mut out_spec,
+                                    CoprocFdSpec::Null,
+                                    &mut displaced_writer,
+                                ),
+                                2 => {
+                                    err_spec = CoprocFdSpec::Null;
+                                    err_touched = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                        continue;
+                    }
+                    // Non-numeric word target.
+                    if fd == 1 {
+                        // GNU redir.c:832-838 r_err_and_out:
+                        // `>&word` / `1>&word` opens ONE file
+                        // for both fds (shared description).
+                        // The stored target still carries the
+                        // operator's `&` (like the compound
+                        // arms); strip it for the open.
+                        let path = target.strip_prefix('&').unwrap_or(&target);
+                        let file = self.create_redirect_output(path, redirect.clobber)?;
+                        let shared = file.try_clone()?;
+                        replace_coproc_out_spec(
+                            &mut out_spec,
+                            CoprocFdSpec::File(file),
+                            &mut displaced_writer,
+                        );
+                        err_spec = CoprocFdSpec::File(shared);
+                        err_touched = true;
+                    } else {
+                        // `2>&word` is an ambiguous redirect in
+                        // GNU (and in rubash's plain commands):
+                        // report it once and decline the spawn
+                        // (Declined); an Err here would make the
+                        // IoError reporter print the message a
+                        // second time.
+                        let raw_word = redirect
+                            .target_metadata
+                            .raw
+                            .strip_prefix('&')
+                            .unwrap_or(&redirect.target_metadata.raw);
+                        eprintln!(
+                            "{}{}: ambiguous redirect",
+                            self.diagnostic_prefix(),
+                            raw_word
+                        );
+                        return Ok(CoprocRedirectOutcome::Declined);
+                    }
+                }
+                _ => {}
             }
         }
-        let displaced_writer = if stdout_displaced {
-            Some(stdout_writer)
-        } else {
-            child.stdout(stdout_writer);
-            None
-        };
-
-        if let Some(redirect) = &cmd.redirect_err {
-            let target = self.expand_redirect_target(redirect);
-            if is_closed_redirect_target(&target) {
-                child.stderr(Stdio::null());
-            } else if redirect_target_fd(&target).is_none() {
-                child.stderr(Stdio::from(
-                    self.create_redirect_output(&target, redirect.clobber)?,
-                ));
-            }
-        } else if let Some(redirect) = &cmd.redirect_err_append {
-            let target = self.expand_redirect_target(redirect);
-            if is_closed_redirect_target(&target) {
-                child.stderr(Stdio::null());
-            } else if redirect_target_fd(&target).is_none() {
-                child.stderr(Stdio::from(open_redirect_append(&self.session_path(
-                    shell_path_to_windows(&target, &self.shell_state.env_vars),
-                ))?));
-            }
+        child.stdout(out_spec.into_stdio());
+        if err_touched {
+            child.stderr(err_spec.into_stdio());
         }
 
         // The body pipe replaces the coproc pipe set by the caller
@@ -4242,7 +4507,34 @@ impl Executor {
             child.stdin(stdio);
         }
 
-        Ok(displaced_writer)
+        Ok(CoprocRedirectOutcome::Proceed(displaced_writer))
+    }
+
+    /// rubash#1644: the fd-2 spec a coproc dup (`>&2`) must copy
+    /// when the child's stderr was handed over directly at spawn
+    /// (rubash#1882 CoprocStderrPlan::Direct): an owned dup of the
+    /// same endpoint coproc_stderr_plan resolved from fd 2.
+    fn coproc_stderr_direct_spec(&mut self) -> Result<CoprocFdSpec, ExecuteError> {
+        if self.fd_table.is_closed(2) {
+            // The plan hands the child /dev/null; the spec is Null.
+            return Ok(CoprocFdSpec::Null);
+        }
+        Ok(match self.fd_table.write_endpoint(2) {
+            None | Some(FdWriteEndpoint::Stderr) => CoprocFdSpec::File(dup_coproc_process_fd(2)?),
+            Some(FdWriteEndpoint::Stdout) => CoprocFdSpec::File(dup_coproc_process_fd(1)?),
+            Some(FdWriteEndpoint::File(file_fd)) => CoprocFdSpec::File(crate::fd::handle_to_file(
+                crate::fd::duplicate_handle_inheritable(file_fd.handle)?,
+            )),
+            Some(FdWriteEndpoint::ProcessSubstitution { path, .. }) => {
+                // The plan always forwards this endpoint, so the
+                // direct seed never serves it in practice; mirror
+                // the forwarder's append-open if it ever did.
+                CoprocFdSpec::File(open_redirect_append(&path)?)
+            }
+            Some(FdWriteEndpoint::CoprocStdin { fd, .. }) => CoprocFdSpec::File(
+                crate::fd::handle_to_file(crate::fd::duplicate_handle_inheritable(fd.handle)?),
+            ),
+        })
     }
 
     pub(in crate::executor) fn execute_case_command(

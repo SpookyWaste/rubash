@@ -4058,49 +4058,12 @@ fn compound_assignment_operand_word(cmd: &CommandNode, index: usize, word: &str)
 }
 
 fn raw_word_contains_process_substitution(raw: Option<&str>) -> bool {
-    let Some(raw) = raw else {
-        return false;
-    };
-    // Whitelist admission (rubash#117 discipline): the DFA below only
-    // reports `<(`/`>(` outside quotes. Without either byte pair no arm
-    // can fire, so skip the char-collect + scan. A present pair runs the
-    // full quote-aware scan unchanged.
-    if !raw.contains("<(") && !raw.contains(">(") {
-        return false;
-    }
-    let chars = raw.chars().collect::<Vec<_>>();
-    let mut index = 0usize;
-    let mut single = false;
-    let mut double = false;
-    let mut escaped = false;
-    while index < chars.len() {
-        let ch = chars[index];
-        if escaped {
-            escaped = false;
-            index += 1;
-            continue;
-        }
-        if ch == '\\' && !single {
-            escaped = true;
-            index += 1;
-            continue;
-        }
-        if ch == '\'' && !double {
-            single = !single;
-            index += 1;
-            continue;
-        }
-        if ch == '"' && !single {
-            double = !double;
-            index += 1;
-            continue;
-        }
-        if !single && !double && matches!(ch, '<' | '>') && chars.get(index + 1) == Some(&'(') {
-            return true;
-        }
-        index += 1;
-    }
-    false
+    // Sole implementation: the parser's quote-aware DFA (subst.c:11349-
+    // 11378 `expand_word_internal` cases '<' and '>'). This Option adapter
+    // and the external_setup call sites used to carry verbatim copies of
+    // the same scan; all of them now delegate to the one implementation so
+    // the answers can never drift apart.
+    raw.is_some_and(crate::parser::raw_word_has_unquoted_process_substitution)
 }
 
 /// Whether the raw source of an associative element-assignment word

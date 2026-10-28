@@ -209,6 +209,24 @@ impl Executor {
     ) -> Result<(), ExecuteError> {
         let args = &cmd.words[1..];
         let mut stderr = Vec::new();
+        // GNU builtins/return.def: CHECK_HELPOPT (builtins/common.h:29)
+        // inspects the RAW first word before get_exitstat's `--` skip:
+        // `return --help` prints the long help to stdout and the builtin
+        // RETURNS EX_USAGE (258 > EX_SHERRBASE) WITHOUT unwinding — a
+        // function/source body continues after it in default mode, and in
+        // POSIX non-interactive mode the special-builtin channel converts
+        // the failure at this frame (execute_cmd.c:4886-4888,
+        // :1004-1017). RC audit phase-1 finding ④ / errors10: pre-fix
+        // this fell into the status-word path below and misreported
+        // `--help` as a numeric-argument error (and unwound).
+        if args.first().map(String::as_str) == Some("--help") {
+            let mut stdout = Vec::new();
+            crate::builtins::help::print_builtin_help("return", &mut stdout)?;
+            self.write_buffered_builtin_output(cmd, &stdout, &[])?;
+            self.exit_code = 2;
+            self.special_builtin_failed.set(true);
+            return Ok(());
+        }
         // GNU builtins/common.c get_exitstat: ISOPTION(word, '-') skips a
         // leading `--` before the status word — `return -- N` returns N
         // (rubash#1379). Mirrors src/builtins/exit.rs.
@@ -239,6 +257,7 @@ impl Executor {
             self.evalerror_exit_toomany_pending.set(true);
             return Ok(());
         }
+        let mut numeric_failed = false;
         let status = if let Some(value) = args.first() {
             // GNU get_exitstat parses via general.c:248 valid_number
             // (intmax_t): whitespace-padded numerics are legal
@@ -246,11 +265,26 @@ impl Executor {
             match crate::builtins::exit::gnu_valid_number(value) {
                 Some(value) => crate::builtins::exit::normalize_status(value),
                 None => {
+                    numeric_failed = true;
                     writeln!(
                         &mut stderr,
                         "{}return: {value}: numeric argument required",
                         self.diagnostic_prefix()
                     )?;
+                    // GNU builtins/return.def:57-69: get_exitstat's
+                    // failure is EX_USAGE (258 > EX_SHERRBASE), so the
+                    // builtin's completion marks special_builtin_failed
+                    // (execute_cmd.c:4886-4888). return_builtin's own
+                    // posix guard hands the raw code back for the
+                    // conversion when the command is not
+                    // command-prefixed; rubash's gate in
+                    // execute_materialized_command performs the same
+                    // conversion when this Return unwind lands at the
+                    // enclosing call/source frame, and the
+                    // `command'-builtin wrapper clears the mark for
+                    // `command return ...' (execute_cmd.c:4657-4666).
+                    // RC audit phase-1 finding ④ / errors10.
+                    self.special_builtin_failed.set(true);
                     2
                 }
             }
@@ -284,6 +318,44 @@ impl Executor {
             .get("__RUBASH_IN_SOURCE")
             .map(String::as_str)
             == Some("1");
+        if numeric_failed && (in_function || in_source) {
+            // GNU builtins/return.def:62-65: on an invalid numeric
+            // argument in a non-interactive POSIX shell (and not under
+            // the `command' builtin), return_builtin RETURNS EX_USAGE
+            // instead of longjmping the return_catch — "the
+            // return_catch targets aren't set up to deal with
+            // EXITSHELL, so we just jump_to_top_level directly". The
+            // completion machinery owns the outcome from there:
+            // execute_simple_command marks special_builtin_failed
+            // (execute_cmd.c:4888) and the return command's own frame
+            // exits the shell when the context is untested
+            // (execute_cmd.c:1004-1017); in a tested context
+            // (ignore_return / invert) the builtin simply fails with
+            // status 2 and the body RUNS ON — no unwind at all (oracle:
+            // `f(){ return abcde; echo INFUNC; }; f || echo OR' prints
+            // INFUNC under -o posix). Mirror both arms here: the
+            // dispatch gate cannot adjudicate this builtin, because its
+            // completion is an unwind (the gate passes Return through)
+            // and a function call's fast path
+            // (execute_function_command_invocation) has no gate.
+            // RC audit phase-1 finding ④ / errors10.
+            if self.posix_mode_enabled()
+                && self.command_builtin_depth == 0
+                && self
+                    .shell_state
+                    .env_vars
+                    .get("__RUBASH_INTERACTIVE")
+                    .map(String::as_str)
+                    != Some("1")
+            {
+                self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                self.exit_code = 2;
+                if self.errexit_is_active() {
+                    return Err(ExecuteError::ExitCode(2));
+                }
+                return Ok(());
+            }
+        }
         if in_function || in_source {
             self.write_buffered_builtin_output(cmd, &[], &stderr)?;
             return Err(ExecuteError::Return(status));

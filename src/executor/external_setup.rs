@@ -93,7 +93,7 @@ pub(in crate::executor) fn command_needs_process_substitution_materialization(
 
 fn word_metadata_needs_process_substitution_materialization(metadata: &WordMetadata) -> bool {
     !metadata.process_substitutions.is_empty()
-        || raw_word_contains_process_substitution(&metadata.raw)
+        || crate::parser::raw_word_has_unquoted_process_substitution(&metadata.raw)
 }
 
 pub(in crate::executor) fn shared_combined_output_process_substitution(
@@ -389,10 +389,9 @@ impl Executor {
                 .map(|metadata| metadata.process_substitutions.clone())
                 .unwrap_or_default();
             let substitutions = if substitutions.is_empty()
-                && metadata
-                    .as_ref()
-                    .is_some_and(|metadata| raw_word_contains_process_substitution(&metadata.raw))
-            {
+                && metadata.as_ref().is_some_and(|metadata| {
+                    crate::parser::raw_word_has_unquoted_process_substitution(&metadata.raw)
+                }) {
                 WordMetadata::new(
                     word_index,
                     rewritten.words[word_index].clone(),
@@ -1787,45 +1786,7 @@ fn sync_ordered_redirect_targets(command: &mut CommandNode) {
     }
 }
 
-fn raw_word_contains_process_substitution(raw: &str) -> bool {
-    // Whitelist admission (rubash#117 discipline): the DFA below only
-    // reports `<(`/`>(` outside quotes. Without either byte pair no arm
-    // can fire, so skip the char-collect + scan. A present pair runs the
-    // full quote-aware scan unchanged.
-    if !raw.contains("<(") && !raw.contains(">(") {
-        return false;
-    }
-    let chars = raw.chars().collect::<Vec<_>>();
-    let mut index = 0usize;
-    let mut single = false;
-    let mut double = false;
-    let mut escaped = false;
-    while index < chars.len() {
-        let ch = chars[index];
-        if escaped {
-            escaped = false;
-            index += 1;
-            continue;
-        }
-        if ch == '\\' && !single {
-            escaped = true;
-            index += 1;
-            continue;
-        }
-        if ch == '\'' && !double {
-            single = !single;
-            index += 1;
-            continue;
-        }
-        if ch == '"' && !single {
-            double = !double;
-            index += 1;
-            continue;
-        }
-        if !single && !double && matches!(ch, '<' | '>') && chars.get(index + 1) == Some(&'(') {
-            return true;
-        }
-        index += 1;
-    }
-    false
-}
+// The "raw word carries an unquoted process substitution" scan lives
+// solely in the parser (crate::parser::
+// raw_word_has_unquoted_process_substitution); this file used to carry a
+// verbatim copy of the same DFA.

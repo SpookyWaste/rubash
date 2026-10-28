@@ -683,11 +683,12 @@ fn fd_pipe_test(
     operand: &str,
     env_vars: &crate::shell::var_table::VarTable,
 ) -> Option<bool> {
-    let fd: u32 = operand
-        .strip_prefix("/dev/fd/")
-        .or_else(|| operand.strip_prefix("/proc/self/fd/"))?
-        .parse()
-        .ok()?;
+    // The spelling judgment is the registry's (redundancy audit R3/D4):
+    // the local strip+parse also accepted `/dev/fd/+3`, which GNU
+    // rejects on every face (redir.c's special-filename handling never
+    // parses a sign; on the oracle platform the literal open fails
+    // ENOENT in procfs).
+    let fd: u32 = crate::special_paths::fd_alias_target(operand)?;
     if env_vars
         .get(&format!("__RUBASH_FD_PIPE_{fd}"))
         .map(String::as_str)

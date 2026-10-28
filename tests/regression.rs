@@ -3799,12 +3799,17 @@ mod win_face_fd_history {
     ///
     /// The assertion is the #1888 projection of the output — the two
     /// history lines, in order, and no "after history: 1" anywhere —
-    /// not the full byte stream: the file's POSIX-mode `-c` children
-    /// print their "after" lines where GNU's posix shell dies on the
-    /// special-builtin error, a separate pre-existing divergence the
-    /// committed errors.snap golden has absorbed (the golden is a
-    /// rubash-recorded snapshot; the two history lines are the part
-    /// the GNU 5.3.20 oracle adjudicated for this issue).
+    /// plus, since the RC audit phase-1 finding ④ fix, the errors10
+    /// numeric segment itself: the file's POSIX-mode `-c` children used
+    /// to print a second set of "after exit/shift/return" lines where
+    /// GNU's posix shell dies on the special-builtin error (EX_USAGE >
+    /// EX_SHERRBASE, execute_cmd.c:4886-4888 + :1004-1017), a
+    /// divergence the committed errors.snap golden had absorbed. The
+    /// product now converts the failure at the dispatch gate (and, for
+    /// `return`, in execute_return per builtins/return.def:62-65), the
+    /// golden was re-recorded from the GNU 5.3.20 oracle's output, and
+    /// the segment below pins the POSIX trio's absence: the
+    /// default-mode trio is followed DIRECTLY by the history lines.
     #[test]
     fn issue_1888_errors10_sub_verbatim() {
         let sub =
@@ -3828,6 +3833,195 @@ mod win_face_fd_history {
         assert!(
             !stdout.contains("after history: 1"),
             "history status folded to 1:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains(
+                "invalid numeric argument\nafter exit: 2\nafter shift: 2\nafter return: 2\nafter history: 2\n"
+            ),
+            "errors10 numeric segment diverged (the POSIX-mode trio must \
+             be absent — GNU's posix shell dies on the error):\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// RC audit phase-1 finding ④ (errors10): in POSIX mode, a special
+/// builtin's EX_USAGE-class failure (numeric-argument error, `--help`)
+/// is FATAL to a non-interactive shell — GNU returns EX_USAGE (258 >
+/// EX_SHERRBASE) from the builtin, execute_simple_command marks
+/// special_builtin_failed (execute_cmd.c:4886-4888), and the command's
+/// frame exits (execute_cmd.c:1004-1017) unless the context is tested
+/// (ignore_return / invert) or the builtin ran under `command`.
+/// rubash used to report the error and run the next command; the
+/// committed errors.snap golden had absorbed the non-fatal bytes.
+/// Expectations are the GNU bash 5.3.20 oracle's, byte for byte
+/// (stdout / stderr / exit status); see the fix-errors10 REPORT for
+/// the full two-mode classification matrix.
+mod errors10_posix_fatal {
+    use super::*;
+
+    fn run(args: &[&str]) -> (String, String, Option<i32>) {
+        let dir = case_scratch("errors10");
+        let out = run_rubash_in(&dir, args, Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    #[test]
+    fn errors10_posix_exit_numeric_is_fatal() {
+        let (stdout, stderr, code) = run(&["-o", "posix", "-c", "exit abcde; echo AFTER:$?"]);
+        assert_eq!(code, Some(2), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(stdout, "", "stderr:\n{stderr}");
+        assert_eq!(
+            stderr,
+            "bash: line 1: exit: abcde: numeric argument required\n"
+        );
+    }
+
+    #[test]
+    fn errors10_posix_shift_numeric_is_fatal() {
+        let (stdout, stderr, code) = run(&[
+            "-o",
+            "posix",
+            "-c",
+            "set -- a b c; shift abcde; echo AFTER:$?",
+        ]);
+        assert_eq!(code, Some(2), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(stdout, "", "stderr:\n{stderr}");
+        assert_eq!(
+            stderr,
+            "bash: line 1: shift: abcde: numeric argument required\n"
+        );
+    }
+
+    #[test]
+    fn errors10_posix_return_numeric_is_fatal() {
+        let (stdout, stderr, code) = run(&[
+            "-o",
+            "posix",
+            "-c",
+            "f(){ return abcde; echo INFUNC; }; f; echo AFTER:$?",
+        ]);
+        assert_eq!(code, Some(2), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(stdout, "", "stderr:\n{stderr}");
+        assert_eq!(
+            stderr,
+            "bash: line 1: return: abcde: numeric argument required\n"
+        );
+    }
+
+    #[test]
+    fn errors10_posix_exit_help_is_fatal() {
+        let (stdout, _stderr, code) =
+            run(&["-o", "posix", "-c", "exit --help >/dev/null; echo AFTER:$?"]);
+        assert_eq!(code, Some(2), "stdout:\n{stdout}");
+        assert_eq!(stdout, "");
+    }
+
+    #[test]
+    fn errors10_posix_shift_help_is_fatal() {
+        let (stdout, _stderr, code) = run(&[
+            "-o",
+            "posix",
+            "-c",
+            "set -- a b c; shift --help >/dev/null; echo AFTER:$?",
+        ]);
+        assert_eq!(code, Some(2), "stdout:\n{stdout}");
+        assert_eq!(stdout, "");
+    }
+
+    #[test]
+    fn errors10_posix_return_help_is_fatal() {
+        let (stdout, _stderr, code) = run(&[
+            "-o",
+            "posix",
+            "-c",
+            "f(){ return --help >/dev/null; echo INFUNC:$?; }; f; echo AFTER:$?",
+        ]);
+        assert_eq!(code, Some(2), "stdout:\n{stdout}");
+        assert_eq!(stdout, "");
+    }
+
+    /// GNU return.def:62-65's other arm: in a TESTED context the posix
+    /// builtin returns EX_USAGE without unwinding, so the function body
+    /// runs on and the call's status is the body's last status.
+    #[test]
+    fn errors10_posix_tested_return_numeric_body_continues() {
+        let (stdout, stderr, code) = run(&[
+            "-o",
+            "posix",
+            "-c",
+            "f(){ return abcde; echo INFUNC; }; f || echo OR:$?; echo DONE:$?",
+        ]);
+        assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(stdout, "INFUNC\nDONE:0\n", "stderr:\n{stderr}");
+    }
+
+    #[test]
+    fn errors10_default_exit_numeric_continues() {
+        let (stdout, stderr, code) = run(&["-c", "exit abcde; echo AFTER:$?"]);
+        assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(stdout, "AFTER:2\n", "stderr:\n{stderr}");
+    }
+
+    #[test]
+    fn errors10_posix_command_exit_numeric_continues() {
+        let (stdout, stderr, code) =
+            run(&["-o", "posix", "-c", "command exit abcde; echo AFTER:$?"]);
+        assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(stdout, "AFTER:2\n", "stderr:\n{stderr}");
+    }
+
+    #[test]
+    fn errors10_posix_if_exit_numeric_is_tested() {
+        let (stdout, stderr, code) = run(&[
+            "-o",
+            "posix",
+            "-c",
+            "if exit abcde; then echo T; else echo E:$?; fi; echo DONE",
+        ]);
+        assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(stdout, "E:2\nDONE\n", "stderr:\n{stderr}");
+    }
+
+    /// Sibling branch: shift's negative / out-of-range counts are
+    /// EXECUTION_FAILURE (never > EX_SHERRBASE), so they stay non-fatal
+    /// in POSIX mode; the out-of-range diagnostic prints because
+    /// posix_initialize sets print_shift_error (general.c:112).
+    #[test]
+    fn errors10_posix_shift_out_of_range_continues() {
+        let (stdout, stderr, code) =
+            run(&["-o", "posix", "-c", "set -- a b c; shift 99; echo AFTER:$?"]);
+        assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(stdout, "AFTER:1\n", "stderr:\n{stderr}");
+        assert_eq!(
+            stderr,
+            "bash: line 1: shift: 99: shift count out of range\n"
+        );
+    }
+
+    /// The too-many-arguments class is no_args DISCARD (mode
+    /// independent, NOT the special-builtin fatality channel): in
+    /// script-file form the failing line is abandoned, the function
+    /// (for `return`) unwinds, and the NEXT line runs with $?=2 —
+    /// exactly the errors10.sub tail segments.
+    #[test]
+    fn errors10_posix_too_many_script_form_continues() {
+        let dir = case_scratch("errors10-toomany");
+        std::fs::write(
+            dir.join("fg.sh"),
+            "set -- a b c\nexit 1 2\necho \"after exit: $?\"\nshift 1 2\necho \"after shift: $?\"\nf(){ return 1 2; echo INFUNC; }\nf\necho \"after return: $?\"\n",
+        )
+        .expect("write fg.sh");
+        let out = run_rubash_in(&dir, &["-o", "posix", "fg.sh"], Duration::from_secs(30));
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(
+            stdout, "after exit: 2\nafter shift: 2\nafter return: 2\n",
+            "stderr:\n{stderr}"
         );
     }
 }
@@ -4704,5 +4898,113 @@ mod issue_1952 {
         );
         assert_eq!(status, Some(0), "stderr:\n{stderr}");
         assert_eq!(stdout, "wait:3\nkill0:1\n", "stderr:\n{stderr}");
+    }
+
+    /// R3/D6: the comsub quick-read used to strip only the `/dev/fd/`
+    /// prefix itself, so `$(</proc/self/fd/N)` missed the fd table and
+    /// fell to the filesystem (ENOENT on Windows). GNU reads the fd
+    /// (subst.c read_comsub opens the spelling; procfs resolves it).
+    #[test]
+    fn r3_comsub_quick_read_proc_self_fd_spelling() {
+        let dir = case_scratch("r3-comsub-self");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "printf 'probe-r3\\n' > in.txt\n\
+             exec 3<in.txt\n\
+             x=$(</proc/self/fd/3)\n\
+             echo \"got:[$x]\"\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "got:[probe-r3]\n", "stderr:\n{stderr}");
+    }
+
+    /// R3/D6: `/dev/fd/+3` is not an fd spelling anywhere in GNU — the
+    /// literal open fails ENOENT on every face (oracle-verified), so
+    /// the quick-read must not serve fd 3's bytes for it. Before the
+    /// convergence this face's own parse accepted the sign and did.
+    #[test]
+    fn r3_comsub_quick_read_plus_fd_spelling_rejected() {
+        let dir = case_scratch("r3-comsub-plus");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "printf 'probe-r3\\n' > in.txt\n\
+             exec 3<in.txt\n\
+             x=$(</dev/fd/+3)\n\
+             echo \"got:[$x]\"\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "got:[]\n", "stderr:\n{stderr}");
+    }
+
+    /// R3/D4: `test -p` on a live pipe fd answers through the pipe-mark
+    /// matrix; the `+3` spelling used to parse to fd 3 and inherit its
+    /// mark. GNU: `/dev/fd/+3` stats ENOENT, so -p is false, while the
+    /// canonical spelling of the same pipe stays true.
+    #[test]
+    fn r3_test_pipe_plus_fd_spelling_rejected() {
+        let dir = case_scratch("r3-test-plus");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "exec 3< <(printf 'x\\n')\n\
+             if [ -p /dev/fd/3 ]; then echo canon-pipe; else echo canon-not-pipe; fi\n\
+             if [ -p /dev/fd/+3 ]; then echo plus-pipe; else echo plus-not-pipe; fi\n\
+             exec 3<&-\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "canon-pipe\nplus-not-pipe\n", "stderr:\n{stderr}");
+    }
+
+    /// R3/D5 control: the pipe-into-source fast path now recognizes
+    /// every registry fd-0 spelling; the sourced output must stay the
+    /// pipe's text for each (the general path answered these before,
+    /// so this pins the fast path to the same result).
+    #[test]
+    fn r3_pipe_source_fd0_spellings() {
+        let dir = case_scratch("r3-pipe-source");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "echo \"echo via-dev-fd-0\" | . /dev/fd/0\n\
+             echo \"echo via-proc-fd-0\" | . /proc/self/fd/0\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "via-dev-fd-0\nvia-proc-fd-0\n", "stderr:\n{stderr}");
+    }
+
+    /// R3/D6: `source /dev/fd/+3` must fail like GNU's (ENOENT
+    /// diagnostic, nothing sourced); the fd's bytes sit in a Text
+    /// endpoint (herestring), the one shape the old parse-and-serve
+    /// fallback could reach. Canonical /dev/fd/3 sourcing is the
+    /// control in the same script family (oracle-verified pair).
+    #[test]
+    fn r3_source_plus_fd_spelling_rejected() {
+        let dir = case_scratch("r3-source-plus");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "exec 3<<< 'echo should-not-run'\n\
+             . /dev/fd/+3\n\
+             echo after-marker\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "after-marker\n", "stderr:\n{stderr}");
+    }
+
+    /// R3/D1: an external command's `/dev/fd/+3` operand is not an fd
+    /// operand — the word reaches the child literally and the open
+    /// fails in the child (GNU: cat reports ENOENT, rc 1). Before the
+    /// convergence the operand layer parsed the sign, materialized
+    /// fd 3, and cat read it successfully. Canonical /dev/fd/3 is the
+    /// control.
+    #[test]
+    fn r3_external_operand_plus_fd_spelling_rejected() {
+        let dir = case_scratch("r3-operand-plus");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "printf 'probe-r3\\n' > in.txt\n\
+             exec 3<in.txt\n\
+             cat /dev/fd/3\n\
+             cat /dev/fd/+3 2>/dev/null; echo \"catrc:$?\"\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "probe-r3\ncatrc:1\n", "stderr:\n{stderr}");
     }
 }

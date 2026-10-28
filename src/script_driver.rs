@@ -3977,6 +3977,16 @@ fn bind_lines_columns(executor: &mut Executor, lines: i32, columns: i32) {
     });
 }
 
+/// The Session API's terminal-size notification
+/// (`api::Session::notify_terminal_size`): the host reports the
+/// size as (columns, rows) — the order a terminal reports it —
+/// and the session translates to this (lines, columns) bind
+/// order. The values land through the same LINES/COLUMNS
+/// binding the winsize machinery uses.
+pub fn bind_terminal_size(executor: &mut Executor, lines: i32, columns: i32) {
+    bind_lines_columns(executor, lines, columns);
+}
+
 /// jobs.c:2618 get_tty_state -> jobs.c:2647-2648 `if (check_window_size)
 /// get_new_window_size(0, NULL, NULL)` -> winsize.c:98-100: with checkwinsize
 /// on (default, config-top.h:148 CHECKWINSIZE_DEFAULT 1), an interactive
@@ -4175,6 +4185,29 @@ pub fn run_interactive_stdin(executor: &mut Executor) -> i32 {
     // kernel default.
     #[cfg(unix)]
     crate::builtins::kill::reconcile_kernel_trap_dispositions(&executor.shell_state.env_vars);
+    // rubash#1991: job control must exist for every interactive
+    // session, whoever drives it. GNU establishes it inside
+    // initialize_shell_basics for interactive shells (jobs.c:4869
+    // keeps the `m` flag there even without -m); rubash's binary
+    // startup does the equivalent in apply_startup_job_control, but
+    // that step lives in main.rs, so a library host driving THIS
+    // entry (invocation.rs: a library host (niu) drives the stdin
+    // reader) ran interactive sessions with monitor permanently off
+    // and fg/bg refused with "no job control" on a real terminal.
+    // Mirror the binary's rule at the library entry: an interactive
+    // session defaults monitor on; an explicit startup transport
+    // value (__RUBASH_SETOPT_monitor, from -m/+m or -o/+o monitor)
+    // is respected untouched. Applied once per process: a host may
+    // re-enter this reader per line, and a user's later
+    // `set +o monitor` must survive those re-entries.
+    static JOB_CONTROL_DEFAULT_APPLIED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if !JOB_CONTROL_DEFAULT_APPLIED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        && executor.get_env("__RUBASH_INTERACTIVE").as_deref() == Some("1")
+        && executor.get_env("__RUBASH_SETOPT_monitor").is_none()
+    {
+        executor.set_shell_option("monitor", true);
+    }
     // parse.y:1710: the SAME reader serves tty and non-tty stdin; the two
     // cases differ only in who echoes the accepted line (readline echoes
     // itself on a tty — the Windows cooked console echoes each typed key —

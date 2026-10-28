@@ -1605,6 +1605,13 @@ fn array_display_value(variable: &VariableSnapshot) -> String {
 }
 
 impl<W: Write + 'static> StopLoop for DapStopLoop<W> {
+    /// A mid-run announcement (design 5.3's condition failure
+    /// report) rides the adapter's console channel, the same
+    /// one the section 5.4 watch banner uses.
+    fn announce(&mut self, _session: &DebugSession, text: &str) {
+        self.shared.borrow_mut().console(format!("{text}\n"));
+    }
+
     fn serve(&mut self, session: &mut DebugSession) -> StopLoopOutcome {
         // Re-entry after an evaluation: the same stop, still
         // parked; the registries stay valid and only the owed

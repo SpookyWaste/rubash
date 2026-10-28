@@ -12,7 +12,7 @@
 #![allow(unreachable_patterns)]
 #![allow(clashing_extern_declarations)]
 
-pub(crate) mod api;
+pub mod api;
 pub mod build_info;
 pub mod builtins;
 pub mod console_readline;

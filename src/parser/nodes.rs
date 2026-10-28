@@ -316,9 +316,9 @@ pub struct ConditionalPatternOperand {
     pub kind: ConditionalPatternKind,
     pub operators: Vec<String>,
     pub extglob_patterns: Vec<ExtglobPattern>,
-    pub brace_expansions: Vec<BraceExpansion>,
-    pub parameter_expansions: Vec<ParameterExpansion>,
-    pub arithmetic_expansions: Vec<ArithmeticExpansion>,
+    // The brace / parameter / arithmetic operand records are removed
+    // (redundancy R4): empty on every instance, zero readers in
+    // either repo — the executor re-derives them from the text.
     pub has_glob: bool,
     pub has_extglob: bool,
 }
@@ -339,15 +339,10 @@ impl ConditionalPatternOperand {
         } else {
             Vec::new()
         };
-        // wt44/parse4: the brace / parameter / arithmetic operand records
-        // have zero readers (see WordMetadata::new) and stay empty.
         Self {
             has_glob: case_pattern_has_glob(&operators),
             has_extglob: case_pattern_has_extglob(&operators),
             extglob_patterns,
-            brace_expansions: Vec::new(),
-            parameter_expansions: Vec::new(),
-            arithmetic_expansions: Vec::new(),
             text,
             kind,
             operators,
@@ -466,6 +461,13 @@ pub struct CompoundAssignment {
 }
 
 /// Represents one element inside a `name=(...)` compound assignment.
+///
+/// The per-element expansion/quote record vectors are gone
+/// (redundancy R4): the brace/parameter/arithmetic/tilde records were
+/// empty on every instance and the extglob/pathname/word-quote scans
+/// were written per element with zero readers in either repo — the
+/// executor re-derives everything from the element text, as it does
+/// for words (see WordMetadata::new).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompoundAssignmentElement {
     pub subscript: Option<String>,
@@ -473,16 +475,6 @@ pub struct CompoundAssignmentElement {
     pub operator: Option<String>,
     pub append: bool,
     pub element_index: usize,
-    pub subscript_brace_expansions: Vec<BraceExpansion>,
-    pub subscript_parameter_expansions: Vec<ParameterExpansion>,
-    pub subscript_arithmetic_expansions: Vec<ArithmeticExpansion>,
-    pub brace_expansions: Vec<BraceExpansion>,
-    pub parameter_expansions: Vec<ParameterExpansion>,
-    pub arithmetic_expansions: Vec<ArithmeticExpansion>,
-    pub extglob_patterns: Vec<ExtglobPattern>,
-    pub pathname_patterns: Vec<PathnamePattern>,
-    pub tilde_expansions: Vec<TildeExpansion>,
-    pub word_quotes: Vec<WordQuote>,
 }
 
 /// Represents a parsed `name[subscript]=value` or `name[subscript]+=value` word.
@@ -506,15 +498,11 @@ pub struct ArrayElementAssignment {
     pub operator_metadata: Box<WordMetadata>,
     pub append: bool,
     pub word_index: Option<usize>,
-    pub subscript_brace_expansions: Vec<BraceExpansion>,
-    pub subscript_parameter_expansions: Vec<ParameterExpansion>,
-    pub subscript_arithmetic_expansions: Vec<ArithmeticExpansion>,
-    pub brace_expansions: Vec<BraceExpansion>,
-    pub parameter_expansions: Vec<ParameterExpansion>,
-    pub arithmetic_expansions: Vec<ArithmeticExpansion>,
-    pub extglob_patterns: Vec<ExtglobPattern>,
-    pub pathname_patterns: Vec<PathnamePattern>,
-    pub tilde_expansions: Vec<TildeExpansion>,
+    // The always-empty expansion record vectors and the per-element
+    // extglob/pathname scans are removed (redundancy R4, zero readers
+    // in either repo). word_quotes STAYS: it is written by a real scan
+    // and read by the executor's compound-list shape check
+    // (array_assignment_exec) — a live record, not a dead one.
     pub word_quotes: Vec<WordQuote>,
 }
 
@@ -725,10 +713,12 @@ pub struct WordMetadata {
     // every scan that fed them (the executor re-derives all of them
     // from the word text at consumption time), so the vectors were
     // empty on every instance — their storage is removed (perf F4
-    // node diet). Only the three record kinds with live consumers
-    // remain, plus word_quotes below.
+    // node diet). Only the two record kinds with live consumers
+    // remain, plus word_quotes below. The per-word extglob record
+    // went the same way (redundancy R4): no production reader in
+    // either repo — the live store is the CommandNode aggregate,
+    // which push_command_word fills from WordScans directly.
     pub process_substitutions: Vec<ProcessSubstitution>,
-    pub extglob_patterns: Vec<ExtglobPattern>,
     pub pathname_patterns: Vec<PathnamePattern>,
     /// Word-quote records: always empty (wt44/parse4 — the executor
     /// re-derives quoting from the raw word at consumption time), but
@@ -753,7 +743,6 @@ impl WordMetadata {
             value,
             raw,
             process_substitutions: Vec::new(),
-            extglob_patterns: Vec::new(),
             pathname_patterns: Vec::new(),
             word_quotes: Vec::new(),
             lex_locale: None,
@@ -781,7 +770,6 @@ impl WordMetadata {
             // pretty-print rendering re-scans the word, the conditional
             // `=~` check re-scans the raw).
             process_substitutions,
-            extglob_patterns: super::extglob_patterns_in_word_with_raw(&value, &raw),
             pathname_patterns: super::pathname_patterns_in_word(&value, &raw),
             word_quotes: Vec::new(),
             lex_locale: if crate::lexer::raw_has_ansi_u_escape(&raw) {
@@ -808,7 +796,6 @@ impl WordMetadata {
         value: String,
         raw: String,
         process_substitutions: Vec<ProcessSubstitution>,
-        extglob_patterns: Vec<ExtglobPattern>,
         pathname_patterns: Vec<PathnamePattern>,
     ) -> Self {
         let process_substitutions = process_substitutions
@@ -822,7 +809,6 @@ impl WordMetadata {
             word_index,
             // See `new` for why the non-live kinds stay empty (wt44/parse4).
             process_substitutions,
-            extglob_patterns,
             pathname_patterns,
             word_quotes: Vec::new(),
             lex_locale: if crate::lexer::raw_has_ansi_u_escape(&raw) {
@@ -873,9 +859,9 @@ pub struct CasePattern {
     pub operators: Vec<String>,
     pub operator_metadata: Vec<WordMetadata>,
     pub extglob_patterns: Vec<ExtglobPattern>,
-    pub brace_expansions: Vec<BraceExpansion>,
-    pub parameter_expansions: Vec<ParameterExpansion>,
-    pub arithmetic_expansions: Vec<ArithmeticExpansion>,
+    // The brace / parameter / arithmetic records are removed
+    // (redundancy R4): empty on every instance, zero readers in
+    // either repo.
     pub clause_index: usize,
     pub pattern_index: usize,
     pub has_glob: bool,
@@ -906,11 +892,6 @@ impl CasePattern {
             operators,
             operator_metadata,
             extglob_patterns: super::extglob_patterns_in_word_with_raw(&text, &raw_text),
-            // wt44/parse4: zero-reader records stay empty (see
-            // WordMetadata::new).
-            brace_expansions: Vec::new(),
-            parameter_expansions: Vec::new(),
-            arithmetic_expansions: Vec::new(),
             raw_text,
             text,
             clause_index,
