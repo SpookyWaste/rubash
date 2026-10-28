@@ -3777,6 +3777,50 @@ mod issue_1917 {
         assert_eq!(stdout, "VER-OK", "stderr:\n{stderr}");
     }
 
+    /// A-1b: the read faces of synthetic content, one vehicle per
+    /// invocation so a failure names its face. (Added when A-1's
+    /// simple-read vehicle failed on Windows CI while the comsub
+    /// quick-read of the same content passed — the faces do not share
+    /// one resolution path, so they are pinned separately.)
+    #[test]
+    fn issue1917_a1b_read_faces() {
+        let dir = case_scratch("1917-a1b");
+        let faces: &[(&str, &str, &str)] = &[
+            (
+                "simple-read-top",
+                "read -r l < /proc/meminfo; case $l in MemTotal:*) echo OK;; *) echo \"BAD:[$l]\";; esac",
+                "OK",
+            ),
+            (
+                "simple-read-pid",
+                "read -r l < /proc/self/status; case $l in Name:*) echo OK;; *) echo \"BAD:[$l]\";; esac",
+                "OK",
+            ),
+            (
+                "cat-face",
+                "x=$(cat /proc/version); case $x in 'Linux version '*) echo OK;; *) echo \"BAD:[$x]\";; esac",
+                "OK",
+            ),
+            (
+                "exec-fd-face",
+                "exec 9</proc/version; read -r l <&9; case $l in 'Linux version '*) echo OK;; *) echo \"BAD:[$l]\";; esac",
+                "OK",
+            ),
+            (
+                "compound-face",
+                "while read -r l; do case $l in 'Linux version '*) echo OK; break;; *) echo \"BAD:[$l]\"; break;; esac; done < /proc/version",
+                "OK",
+            ),
+        ];
+        for (name, code, expected) in faces {
+            let (stdout, stderr, status) = run(&dir, code);
+            assert_eq!(
+                stdout, *expected,
+                "face {name}: status={status:?} stderr:\n{stderr}"
+            );
+        }
+    }
+
     /// A-2: /proc/self/cmdline carries the TRUE argv — a known marker
     /// argument placed on the shell's own command line must appear as
     /// a NUL-separated field. Pre-fix on Windows the file contained
