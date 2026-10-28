@@ -3831,7 +3831,7 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> bool {
-        if !mixed_assignment_statement_admission(cmd) {
+        if !mixed_arm_admission(cmd) {
             return false;
         }
         // Textual order: the peeled leading plain run (cmd.assignments)
@@ -3915,25 +3915,70 @@ impl Executor {
     }
 }
 
-/// rubash#1568 admission for the mixed assignment statement: every
-/// word is an assignment word (plain via split_assignment_word, or an
-/// array-element word via the parser's records / cooked-text rule)
-/// and at least one word is an element word. Plain-only statements
-/// are peeled into cmd.assignments by the parser and never reach
-/// here; a node with any non-assignment word is a command.
-pub(in crate::executor) fn mixed_assignment_statement_admission(cmd: &CommandNode) -> bool {
-    if cmd.words.is_empty() {
-        return false;
-    }
-    let mut has_element = false;
+/// Word-shape classification for the rubash#1568 mixed assignment
+/// statement, from one walk over cmd.words: every word is an
+/// assignment word (plain via split_assignment_word, or an
+/// array-element word via the parser's records / cooked-text rule),
+/// and whether the words include an element word and a plain word.
+/// A node with any non-assignment word is a command, not a statement.
+struct MixedStatementShape {
+    all_assignment_words: bool,
+    has_element: bool,
+    has_plain: bool,
+}
+
+fn mixed_statement_shape(cmd: &CommandNode) -> MixedStatementShape {
+    let mut shape = MixedStatementShape {
+        all_assignment_words: !cmd.words.is_empty(),
+        has_element: false,
+        has_plain: false,
+    };
     for index in 0..cmd.words.len() {
         if command_word_is_array_element_assignment(cmd, index) {
-            has_element = true;
-        } else if split_assignment_word(&cmd.words[index]).is_none() {
-            return false;
+            shape.has_element = true;
+        } else if split_assignment_word(&cmd.words[index]).is_some() {
+            shape.has_plain = true;
+        } else {
+            shape.all_assignment_words = false;
+            return shape;
         }
     }
-    has_element
+    shape
+}
+
+/// rubash#1568 admission for the mixed assignment statement: every
+/// word is an assignment word and at least one word is an element
+/// word. Plain-only statements are peeled into cmd.assignments by the
+/// parser and never reach here. This is the PIPELINE-stage admission
+/// (pipeline_exec.rs): an all-assignment stage — element-only
+/// included — is a statement in the element's subshell (GNU
+/// execute_simple_command's WORDS==0 arm in the forked child), so it
+/// takes the compound route for isolation.
+pub(in crate::executor) fn mixed_assignment_statement_admission(cmd: &CommandNode) -> bool {
+    let shape = mixed_statement_shape(cmd);
+    shape.all_assignment_words && shape.has_element
+}
+
+/// Top-level admission for execute_mixed_assignment_statement: the
+/// mixed arm exists for nodes the pre-existing dispatch cannot
+/// execute — an element word followed by a plain assignment word
+/// (stranded in cmd.words by the parser's plain-run peel), or a
+/// peeled plain run (cmd.assignments) in front of element words.
+/// An element-only node with no peeled run is the plain
+/// assignment-only statement execute_array_element_assignment has
+/// always owned (single- and multi-word alike — the mixed arm only
+/// delegated each word to it through a full CommandNode clone), so
+/// the mixed arm declines it and the native arm runs without the
+/// per-statement clone. (Perf round 2026-10-28: the clone admission
+/// cost +26–31% on element-write loops — assoc_fill_100k,
+/// array_fill_30000, array_fill_4000 — against the 2026-10-25
+/// baseline; classification and bind order for every node the mixed
+/// arm still takes are unchanged.)
+fn mixed_arm_admission(cmd: &CommandNode) -> bool {
+    let shape = mixed_statement_shape(cmd);
+    shape.all_assignment_words
+        && shape.has_element
+        && (shape.has_plain || !cmd.assignments.is_empty())
 }
 
 fn assignment_builtin_receives_assignment_word(
