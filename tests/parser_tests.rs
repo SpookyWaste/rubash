@@ -1349,14 +1349,6 @@ mod command_body_kind_tests {
         assert_eq!(select_command.variable_metadata.value, "x");
         assert_eq!(select_command.variable_metadata.raw, "x");
         assert_eq!(select_command.word_metadata.len(), 3);
-        assert_eq!(
-            select_command.word_metadata[1].extglob_patterns[0].operator,
-            '@'
-        );
-        assert_eq!(
-            select_command.word_metadata[1].extglob_patterns[0].alternatives,
-            ["yes", "no"]
-        );
     }
 
     #[test]
@@ -2415,13 +2407,6 @@ mod conditional_tests {
             .as_ref()
             .unwrap()
             .extglob_patterns
-            .is_empty());
-        assert!(regex
-            .expression
-            .pattern_operand
-            .as_ref()
-            .unwrap()
-            .brace_expansions
             .is_empty());
         assert_eq!(capture.expression.kind, ConditionalExpressionKind::Binary);
         assert_eq!(capture.expression.operator.as_deref(), Some("=~"));

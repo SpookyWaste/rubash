@@ -972,21 +972,11 @@ impl Executor {
             let mut output = String::new();
             let mut status = 0;
             for word in &words[1..] {
-                // Process substitution `<(...)`: Bash materializes it to a
-                // temporary file holding the command's output, so `cat` reads
-                // that output. Run the inner command directly instead of
-                // treating the literal `<(...)` text as a file path.
-                if let Some(source) = word
-                    .strip_prefix("<(")
-                    .and_then(|rest| rest.strip_suffix(')'))
-                {
-                    let mut executor = self.command_substitution_executor();
-                    crate::builtins::trap::reset_for_subshell_child(
-                        &mut executor.shell_state.env_vars,
-                    );
-                    output.push_str(&executor.expand_command_substitution(source));
-                    continue;
-                }
+                // No `<(...)` operand arm here (redundancy R7): the
+                // triviality gate above admits only the byte set
+                // [A-Za-z0-9 \t_-+=.,/:@%^], which contains neither `<`
+                // nor `(`, so a procsub operand can never reach this
+                // loop — such bodies fall to full execution earlier.
                 let path = self.expand_word(word);
                 // `/dev/stdin`/`/dev/fd/0`/`/proc/self/fd/0` read fd 0 —
                 // the FUNCTION_STDIN cursor (the gate above already sent
@@ -1202,11 +1192,12 @@ impl Executor {
             return output;
         }
 
-        if words.first().map(String::as_str) == Some("mktemp") {
-            if let Some(path) = self.mktemp_command_substitution(&words) {
-                return path;
-            }
-        }
+        // No second mktemp dispatch here (redundancy R7): the in-process
+        // attempt above already ran with these exact words; its decline
+        // paths create nothing and are deterministic, and the external
+        // attempt just declined too (it returns None for mktemp whenever
+        // it must not claim the body), so a repeat call could only
+        // reproduce the first result.
 
         // Fallback: run the source through the real parser/executor in a
         // subshell and capture stdout (function calls, pipelines, compound

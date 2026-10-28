@@ -65,7 +65,6 @@ pub(super) fn push_command_word(cmd: &mut CommandNode, token: &Token) {
         token.value.clone(),
         token.raw.clone(),
         scans.process_substitutions,
-        scans.extglob_patterns,
         scans.pathname_patterns,
     ));
     // rubash#1520: freeze the #1218 verdict on the node as its head word
