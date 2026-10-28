@@ -1440,12 +1440,12 @@ mod tests {
 
     /// rubash#1917 §7.1: the fallback shape is exactly the image name
     /// plus its NUL — failure of the true read degrades content, never
-    /// shape.
+    /// shape. (Attribute-gated: it calls the Windows-only fallback
+    /// constructor directly.)
+    #[cfg(windows)]
     #[test]
     fn cmdline_fallback_shape_is_image_plus_nul() {
-        if cfg!(windows) {
-            assert_eq!(image_cmdline_fallback("prog.exe"), b"prog.exe\0".to_vec());
-        }
+        assert_eq!(image_cmdline_fallback("prog.exe"), b"prog.exe\0".to_vec());
     }
 
     /// rubash#1900: link resolution and unary facts — self/cwd is
@@ -1454,8 +1454,9 @@ mod tests {
     /// resolves to the running image, content entries are not links,
     /// a dead pid dangles, and the facts face agrees.
     #[test]
+    #[cfg(windows)]
     fn link_targets_and_facts() {
-        if cfg!(windows) {
+        {
             let cwd = self_cwd_forms(std::path::Path::new("D:\\some\\session dir"));
             let target = proc_link_target("/proc/self/cwd", Some(&cwd)).expect("self cwd link");
             assert_eq!(target.native, "D:\\some\\session dir");
