@@ -864,6 +864,17 @@ impl Executor {
                 self.maybe_run_error_trap(cmd)?;
             }
             self.errexit_status_converted.set(true);
+            // DE-06 (design 9.3; PLAN row 12): the errexit
+            // decision — park a selected `set -e` filter here,
+            // before the exit path (timed deaths park at the
+            // time branch's promotion instead).
+            if self.timed_dispatch_depth.get() == 0 {
+                self.debugger_note_exception_site(
+                    crate::debugger::ExceptionKind::Errexit,
+                    self.exit_code,
+                    None,
+                )?;
+            }
             return Err(ExecuteError::ExitCode(self.exit_code));
         }
         Ok(())
