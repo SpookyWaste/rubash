@@ -980,56 +980,28 @@ impl Executor {
                 let path = self.expand_word(word);
                 // `/dev/stdin`/`/dev/fd/0`/`/proc/self/fd/0` read fd 0 —
                 // the FUNCTION_STDIN cursor (the gate above already sent
-                // N>0 descriptors to full execution). Consuming fd 0 here
-                // writes the cursor back the way the external fast path
-                // does (comsub_stdin_writeback).
+                // N>0 descriptors to full execution).
                 if crate::executor::dev_fd_operands::dev_operand_fd(&path) == Some(0) {
-                    if let Some(text) = self.shell_state.env_vars.get(FUNCTION_STDIN) {
-                        self.comsub_stdin_writeback
-                            .set(Some((text.len(), Self::function_stdin_fingerprint(text))));
-                    }
-                    output.push_str(&self.function_stdin_remaining().unwrap_or_default());
+                    output.push_str(&self.comsub_cat_function_stdin_text());
                     continue;
                 }
-                // niubash#177: same operand resolution as the argv funnel —
-                // a virtual-root file operand may exist only under its
-                // `.exe` spelling on disk.
-                //
-                // Read bytes, not a decoded String: GNU cat.c reads the file
-                // as raw bytes (safe_read -> write), so a non-UTF-8 file is
-                // content, not an error. `read_to_string` rejected any
-                // invalid sequence as ENOENT and the shortcut then reported a
-                // file that plainly exists as "No such file" and returned an
-                // empty value (rubash#772). The bytes ride the same
-                // bytes_to_shell_text carrier contract as every other
-                // substitution capture, and GNU read_comsub discards NUL
-                // bytes while reading the child pipe (substitution_metadata
-                // SubstitutionOutput::readback), so drop NUL first.
-                // Registry first, in the quick-read / external_cat order
-                // (rubash#1917 cat-face): synthetic /proc content has no
-                // filesystem file behind the mapped path on Windows, so
-                // reading the mapped path directly reported a live
-                // /proc file as ENOENT; a SyntheticLink operand
-                // (rubash#1900) resolves through the registry to its
-                // native target and reads that (the session cwd answers
-                // for self/cwd, per the open ladder / read_io).
-                let read_result =
-                    if let Some(bytes) = crate::special_paths::synthetic_proc_content(&path) {
-                        Ok(bytes)
-                    } else if let Some(link) = crate::special_paths::synthetic_link_target(
-                        &path,
-                        Some(&crate::proc_vfs::self_cwd_forms(self.session_cwd())),
-                    ) {
-                        fs::read(&link.native)
-                    } else {
-                        fs::read(self.session_path(
-                            crate::executor::path::windows_operand_file_path(
-                                shell_path_to_windows(&path, &self.shell_state.env_vars),
-                                &self.shell_state.env_vars,
-                            ),
-                        ))
-                    };
-                match read_result {
+                // Byte source: the ladder shared with the timed cat arm
+                // (comsub_cat_operand_bytes). This arm's own policy is
+                // unchanged: read bytes, not a decoded String — GNU cat.c
+                // reads the file as raw bytes (safe_read -> write), so a
+                // non-UTF-8 file is content, not an error. `read_to_string`
+                // rejected any invalid sequence as ENOENT and the shortcut
+                // then reported a file that plainly exists as "No such
+                // file" and returned an empty value (rubash#772). The bytes
+                // ride the same bytes_to_shell_text carrier contract as
+                // every other substitution capture, and GNU read_comsub
+                // discards NUL bytes while reading the child pipe
+                // (substitution_metadata SubstitutionOutput::readback), so
+                // drop NUL first; a failed read diagnoses and sets status
+                // 1 — unlike the timed arm, which skips silently at
+                // status 0 (that fork is deliberate and stays unfused;
+                // see T2 in the redundancy audit).
+                match self.comsub_cat_operand_bytes(&path) {
                     Ok(mut bytes) => {
                         bytes.retain(|byte| *byte != 0);
                         output.push_str(&bytes_to_shell_text(&bytes));
@@ -1781,6 +1753,7 @@ impl Executor {
             pipeline_stage_pre_traced: std::cell::Cell::new(false),
             pipeline_stage_restricted_refused: std::cell::Cell::new(false),
             last_heredoc_warning_source: RefCell::new(None),
+            heredoc_admission_declined_source: RefCell::new(None),
             comsub_leading_newlines: Cell::new(0),
             current_shell_substitution_exit: Cell::new(self.current_shell_substitution_exit.get()),
             last_command_substitution_parse_error: Cell::new(false),

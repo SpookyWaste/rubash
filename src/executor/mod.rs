@@ -1293,6 +1293,16 @@ pub struct Executor {
     /// (expand_assignment_value_inner → expand_command_substitution_mut_typed
     /// and expand_embedded_parameters_mut → expand_command_substitution_mut).
     last_heredoc_warning_source: RefCell<Option<String>>,
+    /// Decline-only memo for the heredoc comsub shortcut: the
+    /// (IFS_GLUE-stripped) source whose most recent admission attempt
+    /// declined. The mut dispatcher tries the typed heredoc entry
+    /// first and, on decline, falls through to routes that retry the
+    /// readback entry for the same source; the memo lets that retry
+    /// skip a second tokenize/parse + admission pass. It can never
+    /// admit anything — a hit only routes the body to the real
+    /// executor — so a stale record costs at most the shortcut, never
+    /// semantics. An unrelated heredoc attempt clears it.
+    heredoc_admission_declined_source: RefCell<Option<String>>,
     /// Leading newlines in the comsub source (before trimming). Used to
     /// adjust heredoc warning line numbers: when `$(` is at end of line,
     /// the comsub body starts on the next line.

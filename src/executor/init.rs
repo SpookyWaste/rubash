@@ -558,6 +558,7 @@ impl Executor {
             pipeline_stage_pre_traced: std::cell::Cell::new(false),
             pipeline_stage_restricted_refused: std::cell::Cell::new(false),
             last_heredoc_warning_source: RefCell::new(None),
+            heredoc_admission_declined_source: RefCell::new(None),
             comsub_leading_newlines: Cell::new(0),
             current_shell_substitution_exit: Cell::new(None),
             last_command_substitution_parse_error: Cell::new(false),
