@@ -1706,6 +1706,7 @@ impl Executor {
             inside_compound_condition: Cell::new(false),
             inside_assignment_rhs: Cell::new(false),
             background_children: HashMap::new(),
+            procsub_stream_children: HashMap::new(),
             pending_job_completions: Vec::new(),
             pending_timed_coproc_reports: Vec::new(),
             timed_coproc_death_instants: std::collections::HashMap::new(),
@@ -2142,6 +2143,16 @@ impl Executor {
                             .trim_capture_terminator()
                             .to_string();
                     }
+                }
+                // rubash#1952: a streamed procsub binds a live File
+                // endpoint instead of a buffered one — drain it
+                // through the shared handle (reads to EOF, the
+                // quick-read's defining semantics).
+                if let Some(content) = self.fd_table.read_file_endpoint_bytes(fd) {
+                    self.last_command_substitution_status.set(Some(0));
+                    return bytes_to_shell_text(&content)
+                        .trim_capture_terminator()
+                        .to_string();
                 }
             }
         }

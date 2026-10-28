@@ -567,6 +567,11 @@ pub struct Executor {
     /// executors keep the restore.
     is_process_exit_executor: bool,
     background_children: HashMap<u32, crate::fd::SpawnedChild>,
+    /// rubash#1952: pids spawned as streamed input process
+    /// substitutions (real children in background_children), mapped
+    /// to whether the boundary reap has spent its one bounded grace
+    /// wait for the pid (see refresh_background_jobs_impl).
+    procsub_stream_children: HashMap<u32, bool>,
     /// Background-job completions the boundary reap has already
     /// observed (try_wait returned) but whose job-table visibility is
     /// deferred to the next GNU observation point — a foreground

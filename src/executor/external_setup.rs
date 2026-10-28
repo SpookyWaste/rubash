@@ -425,7 +425,17 @@ impl Executor {
                 .strip_prefix("<(")
                 .and_then(|target| target.strip_suffix(')'))
             {
-                if let Some((output, body_timing)) =
+                // rubash#1952: stream first — name the spawned body's
+                // pipe by its word fd (GNU subst.c:6362 hands the
+                // consumer a /dev/fd/N); the downstream redirect
+                // machinery resolves the alias to the live endpoint.
+                // The collected temp-carrier form below is the
+                // spawn-failure fallback.
+                if let Some(streamed) = self.process_substitution_child_fd_word(source, cmd_line) {
+                    let old_target = redirect.target.clone();
+                    redirect.target = streamed;
+                    redirect_target_rewrites.push((old_target, redirect.target.clone()));
+                } else if let Some((output, body_timing)) =
                     self.process_substitution_output_bytes_timed(source)
                 {
                     let path = self.write_process_substitution_temp_bytes(&output)?;
@@ -621,6 +631,16 @@ impl Executor {
             .strip_prefix("<(")
             .and_then(|word| word.strip_suffix(')'))
         {
+            // rubash#1952: stream first — GNU process_substitute
+            // (subst.c:6362) forks the body onto a pipe at expansion
+            // time, so the consumer starts on the first bytes; the
+            // collected form below starves it until the body exits
+            // (forever for a non-terminating producer) and remains
+            // only as the spawn-failure fallback.
+            if let Some(streamed) = self.process_substitution_child_fd_word(source, line) {
+                *word = streamed;
+                return Ok(());
+            }
             let Some(output) = self.process_substitution_output_bytes(source) else {
                 return Ok(());
             };
@@ -661,6 +681,16 @@ impl Executor {
                 let display_path = self.process_substitution_output_fd_word(&path);
                 *word = word.replacen(&substitution.target, &display_path, 1);
             } else {
+                // rubash#1952: stream first (see
+                // materialize_standalone_process_substitution_word);
+                // the collected form below is the spawn-failure
+                // fallback.
+                if let Some(streamed) =
+                    self.process_substitution_child_fd_word(&substitution.source, line)
+                {
+                    *word = word.replacen(&substitution.target, &streamed, 1);
+                    continue;
+                }
                 let Some((output, body_timing)) =
                     self.process_substitution_output_bytes_timed(&substitution.source)
                 else {
@@ -778,6 +808,16 @@ impl Executor {
                 word.replace_range(start..end, &word_form);
                 cursor = start + word_form.len();
             } else {
+                // rubash#1952: stream first (see
+                // materialize_process_substitution_word); the collected
+                // form below is the spawn-failure fallback.
+                if let Some(word_form) =
+                    self.process_substitution_child_fd_word(&substitution.source, None)
+                {
+                    word.replace_range(start..end, &word_form);
+                    cursor = start + word_form.len();
+                    continue;
+                }
                 let Some(output) = self.process_substitution_output_bytes(&substitution.source)
                 else {
                     continue;
@@ -837,6 +877,19 @@ impl Executor {
                     cursor = start + word_form.len();
                 }
             } else {
+                // rubash#1952: stream first (see
+                // materialize_process_substitution_word); the
+                // registration happens even when the splice misses,
+                // mirroring the collected form below.
+                if let Some(word_form) =
+                    self.process_substitution_child_fd_word(&substitution.source, None)
+                {
+                    if let Some((start, end)) = range {
+                        word.replace_range(start..end, &word_form);
+                        cursor = start + word_form.len();
+                    }
+                    continue;
+                }
                 let Some(output) = self.process_substitution_output_bytes(&substitution.source)
                 else {
                     continue;
@@ -1258,27 +1311,66 @@ impl Executor {
     /// close-on-exec but keeps it in the parent, so a variable carrying
     /// `/dev/fd/N` remains resolvable later.
     fn register_process_substitution_fd(&mut self, output: &[u8]) -> u32 {
-        let mut fd = 63u32;
-        while fd > 3 && !self.fd_table_fd_free(fd) {
-            fd -= 1;
-        }
-        if fd <= 3 {
-            // move_to_high_fd (general.c:681) is dup2-backed in GNU — it
-            // scans downward from maxfd-1 via fcntl F_GETFD and dup2()s
-            // into the first free slot — a different mechanism from the
-            // fcntl F_DUPFD that backs {var} allocation (redir.c:942).
-            // The limit-aware fallback below is bounded by the same
-            // RLIMIT_NOFILE soft limit as every other dynamic allocation
-            // (rubash#773); its low-first pick order is a pre-existing
-            // simplification of GNU's high-side scan.
-            return self.allocate_dynamic_fd().unwrap_or(63);
-        }
+        let fd = self.allocate_process_substitution_word_fd();
         self.fd_table.open_input(
             fd,
             FdReadEndpoint::process_substitution_bytes(output.to_vec()),
             true,
         );
         fd
+    }
+
+    /// The fd a word-form input process substitution binds.
+    /// move_to_high_fd (general.c:681) is dup2-backed in GNU — it scans
+    /// downward from maxfd-1 via fcntl F_GETFD and dup2()s into the
+    /// first free slot — a different mechanism from the fcntl F_DUPFD
+    /// that backs {var} allocation (redir.c:942). The limit-aware
+    /// fallback below is bounded by the same RLIMIT_NOFILE soft limit
+    /// as every other dynamic allocation (rubash#773); its low-first
+    /// pick order is a pre-existing simplification of GNU's high-side
+    /// scan.
+    fn allocate_process_substitution_word_fd(&mut self) -> u32 {
+        let mut fd = 63u32;
+        while fd > 3 && !self.fd_table_fd_free(fd) {
+            fd -= 1;
+        }
+        if fd <= 3 {
+            return self.allocate_dynamic_fd().unwrap_or(63);
+        }
+        fd
+    }
+
+    /// rubash#1952: the streaming registration behind a word-form
+    /// input process substitution — spawn the body as a child shell
+    /// on a real pipe (GNU subst.c:6362 process_substitute) and bind
+    /// the pipe read end at the word fd, so the consumer starts on
+    /// the body's first bytes instead of after its exit. The fd is
+    /// command-scoped exactly like the collected form's (see
+    /// process_substitution_fd_word). Returns None when the spawn
+    /// could not be set up; the caller then collects synchronously.
+    fn register_process_substitution_child(
+        &mut self,
+        source: &str,
+        line: Option<usize>,
+    ) -> Option<u32> {
+        let file_fd = self.spawn_input_process_substitution_child(source, line)?;
+        let fd = self.allocate_process_substitution_word_fd();
+        self.fd_table
+            .open_input(fd, FdReadEndpoint::File(file_fd), true);
+        self.command_scoped_procsub_input_fds.push(fd);
+        Some(fd)
+    }
+
+    /// The word form of a streamed input process substitution:
+    /// `/dev/fd/N` per GNU subst.c:6362, naming the pipe read end
+    /// bound by register_process_substitution_child.
+    pub(in crate::executor) fn process_substitution_child_fd_word(
+        &mut self,
+        source: &str,
+        line: Option<usize>,
+    ) -> Option<String> {
+        self.register_process_substitution_child(source, line)
+            .map(|fd| format!("/dev/fd/{fd}"))
     }
 
     fn fd_table_fd_free(&self, fd: u32) -> bool {

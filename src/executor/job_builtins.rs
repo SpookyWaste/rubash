@@ -1220,7 +1220,38 @@ impl Executor {
         self.apply_pending_job_completions(observe)?;
         let mut finished = Vec::new();
         for (pid, child) in &mut self.background_children {
-            if let Some(status) = child.try_wait()? {
+            let mut reaped = child.try_wait()?;
+            if reaped.is_none() {
+                // rubash#1952: a streamed procsub producer closes its
+                // pipe during exit teardown, so an in-process consumer
+                // can observe EOF a hair before the producer becomes
+                // reapable; GNU wins the same race because wait_for
+                // (jobs.c:3064) reaps while blocked on the foreground
+                // process. Give a streamed producer one bounded grace
+                // wait (5 ms) at the first boundary that finds it
+                // unreaped, so `$!` liveness (`kill -0`) is
+                // deterministic for a producer that already delivered
+                // EOF. A genuinely live producer pays the grace once
+                // and stays registered.
+                let grace = matches!(self.procsub_stream_children.get(pid), Some(false));
+                if grace {
+                    self.procsub_stream_children.insert(*pid, true);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(done)) => {
+                                reaped = Some(done);
+                                break;
+                            }
+                            Ok(None) if std::time::Instant::now() < deadline => {
+                                std::thread::sleep(std::time::Duration::from_micros(100));
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+            if let Some(status) = reaped {
                 // rubash#1776: sample the reaped child's CPU for the
                 // Windows CHILDREN half while its handle is live.
                 super::read_helpers::note_reaped_child_cpu(child);
@@ -1245,6 +1276,7 @@ impl Executor {
 
         for (pid, status, term_signal) in finished {
             self.background_children.remove(&pid);
+            self.procsub_stream_children.remove(&pid);
             // rubash#169: the reaped child no longer holds a capture pipe
             // write end — retire it from the writer set (drain when last).
             let drained = crate::executor::shell_options::retire_background_capture_writer(pid);
@@ -1625,6 +1657,7 @@ impl Executor {
         let Some(mut child) = self.background_children.remove(&pid) else {
             return Ok(WaitPidOutcome::NotFound);
         };
+        self.procsub_stream_children.remove(&pid);
         // GNU jobs.c:3064 wait_for + wait.def:178-191 wait_intr_flag: the
         // blocking waitpid is interruptible — a trapped signal longjmps out
         // and wait returns 128+sig while the job stays live. The mailbox
@@ -2019,6 +2052,7 @@ impl Executor {
                         .chain(self.background_children.keys().copied())
                         .collect();
                     self.background_children.clear();
+                    self.procsub_stream_children.clear();
                     for pid in &pids {
                         // rubash#1304: `disown -a` leaves nothing
                         // waitable (GNU: a later `wait <pid>` reports

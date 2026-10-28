@@ -1784,7 +1784,17 @@ impl Executor {
             // drains the source, later ones see EOF (GNU cat.c reads
             // stdin once — shared file offset).
             let mut stdin_remaining: Option<Vec<u8>> = None;
+            // rubash#1952: a streamed procsub operand (see the dev-fd
+            // arm below) writes through ONE output sink kept alive
+            // until the finish emit — the finish must append the
+            // accumulated remainder to the same sink instead of
+            // re-creating (truncating) the target via write_cat_output.
+            let operand_count = operands.len();
+            let mut operand_index = 0usize;
+            let mut procsub_sink: Option<File> = None;
+            let mut procsub_streamed = false;
             for word in operands {
+                operand_index += 1;
                 // cmd.words are the already-expanded argv: the simple-command
                 // executor ran each word through expand_command_words once
                 // (execute_cmd.c execute_disk_command -> expand_words), which
@@ -1834,6 +1844,45 @@ impl Executor {
                 // the fd endpoint's remaining bytes (subst.c shared
                 // offset).
                 if let Some(fd) = crate::executor::dev_fd_operands::dev_operand_fd(&target) {
+                    // rubash#1952: an identity cat over a live File
+                    // endpoint (a process substitution's pipe, a FIFO)
+                    // streams chunk-wise as bytes arrive — GNU cat.c's
+                    // byte-copy loop over the dup'd descriptor. The
+                    // buffered serve below drains the endpoint whole,
+                    // which starves on a non-terminating producer.
+                    // Formatting options keep the buffered serve (their
+                    // state spans the whole stream — see
+                    // stream_inherited_cat). The stream is taken only
+                    // for the LAST operand with no diagnostics pending:
+                    // earlier output flushes into the sink in order,
+                    // and nothing buffered can follow the stream, so
+                    // the finish emit stays a pure append.
+                    if options.identity()
+                        && fd >= 3
+                        && operand_index == operand_count
+                        && diagnostics.is_empty()
+                    {
+                        if let Some(file) = self.dev_fd_operand_live_file(cmd, fd) {
+                            use std::io::Write;
+                            if procsub_sink.is_none() && !procsub_streamed {
+                                procsub_sink = self.open_cat_output_sink(cmd)?;
+                            }
+                            if !output.is_empty() {
+                                match procsub_sink.as_mut() {
+                                    Some(sink_file) => {
+                                        sink_file.write_all(&filter(&output))?;
+                                    }
+                                    None => {
+                                        self.write_cat_output(cmd, &filter(&output))?;
+                                    }
+                                }
+                                output.clear();
+                            }
+                            self.stream_cat_file_operand(cmd, &file, &mut procsub_sink)?;
+                            procsub_streamed = true;
+                            continue;
+                        }
+                    }
                     match self.dev_fd_operand_bytes_for_command(cmd, fd) {
                         Some(read) if read.stdout_file && !read.bytes.is_empty() => {
                             // GNU cat.c: input resolves to the file fd 1
@@ -1930,7 +1979,19 @@ impl Executor {
             }
             let output = filter(&output);
             if diagnostics.is_empty() {
-                self.write_cat_output(cmd, &output)?;
+                if procsub_streamed {
+                    // rubash#1952: the streamed operand already wrote
+                    // through the sink; append the (normally empty)
+                    // remainder there — write_cat_output would
+                    // re-create and truncate the target.
+                    use std::io::Write;
+                    match procsub_sink.as_mut() {
+                        Some(sink_file) => sink_file.write_all(&output)?,
+                        None => self.write_cat_output(cmd, &output)?,
+                    }
+                } else {
+                    self.write_cat_output(cmd, &output)?;
+                }
             } else {
                 // rubash#1371: ONE emit for both streams so the ordered
                 // redirect walk opens each target exactly once — with
@@ -2106,6 +2167,31 @@ impl Executor {
             match sink.as_mut() {
                 Some(file) => file.write_all(&buffer[..count])?,
                 None => self.write_cat_output(cmd, &buffer[..count])?,
+            }
+        }
+        Ok(())
+    }
+    /// rubash#1952: stream a live fd-table File endpoint (a process
+    /// substitution's pipe read end) to the cat output as bytes
+    /// arrive, the way GNU cat.c copies the dup'd descriptor — the
+    /// buffered operand serve drains the endpoint whole and starves
+    /// on a non-terminating producer. The output target is opened
+    /// ONCE for the whole copy (see stream_cat_stdin_operand).
+    fn stream_cat_file_operand(
+        &mut self,
+        cmd: &CommandNode,
+        file: &FileFd,
+        sink: &mut Option<File>,
+    ) -> Result<(), ExecuteError> {
+        use std::io::Write;
+        loop {
+            let chunk = crate::fd::read_some(file.handle, 8192).map_err(ExecuteError::IoError)?;
+            if chunk.is_empty() {
+                break;
+            }
+            match sink.as_mut() {
+                Some(sink_file) => sink_file.write_all(&chunk)?,
+                None => self.write_cat_output(cmd, &chunk)?,
             }
         }
         Ok(())

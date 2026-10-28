@@ -1149,6 +1149,27 @@ impl FdTable {
         Some((input.data.clone(), input.offset))
     }
 
+    /// rubash#1952: drain a live File read endpoint (a streamed
+    /// procsub's pipe, an exec-bound file) from its current offset to
+    /// EOF through the shared OS handle — the &self counterpart of
+    /// read_all_bytes for expansion-time readers (the comsub
+    /// quick-read ladder) that cannot take &mut. The reads advance
+    /// the shared offset, exactly like a GNU fork child's reads.
+    pub(crate) fn read_file_endpoint_bytes(&self, fd: u32) -> Option<Vec<u8>> {
+        let FdReadEndpoint::File(file) = self.read_endpoint(fd)? else {
+            return None;
+        };
+        let mut out = Vec::new();
+        loop {
+            match crate::fd::read_some(file.handle, 8192) {
+                Ok(buf) if buf.is_empty() => break,
+                Ok(buf) => out.extend_from_slice(&buf),
+                Err(_) => break,
+            }
+        }
+        Some(out)
+    }
+
     pub(crate) fn input_snapshot(&self, fd: u32) -> Option<(String, usize)> {
         self.input_snapshot_bytes(fd)
             .map(|(bytes, offset)| (bytes_to_shell_text(&bytes), offset))

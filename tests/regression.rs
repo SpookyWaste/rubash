@@ -4559,3 +4559,124 @@ mod issue_1918 {
         // pin proves value-for-value against the snapshot record.
     }
 }
+
+/// rubash#1952 (RC audit A-F1): process substitution materialized its
+/// whole output before any consumer could start, so a producer that
+/// never terminates starved the consumer forever (`cat <(echo x;
+/// sleep 20)` printed nothing until EOF). GNU process_substitute
+/// (subst.c:6362) forks the body onto a pipe and hands the consumer
+/// the read end at once: consumers observe the first bytes while the
+/// producer still runs. The pins use a bounded producer — first line,
+/// sleep 2, flag file, second line — so the flag orders each line's
+/// arrival against the producer's exit without clocks: pre-fix every
+/// line reads late/starved because the flag is created during the
+/// up-front collection, before the consumer starts.
+mod issue_1952 {
+    use super::*;
+
+    fn run(dir: &Path, code: &str) -> (String, String, Option<i32>) {
+        let out = run_rubash_in(dir, &["-c", code], Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    /// Redirect form: the while-read loop must see line 1 before the
+    /// producer creates the flag (i.e. before it exits).
+    #[test]
+    fn issue1952_redirect_loop_streams_first_line() {
+        let dir = case_scratch("1952-loop");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "rm -f pd\n\
+             while IFS= read -r l; do\n\
+               if [ -e pd ]; then echo \"late:$l\"; else echo \"early:$l\"; fi\n\
+             done < <(printf 'first\\n'; sleep 2; touch pd; printf 'second\\n')\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "early:first\nlate:second\n", "stderr:\n{stderr}");
+    }
+
+    /// Argument form: the producer itself observes the cat output
+    /// file mid-flight — cat must have written line 1 into it before
+    /// the producer's post-sleep check.
+    #[test]
+    fn issue1952_cat_argument_streams_first_line() {
+        let dir = case_scratch("1952-cat");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "rm -f pd out.txt\n\
+             cat <(printf 'first\\n'; sleep 2; \
+               if [ -s out.txt ]; then touch pd; fi; \
+               printf 'second\\n') > out.txt\n\
+             if [ -e pd ]; then echo streamed; else echo starved; fi\n\
+             cat out.txt\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "streamed\nfirst\nsecond\n", "stderr:\n{stderr}");
+    }
+
+    /// Pipeline form: `head -1` completes the pipeline from line 1
+    /// alone, before the producer's flag exists.
+    ///
+    /// Ignored pending rubash#1959: on Windows, a process
+    /// substitution delivered as an argv word to a spawned external
+    /// child (`head` here) is drained to a temp file before spawn —
+    /// the parent reads the pipe to EOF first, so this form does not
+    /// stream there yet (root-cause chain: rubash#1959 and
+    /// fix-1952 REPORT §7). The in-process consumer forms above do
+    /// stream on Windows. The GNU assertion below is kept verbatim;
+    /// remove this ignore once #1959's rendezvous endpoint (named
+    /// pipe delivery to external children) lands.
+    #[test]
+    #[ignore = "rubash#1959: Windows drains procsub argv words to external children to a temp file before spawn (no streaming); remove when the #1959 rendezvous endpoint lands"]
+    fn issue1952_pipeline_head_streams_first_line() {
+        let dir = case_scratch("1952-pipe");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "rm -f pd\n\
+             head -1 <(printf 'first\\n'; sleep 2; touch pd; \
+               printf 'second\\n' 2>/dev/null) | cat\n\
+             if [ -e pd ]; then echo late; else echo early; fi\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "first\nearly\n", "stderr:\n{stderr}");
+    }
+
+    /// Control: the exec-bound form streamed even before this fix
+    /// (rubash#1021) — it must keep streaming.
+    #[test]
+    fn issue1952_exec_redirect_control_still_streams() {
+        let dir = case_scratch("1952-exec");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "rm -f pd\n\
+             exec 3< <(printf 'first\\n'; sleep 2; touch pd; printf 'second\\n')\n\
+             IFS= read -r l <&3\n\
+             if [ -e pd ]; then echo \"late:$l\"; else echo \"early:$l\"; fi\n\
+             exec 3<&-\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "early:first\n", "stderr:\n{stderr}");
+    }
+
+    /// $! names the real producer: `wait` collects its real status,
+    /// and once a finished producer is consumed its pid is reaped, so
+    /// `kill -0` reports ESRCH like GNU (rubash#1022 parity for the
+    /// streamed child).
+    #[test]
+    fn issue1952_bang_wait_status_and_reaped_kill0() {
+        let dir = case_scratch("1952-bang");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "cat <(exit 3) >/dev/null\n\
+             wait $!; echo \"wait:$?\"\n\
+             cat <(echo hi) >/dev/null\n\
+             kill -0 $! 2>/dev/null; echo \"kill0:$?\"\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "wait:3\nkill0:1\n", "stderr:\n{stderr}");
+    }
+}

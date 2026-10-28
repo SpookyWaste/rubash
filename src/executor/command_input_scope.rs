@@ -180,6 +180,37 @@ impl Executor {
                     .and_then(|target| target.strip_suffix(')'))
                     .map(str::to_string)
                 {
+                    // rubash#1952: stream first — GNU process_substitute
+                    // (subst.c:6362) binds the forked body's pipe, so
+                    // the compound's reads observe real arrival times
+                    // and a non-terminating producer no longer starves
+                    // the compound forever. The timed collection below
+                    // is the spawn-failure fallback (its recorded
+                    // schedule served #1141 before a live pipe could).
+                    if let Some(file_fd) =
+                        self.spawn_input_process_substitution_child(&source, cmd.line)
+                    {
+                        let saved_fd0_entry = self.fd_table.entries.get(&0).cloned();
+                        let saved_function_stdin =
+                            self.shell_state.env_vars.get(FUNCTION_STDIN).cloned();
+                        let saved_function_stdin_offset = self
+                            .shell_state
+                            .env_vars
+                            .get(FUNCTION_STDIN_OFFSET)
+                            .cloned();
+                        self.fd_table
+                            .open_input(0, FdReadEndpoint::File(file_fd), false);
+                        return Ok(Some(CommandFd0InputGuard {
+                            saved_fd0_entry,
+                            saved_function_stdin,
+                            saved_function_stdin_offset,
+                            // The text channel is untouched in this
+                            // branch, so its timing stays valid; restore
+                            // writes the same value back.
+                            saved_timed_stdin: self.timed_stdin.clone(),
+                            procsub_stream_path: None,
+                        }));
+                    }
                     if let Some((output, body_timing)) =
                         self.process_substitution_output_bytes_timed(&source)
                     {
@@ -452,6 +483,19 @@ impl Executor {
                 .strip_prefix("<(")
                 .and_then(|target| target.strip_suffix(')'))
             {
+                // rubash#1952: stream first — GNU process_substitute
+                // (subst.c:6362) binds the forked body's pipe read end
+                // on the target fd; the collected form below is the
+                // spawn-failure fallback.
+                if let Some(file_fd) = self.spawn_input_process_substitution_child(source, cmd.line)
+                {
+                    self.set_fd_input_file(fd, file_fd, true);
+                    if redirect.kind == crate::parser::RedirectKind::ReadWrite {
+                        self.set_fd_readwrite_file(fd, &target, true)
+                            .map_err(|e| crate::posix_errors::path_error(&target, e))?;
+                    }
+                    continue;
+                }
                 let Some(output) = self.process_substitution_output(source) else {
                     continue;
                 };
