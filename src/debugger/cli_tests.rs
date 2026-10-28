@@ -705,7 +705,15 @@ fn issue1962_condition_command_substitution_runs_once_per_consult() {
     let _span = GateTestSpan::new();
     let (dir, program) = program_file("condcomsub", ISSUE1962_SCRIPT);
     let ticks = dir.join("ticks");
-    let ticks = ticks.to_string_lossy().into_owned();
+    // The path is embedded into shell text (the condition), so
+    // it must carry the shell-facing spelling: a native Windows
+    // path's backslashes are the lexer's escape character and
+    // would be eaten by quote removal before the redirect ever
+    // opens (the ticks then land in a separator-stripped namesake
+    // file, one per consult — the count semantics are not what
+    // fails on Windows, the spelling is). Same convention as the
+    // other shell-text path embeddings in the test tree.
+    let ticks = ticks.to_string_lossy().replace('\\', "/");
     // A false condition whose substitution appends one tick per
     // evaluation: three consults, exactly three ticks, no stop.
     let commands = format!("break 2 if [[ $(echo tick >> {ticks}; echo $i) == 99 ]]\ncontinue\n");
