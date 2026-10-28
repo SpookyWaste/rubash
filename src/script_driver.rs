@@ -3567,6 +3567,16 @@ fn bind_lines_columns(executor: &mut Executor, lines: i32, columns: i32) {
     });
 }
 
+/// The Session API's terminal-size notification
+/// (`api::Session::notify_terminal_size`): the host reports the
+/// size as (columns, rows) — the order a terminal reports it —
+/// and the session translates to this (lines, columns) bind
+/// order. The values land through the same LINES/COLUMNS
+/// binding the winsize machinery uses.
+pub fn bind_terminal_size(executor: &mut Executor, lines: i32, columns: i32) {
+    bind_lines_columns(executor, lines, columns);
+}
+
 /// jobs.c:2618 get_tty_state -> jobs.c:2647-2648 `if (check_window_size)
 /// get_new_window_size(0, NULL, NULL)` -> winsize.c:98-100: with checkwinsize
 /// on (default, config-top.h:148 CHECKWINSIZE_DEFAULT 1), an interactive

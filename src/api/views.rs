@@ -398,6 +398,21 @@ impl Executor {
         StateViews { executor: self }
     }
 
+    /// The §5.3 variables view directly over this executor —
+    /// the one-hop form for owners that return the view itself
+    /// (the Session API): a view borrowed through a temporary
+    /// `StateViews` cannot outlive the call, so the constructor
+    /// lives here, beside `state_views`.
+    pub fn variables_view(&mut self) -> VariablesView<'_> {
+        VariablesView { executor: self }
+    }
+
+    /// The §5.3 options view directly over this executor (the
+    /// one-hop form of `state_views().options()`).
+    pub fn options_view(&mut self) -> OptionsView<'_> {
+        OptionsView { executor: self }
+    }
+
     /// The session cwd as an owned path (convenience for hosts that
     /// cannot hold the borrow).
     pub fn state_cwd_owned(&self) -> PathBuf {
