@@ -744,7 +744,16 @@ impl Executor {
 
         self.restore_shell_env(saved_env);
         if let Some(saved_shell_state) = saved_shell_state {
+            // rubash#1907: this direct-assignment restore bypasses
+            // restore_flat_subshell, so apply its process-umask half
+            // explicitly — the in-process child script ran against
+            // this same process, and a `umask` inside it must die at
+            // this process boundary like GNU's exec'd child.
+            let fork_saved_process_umask = saved_shell_state.fork_saved_process_umask;
             self.shell_state = saved_shell_state;
+            if let Some(mask) = fork_saved_process_umask {
+                crate::builtins::umask::apply_process_umask(mask);
+            }
         }
         self.shell_state.coproc_names = saved_coproc_names;
         self.shell_state.last_background_pid = saved_last_background_pid;
