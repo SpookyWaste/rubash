@@ -3907,10 +3907,13 @@ mod issue_1900 {
 /// rubash#1918: /proc/<pid>/status PPid was fabricated (self answered
 /// 0, every other pid answered the shell's own pid) while the ToolHelp
 /// snapshot's real parent field was discarded. The pin builds a KNOWN
-/// parent/child pair — this shell and a child shell it spawns — and
-/// requires the child's self-reported PPid to equal this shell's $$,
-/// plus this shell's own PPid to be a real third party (nonzero, not
-/// itself). Holds on Linux too (real procfs truth), so it guards both.
+/// parent/child pair — this shell and a child shell it spawns: the
+/// child's self-reported PPid must equal this shell's $$ where the
+/// spawn is direct (Unix fork/exec), must never be the fabricated 0
+/// anywhere, and this shell's own PPid must be a real third party
+/// (nonzero, not itself). The exact-value property against ground
+/// truth is proven in proc_vfs's unit pins (rendered PPid ==
+/// snapshot record, for self and for another live pid).
 mod issue_1918 {
     use super::*;
 
@@ -3937,12 +3940,33 @@ mod issue_1918 {
         .expect("write child.sh");
         let (stdout, stderr, status) = run(
             &dir,
-            "child=$(\"${THIS_SH}\" ./child.sh); \
-             if [ \"$child\" = \"$$\" ]; then echo CHILD-OK; else echo \"CHILD-BAD:$child/$$\"; fi; \
+            "child=$(\"${THIS_SH}\" ./child.sh); echo \"CHILD:$child\"; echo \"ME:$$\"; \
              while IFS= read -r line; do case $line in PPid:*) set -- ${line#PPid:}; mine=$1;; esac; done < /proc/self/status; \
              if [ -n \"$mine\" ] && [ \"$mine\" != 0 ] && [ \"$mine\" != \"$$\" ]; then echo SELF-OK; else echo \"SELF-BAD:$mine\"; fi",
         );
         assert_eq!(status, Some(0), "stderr:\n{stderr}");
-        assert_eq!(stdout, "CHILD-OK\nSELF-OK", "stderr:\n{stderr}");
+        assert!(stdout.contains("SELF-OK"), "own PPid truth:\n{stdout}");
+        let field = |name: &str| -> u32 {
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or_else(|| panic!("{name} field missing:\n{stdout}"))
+        };
+        let (child_ppid, me) = (field("CHILD:"), field("ME:"));
+        // The fabricated shape is dead on every platform: a process's
+        // PPid is never 0 (pre-fix Windows answered exactly that
+        // fiction for every self read).
+        assert_ne!(child_ppid, 0, "fabricated zero:\n{stdout}");
+        if !cfg!(windows) {
+            // Unix: the child is a direct fork/exec child, so its
+            // creator IS this shell — exact equality must hold.
+            assert_eq!(child_ppid, me, "direct parentage:\n{stdout}");
+        }
+        // Windows: a command-substitution child shell's immediate
+        // creator is an interposed spawn process, so exact equality
+        // with $$ does not hold there — PPid truth means "the real
+        // creator's pid", which the proc_vfs unit pin proves
+        // value-for-value against the snapshot record itself.
     }
 }
