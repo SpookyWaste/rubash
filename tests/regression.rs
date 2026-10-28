@@ -4679,4 +4679,112 @@ mod issue_1952 {
         assert_eq!(status, Some(0), "stderr:\n{stderr}");
         assert_eq!(stdout, "wait:3\nkill0:1\n", "stderr:\n{stderr}");
     }
+
+    /// R3/D6: the comsub quick-read used to strip only the `/dev/fd/`
+    /// prefix itself, so `$(</proc/self/fd/N)` missed the fd table and
+    /// fell to the filesystem (ENOENT on Windows). GNU reads the fd
+    /// (subst.c read_comsub opens the spelling; procfs resolves it).
+    #[test]
+    fn r3_comsub_quick_read_proc_self_fd_spelling() {
+        let dir = case_scratch("r3-comsub-self");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "printf 'probe-r3\\n' > in.txt\n\
+             exec 3<in.txt\n\
+             x=$(</proc/self/fd/3)\n\
+             echo \"got:[$x]\"\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "got:[probe-r3]\n", "stderr:\n{stderr}");
+    }
+
+    /// R3/D6: `/dev/fd/+3` is not an fd spelling anywhere in GNU — the
+    /// literal open fails ENOENT on every face (oracle-verified), so
+    /// the quick-read must not serve fd 3's bytes for it. Before the
+    /// convergence this face's own parse accepted the sign and did.
+    #[test]
+    fn r3_comsub_quick_read_plus_fd_spelling_rejected() {
+        let dir = case_scratch("r3-comsub-plus");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "printf 'probe-r3\\n' > in.txt\n\
+             exec 3<in.txt\n\
+             x=$(</dev/fd/+3)\n\
+             echo \"got:[$x]\"\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "got:[]\n", "stderr:\n{stderr}");
+    }
+
+    /// R3/D4: `test -p` on a live pipe fd answers through the pipe-mark
+    /// matrix; the `+3` spelling used to parse to fd 3 and inherit its
+    /// mark. GNU: `/dev/fd/+3` stats ENOENT, so -p is false, while the
+    /// canonical spelling of the same pipe stays true.
+    #[test]
+    fn r3_test_pipe_plus_fd_spelling_rejected() {
+        let dir = case_scratch("r3-test-plus");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "exec 3< <(printf 'x\\n')\n\
+             if [ -p /dev/fd/3 ]; then echo canon-pipe; else echo canon-not-pipe; fi\n\
+             if [ -p /dev/fd/+3 ]; then echo plus-pipe; else echo plus-not-pipe; fi\n\
+             exec 3<&-\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "canon-pipe\nplus-not-pipe\n", "stderr:\n{stderr}");
+    }
+
+    /// R3/D5 control: the pipe-into-source fast path now recognizes
+    /// every registry fd-0 spelling; the sourced output must stay the
+    /// pipe's text for each (the general path answered these before,
+    /// so this pins the fast path to the same result).
+    #[test]
+    fn r3_pipe_source_fd0_spellings() {
+        let dir = case_scratch("r3-pipe-source");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "echo \"echo via-dev-fd-0\" | . /dev/fd/0\n\
+             echo \"echo via-proc-fd-0\" | . /proc/self/fd/0\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "via-dev-fd-0\nvia-proc-fd-0\n", "stderr:\n{stderr}");
+    }
+
+    /// R3/D6: `source /dev/fd/+3` must fail like GNU's (ENOENT
+    /// diagnostic, nothing sourced); the fd's bytes sit in a Text
+    /// endpoint (herestring), the one shape the old parse-and-serve
+    /// fallback could reach. Canonical /dev/fd/3 sourcing is the
+    /// control in the same script family (oracle-verified pair).
+    #[test]
+    fn r3_source_plus_fd_spelling_rejected() {
+        let dir = case_scratch("r3-source-plus");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "exec 3<<< 'echo should-not-run'\n\
+             . /dev/fd/+3\n\
+             echo after-marker\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "after-marker\n", "stderr:\n{stderr}");
+    }
+
+    /// R3/D1: an external command's `/dev/fd/+3` operand is not an fd
+    /// operand — the word reaches the child literally and the open
+    /// fails in the child (GNU: cat reports ENOENT, rc 1). Before the
+    /// convergence the operand layer parsed the sign, materialized
+    /// fd 3, and cat read it successfully. Canonical /dev/fd/3 is the
+    /// control.
+    #[test]
+    fn r3_external_operand_plus_fd_spelling_rejected() {
+        let dir = case_scratch("r3-operand-plus");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "printf 'probe-r3\\n' > in.txt\n\
+             exec 3<in.txt\n\
+             cat /dev/fd/3\n\
+             cat /dev/fd/+3 2>/dev/null; echo \"catrc:$?\"\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "probe-r3\ncatrc:1\n", "stderr:\n{stderr}");
+    }
 }
