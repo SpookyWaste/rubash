@@ -5359,8 +5359,15 @@ impl Executor {
     /// installation activates the session; termination
     /// ([`Executor::debugger_note_exit`]) or detach deactivates it.
     pub(crate) fn install_debug_session(&mut self, driver: crate::debugger::SessionDriver) {
-        driver.session().activate();
+        // Store first, activate second (PLAN row 11): storing
+        // drops any driver being replaced, and a dropped driver
+        // disarms the gate (SessionDriver's Drop) — that disarm
+        // must land before this session's activation, or the
+        // replacement would leave the new session's gate lowered.
         self.debug_driver = Some(driver);
+        if let Some(driver) = &self.debug_driver {
+            driver.session().activate();
+        }
     }
 
     /// The attached session's driver, if any (frontend and test
@@ -5887,7 +5894,19 @@ impl Executor {
                     // Finish arming is primarily serviced at the
                     // frame's return site; the seam predicate
                     // carries its shallower-frame backstop.
-                    let step_stop = crate::debugger::arming_stops_at_seam(session.arming(), depth);
+                    // The file-aware form (PLAN row 11): `step+`
+                    // scopes to the recorded file identity, so
+                    // the seam's spelling is converged here, at
+                    // the same point registrations converge.
+                    let seam_identity = location
+                        .as_ref()
+                        .map(|loc| crate::debugger::file_identity(&loc.file));
+                    let step_stop = crate::debugger::arming_stops_at_seam_in_file(
+                        session.arming(),
+                        depth,
+                        seam_identity.as_deref(),
+                        session.step_file_scope(),
+                    );
                     if step_stop {
                         pending = Pending::Stop(StopInfo {
                             reason: StopReason::Step,

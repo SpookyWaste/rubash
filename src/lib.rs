@@ -42,7 +42,10 @@ pub mod usage;
 // embedding hosts dispatch to. The session core stays crate-
 // private behind this facade until the API finalization gives it
 // a curated public surface.
-pub use debugger::{run_dap_server, run_dap_stdio, DapLaunchPreset};
+pub use debugger::{
+    run_dap_server, run_dap_stdio, run_debug_cli, run_debug_cli_with_stream, DapLaunchPreset,
+    DebugCliPreset,
+};
 
 // Re-export commonly used types
 #[cfg(windows)]

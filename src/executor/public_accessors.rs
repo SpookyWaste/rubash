@@ -337,6 +337,29 @@ impl Executor {
         std::mem::take(&mut self.signal_discard_pending)
     }
 
+    /// Tier A signal face (Session API RFC section 6.4; PLAN row
+    /// 11, M-3): queue `signal` for this process through the
+    /// engine's own delivery machinery — the same queue the
+    /// `kill` builtin's self-deliveries use. The delivery is
+    /// serviced at the next command boundary by the boundary
+    /// poll: a trapped signal runs its trap, an ignored one is
+    /// dropped, an untrapped fatal one ends the run with
+    /// 128 + signal. This replaces the `builtins::kill` console
+    /// hooks as the surface hosts consume; those hooks are the
+    /// engine's internal plumbing from here on.
+    pub fn inject_signal(&mut self, signal: i32) {
+        crate::builtins::kill::queue_self_signal(signal);
+    }
+
+    /// Tier A cooperative cancellation (RFC section 6.4): ask
+    /// the running execution to end as if SIGINT had arrived —
+    /// an injected SIGINT, serviced at the next command
+    /// boundary with traps honored and the conventional 130
+    /// status for an untrapped interrupt.
+    pub fn interrupt(&mut self) {
+        self.inject_signal(2);
+    }
+
     /// GNU execute_cmd.c:652-656: `!` gives the command CMD_IGNORE_RETURN
     /// under errexit — the grouped drivers' post-group `status != 0 &&
     /// errexit` check reads this to honor the exemption.

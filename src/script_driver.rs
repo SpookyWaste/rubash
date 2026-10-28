@@ -2384,6 +2384,27 @@ fn unquoted_delimiter_depth(source: &str, open: char) -> usize {
     depth
 }
 
+/// Tier B host hook (PLAN row 11, M-3): note a console Ctrl+C
+/// the host's own handler received, so the engine's in-process
+/// waits see the interrupt. This is the driver-layer face hosts
+/// consume; it delegates to the kill builtin's mailbox plumbing
+/// (`builtins::kill::note_console_ctrl_c`), which is internal
+/// from this row on. On Unix it is a no-op by design: the
+/// kernel backend already receives the process's SIGINT.
+pub fn inject_console_ctrl_c() {
+    crate::builtins::kill::note_console_ctrl_c();
+}
+
+/// Tier B host hook (PLAN row 11, M-3): consume the background
+/// wrapper handshake from a host launcher's argv before the
+/// host's own option parsing sees it — the driver-layer face of
+/// `builtins::kill::consume_background_wrapper_handshake`, which
+/// is internal plumbing from this row on. Rubash's own binary
+/// calls the same internal entry; hosts call this one.
+pub fn consume_background_wrapper_handshake(args: &mut Vec<String>) {
+    crate::builtins::kill::consume_background_wrapper_handshake(args);
+}
+
 pub fn run_source(executor: &mut Executor, input: &str, interactive: bool) -> i32 {
     run_source_with_line_offset(executor, input, interactive, 0, None, None)
 }

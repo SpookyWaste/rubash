@@ -391,6 +391,10 @@ fn dap_initialize_capabilities_are_exactly_the_landed_features() {
         "supportsEvaluateForHovers",
         "supportsTerminateRequest",
         "supportTerminateDebuggee",
+        // WP-15 (row 11): the filters and exceptionInfo landed
+        // at the operation-set layer in this change, so the
+        // claim lands in the same change (section 13's rule).
+        "supportsExceptionInfoRequest",
     ] {
         assert_eq!(
             caps.get(claimed).and_then(Json::as_bool),
@@ -403,11 +407,63 @@ fn dap_initialize_capabilities_are_exactly_the_landed_features() {
         "supportsStepBack",
         "supportsRestartRequest",
         "supportsLoadedSourcesRequest",
-        "exceptionBreakpointFilters",
     ] {
         assert!(caps.get(unclaimed).is_none(), "must not claim {unclaimed}");
     }
+    // The offered filters are exactly the design's three ids.
+    let filters = caps
+        .get("exceptionBreakpointFilters")
+        .and_then(Json::as_array)
+        .expect("exceptionBreakpointFilters claimed with WP-15");
+    let filter_ids: Vec<&str> = filters
+        .iter()
+        .filter_map(|filter| filter.get("filter").and_then(Json::as_str))
+        .collect();
+    assert_eq!(filter_ids, vec!["err-trap", "set -e", "parse-error"]);
     // A disconnect before any launch ends the conversation.
+    client.ok("disconnect", Json::obj(vec![]));
+    assert_eq!(server.join().expect("server thread"), 0);
+}
+
+/// WP-15 (row 11): the exception filters are stored by the
+/// session at the operation-set layer — known ids accepted,
+/// unknown ids rejected as a batch — and `exceptionInfo` at a
+/// stop that carries no exception answers with the honest
+/// error (sites are notifications; parking is M2).
+#[test]
+fn dap_exception_filters_and_exception_info() {
+    let _span = GateTestSpan::new();
+    let program = program_file("exceptions", "X=1\necho done\n");
+    let (mut client, server) = start_server(DapLaunchPreset::default());
+    handshake(&mut client, &program, vec![]);
+    client.ok(
+        "setExceptionBreakpoints",
+        Json::obj(vec![(
+            "filters",
+            Json::Array(vec![Json::from("err-trap"), Json::from("parse-error")]),
+        )]),
+    );
+    let rejected = client.command(
+        "setExceptionBreakpoints",
+        Json::obj(vec![("filters", Json::Array(vec![Json::from("bogus")]))]),
+    );
+    assert_eq!(
+        rejected.get("success").and_then(Json::as_bool),
+        Some(false),
+        "an unknown filter id is an error, never silently dropped: {rejected:?}"
+    );
+    client.ok("configurationDone", Json::obj(vec![]));
+    let stopped = client.take_event("stopped");
+    assert_eq!(s(&stopped, "reason"), "entry");
+    let info = client.command("exceptionInfo", Json::obj(vec![("threadId", Json::Int(1))]));
+    assert_eq!(
+        info.get("success").and_then(Json::as_bool),
+        Some(false),
+        "no exception at the entry stop: {info:?}"
+    );
+    client.ok("continue", Json::obj(vec![]));
+    let (_, exit_code) = client.collect_outputs_until_terminated();
+    assert_eq!(exit_code, 0);
     client.ok("disconnect", Json::obj(vec![]));
     assert_eq!(server.join().expect("server thread"), 0);
 }

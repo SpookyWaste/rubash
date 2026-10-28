@@ -849,6 +849,14 @@ pub fn send_signal(pid: u32, signal: i32) -> Result<(), &'static str> {
 /// Unix: no-op — the kernel `signal_hook` backend already receives SIGINT
 /// for the process; a second injection would double-dispatch.
 pub fn note_console_ctrl_c() {
+    // PLAN row 11 (M-3): this hook is engine plumbing now. The
+    // consumed faces are `script_driver::inject_console_ctrl_c`
+    // (host handlers) and `Executor::inject_signal` /
+    // `Executor::interrupt` (Tier A). The item stays `pub` only
+    // until niubash's migration lands on master — the pairing
+    // compile compiles niubash master against this tree — and is
+    // demoted to pub(crate) in the follow-up change recorded in
+    // the API ledger.
     #[cfg(not(unix))]
     {
         // Linux mailbox wire format: SIGINT = 2.
@@ -1122,7 +1130,7 @@ fn take_all_signals() -> Vec<i32> {
     signals
 }
 
-fn queue_self_signal(signal: i32) {
+pub(crate) fn queue_self_signal(signal: i32) {
     SELF_SIGNALS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

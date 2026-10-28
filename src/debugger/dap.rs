@@ -595,14 +595,33 @@ impl<W: Write + 'static> Server<W> {
                     let body = self.apply_function_breakpoints(&arguments);
                     self.respond(seq, "setFunctionBreakpoints", true, Some(body));
                 }
-                "setExceptionBreakpoints" => {
-                    self.respond(
-                        seq,
-                        "setExceptionBreakpoints",
-                        true,
-                        Some(Json::obj(vec![("breakpoints", Json::Array(vec![]))])),
-                    );
-                }
+                "setExceptionBreakpoints" => match self.session.as_mut() {
+                    Some(session) => match apply_exception_filters(session, &arguments) {
+                        Ok(()) => {
+                            self.respond(
+                                seq,
+                                "setExceptionBreakpoints",
+                                true,
+                                Some(Json::obj(vec![("breakpoints", Json::Array(vec![]))])),
+                            );
+                        }
+                        Err(unknown) => {
+                            self.error(
+                                seq,
+                                "setExceptionBreakpoints",
+                                &format!("unknown exception filter(s): {}", unknown.join(", ")),
+                            );
+                        }
+                    },
+                    None => {
+                        self.respond(
+                            seq,
+                            "setExceptionBreakpoints",
+                            true,
+                            Some(Json::obj(vec![("breakpoints", Json::Array(vec![]))])),
+                        );
+                    }
+                },
                 "threads" => self.answer_threads(seq),
                 "configurationDone" => {
                     self.respond(seq, "configurationDone", true, None);
@@ -976,9 +995,34 @@ fn capabilities() -> Json {
         ("supportsEvaluateForHovers", Json::Bool(true)),
         ("supportsTerminateRequest", Json::Bool(true)),
         ("supportTerminateDebuggee", Json::Bool(true)),
+        // WP-15 (row 11): the exception filters exist at the
+        // operation-set layer — the session stores exactly these
+        // ids, both frontends read and write the one set — and
+        // the `exceptionInfo` request is answered (with the
+        // no-exception-at-this-stop error until the row-12 site
+        // producers land). Claimed in the same change that lands
+        // the machinery, per section 13's rule.
+        ("supportsExceptionInfoRequest", Json::Bool(true)),
+        (
+            "exceptionBreakpointFilters",
+            Json::Array(vec![
+                Json::obj(vec![
+                    ("filter", Json::from("err-trap")),
+                    ("label", Json::from("ERR trap")),
+                ]),
+                Json::obj(vec![
+                    ("filter", Json::from("set -e")),
+                    ("label", Json::from("set -e (errexit)")),
+                ]),
+                Json::obj(vec![
+                    ("filter", Json::from("parse-error")),
+                    ("label", Json::from("Parse error")),
+                ]),
+            ]),
+        ),
         // Never claimed at this milestone: supportsDataBreakpoints
-        // (M3 at the earliest), exception filters (none exist),
-        // supportsStepBack / restart (no such session operation).
+        // (M3 at the earliest), supportsStepBack / restart (no
+        // such session operation).
     ])
 }
 
@@ -1004,8 +1048,10 @@ fn file_identity(given: &str) -> String {
 }
 
 /// Single-quote one word for the run input: the shell's own
-/// quoting, `'` escaped as `'\''`.
-fn shell_single_quote(text: &str) -> String {
+/// quoting, `'` escaped as `'\''`. Shared with the CLI frontend
+/// (row 11): both frontends build the same run input, so the
+/// quoting lives in exactly one place.
+pub(crate) fn shell_single_quote(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('\'');
     for ch in text.chars() {
@@ -1017,6 +1063,29 @@ fn shell_single_quote(text: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+/// Apply a `setExceptionBreakpoints` request to the session's
+/// filter store (WP-15): the request's `filters` array names
+/// filter ids, and the session — the operation-set owner —
+/// validates them against the canonical set. Unknown ids come
+/// back as the error payload; the previous selection is then
+/// untouched (the session rejects as a batch).
+fn apply_exception_filters(
+    session: &mut DebugSession,
+    arguments: &Json,
+) -> Result<(), Vec<String>> {
+    let ids: Vec<String> = arguments
+        .get("filters")
+        .and_then(Json::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    session.set_exception_filters(ids)
 }
 
 /// Replace one source's line breakpoints in the session and
@@ -1803,11 +1872,37 @@ impl<W: Write + 'static> DapStopLoop<W> {
                         Some(Json::obj(vec![("breakpoints", Json::Array(rendered))])),
                     );
                 }
-                "setExceptionBreakpoints" => {
-                    self.respond(
+                "setExceptionBreakpoints" => match apply_exception_filters(session, &arguments) {
+                    Ok(()) => {
+                        self.respond(
+                            seq,
+                            "setExceptionBreakpoints",
+                            Some(Json::obj(vec![("breakpoints", Json::Array(vec![]))])),
+                        );
+                    }
+                    Err(unknown) => {
+                        self.fail(
+                            seq,
+                            "setExceptionBreakpoints",
+                            &format!("unknown exception filter(s): {}", unknown.join(", ")),
+                        );
+                    }
+                },
+                "exceptionInfo" => {
+                    // WP-15: the request shape exists, and its
+                    // honest answer at any stop reachable today is
+                    // that the stop carries no exception: sites are
+                    // notifications (DE-06, rendered as console
+                    // output when the row-12 producers land), and
+                    // parking at a site is the M2 session option —
+                    // a stop that IS an exception stop cannot occur
+                    // yet, so no body is ever fabricated here.
+                    self.fail(
                         seq,
-                        "setExceptionBreakpoints",
-                        Some(Json::obj(vec![("breakpoints", Json::Array(vec![]))])),
+                        "exceptionInfo",
+                        "exceptionInfo: the current stop carries no exception site \
+                         (sites are reported as output events; parking at the site \
+                         is an M2 session option)",
                     );
                 }
                 "continue" => {

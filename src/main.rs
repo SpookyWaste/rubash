@@ -271,6 +271,14 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
     // flag handled in this same leading scan, for the same reason
     // as --profile — the GNU long-option contract stays untouched.
     let mut dap_mode = false;
+    // `--debug` (design section 2; PLAN row 11): the native
+    // debugger's interactive frontend. The word itself stays in
+    // the filtered args — the extdebug arming below is still the
+    // behavior for the forms the frontend does not take over
+    // (-c, -s, interactive) — and the diversion after the scan
+    // claims exactly the one form the design names:
+    // `rubash --debug script.sh [args…]`.
+    let mut debug_flag = false;
     let mut filtered_args: Vec<String> = Vec::with_capacity(args.len());
     {
         let mut index = 0usize;
@@ -283,6 +291,11 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
                 }
                 "--dap" => {
                     dap_mode = true;
+                    index += 1;
+                }
+                "--debug" => {
+                    debug_flag = true;
+                    filtered_args.push(arg.to_string());
                     index += 1;
                 }
                 "--profile-output" => match args.get(index + 1) {
@@ -343,6 +356,42 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
             program: operands.first().cloned(),
             args: operands.get(1..).unwrap_or(&[]).to_vec(),
         });
+    }
+    if debug_flag {
+        // The `--debug` diversion (design section 2): claim the
+        // run only when a script operand follows and no -c / -s
+        // form appears among the leading options — those forms,
+        // and the interactive form, keep today's behavior (the
+        // invocation layer arms extdebug from the flag). A `--`
+        // ends the option region: the word after it is the
+        // operand even if it starts with '-'.
+        let mut operand_at: Option<usize> = None;
+        let mut index = 0usize;
+        while index < args.len() {
+            let word = args[index].as_str();
+            if word == "--" {
+                if index + 1 < args.len() {
+                    operand_at = Some(index + 1);
+                }
+                break;
+            }
+            if word == "-" || !word.starts_with('-') {
+                if !word.starts_with('-') {
+                    operand_at = Some(index);
+                }
+                break;
+            }
+            if !word.starts_with("--") && word[1..].contains(['c', 's']) {
+                break;
+            }
+            index += 1;
+        }
+        if let Some(start) = operand_at {
+            return rubash::run_debug_cli(rubash::DebugCliPreset {
+                program: Some(args[start].clone()),
+                args: args[start + 1..].to_vec(),
+            });
+        }
     }
     // TODO(shell.c): GNU Bash has a full option parser and shell-name handling.
     // This narrow parser supports the `-c` and `-o posix -c` forms used by
