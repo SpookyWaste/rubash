@@ -450,6 +450,7 @@ impl Executor {
             owns_signal_mailbox,
             is_process_exit_executor: process_exit,
             background_children: HashMap::new(),
+            procsub_stream_children: HashMap::new(),
             pending_job_completions: Vec::new(),
             pending_timed_coproc_reports: Vec::new(),
             timed_coproc_death_instants: std::collections::HashMap::new(),

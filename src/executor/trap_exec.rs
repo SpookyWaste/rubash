@@ -3021,26 +3021,25 @@ impl Executor {
     }
 
     /// rubash#1021 helper: spawn a `<(source)` body as a child shell
-    /// writing to a pipe and bind the read end on `fd`, the way GNU
-    /// process_substitute forks instead of collecting output first.
-    /// The child gets the coproc spawn's environment treatment (shell
-    /// vars plus the full function table as BASH_FUNC entries), is
-    /// registered for reaping, and becomes `$!`. Returns false when the
-    /// spawn could not be set up; the caller then falls back to
+    /// writing to a pipe, the way GNU process_substitute forks instead
+    /// of collecting output first (subst.c:6362). The child gets the
+    /// coproc spawn's environment treatment (shell vars plus the full
+    /// function table as BASH_FUNC entries), is registered for
+    /// reaping, and becomes `$!`. Returns the pipe's read end, or None
+    /// when the spawn could not be set up; callers then fall back to
     /// synchronous collection.
-    fn bind_input_process_substitution_child(
+    pub(in crate::executor) fn spawn_input_process_substitution_child(
         &mut self,
-        fd: u32,
         source: &str,
         line: Option<usize>,
-    ) -> bool {
+    ) -> Option<Rc<FileFd>> {
         use std::process::{Command, Stdio};
         let exe = std::env::var_os("CARGO_BIN_EXE_rubash")
             .map(std::path::PathBuf::from)
             .or_else(|| std::env::current_exe().ok())
             .unwrap_or_else(|| "rubash".into());
         let Ok((reader, writer)) = std::io::pipe() else {
-            return false;
+            return None;
         };
         let mut child = Command::new(&exe);
         child.arg("-c").arg(source);
@@ -3095,16 +3094,35 @@ impl Executor {
                 let pid = child_proc.id();
                 self.background_children
                     .insert(pid, crate::fd::SpawnedChild::from(child_proc));
+                // rubash#1952: mark the pid as a streamed procsub
+                // producer so the boundary reap can spend its one
+                // bounded grace wait on it (job_builtins.rs).
+                self.procsub_stream_children.insert(pid, false);
                 // GNU process_substitute records the child in $!
                 // (subst.c assigns last_made_pid).
                 self.shell_state.last_background_pid = Some(pid);
                 let file = crate::fd::handle_to_file(crate::fd::into_handle(reader));
-                let file_fd = FileFd::from_file(file, format!("<({source})").into());
-                self.set_fd_input_file(fd, file_fd, fd != 0);
-                true
+                Some(FileFd::from_file(file, format!("<({source})").into()))
             }
-            Err(_) => false,
+            Err(_) => None,
         }
+    }
+
+    /// rubash#1021: bind the read end of a spawned `<(source)` body on
+    /// `fd` (see spawn_input_process_substitution_child). Returns false
+    /// when the spawn could not be set up; the caller then falls back
+    /// to synchronous collection.
+    pub(in crate::executor) fn bind_input_process_substitution_child(
+        &mut self,
+        fd: u32,
+        source: &str,
+        line: Option<usize>,
+    ) -> bool {
+        let Some(file_fd) = self.spawn_input_process_substitution_child(source, line) else {
+            return false;
+        };
+        self.set_fd_input_file(fd, file_fd, fd != 0);
+        true
     }
 
     /// The no-operand exec forms (redirects only, or operands that expand
@@ -4633,19 +4651,40 @@ impl Executor {
                     .strip_prefix("<(")
                     .and_then(|target| target.strip_suffix(')'))
                 {
-                    if let Some(input) = self.process_substitution_output(source) {
-                        let Some(fd) = self.allocate_dynamic_fd() else {
-                            return Err(ExecuteError::IoError(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                self.fd_dup_error_payload(&target),
-                            )));
-                        };
-                        self.fd_table.open_input(
-                            fd,
-                            FdReadEndpoint::process_substitution(&input),
-                            true,
-                        );
-                        self.set_fd_input_text(fd, input, true);
+                    // rubash#1952: stream first, exactly like the plain
+                    // exec arm — GNU process_substitute (subst.c:6362)
+                    // forks the body and binds the pipe read end
+                    // immediately; collecting the output first starves
+                    // the consumer until the producer exits, forever
+                    // for a non-terminating producer. The collected form
+                    // below remains the fallback when the spawn could
+                    // not be set up. (No constructing-command line is
+                    // plumbed into this entry, so the child's diagnostic
+                    // frame starts from the body's own text.)
+                    let mut bound_fd = None;
+                    if let Some(fd) = self.allocate_dynamic_fd() {
+                        if self.bind_input_process_substitution_child(fd, source, None) {
+                            bound_fd = Some(fd);
+                        }
+                    }
+                    if bound_fd.is_none() {
+                        if let Some(input) = self.process_substitution_output(source) {
+                            let Some(fd) = self.allocate_dynamic_fd() else {
+                                return Err(ExecuteError::IoError(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    self.fd_dup_error_payload(&target),
+                                )));
+                            };
+                            self.fd_table.open_input(
+                                fd,
+                                FdReadEndpoint::process_substitution(&input),
+                                true,
+                            );
+                            self.set_fd_input_text(fd, input, true);
+                            bound_fd = Some(fd);
+                        }
+                    }
+                    if let Some(fd) = bound_fd {
                         if redirect.kind == crate::parser::RedirectKind::ReadWrite {
                             // `<(...)` has no openable path; ledger-only
                             // companion is best-effort.

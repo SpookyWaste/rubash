@@ -1706,6 +1706,7 @@ impl Executor {
             inside_compound_condition: Cell::new(false),
             inside_assignment_rhs: Cell::new(false),
             background_children: HashMap::new(),
+            procsub_stream_children: HashMap::new(),
             pending_job_completions: Vec::new(),
             pending_timed_coproc_reports: Vec::new(),
             timed_coproc_death_instants: std::collections::HashMap::new(),

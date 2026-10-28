@@ -15,9 +15,10 @@
 
 use std::io::Read;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use super::fd_table::{FdReadEndpoint, FdWriteEndpoint};
+use super::fd_table::{FdReadEndpoint, FdWriteEndpoint, FileFd};
 use super::Executor;
 use super::{is_closed_redirect_target, redirect_target_fd};
 use crate::parser::{CommandNode, Redirect, RedirectKind};
@@ -441,7 +442,17 @@ impl Executor {
                 }
                 FdReadEndpoint::File(file) => {
                     m.consume_fds.push(fd);
-                    Some(file.path.to_string_lossy().into_owned())
+                    // A pipe-backed endpoint (a process substitution's
+                    // read end, rubash#1952) carries only a display
+                    // name, not a filesystem path — drain its handle
+                    // into a temp the child can open, like the
+                    // buffered endpoints above. Real file endpoints
+                    // keep handing over their path.
+                    if file.path.to_string_lossy().starts_with("<(") {
+                        drain_handle_to_temp(file.handle, m)
+                    } else {
+                        Some(file.path.to_string_lossy().into_owned())
+                    }
                 }
                 FdReadEndpoint::InheritedProcessStdin => {
                     drain_handle_to_temp(crate::fd::process_std_handle(0), m)
@@ -686,6 +697,28 @@ impl Executor {
     /// child a dup of the descriptor, so the in-process equivalent is the
     /// fd endpoint's remaining bytes, consuming the shared offset).
     /// `None` for an unbound or write-only-pipe fd — callers report ENOENT.
+    /// rubash#1952: the live File endpoint a `/dev/fd/N` operand
+    /// names, when the command does not rebind that descriptor
+    /// itself — a streaming consumer (the in-process cat) copies it
+    /// chunk-wise as bytes arrive instead of draining it whole (GNU
+    /// cat.c reads the dup'd descriptor in a byte-copy loop).
+    /// Buffered endpoints and command-rebound descriptors keep the
+    /// byte serve (dev_fd_operand_bytes_for_command), which stays
+    /// authoritative for them.
+    pub(in crate::executor) fn dev_fd_operand_live_file(
+        &self,
+        cmd: &CommandNode,
+        fd: u32,
+    ) -> Option<Rc<FileFd>> {
+        if command_redirect_for_fd(cmd, fd).is_some() {
+            return None;
+        }
+        match self.fd_table.read_endpoint(fd) {
+            Some(FdReadEndpoint::File(file)) => Some(file),
+            _ => None,
+        }
+    }
+
     pub(in crate::executor) fn dev_fd_operand_bytes(&mut self, fd: u32) -> Option<Vec<u8>> {
         let entry = self.fd_table.entries.get(&fd)?.clone();
         if entry.closed {

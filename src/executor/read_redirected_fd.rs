@@ -39,6 +39,43 @@ impl Executor {
             .strip_prefix("<(")
             .and_then(|target| target.strip_suffix(')'))
         {
+            // rubash#1952: stream first — serve the record from the
+            // spawned body's live pipe through a scratch fd (GNU
+            // subst.c:6362 process_substitute forks the body; the
+            // record reader observes real arrival). Collection below
+            // is the spawn-failure fallback.
+            if let Some(scratch) = self.allocate_dynamic_fd() {
+                if let Some(file_fd) = self.spawn_input_process_substitution_child(source, cmd.line)
+                {
+                    self.fd_table
+                        .open_input(scratch, FdReadEndpoint::File(file_fd), true);
+                    let line = self.fd_table.read_text(
+                        scratch,
+                        delimiter,
+                        char_limit,
+                        exact_char_limit,
+                        escape_aware,
+                        raw,
+                    );
+                    self.fd_table.entries.remove(&scratch);
+                    return Some(match line {
+                        Some(line) => trim_read_input(
+                            line,
+                            delimiter,
+                            char_limit,
+                            exact_char_limit,
+                            escape_aware,
+                            raw,
+                        ),
+                        None => {
+                            if !self.fd_table.read_timed_out {
+                                self.read_eof_no_delimiter = true;
+                            }
+                            String::new()
+                        }
+                    });
+                }
+            }
             let output = self.process_substitution_output(source)?;
             self.read_eof_no_delimiter |= slurped_record_eof_no_delimiter(
                 &output,
