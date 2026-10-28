@@ -3777,6 +3777,37 @@ mod issue_1917 {
         assert_eq!(stdout, "VER-OK", "stderr:\n{stderr}");
     }
 
+    /// A-2: /proc/self/cmdline carries the TRUE argv — a known marker
+    /// argument placed on the shell's own command line must appear as
+    /// a NUL-separated field. Pre-fix on Windows the file contained
+    /// only the image name (the ToolHelp snapshot knows nothing else),
+    /// so the marker and the `-c` field were both absent.
+    #[test]
+    fn issue1917_a2_cmdline_true_argv() {
+        let dir = case_scratch("1917-a2");
+        let out = run_rubash_in(
+            &dir,
+            &[
+                "-c",
+                "while IFS= read -r -d '' a; do printf '%s|' \"$a\"; done < /proc/self/cmdline; echo END",
+                "rubash",
+                "MARKER1917A2",
+            ],
+            Duration::from_secs(30),
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.code, Some(0), "stderr:\n{stderr}");
+        assert!(
+            stdout.contains("MARKER1917A2"),
+            "known argv marker missing from cmdline:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("-c|"),
+            "the -c field of the true argv is missing:\n{stdout}"
+        );
+    }
+
     /// A-7: an exited pid's /proc directory vanishes — files under it
     /// fail like ENOENT and test -e answers false (procfs semantics,
     /// both platforms).

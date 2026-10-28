@@ -341,26 +341,277 @@ fn image_cmdline_fallback(image: &str) -> Vec<u8> {
     cmdline
 }
 
-/// Another process's cmdline bytes. (The PEB true-argv read lands in
-/// the rubash#1917 cmdline slice; until then, and as its failure
-/// fallback after, this is the snapshot shape.)
+/// Another process's cmdline bytes: the TRUE argv, read from the
+/// target's PEB (rubash#1917 §3.1 — the same technique WinuxCmd's
+/// ps.cpp uses: NtQueryInformationProcess → PEB →
+/// RTL_USER_PROCESS_PARAMETERS.CommandLine). The snapshot only knows
+/// the image name, which is NOT argv; on any read failure (access,
+/// bitness, the process exiting mid-read) the answer falls back to
+/// the image-name shape — the shape never changes, only the content's
+/// fidelity.
 #[cfg(windows)]
-fn pid_cmdline(_pid: u32, entry: &SnapshotEntry) -> Vec<u8> {
+fn pid_cmdline(pid: u32, entry: &SnapshotEntry) -> Vec<u8> {
+    if let Some(command_line) = peb_strings(pid).and_then(|peb| peb.command_line) {
+        let bytes = command_line_to_argv_bytes(&command_line);
+        if !bytes.is_empty() {
+            return bytes;
+        }
+    }
     image_cmdline_fallback(&entry.image)
 }
 
-/// The shell's own cmdline bytes. (The GetCommandLineW true-argv read
-/// lands in the rubash#1917 cmdline slice; until then, and as its
-/// failure fallback after, this is the snapshot shape — sourced from
-/// the module path so the self face stays snapshot-free.)
+/// The shell's own cmdline bytes: GetCommandLineW is the direct self
+/// query (no snapshot, no PEB walk); the image-name shape is the
+/// fallback if it somehow yields nothing.
 #[cfg(windows)]
 fn self_cmdline() -> Vec<u8> {
+    if let Some(command_line) = own_command_line() {
+        let bytes = command_line_to_argv_bytes(&command_line);
+        if !bytes.is_empty() {
+            return bytes;
+        }
+    }
     match self_image_name() {
         Some(image) => image_cmdline_fallback(&image),
         None => snapshot_entry(std::process::id())
             .map(|entry| image_cmdline_fallback(&entry.image))
             .unwrap_or_default(),
     }
+}
+
+/// The current process's raw command line (UTF-16 units, no NUL).
+#[cfg(windows)]
+fn own_command_line() -> Option<Vec<u16>> {
+    extern "system" {
+        fn GetCommandLineW() -> *const u16;
+    }
+    let ptr = unsafe { GetCommandLineW() };
+    if ptr.is_null() {
+        return None;
+    }
+    let mut units = Vec::new();
+    // The string is NUL-terminated; the scan bound is a sanity rail
+    // against a corrupt pointer, far past any real command line.
+    for i in 0..(1 << 20) {
+        let unit = unsafe { *ptr.add(i) };
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+    }
+    Some(units)
+}
+
+/// The strings the PEB route can read for one process.
+#[cfg(windows)]
+struct PebStrings {
+    /// RTL_USER_PROCESS_PARAMETERS.CommandLine, raw UTF-16 units.
+    command_line: Option<Vec<u16>>,
+    /// RTL_USER_PROCESS_PARAMETERS.CurrentDirectory.DosPath, rendered
+    /// (the /proc/<pid>/cwd face consumes this in the #1900 slice).
+    #[allow(dead_code)]
+    current_dir: Option<String>,
+}
+
+// PEB / RTL_USER_PROCESS_PARAMETERS field offsets for the two strings
+// this module reads. The layouts are pointer-width dependent; a
+// cross-bitness read (64-bit shell, 32-bit target) addresses the
+// wrong fields, fails the sanity checks below, and falls back — the
+// design's accepted coverage edge (rubash#1917 §7.1).
+#[cfg(windows)]
+#[cfg(target_pointer_width = "64")]
+const PEB_PARAMS_OFFSET: usize = 0x20;
+#[cfg(windows)]
+#[cfg(target_pointer_width = "32")]
+const PEB_PARAMS_OFFSET: usize = 0x10;
+#[cfg(windows)]
+#[cfg(target_pointer_width = "64")]
+const PARAMS_CURDIR_OFFSET: usize = 0x38;
+#[cfg(windows)]
+#[cfg(target_pointer_width = "32")]
+const PARAMS_CURDIR_OFFSET: usize = 0x24;
+#[cfg(windows)]
+#[cfg(target_pointer_width = "64")]
+const PARAMS_CMDLINE_OFFSET: usize = 0x70;
+#[cfg(windows)]
+#[cfg(target_pointer_width = "32")]
+const PARAMS_CMDLINE_OFFSET: usize = 0x40;
+
+/// Read a process's PEB strings. None when the process cannot be
+/// opened for query+VM-read (protected, wrong bitness plumbing, or
+/// already gone); individual strings are None when their field fails
+/// its sanity checks.
+#[cfg(windows)]
+fn peb_strings(pid: u32) -> Option<PebStrings> {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+    };
+
+    extern "system" {
+        fn NtQueryInformationProcess(
+            process: *mut c_void,
+            process_information_class: u32,
+            process_information: *mut c_void,
+            process_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+        fn ReadProcessMemory(
+            process: *mut c_void,
+            base_address: *const c_void,
+            buffer: *mut c_void,
+            size: usize,
+            bytes_read: *mut usize,
+        ) -> i32;
+    }
+
+    // Same PROCESS_BASIC_INFORMATION layout as nt_own_parent_pid.
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct ProcessBasicInformation {
+        ExitStatus: *mut c_void,
+        PebBaseAddress: *mut c_void,
+        AffinityMask: [*mut c_void; 2],
+        UniqueProcessId: usize,
+        InheritedFromUniqueProcessId: usize,
+    }
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let result = (|| {
+        let mut info = unsafe { std::mem::zeroed::<ProcessBasicInformation>() };
+        let mut returned = 0u32;
+        let status = unsafe {
+            NtQueryInformationProcess(
+                handle,
+                0,
+                &mut info as *mut _ as *mut c_void,
+                std::mem::size_of::<ProcessBasicInformation>() as u32,
+                &mut returned,
+            )
+        };
+        if status != 0 || info.PebBaseAddress.is_null() {
+            return None;
+        }
+        let read = |address: usize, buffer: &mut [u8]| -> bool {
+            let mut got = 0usize;
+            unsafe {
+                ReadProcessMemory(
+                    handle,
+                    address as *const c_void,
+                    buffer.as_mut_ptr() as *mut c_void,
+                    buffer.len(),
+                    &mut got,
+                ) != 0
+                    && got == buffer.len()
+            }
+        };
+        // PEB.ProcessParameters pointer.
+        let mut params_ptr = [0u8; std::mem::size_of::<usize>()];
+        if !read(
+            info.PebBaseAddress as usize + PEB_PARAMS_OFFSET,
+            &mut params_ptr,
+        ) {
+            return None;
+        }
+        let params_addr = usize::from_ne_bytes(params_ptr);
+        if params_addr == 0 {
+            return None;
+        }
+        // The parameter block's first 0x100 bytes cover both strings'
+        // UNICODE_STRING headers on either width.
+        let mut params = [0u8; 0x100];
+        if !read(params_addr, &mut params) {
+            return None;
+        }
+        let unicode_string = |offset: usize| -> Option<Vec<u16>> {
+            let length = u16::from_ne_bytes(params[offset..offset + 2].try_into().ok()?) as usize;
+            let buffer_offset = offset
+                + if cfg!(target_pointer_width = "64") {
+                    8
+                } else {
+                    4
+                };
+            let buffer_addr = usize::from_ne_bytes(
+                params[buffer_offset..buffer_offset + std::mem::size_of::<usize>()]
+                    .try_into()
+                    .ok()?,
+            );
+            // Sanity rails: a genuine command line / DosPath is a
+            // non-empty, even-length UTF-16 string of bounded size;
+            // anything else means the offsets addressed the wrong
+            // layout (cross-bitness) and the read is void.
+            if length == 0 || length % 2 != 0 || length > 32766 || buffer_addr == 0 {
+                return None;
+            }
+            let mut raw = vec![0u8; length];
+            if !read(buffer_addr, &mut raw) {
+                return None;
+            }
+            Some(
+                raw.chunks_exact(2)
+                    .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+                    .collect(),
+            )
+        };
+        Some(PebStrings {
+            command_line: unicode_string(PARAMS_CMDLINE_OFFSET),
+            current_dir: unicode_string(PARAMS_CURDIR_OFFSET)
+                .map(|units| String::from_utf16_lossy(&units)),
+        })
+    })();
+    unsafe {
+        CloseHandle(handle);
+    }
+    result
+}
+
+/// Derive procfs cmdline bytes from a raw Windows command line: split
+/// with the OS's own CommandLineToArgvW rules (the derivation every
+/// Windows process's argv undergoes), then emit each argument as
+/// UTF-8, NUL-terminated — the procfs byte shape. An empty derivation
+/// yields an empty Vec and the caller falls back.
+#[cfg(windows)]
+fn command_line_to_argv_bytes(command_line: &[u16]) -> Vec<u8> {
+    use std::ffi::c_void;
+
+    extern "system" {
+        fn CommandLineToArgvW(cmd_line: *const u16, num_args: *mut i32) -> *mut *mut u16;
+        fn LocalFree(mem: *mut c_void) -> *mut c_void;
+    }
+
+    if command_line.is_empty() {
+        return Vec::new();
+    }
+    // CommandLineToArgvW needs a NUL-terminated string.
+    let mut terminated = command_line.to_vec();
+    terminated.push(0);
+    let mut argc = 0i32;
+    let argv = unsafe { CommandLineToArgvW(terminated.as_ptr(), &mut argc) };
+    if argv.is_null() || argc <= 0 {
+        return Vec::new();
+    }
+    let mut bytes = Vec::new();
+    unsafe {
+        for i in 0..argc as isize {
+            let arg_ptr = *argv.offset(i);
+            if arg_ptr.is_null() {
+                continue;
+            }
+            let mut len = 0usize;
+            while *arg_ptr.add(len) != 0 {
+                len += 1;
+            }
+            let arg = String::from_utf16_lossy(std::slice::from_raw_parts(arg_ptr, len));
+            bytes.extend_from_slice(arg.as_bytes());
+            bytes.push(0);
+        }
+        LocalFree(argv as *mut c_void);
+    }
+    bytes
 }
 
 /// One process's ToolHelp snapshot record: image name and the REAL
@@ -966,6 +1217,44 @@ mod tests {
                 parent_entry.parent_pid,
                 "another pid's PPid must be ITS parent, not the shell's pid"
             );
+        }
+    }
+
+    /// rubash#1917 A1: /proc/self/cmdline is the TRUE argv (the PEB /
+    /// GetCommandLineW command line), not the snapshot's image name —
+    /// argv[0] as invoked is a path ending in the image name, and the
+    /// PEB route and the self fast path derive identical bytes.
+    #[cfg(windows)]
+    #[test]
+    fn cmdline_is_true_argv_for_self() {
+        let bytes = proc_file_content("/proc/self/cmdline").expect("self cmdline");
+        assert!(bytes.ends_with(&[0]), "cmdline is NUL-terminated");
+        let fields: Vec<&[u8]> = bytes[..bytes.len() - 1].split(|b| *b == 0).collect();
+        assert!(!fields.is_empty());
+        let image = self_image_name().expect("own image name");
+        let argv0 = String::from_utf8_lossy(fields[0]).into_owned();
+        assert!(
+            argv0.ends_with(&image),
+            "argv[0] {argv0:?} should end with the image name {image:?}"
+        );
+        // The test binary is invoked with arguments by the harness, so
+        // a true argv has more than the lone image-name field the
+        // snapshot fallback produces.
+        assert!(
+            fields.len() > 1,
+            "true argv has the harness's arguments, got {fields:?}"
+        );
+        let entry = snapshot_entry(std::process::id()).expect("own snapshot entry");
+        assert_eq!(pid_cmdline(std::process::id(), &entry), self_cmdline());
+    }
+
+    /// rubash#1917 §7.1: the fallback shape is exactly the image name
+    /// plus its NUL — failure of the true read degrades content, never
+    /// shape.
+    #[test]
+    fn cmdline_fallback_shape_is_image_plus_nul() {
+        if cfg!(windows) {
+            assert_eq!(image_cmdline_fallback("prog.exe"), b"prog.exe\0".to_vec());
         }
     }
 }
