@@ -249,6 +249,17 @@ impl Executor {
             }
             return None;
         }
+        // SyntheticLink (rubash#1900): /proc/<pid>/exe and .../cwd are
+        // magic links — the open goes to the resolved target file. The
+        // session cwd (G-02; never the process-global cwd) answers for
+        // self/cwd. A directory target (cwd) fails the OS open here,
+        // which the caller reports like any unreadable redirect source.
+        if let Some(link) = crate::special_paths::synthetic_link_target(
+            target,
+            Some(&crate::proc_vfs::self_cwd_forms(self.session_cwd())),
+        ) {
+            return Some(File::open(&link.native));
+        }
         // Q11 /proc P1 (docs/proc-vfs-plan.md hook B): synthetic /proc files
         // serve as a pre-filled pipe converted to a File; reads hit EOF at
         // content end, matching procfs static-snapshot semantics.

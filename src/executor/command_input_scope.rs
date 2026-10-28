@@ -1253,6 +1253,9 @@ impl Executor {
         if crate::special_paths::synthetic_proc_content(&target).is_some() {
             return None;
         }
+        if crate::special_paths::is_synthetic_link_path(&target) {
+            return None;
+        }
         // niubash#177: same operand resolution as open_input_redirect so
         // this regular-file probe agrees with the read that follows.
         let path = self.session_path(super::path::windows_operand_file_path(
@@ -1349,6 +1352,9 @@ impl Executor {
             return None;
         }
         if crate::special_paths::synthetic_proc_content(&target).is_some() {
+            return None;
+        }
+        if crate::special_paths::is_synthetic_link_path(&target) {
             return None;
         }
         // niubash#177: same operand resolution as open_input_redirect —

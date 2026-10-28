@@ -159,6 +159,22 @@ pub(crate) fn is_synthetic_link_path(target: &str) -> bool {
     crate::proc_vfs::proc_is_link_path(target)
 }
 
+/// Resolve a synthetic-link path to its target (rubash#1900): both
+/// spellings — the OS-native one for opens/metadata and the
+/// shell-namespace display one for readlink-style answers. The
+/// caller supplies the session cwd's forms for the self/cwd entry.
+/// None when the path is not a live synthetic link or its target
+/// cannot be resolved (dead pid, protected process).
+pub(crate) fn synthetic_link_target(
+    target: &str,
+    self_cwd: Option<&crate::proc_vfs::ProcSelfCwd>,
+) -> Option<crate::proc_vfs::ProcLinkTarget> {
+    if !is_synthetic_link_path(target) {
+        return None;
+    }
+    crate::proc_vfs::proc_link_target(target, self_cwd)
+}
+
 /// The registry's enumeration face for synthetic /proc directories:
 /// the entry names of `/proc`, `/proc/self`, or a live `/proc/<pid>`,
 /// from the one enumeration source in [`crate::proc_vfs`]. Glob and
@@ -336,5 +352,22 @@ mod tests {
                 "link query vs classify for {target:?}"
             );
         }
+    }
+
+    /// rubash#1900: resolution answers exactly for the link class —
+    /// self/cwd passes the caller's session-cwd forms through
+    /// untouched, and non-link spellings resolve to None.
+    #[test]
+    fn link_target_resolution_matches_classification() {
+        if cfg!(windows) {
+            let cwd = crate::proc_vfs::self_cwd_forms(std::path::Path::new("C:\\session"));
+            let target = synthetic_link_target("/proc/self/cwd", Some(&cwd))
+                .expect("self/cwd resolves through the session forms");
+            assert_eq!(target.native, "C:\\session");
+            assert_eq!(target.display, cwd.display);
+            assert!(synthetic_link_target("/proc/self/exe", None).is_some());
+        }
+        assert!(synthetic_link_target("/proc/self/status", None).is_none());
+        assert!(synthetic_link_target("/etc/passwd", None).is_none());
     }
 }

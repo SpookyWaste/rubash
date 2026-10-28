@@ -409,8 +409,197 @@ struct PebStrings {
     command_line: Option<Vec<u16>>,
     /// RTL_USER_PROCESS_PARAMETERS.CurrentDirectory.DosPath, rendered
     /// (the /proc/<pid>/cwd face consumes this in the #1900 slice).
-    #[allow(dead_code)]
     current_dir: Option<String>,
+}
+
+/// The shell session's cwd in both spellings (rubash#1900): `native`
+/// for handing to the OS, `display` for shell-namespace answers.
+/// Built from the G-02 session cwd — the process-global cwd is never
+/// consulted for /proc/self/cwd (the rubash#1887 anchoring rule).
+pub struct ProcSelfCwd {
+    pub native: String,
+    pub display: String,
+}
+
+pub fn self_cwd_forms(session_cwd: &std::path::Path) -> ProcSelfCwd {
+    let native = session_cwd.to_string_lossy().into_owned();
+    let display = crate::executor::path::shell_pwd_display_path(&native);
+    ProcSelfCwd { native, display }
+}
+
+/// A resolved synthetic-link target in both spellings.
+pub struct ProcLinkTarget {
+    pub native: String,
+    pub display: String,
+}
+
+/// Resolve a SyntheticLink path to its target (rubash#1900).
+/// `/proc/self/exe` is the running image; `/proc/<pid>/exe` is asked
+/// of the OS per process (QueryFullProcessImageNameW — the image a
+/// process was actually started from, not the snapshot's file NAME);
+/// cwd comes from the session (self) or the target's PEB
+/// CurrentDirectory.DosPath (other pids). A dead or unopenable pid
+/// resolves to None — the link dangles exactly when its process does.
+#[cfg(windows)]
+pub fn proc_link_target(path: &str, self_cwd: Option<&ProcSelfCwd>) -> Option<ProcLinkTarget> {
+    let name = proc_file_name(path)?;
+    if !PID_LINK_FILES.contains(&name) {
+        return None;
+    }
+    match proc_pid_ref(path)? {
+        PidRef::SelfPid => match name {
+            "exe" => {
+                let native = std::env::current_exe().ok()?.to_string_lossy().into_owned();
+                let display = crate::executor::path::shell_pwd_display_path(&native);
+                Some(ProcLinkTarget { native, display })
+            }
+            "cwd" => self_cwd.map(|cwd| ProcLinkTarget {
+                native: cwd.native.clone(),
+                display: cwd.display.clone(),
+            }),
+            _ => None,
+        },
+        PidRef::Pid(pid) => {
+            if pid == 0 {
+                return None;
+            }
+            match name {
+                "exe" => {
+                    let native = process_image_path(pid)?;
+                    let display = crate::executor::path::shell_pwd_display_path(&native);
+                    Some(ProcLinkTarget { native, display })
+                }
+                "cwd" => {
+                    let native = peb_strings(pid).and_then(|peb| peb.current_dir)?;
+                    let display = crate::executor::path::shell_pwd_display_path(&native);
+                    Some(ProcLinkTarget { native, display })
+                }
+                _ => None,
+            }
+        }
+        PidRef::Root => None,
+    }
+}
+
+#[cfg(not(windows))]
+pub fn proc_link_target(_path: &str, _self_cwd: Option<&ProcSelfCwd>) -> Option<ProcLinkTarget> {
+    None
+}
+
+/// A process's full image path, asked of the OS
+/// (QueryFullProcessImageNameW). None for dead or protected pids.
+#[cfg(windows)]
+fn process_image_path(pid: u32) -> Option<String> {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    extern "system" {
+        fn QueryFullProcessImageNameW(
+            process: *mut c_void,
+            flags: u32,
+            exe_name: *mut u16,
+            size: *mut u32,
+        ) -> i32;
+    }
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut buffer = vec![0u16; 1024];
+    let mut size = buffer.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) };
+    unsafe {
+        CloseHandle(handle);
+    }
+    if ok == 0 || size == 0 {
+        return None;
+    }
+    buffer.truncate(size as usize);
+    Some(String::from_utf16_lossy(&buffer))
+}
+
+/// File-test facts for a synthetic /proc path (rubash#1900/#1902):
+/// derived from the registry tables plus pid liveness — the test
+/// face's previous implementation answered from a constant table that
+/// never consulted either, which is why /proc/self/cmdline claimed
+/// "not a file". `link_target_is_dir` states the link ENTRY's
+/// definitional target kind (an exe image is a file; a cwd is a
+/// directory), not a per-instance guess.
+pub struct ProcUnaryFacts {
+    pub is_dir: bool,
+    pub is_file: bool,
+    pub is_link: bool,
+    pub link_target_is_dir: bool,
+}
+
+#[cfg(windows)]
+pub fn proc_unary_facts(path: &str) -> Option<ProcUnaryFacts> {
+    let facts = |is_dir: bool, is_file: bool, is_link: bool, link_target_is_dir: bool| {
+        Some(ProcUnaryFacts {
+            is_dir,
+            is_file,
+            is_link,
+            link_target_is_dir,
+        })
+    };
+    let trimmed = path.trim_end_matches('/');
+    if trimmed == "/proc" || trimmed == "proc" {
+        return facts(true, false, false, false);
+    }
+    match proc_pid_ref(trimmed)? {
+        PidRef::Root => {
+            let leaf = proc_file_name(trimmed)?;
+            if TOP_LEVEL_FILES.contains(&leaf) {
+                facts(false, true, false, false)
+            } else {
+                None
+            }
+        }
+        PidRef::SelfPid => proc_pid_facts(trimmed, "self", None),
+        PidRef::Pid(pid) => {
+            if pid == 0 || snapshot_entry(pid).is_none() {
+                return None;
+            }
+            proc_pid_facts(trimmed, &pid.to_string(), Some(pid))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn proc_pid_facts(path: &str, segment: &str, pid: Option<u32>) -> Option<ProcUnaryFacts> {
+    let leaf = proc_file_name(path)?;
+    if leaf == segment || pid.is_some_and(|pid| leaf.parse::<u32>() == Ok(pid)) {
+        return Some(ProcUnaryFacts {
+            is_dir: true,
+            is_file: false,
+            is_link: false,
+            link_target_is_dir: false,
+        });
+    }
+    if PID_CONTENT_FILES.contains(&leaf) {
+        return Some(ProcUnaryFacts {
+            is_dir: false,
+            is_file: true,
+            is_link: false,
+            link_target_is_dir: false,
+        });
+    }
+    if PID_LINK_FILES.contains(&leaf) {
+        return Some(ProcUnaryFacts {
+            is_dir: false,
+            is_file: false,
+            is_link: true,
+            link_target_is_dir: leaf == "cwd",
+        });
+    }
+    None
+}
+
+#[cfg(not(windows))]
+pub fn proc_unary_facts(_path: &str) -> Option<ProcUnaryFacts> {
+    None
 }
 
 // PEB / RTL_USER_PROCESS_PARAMETERS field offsets for the two strings
@@ -1188,6 +1377,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     fn ppid_field(status_text: &str) -> u32 {
         status_text
             .lines()
@@ -1255,6 +1445,40 @@ mod tests {
     fn cmdline_fallback_shape_is_image_plus_nul() {
         if cfg!(windows) {
             assert_eq!(image_cmdline_fallback("prog.exe"), b"prog.exe\0".to_vec());
+        }
+    }
+
+    /// rubash#1900: link resolution and unary facts — self/cwd is
+    /// exactly the session cwd the caller passed (both forms pass
+    /// through; the process-global cwd is never asked), self/exe
+    /// resolves to the running image, content entries are not links,
+    /// a dead pid dangles, and the facts face agrees.
+    #[test]
+    fn link_targets_and_facts() {
+        if cfg!(windows) {
+            let cwd = self_cwd_forms(std::path::Path::new("D:\\some\\session dir"));
+            let target = proc_link_target("/proc/self/cwd", Some(&cwd)).expect("self cwd link");
+            assert_eq!(target.native, "D:\\some\\session dir");
+            assert_eq!(target.display, cwd.display);
+            assert!(proc_link_target("/proc/self/cwd", None).is_none());
+            let exe = proc_link_target("/proc/self/exe", None).expect("self exe link");
+            let image = self_image_name().expect("own image name");
+            assert!(exe.native.ends_with(&image), "exe target {}", exe.native);
+            assert!(exe.display.starts_with('/'));
+            assert!(proc_link_target("/proc/self/status", Some(&cwd)).is_none());
+            assert!(proc_link_target("/proc/4294967294/exe", None).is_none());
+            let facts = proc_unary_facts("/proc/self/exe").expect("exe facts");
+            assert!(facts.is_link && !facts.link_target_is_dir);
+            let facts = proc_unary_facts("/proc/self/cwd").expect("cwd facts");
+            assert!(facts.is_link && facts.link_target_is_dir);
+            assert!(proc_unary_facts("/proc/self").expect("dir facts").is_dir);
+            assert!(
+                proc_unary_facts("/proc/self/status")
+                    .expect("file facts")
+                    .is_file
+            );
+            assert!(proc_unary_facts("/proc").expect("root facts").is_dir);
+            assert!(proc_unary_facts("/proc/4294967294/status").is_none());
         }
     }
 }

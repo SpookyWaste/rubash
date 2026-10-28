@@ -3845,6 +3845,65 @@ mod issue_1917 {
     }
 }
 
+/// rubash#1900: /proc/<pid>/exe and /proc/<pid>/cwd were not
+/// simulated at all — every face (open, test, glob) fell through to a
+/// filesystem that has no such names on Windows. The pins assert the
+/// link semantics end to end: test -e/-L/-f/-d from registry facts,
+/// and reading /proc/self/exe yields the running image's own magic
+/// bytes (MZ on Windows, ELF on Linux's real procfs).
+mod issue_1900 {
+    use super::*;
+
+    fn run(dir: &Path, code: &str) -> (Vec<u8>, String, Option<i32>) {
+        let out = run_rubash_in(dir, &["-c", code], Duration::from_secs(30));
+        (
+            out.stdout,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    #[test]
+    fn issue1900_a4_exe_cwd_links() {
+        let dir = case_scratch("1900-a4");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "test -e /proc/self/exe && test -L /proc/self/exe && test -f /proc/self/exe \
+             && test -e /proc/self/cwd && test -d /proc/self/cwd && echo A4-OK; \
+             IFS= read -r -N 2 magic < /proc/self/exe; echo \"len:${#magic}\"; printf '%s' \"$magic\"",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        let text = String::from_utf8_lossy(&stdout).into_owned();
+        assert!(text.contains("A4-OK"), "link tests failed:\n{text}");
+        assert!(text.contains("len:2"), "short read of exe:\n{text}");
+        if cfg!(windows) {
+            assert!(stdout.windows(2).any(|w| w == b"MZ"), "exe magic:\n{text}");
+        } else {
+            assert!(
+                stdout.windows(2).any(|w| w == [0x7f, b'E']),
+                "exe magic:\n{text}"
+            );
+        }
+    }
+
+    /// A-5: /proc/self/cwd tracks the SESSION cwd — after `cd` into a
+    /// subdirectory it still answers as an existing directory (its
+    /// target text equality with the session cwd is pinned at the
+    /// proc_vfs unit level, where the session value is injected).
+    #[test]
+    fn issue1900_a5_self_cwd_tracks_session() {
+        let dir = case_scratch("1900-a5");
+        std::fs::create_dir(dir.join("sub")).expect("create subdir");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "cd sub && test -d /proc/self/cwd && test -e /proc/self/cwd && echo A5-OK",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        let text = String::from_utf8_lossy(&stdout).into_owned();
+        assert_eq!(text.trim(), "A5-OK");
+    }
+}
+
 /// rubash#1918: /proc/<pid>/status PPid was fabricated (self answered
 /// 0, every other pid answered the shell's own pid) while the ToolHelp
 /// snapshot's real parent field was discarded. The pin builds a KNOWN
