@@ -36,13 +36,14 @@ const PID_LINK_FILES: [&str; 2] = ["cwd", "exe"];
 #[allow(dead_code)] // table face consumed by the Windows generators and the cross-platform tests
 const PID_ENTRIES: [&str; 4] = ["cmdline", "cwd", "exe", "status"];
 
-/// Count of ToolHelp process snapshots taken by this module on the
-/// calling thread, so the rubash#1917 §4.2 call-count budget (self
-/// face: zero snapshots; one enumeration pass: at most one) is
-/// assertable in tests instead of by timing. The budget is a
-/// per-command-execution property, and a command executes on one
-/// thread, so the counter is thread-local; only the snapshot SITES in
-/// this module are counted.
+// Count of ToolHelp process snapshots taken by this module on the
+// calling thread, so the rubash#1917 §4.2 call-count budget (self
+// face: zero snapshots; one enumeration pass: at most one) is
+// assertable in tests instead of by timing. The budget is a
+// per-command-execution property, and a command executes on one
+// thread, so the counter is thread-local; only the snapshot SITES in
+// this module are counted. (Plain comment: a doc comment cannot
+// attach to a thread_local! invocation.)
 #[cfg(windows)]
 thread_local! {
     static TOOLHELP_SNAPSHOTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -442,12 +443,12 @@ pub struct ProcLinkTarget {
 /// resolves to None — the link dangles exactly when its process does.
 #[cfg(windows)]
 pub fn proc_link_target(path: &str, self_cwd: Option<&ProcSelfCwd>) -> Option<ProcLinkTarget> {
-    let name = proc_file_name(path)?;
-    if !PID_LINK_FILES.contains(&name) {
+    let (pid_ref, tail) = parse_pid_spelling(path)?;
+    if !PID_LINK_FILES.contains(&tail) {
         return None;
     }
-    match proc_pid_ref(path)? {
-        PidRef::SelfPid => match name {
+    match pid_ref {
+        PidRef::SelfPid => match tail {
             "exe" => {
                 let native = std::env::current_exe().ok()?.to_string_lossy().into_owned();
                 let display = crate::executor::path::shell_pwd_display_path(&native);
@@ -460,10 +461,10 @@ pub fn proc_link_target(path: &str, self_cwd: Option<&ProcSelfCwd>) -> Option<Pr
             _ => None,
         },
         PidRef::Pid(pid) => {
-            if pid == 0 {
-                return None;
-            }
-            match name {
+            // No liveness pre-walk: the OS queries below are the
+            // liveness check — a dead or protected pid fails them and
+            // the link dangles, which is the answer either way.
+            match tail {
                 "exe" => {
                     let native = process_image_path(pid)?;
                     let display = crate::executor::path::shell_pwd_display_path(&native);
@@ -477,7 +478,6 @@ pub fn proc_link_target(path: &str, self_cwd: Option<&ProcSelfCwd>) -> Option<Pr
                 _ => None,
             }
         }
-        PidRef::Root => None,
     }
 }
 
@@ -536,63 +536,47 @@ pub struct ProcUnaryFacts {
 
 #[cfg(windows)]
 pub fn proc_unary_facts(path: &str) -> Option<ProcUnaryFacts> {
-    let facts = |is_dir: bool, is_file: bool, is_link: bool, link_target_is_dir: bool| {
-        Some(ProcUnaryFacts {
-            is_dir,
-            is_file,
-            is_link,
-            link_target_is_dir,
-        })
+    let dir_facts = ProcUnaryFacts {
+        is_dir: true,
+        is_file: false,
+        is_link: false,
+        link_target_is_dir: false,
+    };
+    let file_facts = ProcUnaryFacts {
+        is_dir: false,
+        is_file: true,
+        is_link: false,
+        link_target_is_dir: false,
     };
     let trimmed = path.trim_end_matches('/');
-    if trimmed == "/proc" || trimmed == "proc" {
-        return facts(true, false, false, false);
+    if trimmed == "/proc" {
+        return Some(dir_facts);
     }
-    match proc_pid_ref(trimmed)? {
-        PidRef::Root => {
-            let leaf = proc_file_name(trimmed)?;
-            if TOP_LEVEL_FILES.contains(&leaf) {
-                facts(false, true, false, false)
-            } else {
-                None
-            }
+    if let Some((pid_ref, tail)) = parse_pid_spelling(trimmed) {
+        if !pid_ref_alive(pid_ref) {
+            return None;
         }
-        PidRef::SelfPid => proc_pid_facts(trimmed, "self", None),
-        PidRef::Pid(pid) => {
-            if pid == 0 || snapshot_entry(pid).is_none() {
-                return None;
-            }
-            proc_pid_facts(trimmed, &pid.to_string(), Some(pid))
+        if tail.is_empty() {
+            return Some(dir_facts);
         }
+        if PID_CONTENT_FILES.contains(&tail) {
+            return Some(file_facts);
+        }
+        if PID_LINK_FILES.contains(&tail) {
+            return Some(ProcUnaryFacts {
+                is_dir: false,
+                is_file: false,
+                is_link: true,
+                link_target_is_dir: tail == "cwd",
+            });
+        }
+        return None;
     }
-}
-
-#[cfg(windows)]
-fn proc_pid_facts(path: &str, segment: &str, pid: Option<u32>) -> Option<ProcUnaryFacts> {
-    let leaf = proc_file_name(path)?;
-    if leaf == segment || pid.is_some_and(|pid| leaf.parse::<u32>() == Ok(pid)) {
-        return Some(ProcUnaryFacts {
-            is_dir: true,
-            is_file: false,
-            is_link: false,
-            link_target_is_dir: false,
-        });
-    }
-    if PID_CONTENT_FILES.contains(&leaf) {
-        return Some(ProcUnaryFacts {
-            is_dir: false,
-            is_file: true,
-            is_link: false,
-            link_target_is_dir: false,
-        });
-    }
-    if PID_LINK_FILES.contains(&leaf) {
-        return Some(ProcUnaryFacts {
-            is_dir: false,
-            is_file: false,
-            is_link: true,
-            link_target_is_dir: leaf == "cwd",
-        });
+    // Top-level content files (the pid spelling parse rejects their
+    // non-numeric head, which is what routes them here).
+    let leaf = trimmed.strip_prefix("/proc/")?;
+    if !leaf.contains('/') && TOP_LEVEL_FILES.contains(&leaf) {
+        return Some(file_facts);
     }
     None
 }
