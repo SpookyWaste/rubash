@@ -202,6 +202,38 @@ fn parameter_pattern_match(pattern: &str, word: &str, nocase: bool, extglob: boo
     }
 }
 
+/// Prechecked twin of [`parameter_pattern_match`] for the finders below:
+/// the caller has evaluated both byte gates once for the whole
+/// (pattern, value) pair and they do not fire, and every candidate is a
+/// char-boundary slice of that same value, so the per-candidate gate
+/// re-evaluation inside the case matchers could only repeat the same
+/// negative verdict at O(candidate length) per boundary — on a
+/// multi-thousand-char value with an anchored pattern (`${v/#seg/…}`,
+/// `${v/%gz/…}`) that re-scan was the dominant cost of the expansion.
+fn parameter_pattern_match_prechecked(
+    pattern: &str,
+    word: &str,
+    nocase: bool,
+    extglob: bool,
+) -> bool {
+    if extglob && pattern_uses_extglob_syntax(pattern) {
+        if nocase {
+            return super::conditional::extglob_case_pattern_matches_nocase(pattern, word);
+        }
+        return super::conditional::extglob_case_pattern_matches(pattern, word);
+    }
+    super::conditional::pattern::case_pattern_matches_prechecked(pattern, word, nocase)
+}
+
+/// One-time gate verdict for a (pattern, value) pair whose char-boundary
+/// slices are about to be matched one by one: both byte gates are
+/// containment predicates, so a gate-clean pair stays clean for every
+/// slice (see case_pattern_matches_prechecked).
+fn pattern_pair_gates_clean(pattern: &str, value: &str) -> bool {
+    !super::conditional::pattern::sides_need_byte_char_matching(pattern, value)
+        && !super::conditional::pattern::sides_need_byte_locale_units(pattern, value)
+}
+
 fn normalize_parameter_pattern_backslashes(pattern: &str) -> String {
     // The three passes rewrite the internal backslash markers only; a
     // pattern carrying none of them is already normalized, so skip the
@@ -269,12 +301,20 @@ pub(in crate::executor) fn find_parameter_prefix_match(
         return Some(0);
     }
 
+    let prechecked = pattern_pair_gates_clean(pattern, value);
+    let candidate_matches = |word: &str| {
+        if prechecked {
+            parameter_pattern_match_prechecked(pattern, word, false, extglob)
+        } else {
+            parameter_pattern_match(pattern, word, false, extglob)
+        }
+    };
     value
         .char_indices()
         .map(|(index, _)| index)
         .chain(std::iter::once(value.len()))
         .rev()
-        .find(|end| parameter_pattern_match(pattern, &value[..*end], false, extglob))
+        .find(|end| candidate_matches(&value[..*end]))
 }
 
 pub(in crate::executor) fn find_parameter_suffix_match(
@@ -286,11 +326,19 @@ pub(in crate::executor) fn find_parameter_suffix_match(
         return Some(value.len());
     }
 
+    let prechecked = pattern_pair_gates_clean(pattern, value);
+    let candidate_matches = |word: &str| {
+        if prechecked {
+            parameter_pattern_match_prechecked(pattern, word, false, extglob)
+        } else {
+            parameter_pattern_match(pattern, word, false, extglob)
+        }
+    };
     value
         .char_indices()
         .map(|(index, _)| index)
         .chain(std::iter::once(value.len()))
-        .find(|start| parameter_pattern_match(pattern, &value[*start..], false, extglob))
+        .find(|start| candidate_matches(&value[*start..]))
 }
 
 pub(in crate::executor) fn find_parameter_pattern_match(
@@ -302,6 +350,19 @@ pub(in crate::executor) fn find_parameter_pattern_match(
     extglob: bool,
 ) -> Option<(usize, usize)> {
     let start_index = indices.iter().position(|index| *index >= cursor)?;
+
+    // The byte gates are evaluated once for the whole (pattern, value)
+    // pair; every candidate below is a char-boundary slice of the value,
+    // so the verdict cannot change per candidate (see
+    // case_pattern_matches_prechecked).
+    let prechecked = pattern_pair_gates_clean(pattern, value);
+    let candidate_matches = |word: &str| {
+        if prechecked {
+            parameter_pattern_match_prechecked(pattern, word, nocase, extglob)
+        } else {
+            parameter_pattern_match(pattern, word, nocase, extglob)
+        }
+    };
 
     // GNU strmatch scans per position with the pattern itself, so a
     // bracket-class pattern over a long value stays linear. The descending
@@ -363,7 +424,7 @@ pub(in crate::executor) fn find_parameter_pattern_match(
             if ends_at_value_end && *end != value.len() {
                 continue;
             }
-            if parameter_pattern_match(pattern, &value[*start..*end], nocase, extglob) {
+            if candidate_matches(&value[*start..*end]) {
                 best = Some(*end);
             }
         }
