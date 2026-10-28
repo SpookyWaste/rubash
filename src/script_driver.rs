@@ -3765,6 +3765,29 @@ pub fn run_interactive_stdin(executor: &mut Executor) -> i32 {
     // kernel default.
     #[cfg(unix)]
     crate::builtins::kill::reconcile_kernel_trap_dispositions(&executor.shell_state.env_vars);
+    // rubash#1991: job control must exist for every interactive
+    // session, whoever drives it. GNU establishes it inside
+    // initialize_shell_basics for interactive shells (jobs.c:4869
+    // keeps the `m` flag there even without -m); rubash's binary
+    // startup does the equivalent in apply_startup_job_control, but
+    // that step lives in main.rs, so a library host driving THIS
+    // entry (invocation.rs: a library host (niu) drives the stdin
+    // reader) ran interactive sessions with monitor permanently off
+    // and fg/bg refused with "no job control" on a real terminal.
+    // Mirror the binary's rule at the library entry: an interactive
+    // session defaults monitor on; an explicit startup transport
+    // value (__RUBASH_SETOPT_monitor, from -m/+m or -o/+o monitor)
+    // is respected untouched. Applied once per process: a host may
+    // re-enter this reader per line, and a user's later
+    // `set +o monitor` must survive those re-entries.
+    static JOB_CONTROL_DEFAULT_APPLIED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if !JOB_CONTROL_DEFAULT_APPLIED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        && executor.get_env("__RUBASH_INTERACTIVE").as_deref() == Some("1")
+        && executor.get_env("__RUBASH_SETOPT_monitor").is_none()
+    {
+        executor.set_shell_option("monitor", true);
+    }
     // parse.y:1710: the SAME reader serves tty and non-tty stdin; the two
     // cases differ only in who echoes the accepted line (readline echoes
     // itself on a tty — the Windows cooked console echoes each typed key —

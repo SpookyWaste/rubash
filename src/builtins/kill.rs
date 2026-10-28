@@ -1983,6 +1983,59 @@ mod kernel_signals {
         }
     }
 
+    /// Monotonic count of kernel-caused SIGINT deliveries drained so
+    /// far (rubash#1990). Unlike KERNEL_CAUSED — a last-wins origin bit
+    /// a later kill(2) delivery of the same signal can flip back — the
+    /// epoch never decreases, so a consumer that snapshots it at the
+    /// start of a wait can tell "a terminal ^C arrived DURING this
+    /// wait" even if other deliveries interleave. The foreground wait
+    /// (executor external_inner) uses it to forward the interrupt to a
+    /// child the terminal delivery never reached.
+    static SIGINT_KERNEL_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+    /// Current value of the kernel-SIGINT epoch (see SIGINT_KERNEL_EPOCH).
+    pub(super) fn sigint_kernel_epoch() -> u64 {
+        SIGINT_KERNEL_EPOCH.load(Ordering::Relaxed)
+    }
+
+    /// The `trap ''` ignore set, recorded from the trap TABLE by the
+    /// boundary reconcile (reconcile_kernel_trap_dispositions) — never
+    /// from the live kernel state word (rubash#1991). The state word
+    /// also carries shell-policy ignores that exist only for this
+    /// process: an interactive shell ignores SIGTERM for itself
+    /// (sig.c:338-339, where get_original_signal snapshots the entry
+    /// disposition BEFORE the ignore is installed). GNU's fork-child
+    /// restore (trap.c:1489 restore_original_signals) restores from
+    /// that entry snapshot plus the trap '' set, so a policy ignore
+    /// must not leak into children — reading the live state word in
+    /// pre_exec did exactly that, and every child of an interactive
+    /// shell inherited SIG_IGN for SIGTERM (kill %1 then "succeeded"
+    /// while the job ran on, immune to TERM).
+    static TRAP_IGNORED: AtomicU64 = AtomicU64::new(0);
+
+    /// Record whether `sig` is currently ignored via `trap ''`.
+    pub(super) fn set_trap_ignored(sig: i32, ignored: bool) {
+        if !is_managed(sig) {
+            return;
+        }
+        if ignored {
+            TRAP_IGNORED.fetch_or(bit(sig), Ordering::Relaxed);
+        } else {
+            TRAP_IGNORED.fetch_and(!bit(sig), Ordering::Relaxed);
+        }
+    }
+
+    /// True when `sig` is ignored via `trap ''` (see TRAP_IGNORED).
+    pub(super) fn trap_ignored(sig: i32) -> bool {
+        is_managed(sig) && TRAP_IGNORED.load(Ordering::Relaxed) & bit(sig) != 0
+    }
+
+    /// Clear the whole trap '' record (the reconcile fast path, where
+    /// no trap-table keys exist at all).
+    pub(super) fn clear_trap_ignored_all() {
+        TRAP_IGNORED.store(0, Ordering::Relaxed);
+    }
+
     /// The named signals the backend manages dispositions for (the
     /// signal_hook-catchable set a trap can name and the executor can
     /// dispatch). SIGPIPE joined the set with rubash#1333: it used to be
@@ -2776,6 +2829,9 @@ mod kernel_signals {
                 if is_managed(origin.signal) {
                     if matches!(origin.cause, Cause::Kernel) {
                         KERNEL_CAUSED.fetch_or(bit(origin.signal), Ordering::Relaxed);
+                        if origin.signal == libc::SIGINT {
+                            SIGINT_KERNEL_EPOCH.fetch_add(1, Ordering::Relaxed);
+                        }
                     } else {
                         KERNEL_CAUSED.fetch_and(!bit(origin.signal), Ordering::Relaxed);
                     }
@@ -2822,8 +2878,13 @@ mod kernel_signals {
                 // disposition (SIG_DFL here, entry-ignored handled above)
                 // is what children exec with.
                 libc::SIG_DFL
-            } else if current_state(sig) == 1 {
-                // trap '' ignore (trap.c:1451-1455): survives into children.
+            } else if trap_ignored(sig) {
+                // trap '' ignore (trap.c:1451-1455): survives into
+                // children. Read from the trap-table record, NOT the
+                // live state word: the word also holds shell-policy
+                // ignores (interactive SIGTERM, sig.c:339) that GNU
+                // never folds into original_signals, so they must not
+                // cross into children (rubash#1991).
                 libc::SIG_IGN
             } else {
                 // Trapped (handler) or default: children get the entry
@@ -2962,6 +3023,9 @@ pub fn reconcile_kernel_trap_dispositions(env_vars: &std::collections::HashMap<S
         && kernel_signals::at_default_state()
         && kernel_signals::fatal_at_default()
     {
+        // No trap keys exist on this path, so the trap '' record is
+        // empty by construction (rubash#1991).
+        kernel_signals::clear_trap_ignored_all();
         return;
     }
     // G-01: the slow path mutates process-wide kernel dispositions —
@@ -2987,6 +3051,15 @@ pub fn reconcile_kernel_trap_dispositions(env_vars: &std::collections::HashMap<S
         && !reset_contains(reset, "EXIT");
     let mut dispositions: Vec<(i32, Disposition)> = Vec::new();
     for (sig, short, key) in managed_trap_keys() {
+        // rubash#1991: keep the trap '' record in step with the table
+        // this reconcile is applying — it is the ONLY ignore source the
+        // fork-child restore may consult besides the entry snapshot
+        // (see kernel_signals::TRAP_IGNORED).
+        kernel_signals::set_trap_ignored(
+            *sig,
+            matches!(env_vars.get(key.as_str()), Some(action) if action.is_empty())
+                && !reset_contains(reset, short),
+        );
         let want = match env_vars.get(key.as_str()) {
             // A real action and not reset-listed -> handler (trap.c
             // trap_builtin -> sig.c:830 set_signal_handler).
@@ -3146,6 +3219,13 @@ pub fn kernel_handler_installed(signal: i32) -> bool {
 #[cfg(unix)]
 pub fn last_delivery_kernel_caused(signal: i32) -> bool {
     kernel_signals::last_delivery_kernel_caused(signal)
+}
+
+/// Monotonic count of kernel-caused SIGINT deliveries drained so far
+/// (rubash#1990) — see kernel_signals::SIGINT_KERNEL_EPOCH.
+#[cfg(unix)]
+pub fn sigint_kernel_epoch() -> u64 {
+    kernel_signals::sigint_kernel_epoch()
 }
 
 /// Whether the boundary dispatcher can adjudicate `signal` (managed or
