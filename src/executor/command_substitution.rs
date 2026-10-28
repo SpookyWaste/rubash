@@ -2134,11 +2134,15 @@ impl Executor {
         // the mapped pseudo-path simply failed to open and the
         // substitution came back empty with a spurious diagnostic.
         if crate::special_paths::is_net_redirect_target(file_word) {
-            return match self.open_net_redirect_raw(file_word) {
-                Ok(mut file) => {
+            // Read through the native socket form, not the
+            // handle-adopted File: std File reads on an adopted
+            // overlapped socket fail on Windows
+            // (ERROR_INVALID_PARAMETER). See connect_net_stream.
+            return match self.connect_net_stream(file_word) {
+                Ok(mut stream) => {
                     use std::io::Read as _;
                     let mut buf = Vec::new();
-                    match file.read_to_end(&mut buf) {
+                    match stream.read_to_end(&mut buf) {
                         Ok(_) => {
                             self.last_command_substitution_status.set(Some(0));
                             bytes_to_shell_text(&buf)

@@ -63,6 +63,29 @@ fn resolve_net_service_port(port_text: &str, udp: bool) -> Option<u16> {
     None
 }
 
+/// A connected net-redirection endpoint in its native socket form
+/// (rubash#1026). Reads go through the socket API (WSARecv/recv);
+/// see Executor::connect_net_stream for why byte consumers use this
+/// form instead of the handle-adopted File.
+pub(in crate::executor) enum NetStream {
+    Tcp(std::net::TcpStream),
+    Udp(std::net::UdpSocket),
+}
+
+impl io::Read for NetStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            NetStream::Tcp(stream) => stream.read(buf),
+            // UdpSocket has no Read impl; recv is its read (one
+            // datagram per call, so read_to_end keeps collecting
+            // until the peer closes or a read would block — the
+            // same EOF profile GNU's read_comsub sees on a UDP
+            // descriptor).
+            NetStream::Udp(socket) => socket.recv(buf),
+        }
+    }
+}
+
 impl Executor {
     pub(in crate::executor) fn open_input_redirect(&self, target: &str) -> io::Result<File> {
         self.open_input_redirect_impl(target, true)
@@ -109,6 +132,22 @@ impl Executor {
     /// Raw variant for callers that apply posix_errors::path_error
     /// themselves (e.g. set_fd_readwrite_file's `<>` path).
     pub(in crate::executor) fn open_net_redirect_raw(&self, target: &str) -> io::Result<File> {
+        match self.connect_net_stream(target)? {
+            NetStream::Tcp(stream) => Ok(tcp_stream_file(stream)),
+            NetStream::Udp(socket) => Ok(udp_socket_file(socket)),
+        }
+    }
+
+    /// Parse and connect a net redirect target, returning the
+    /// endpoint in its native socket form. The File form
+    /// (open_net_redirect_raw) adopts the SOCKET as a raw handle for
+    /// the fd machinery, but std File reads on an adopted overlapped
+    /// socket fail on Windows (ERROR_INVALID_PARAMETER), so byte
+    /// consumers read through this socket form, whose reads go
+    /// through WSARecv/recv. The diagnostic pre-lines (service-name
+    /// failure, refused connect; rubash#1237) are emitted here so
+    /// both forms report identically.
+    pub(in crate::executor) fn connect_net_stream(&self, target: &str) -> io::Result<NetStream> {
         let (udp, rest) = if let Some(rest) = target.strip_prefix("/dev/tcp/") {
             (false, rest)
         } else if let Some(rest) = target.strip_prefix("/dev/udp/") {
@@ -140,7 +179,7 @@ impl Executor {
         if host.is_empty() {
             return Err(invalid());
         }
-        let file = if udp {
+        if udp {
             let bind_addr = if host.contains(':') {
                 "[::]:0"
             } else {
@@ -148,7 +187,7 @@ impl Executor {
             };
             let socket = std::net::UdpSocket::bind(bind_addr)?;
             socket.connect((host, port))?;
-            udp_socket_file(socket)
+            Ok(NetStream::Udp(socket))
         } else {
             let stream = std::net::TcpStream::connect((host, port)).map_err(|error| {
                 // GNU netopen reports a refused connect through sys_error
@@ -160,9 +199,8 @@ impl Executor {
                 }
                 error
             })?;
-            tcp_stream_file(stream)
-        };
-        Ok(file)
+            Ok(NetStream::Tcp(stream))
+        }
     }
 
     /// The canonical special-path dispatch for input opens (vfs audit
