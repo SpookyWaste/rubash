@@ -2134,26 +2134,31 @@ impl Executor {
         // (subst.c process_substitute + move_to_high_fd): the bytes live in
         // the fd table's ProcessSubstitution endpoint, not on disk. Reading
         // the path with fs would fail with ENOENT where GNU reads the fd.
-        if let Some(fd_text) = file_word.strip_prefix("/dev/fd/") {
-            if let Ok(fd) = fd_text.parse::<u32>() {
-                if let Some((data, offset)) = self.fd_table.input_snapshot_bytes(fd) {
-                    if let Some(content) = data.get(offset..).map(<[u8]>::to_vec) {
-                        self.last_command_substitution_status.set(Some(0));
-                        return bytes_to_shell_text(&content)
-                            .trim_capture_terminator()
-                            .to_string();
-                    }
-                }
-                // rubash#1952: a streamed procsub binds a live File
-                // endpoint instead of a buffered one — drain it
-                // through the shared handle (reads to EOF, the
-                // quick-read's defining semantics).
-                if let Some(content) = self.fd_table.read_file_endpoint_bytes(fd) {
+        // The spelling judgment is the registry's fd-alias family
+        // (redundancy audit R3/D6): this face used to strip only the
+        // `/dev/fd/` prefix and parse the tail itself, so
+        // `$(</proc/self/fd/N)` missed the fd table and fell to the
+        // filesystem (ENOENT on Windows, where GNU reads the fd), while
+        // `/dev/fd/+3` was accepted here even though GNU rejects that
+        // spelling on every face.
+        if let Some(fd) = crate::special_paths::fd_alias_target(file_word) {
+            if let Some((data, offset)) = self.fd_table.input_snapshot_bytes(fd) {
+                if let Some(content) = data.get(offset..).map(<[u8]>::to_vec) {
                     self.last_command_substitution_status.set(Some(0));
                     return bytes_to_shell_text(&content)
                         .trim_capture_terminator()
                         .to_string();
                 }
+            }
+            // rubash#1952: a streamed procsub binds a live File
+            // endpoint instead of a buffered one — drain it
+            // through the shared handle (reads to EOF, the
+            // quick-read's defining semantics).
+            if let Some(content) = self.fd_table.read_file_endpoint_bytes(fd) {
+                self.last_command_substitution_status.set(Some(0));
+                return bytes_to_shell_text(&content)
+                    .trim_capture_terminator()
+                    .to_string();
             }
         }
         // The canonical ladder steps this quick-read ladder used to

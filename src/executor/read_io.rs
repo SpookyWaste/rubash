@@ -1142,10 +1142,11 @@ impl Executor {
     /// Text/ProcessSubstitution read endpoint at N) falls through to the
     /// filesystem open, which stays correct for real files.
     pub(crate) fn sourced_dev_fd_text(&self, filename: &str) -> Option<String> {
-        let fd_text = filename
-            .strip_prefix("/dev/fd/")
-            .or_else(|| filename.strip_prefix("/proc/self/fd/"))?;
-        let fd = fd_text.parse::<u32>().ok()?;
+        // The spelling judgment is the registry's (redundancy audit
+        // R3/D6): the local strip+parse also accepted `/dev/fd/+3`,
+        // which GNU rejects on every face (the literal open fails
+        // ENOENT in procfs).
+        let fd = crate::special_paths::fd_alias_target(filename)?;
         let (data, offset) = self.fd_table.input_snapshot_bytes(fd)?;
         let content = data.get(offset..)?.to_vec();
         Some(bytes_to_shell_text(&content))
