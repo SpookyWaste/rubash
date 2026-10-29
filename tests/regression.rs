@@ -5207,3 +5207,52 @@ mod issue_1646 {
         assert_eq!(drained, b"one\ntwo\n", "stderr:\n{stderr}");
     }
 }
+
+mod issue_1951 {
+    use super::*;
+
+    fn run(dir: &Path, script: &str) -> (String, String, Option<i32>) {
+        let path = dir.join("case.sh");
+        std::fs::write(&path, script).expect("write probe script");
+        let out = run_rubash_in(
+            dir,
+            &[path.to_str().expect("utf8 scratch path")],
+            Duration::from_secs(60),
+        );
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    /// rubash#1951: the streamed input-procsub endpoint serves a
+    /// line-wise `while read` loop completely and in order — the count
+    /// over 20k produced lines is exact (the materialized endpoint this
+    /// replaces lost its constant-factor footing entirely: ~0.29ms per
+    /// line at the audit tip). GNU bash 5.3.20 prints the same count.
+    #[test]
+    fn issue1951_procsub_endpoint_while_read_count_exact() {
+        let dir = case_scratch("1951-stream-count");
+        let (stdout, stderr, code) = run(
+            &dir,
+            "n=0\nwhile read -r l; do n=$((n+1)); done < <(seq 1 20000)\necho \"read=$n\"\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "read=20000\n", "stderr:\n{stderr}");
+    }
+
+    /// rubash#1951 (content face): lines arrive whole and in order —
+    /// the first, middle and last records read off the endpoint match
+    /// the producer's sequence exactly.
+    #[test]
+    fn issue1951_procsub_endpoint_records_whole_and_ordered() {
+        let dir = case_scratch("1951-stream-order");
+        let (stdout, stderr, code) = run(
+            &dir,
+            "n=0\nfirst= mid= last=\nwhile read -r l; do n=$((n+1)); case $n in 1) first=$l;; 1000) mid=$l;; esac; last=$l; done < <(seq 1 2000)\necho \"$first/$mid/$last/$n\"\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "1/1000/2000/2000\n", "stderr:\n{stderr}");
+    }
+}
