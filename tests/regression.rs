@@ -5259,3 +5259,78 @@ mod issue_1584 {
         assert_eq!(stdout, "comm=rubash\nrc=0\n", "stderr:\n{stderr}");
     }
 }
+
+mod issue_1582 {
+    use super::*;
+
+    fn run(dir: &Path, script: &str) -> (String, String, Option<i32>) {
+        let path = dir.join("case.sh");
+        std::fs::write(&path, script).expect("write probe script");
+        let out = run_rubash_in(
+            dir,
+            &[path.to_str().expect("utf8 scratch path")],
+            Duration::from_secs(30),
+        );
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    /// rubash#1582 (contract pin, adjudication pending): at a
+    /// spawn-realized level the identity narrative is already
+    /// GNU-consistent — an async subshell's $BASHPID is the pid its
+    /// children observe as $PPID. Any resolution of the flat-level
+    /// projection must preserve this.
+    #[cfg(unix)]
+    #[test]
+    fn issue1582_async_subshell_bashpid_matches_child_ppid() {
+        let dir = case_scratch("1582-async");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "( /bin/sh -c 'echo $PPID > pp.txt'; echo $BASHPID > bp.txt ) &\n\
+             wait $!\n\
+             if [ \"$(cat pp.txt)\" = \"$(cat bp.txt)\" ]; then echo MATCH; else echo DIFFER; fi\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "MATCH\n", "stderr:\n{stderr}");
+    }
+
+    /// rubash#1582 (contract pin): $PPID is a startup-frozen value
+    /// in GNU (variables.c set_ppid runs once from
+    /// initialize_shell_variables; subshell forks inherit it), and
+    /// rubash matches — a subshell must NOT observe its parent
+    /// shell's pid through $PPID.
+    #[cfg(unix)]
+    #[test]
+    fn issue1582_ppid_is_frozen_in_subshell() {
+        let dir = case_scratch("1582-ppid");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "t=$PPID\n\
+             ( if [ \"$PPID\" = \"$t\" ]; then echo FROZEN; else echo CHANGED; fi )\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "FROZEN\n", "stderr:\n{stderr}");
+    }
+
+    /// rubash#1582 (contract pin): `kill $BASHPID` inside a flat
+    /// subshell is scoped to that subshell layer (the #1461
+    /// interception): the layer dies by the signal (status 143,
+    /// no survival output) and the parent shell lives on. Any
+    /// projection change that points $BASHPID at the host process
+    /// must keep this kill scoped, never suicidal to the host.
+    #[cfg(unix)]
+    #[test]
+    fn issue1582_kill_own_bashpid_stays_scoped_to_the_subshell() {
+        let dir = case_scratch("1582-kill");
+        let (stdout, stderr, status) = run(
+            &dir,
+            "( kill -TERM $BASHPID; echo SURVIVED )\n\
+             echo \"rc=$?\"\n",
+        );
+        assert_eq!(status, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "rc=143\n", "stderr:\n{stderr}");
+    }
+}
