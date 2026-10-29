@@ -3376,22 +3376,23 @@ type CpLinkMap = std::collections::HashMap<(u64, u64), std::path::PathBuf>;
 /// platform exposes neither (links preservation then degrades to
 /// plain copies).
 #[cfg(unix)]
-fn cp_inode_key(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+fn cp_inode_key(source: &std::path::Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
-    Some((metadata.dev(), metadata.ino()))
+    fs::metadata(source)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
 }
 
 #[cfg(windows)]
-fn cp_inode_key(metadata: &fs::Metadata) -> Option<(u64, u64)> {
-    use std::os::windows::fs::MetadataExt;
-    Some((
-        u64::from(metadata.volume_serial_number()?),
-        metadata.file_index()?,
-    ))
+fn cp_inode_key(source: &std::path::Path) -> Option<(u64, u64)> {
+    // std's MetadataExt::file_index is unstable (windows_by_handle);
+    // the executor's handle-based identity helper is the stable
+    // route and the same pair `[ a -ef b ]` compares.
+    crate::executor::path::file_identity(source).map(|(serial, index)| (u64::from(serial), index))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn cp_inode_key(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
+fn cp_inode_key(_source: &std::path::Path) -> Option<(u64, u64)> {
     None
 }
 
@@ -3407,10 +3408,7 @@ fn cp_copy_file(
     link_map: &mut CpLinkMap,
 ) -> io::Result<()> {
     if preserve.links {
-        if let Some(key) = fs::metadata(source)
-            .ok()
-            .and_then(|metadata| cp_inode_key(&metadata))
-        {
+        if let Some(key) = cp_inode_key(source) {
             if let Some(first) = link_map.get(&key) {
                 return fs::hard_link(first, target);
             }
@@ -3554,6 +3552,59 @@ fn cp_apply_preserved_attributes(
     }
 }
 
+/// The xattr syscalls take extra position/options arguments on
+/// macOS; these shims fold them to zero so the copy walk below is
+/// shared across unix flavors.
+#[cfg(all(unix, target_os = "macos"))]
+unsafe fn xattr_list(path: *const libc::c_char, buf: *mut libc::c_char, size: usize) -> isize {
+    unsafe { libc::listxattr(path, buf, size, 0) }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+unsafe fn xattr_list(path: *const libc::c_char, buf: *mut libc::c_char, size: usize) -> isize {
+    unsafe { libc::listxattr(path, buf, size) }
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+unsafe fn xattr_get(
+    path: *const libc::c_char,
+    name: *const libc::c_char,
+    value: *mut libc::c_void,
+    size: usize,
+) -> isize {
+    unsafe { libc::getxattr(path, name, value, size, 0, 0) }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+unsafe fn xattr_get(
+    path: *const libc::c_char,
+    name: *const libc::c_char,
+    value: *mut libc::c_void,
+    size: usize,
+) -> isize {
+    unsafe { libc::getxattr(path, name, value, size) }
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+unsafe fn xattr_set(
+    path: *const libc::c_char,
+    name: *const libc::c_char,
+    value: *const libc::c_void,
+    size: usize,
+) -> libc::c_int {
+    unsafe { libc::setxattr(path, name, value, size, 0, 0) }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+unsafe fn xattr_set(
+    path: *const libc::c_char,
+    name: *const libc::c_char,
+    value: *const libc::c_void,
+    size: usize,
+) -> libc::c_int {
+    unsafe { libc::setxattr(path, name, value, size, 0) }
+}
+
 /// Best-effort xattr copy (the same stance cp_apply_preserved takes
 /// for mode/times: preservation failures do not fail the copy). With
 /// CONTEXT_ONLY, only the SELinux context attribute moves — that is
@@ -3570,13 +3621,13 @@ fn cp_copy_xattrs(source: &std::path::Path, target: &std::path::Path, context_on
     let Ok(target_c) = CString::new(target.as_os_str().as_bytes()) else {
         return;
     };
-    let size = unsafe { libc::listxattr(source_c.as_ptr(), std::ptr::null_mut(), 0) };
+    let size = unsafe { xattr_list(source_c.as_ptr(), std::ptr::null_mut(), 0) };
     if size <= 0 {
         return;
     }
     let mut names = vec![0u8; size as usize];
     let size = unsafe {
-        libc::listxattr(
+        xattr_list(
             source_c.as_ptr(),
             names.as_mut_ptr() as *mut libc::c_char,
             names.len(),
@@ -3594,13 +3645,13 @@ fn cp_copy_xattrs(source: &std::path::Path, target: &std::path::Path, context_on
             continue;
         };
         let value_size =
-            unsafe { libc::getxattr(source_c.as_ptr(), name_c.as_ptr(), std::ptr::null_mut(), 0) };
+            unsafe { xattr_get(source_c.as_ptr(), name_c.as_ptr(), std::ptr::null_mut(), 0) };
         if value_size < 0 {
             continue;
         }
         let mut value = vec![0u8; value_size as usize];
         let got = unsafe {
-            libc::getxattr(
+            xattr_get(
                 source_c.as_ptr(),
                 name_c.as_ptr(),
                 value.as_mut_ptr() as *mut libc::c_void,
@@ -3612,12 +3663,11 @@ fn cp_copy_xattrs(source: &std::path::Path, target: &std::path::Path, context_on
         }
         value.truncate(got as usize);
         unsafe {
-            libc::setxattr(
+            xattr_set(
                 target_c.as_ptr(),
                 name_c.as_ptr(),
                 value.as_ptr() as *const libc::c_void,
                 value.len(),
-                0,
             );
         }
     }
