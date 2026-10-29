@@ -176,6 +176,81 @@ impl Executor {
                 .insert(fd_output_key(fd), target.to_string());
             return Ok(());
         }
+        // rubash#1935: synthetic /proc content — the entry's write
+        // class decides the open, the same answer the probe ladder
+        // gives: the 0444 class fails the open EACCES (redir.c
+        // r_input_output on the real entry); the 0644 class binds —
+        // reads serve the generated snapshot through the byte
+        // channel, writes land in the absorbed sink.
+        if let Some(allowed) = crate::special_paths::synthetic_proc_write_allowed(target) {
+            if !allowed {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Permission denied",
+                ));
+            }
+            let bytes = crate::special_paths::synthetic_proc_content(target).unwrap_or_default();
+            self.set_fd_input_bytes(fd, bytes, dynamic);
+            let sink = Self::synthetic_proc_write_sink(false)?;
+            let file_fd = FileFd::from_file(sink, target.into());
+            self.fd_table
+                .open_output(fd, FdWriteEndpoint::File(file_fd), dynamic);
+            self.shell_state.env_vars.remove(&fd_closed_key(fd));
+            self.shell_state
+                .env_vars
+                .remove(&fd_output_process_substitution_key(fd));
+            self.shell_state
+                .env_vars
+                .insert(fd_output_key(fd), target.to_string());
+            return Ok(());
+        }
+        // rubash#1963: `<> /dev/fd/N` opens the alias through the
+        // kernel on GNU — a closed alias fails the open ENOENT, an
+        // open one binds a dup of the descriptor in both directions.
+        if let Some(alias_fd) = crate::special_paths::fd_alias_target(target) {
+            if !super::redirection::dup_source_fd_open(
+                &self.fd_table,
+                alias_fd,
+                &std::collections::HashMap::new(),
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "No such file or directory",
+                ));
+            }
+            let _ = self.fd_table.dup_input(fd, alias_fd);
+            let _ = self.fd_table.dup_output(fd, alias_fd);
+            self.shell_state.env_vars.remove(&fd_closed_key(fd));
+            self.shell_state
+                .env_vars
+                .remove(&fd_output_process_substitution_key(fd));
+            self.shell_state
+                .env_vars
+                .insert(fd_output_key(fd), target.to_string());
+            return Ok(());
+        }
+        // SyntheticLink (rubash#1900): the open goes to the resolved
+        // native target, as the input arms bind it — the pair split
+        // serves `<>`; a directory target fails the pair open, like
+        // GNU's O_RDWR open of a directory fails.
+        if let Some(link) = crate::special_paths::synthetic_link_target(
+            target,
+            Some(&crate::proc_vfs::self_cwd_forms(self.session_cwd())),
+        ) {
+            let (read_file, write_file) =
+                FileFd::open_readwrite_pair(std::path::PathBuf::from(&link.native))?;
+            self.set_fd_input_file(fd, read_file, dynamic);
+            self.fd_table
+                .open_output(fd, FdWriteEndpoint::File(write_file), dynamic);
+            self.shell_state.env_vars.remove(&fd_closed_key(fd));
+            self.shell_state
+                .env_vars
+                .remove(&fd_output_process_substitution_key(fd));
+            self.shell_state
+                .env_vars
+                .insert(fd_output_key(fd), target.to_string());
+            return Ok(());
+        }
         // G-02 session-cwd anchor (rubash#1887): GNU redir.c:725
         // redir_open opens in the shell process, whose only cwd is the
         // shell's cwd; in this port's split model every session open

@@ -102,10 +102,73 @@ impl Executor {
     /// mode 0666 (make_cmd.c:682, consumed by redir.c:702 redir_open), so
     /// probing a missing name CREATES it — the open is part of the
     /// redirection's side effects (rubash#264), not just a check.
+    ///
+    /// The probe asks the registry first (rubash#1935/#1963/#1964):
+    /// the classes with no filesystem file behind the mapped path get
+    /// their own open semantics instead of a raw open of a literal
+    /// path that cannot exist — a net target connects, a closed fd
+    /// alias fails ENOENT (the kernel open of the alias name decides,
+    /// exactly like the input ladder), a synthetic /proc entry opens
+    /// or refuses by its write class, a synthetic link opens its
+    /// resolved target. Only plain filesystem spellings (and the null
+    /// device, whose mapped open is the device) reach the raw open.
+    /// Errors are raw: callers apply posix_errors::path_error.
     pub(in crate::executor) fn probe_input_redirect_readwrite(
         &self,
         target: &str,
     ) -> io::Result<File> {
+        use crate::special_paths::SpecialPathClass;
+        match crate::special_paths::classify_special_path(target) {
+            SpecialPathClass::NetRedirect => return self.open_net_redirect_raw(target),
+            SpecialPathClass::FdAlias(fd) => {
+                if super::redirection::dup_source_fd_open(
+                    &self.fd_table,
+                    fd,
+                    &std::collections::HashMap::new(),
+                ) {
+                    // The alias is open: GNU's open succeeds (a dup of
+                    // the descriptor). The probe's File is dropped by
+                    // every caller, so the null device stands in.
+                    return self.create_redirect_output("/dev/null", true);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "No such file or directory",
+                ));
+            }
+            SpecialPathClass::SyntheticProc => {
+                match crate::special_paths::synthetic_proc_write_allowed(target) {
+                    Some(false) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "Permission denied",
+                        ));
+                    }
+                    Some(true) => return Self::synthetic_proc_write_sink(false),
+                    None => {}
+                }
+            }
+            SpecialPathClass::SyntheticLink => {
+                match crate::special_paths::synthetic_link_target(
+                    target,
+                    Some(&crate::proc_vfs::self_cwd_forms(self.session_cwd())),
+                ) {
+                    Some(link) => {
+                        return OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(&link.native);
+                    }
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "No such file or directory",
+                        ));
+                    }
+                }
+            }
+            SpecialPathClass::NullDevice | SpecialPathClass::Filesystem => {}
+        }
         let path = self.session_path(shell_path_to_windows(target, &self.shell_state.env_vars));
         // niubash#519: CON has no read+write handle (GENERIC_READ|
         // GENERIC_WRITE -> ERROR_INVALID_PARAMETER); the real `<>` bind
@@ -291,6 +354,50 @@ impl Executor {
             let fd = reader.into_raw_fd();
             Ok(unsafe { File::from_raw_fd(fd) })
         }
+    }
+
+    /// rubash#1935: the write side of a 0644-class synthetic /proc
+    /// entry (`/proc/self/status`, `/proc/self/cmdline`). GNU's open
+    /// of the real entry succeeds and only the WRITE fails (EINVAL),
+    /// but no Windows handle reproduces a per-write EINVAL, so writes
+    /// land in a throwaway temp file. That removes the two failure
+    /// shapes this family exists for — ENOENT (no service face at
+    /// all) and a phantom enclave file created at the mapped literal
+    /// path — while keeping the observable contract: the open
+    /// succeeds, and the generated snapshot stays the only read truth
+    /// (on GNU the failed write never alters what a later read of
+    /// the entry serves either). Unique per call: two opens of the
+    /// entry are two open file descriptions. Delete-on-close where
+    /// the platform supports it.
+    pub(in crate::executor) fn synthetic_proc_write_sink(append: bool) -> io::Result<File> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SINK_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SINK_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rubash-proc-sink-{}-{seq}",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        if append {
+            options.append(true);
+        } else {
+            options.truncate(true);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            // FILE_FLAG_DELETE_ON_CLOSE: the sink must not outlive
+            // the descriptor that owns it.
+            options.custom_flags(0x0400_0000);
+        }
+        let file = options.open(&path)?;
+        #[cfg(unix)]
+        {
+            // The descriptor stays valid after the name is unlinked.
+            let _ = std::fs::remove_file(&path);
+        }
+        Ok(file)
     }
 
     fn open_input_redirect_impl(&self, target: &str, consume: bool) -> io::Result<File> {
@@ -636,6 +743,22 @@ impl Executor {
                 "/dev/null",
                 &self.shell_state.env_vars,
             ));
+        }
+        // rubash#1935: synthetic /proc content has no filesystem file
+        // behind the mapped path — without this step `> /proc/...`
+        // either failed ENOENT or created a phantom enclave file at
+        // the literal path. Ask the entry's write class instead: the
+        // 0444 class refuses the open EACCES; the 0644 class accepts
+        // it and the writes are absorbed (see
+        // synthetic_proc_write_sink).
+        if let Some(allowed) = crate::special_paths::synthetic_proc_write_allowed(target) {
+            if !allowed {
+                return Err(crate::posix_errors::path_error(
+                    target,
+                    io::Error::new(io::ErrorKind::PermissionDenied, "Permission denied"),
+                ));
+            }
+            return Self::synthetic_proc_write_sink(false);
         }
         let target = self.redirect_output_path_target(target);
         let path = self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars));

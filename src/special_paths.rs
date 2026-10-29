@@ -192,6 +192,16 @@ pub(crate) fn synthetic_proc_content(target: &str) -> Option<Vec<u8>> {
     crate::proc_vfs::proc_file_content(target)
 }
 
+/// Whether a write-direction open of a synthetic /proc content entry
+/// succeeds on the real procfs entry (rubash#1935): `Some(false)` for
+/// the 0444 class (the open itself fails EACCES), `Some(true)` for
+/// the 0644 per-pid class (the open succeeds; writes fail later),
+/// `None` when `target` is not synthetic content. The simulation
+/// behind the class is Windows-only, like [`synthetic_proc_content`].
+pub(crate) fn synthetic_proc_write_allowed(target: &str) -> Option<bool> {
+    crate::proc_vfs::proc_content_write_allowed(target)
+}
+
 /// The registry's classification query for the synthetic-link class:
 /// whether `target` names a synthetic /proc link entry whose process
 /// is alive. Resolution to the target path is a separate question

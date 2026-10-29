@@ -608,6 +608,42 @@ pub fn proc_unary_facts(_path: &str) -> Option<ProcUnaryFacts> {
     None
 }
 
+/// The write class of a synthetic /proc CONTENT entry (rubash#1935):
+/// `Some(true)` when a write-direction open succeeds on the real
+/// procfs entry, `Some(false)` when it fails at open, `None` when the
+/// path is not synthetic content at all. The classes are the entries'
+/// procfs modes: the top-level generated files are 0444 and have no
+/// write handler, so even root's O_RDWR/O_WRONLY open fails EACCES;
+/// the per-pid content files (status/cmdline) are 0644, so the open
+/// succeeds and only the WRITE fails (EINVAL). Measured against GNU
+/// bash 5.3.20 on real procfs (`exec 3<>/proc/version` → Permission
+/// denied; `exec 3<>/proc/self/status` opens, reads serve, writes
+/// fail EINVAL). Off Windows the generator is a stub and this answers
+/// None — the real procfs serves the path there.
+#[cfg(windows)]
+pub fn proc_content_write_allowed(path: &str) -> Option<bool> {
+    let trimmed = path.trim_end_matches('/');
+    if let Some((pid_ref, tail)) = parse_pid_spelling(trimmed) {
+        if !pid_ref_alive(pid_ref) {
+            return None;
+        }
+        if PID_CONTENT_FILES.contains(&tail) {
+            return Some(true);
+        }
+        return None;
+    }
+    let leaf = trimmed.strip_prefix("/proc/")?;
+    if !leaf.contains('/') && TOP_LEVEL_FILES.contains(&leaf) {
+        return Some(false);
+    }
+    None
+}
+
+#[cfg(not(windows))]
+pub fn proc_content_write_allowed(_path: &str) -> Option<bool> {
+    None
+}
+
 // PEB / RTL_USER_PROCESS_PARAMETERS field offsets for the two strings
 // this module reads. The layouts are pointer-width dependent; a
 // cross-bitness read (64-bit shell, 32-bit target) addresses the

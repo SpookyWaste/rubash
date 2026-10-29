@@ -234,16 +234,13 @@ impl Executor {
                 // `command : <&8' — rubash#258).
                 self.validate_builtin_dup_source(source_fd)?;
             } else if redirect.append {
-                OpenOptions::new()
-                    .create(true)
-                    .read(true)
-                    .write(true)
-                    .open(
-                        self.session_path(shell_path_to_windows(
-                            &target,
-                            &self.shell_state.env_vars,
-                        )),
-                    )
+                // `<> word` on fd 0: the classified probe performs the
+                // one O_RDWR open — registry classes first (net /
+                // fd alias / synthetic /proc by write class), plain
+                // files through the same raw open as before
+                // (rubash#1935/#1963/#1964) — with the same
+                // path_error shaping.
+                self.probe_input_redirect_readwrite(&target)
                     .map_err(|e| crate::posix_errors::path_error(&target, e))?;
             } else {
                 self.probe_input_redirect(&target)?;
@@ -409,15 +406,19 @@ impl Executor {
                 }
                 crate::parser::RedirectKind::ReadWrite => {
                     if !is_closed_redirect_target(&target)
-                        && redirect_target_fd(&target).is_none()
+                        && (redirect_target_fd(&target).is_none()
+                            || crate::special_paths::fd_alias_target(&target).is_some())
                         && !target.starts_with("<(")
                         && !target.starts_with(">(")
                     {
-                        OpenOptions::new()
-                            .create(true)
-                            .read(true)
-                            .write(true)
-                            .open(shell_path_to_windows(&target, &self.shell_state.env_vars))
+                        // The classified probe performs the one
+                        // O_RDWR open — fd-alias spellings included (a
+                        // closed alias fails ENOENT here instead of
+                        // being skipped silently) and synthetic /proc
+                        // entries by their write class
+                        // (rubash#1935/#1963). `&N` dup spellings stay
+                        // excluded: they name no file to open.
+                        self.probe_input_redirect_readwrite(&target)
                             .map_err(|e| crate::posix_errors::path_error(&target, e))?;
                     }
                 }
