@@ -429,6 +429,43 @@ impl Executor {
         if piped_next.is_some_and(command_has_file_redirect) {
             return None;
         }
+        // rubash#1981: admission must verify the whole shape the
+        // produce step can model. heredoc_comsub_produce concatenates
+        // each admitted cat's stdin body and nothing else: it cannot
+        // honor file operands (GNU cat interleaves operand files with
+        // the heredoc in argument order — `cat file <<EOF` prints the
+        // file, `cat - file <<EOF` prints body then file) and it
+        // cannot honor option flags. Every cat the plan can fetch
+        // (the first command and, in the sequence arm, every top-level
+        // command) must therefore carry no operands beyond a sole
+        // bare `-`, cat's name for the stdin the heredoc supplies.
+        // The pipeline arm models at most [cat, sort -u]; a third
+        // stage would be silently dropped, so longer pipelines
+        // decline too. Declining only costs the shortcut — the real
+        // executor produces GNU's output for every declined shape.
+        let cat_operands_admissible = |command: &CommandNode| {
+            if command.words.first().map(String::as_str) != Some("cat") {
+                return true;
+            }
+            let operands = &command.words[1..];
+            operands.is_empty() || (operands.len() == 1 && operands[0] == "-")
+        };
+        if !cat_operands_admissible(first)
+            || ast
+                .commands
+                .iter()
+                .any(|command| !cat_operands_admissible(command))
+        {
+            return None;
+        }
+        if ast
+            .commands
+            .first()
+            .and_then(|command| command.pipeline_command.as_ref())
+            .is_some_and(|pipeline| pipeline.stages.len() > 2)
+        {
+            return None;
+        }
         if emit_warnings && (closed_by_paren || command_has_warned_heredoc(first)) {
             // Deduplicate: the same comsub can be expanded through multiple
             // paths (expand_assignment_value_inner and
