@@ -336,3 +336,48 @@ fn issue1948_touch_date_beats_reference_and_t_conflicts() {
         .contains("touch: cannot specify times from more than one source"));
     assert!(out.stderr.contains("touch: invalid date format 'badstamp'"));
 }
+// ---------------------------------------------------------------- #1946
+
+#[cfg(unix)]
+#[test]
+fn issue1946_no_argument_long_options_reject_attached_values() {
+    let dir = scratch("1946-eq");
+    let out = run_in_dir(
+        &dir,
+        "echo hi > a; cp --recursive=x a b; echo rc=$?; test -e b && echo B-BAD || echo B-ABSENT",
+    );
+    assert_eq!(out.stdout, "rc=1\nB-ABSENT\n");
+    assert_eq!(
+        out.stderr,
+        "cp: option '--recursive' doesn't allow an argument\nTry 'cp --help' for more information.\n"
+    );
+
+    let out = run_in_dir(
+        &dir,
+        "touch --no-create=x f; echo rc=$?; test -e f && echo F-BAD || echo F-ABSENT",
+    );
+    assert_eq!(out.stdout, "rc=1\nF-ABSENT\n");
+    assert_eq!(
+        out.stderr,
+        "touch: option '--no-create' doesn't allow an argument\nTry 'touch --help' for more information.\n"
+    );
+
+    let out = run_in_dir(
+        &dir,
+        "echo hi > a; rm --force=x a; echo rc=$?; test -e a && echo A-KEPT",
+    );
+    assert_eq!(out.stdout, "rc=1\nA-KEPT\n");
+    assert_eq!(
+        out.stderr,
+        "rm: option '--force' doesn't allow an argument\nTry 'rm --help' for more information.\n"
+    );
+
+    // An abbreviated spelling still reports the canonical name.
+    let out = run_in_dir(&dir, "touch --no-c=x f; echo rc=$?");
+    assert_eq!(out.stdout, "rc=1\n");
+    assert_eq!(
+        out.stderr,
+        "touch: option '--no-create' doesn't allow an argument\nTry 'touch --help' for more information.\n"
+    );
+}
+

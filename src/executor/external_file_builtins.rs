@@ -1594,23 +1594,62 @@ impl Executor {
                 continue;
             }
             if let Some(long) = expanded.strip_prefix("--") {
-                let (name, value) = match long.split_once('=') {
+                let (typed, attached) = match long.split_once('=') {
                     Some((name, value)) => (name, Some(value)),
                     None => (long, None),
                 };
-                match name {
+                let entry = match resolve_long_option(typed, RM_LONG_OPTIONS) {
+                    LongResolution::Matched(entry) => entry,
+                    LongResolution::Abbreviated(entry) => {
+                        // `rm: you may not abbreviate the
+                        // --no-preserve-root option` — bare, no Try
+                        // line (coreutils 9.4, measured).
+                        writeln!(
+                            stderr,
+                            "rm: you may not abbreviate the --{} option",
+                            entry.name
+                        )?;
+                        self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                        self.exit_code = 1;
+                        return Ok(true);
+                    }
+                    LongResolution::Unknown => {
+                        diag_unrecognized_option(&mut stderr, "rm", expanded);
+                        self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                        self.exit_code = 1;
+                        return Ok(true);
+                    }
+                    LongResolution::Ambiguous(candidates) => {
+                        diag_ambiguous_option(&mut stderr, "rm", expanded, &candidates);
+                        self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                        self.exit_code = 1;
+                        return Ok(true);
+                    }
+                };
+                // rubash#1946: a no-argument option given `=value`
+                // (--preserve-root is Optional-arg, exempt here; its
+                // value carries its own diagnostic below).
+                if entry.arg == LongArg::NoArg && attached.is_some() {
+                    diag_option_no_argument_allowed(&mut stderr, "rm", entry.name);
+                    self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                    self.exit_code = 1;
+                    return Ok(true);
+                }
+                match entry.name {
                     // The real binary owns these two texts.
                     "help" | "version" => return Ok(false),
                     "force" => force = true,
                     "recursive" => recursive = true,
                     "dir" => remove_empty_dir = true,
                     "verbose" => verbose = true,
-                    "interactive" | "one-file-system" => {}
+                    // Decline-disposition (rm_declines routed the
+                    // invocation); defensive fallback.
+                    "interactive" | "one-file-system" => return Ok(false),
                     // getopt_long declares --preserve-root with an
                     // optional argument whose only accepted value is
                     // `all`; any other attached value is its own
                     // diagnostic with no Try line (coreutils 9.4).
-                    "preserve-root" => match value {
+                    "preserve-root" => match attached {
                         None | Some("all") => preserve_root = true,
                         Some(other_value) => {
                             writeln!(
@@ -1622,28 +1661,8 @@ impl Executor {
                             return Ok(true);
                         }
                     },
-                    "no-preserve-root" => match value {
-                        None => preserve_root = false,
-                        Some(_) => {
-                            writeln!(
-                                stderr,
-                                "rm: option '--no-preserve-root' doesn't allow an argument"
-                            )?;
-                            writeln!(stderr, "Try 'rm --help' for more information.")?;
-                            self.write_buffered_builtin_output(cmd, &[], &stderr)?;
-                            self.exit_code = 1;
-                            return Ok(true);
-                        }
-                    },
-                    _ => {
-                        // glibc getopt_long reports the whole word,
-                        // an attached `=value` included.
-                        writeln!(stderr, "rm: unrecognized option '--{long}'")?;
-                        writeln!(stderr, "Try 'rm --help' for more information.")?;
-                        self.write_buffered_builtin_output(cmd, &[], &stderr)?;
-                        self.exit_code = 1;
-                        return Ok(true);
-                    }
+                    "no-preserve-root" => preserve_root = false,
+                    _ => unreachable!("the resolver only returns table names"),
                 }
                 continue;
             }
@@ -2526,9 +2545,11 @@ fn rm_declines(words: &[String]) -> bool {
             continue;
         }
         if let Some(long) = arg.strip_prefix("--") {
-            let name = long.split('=').next().unwrap_or(long);
-            if matches!(name, "interactive" | "one-file-system") {
-                return true;
+            let typed = long.split('=').next().unwrap_or(long);
+            if let LongResolution::Matched(entry) = resolve_long_option(typed, RM_LONG_OPTIONS) {
+                if matches!(entry.name, "interactive" | "one-file-system") {
+                    return true;
+                }
             }
             continue;
         }
