@@ -1,0 +1,219 @@
+//! Regression pins for the simulation-layer option-discipline batch
+//! (rubash#1941, #1942, #1943, #1944, #1945, #1946, #1947, #1948):
+//! the emulated coreutils applets in
+//! `src/executor/external_file_builtins.rs` resolve long options the
+//! gnulib getopt_long way (exact match or unambiguous prefix,
+//! argmatch for option values) and print the coreutils 9.4
+//! diagnostics byte-for-byte. Every expectation below was measured
+//! against the local GNU coreutils 9.4 oracle.
+//!
+//! Semantic rows run with the real system PATH: the emulation
+//! answers in-process, so the observed diagnostics and file effects
+//! are the emulation's own. The mkfifo rows are Windows-gated: off
+//! Windows mkfifo declines to the real binary (rubash#1725), so only
+//! the Windows arm can pin rubash#1945.
+
+#[cfg(any(unix, windows))]
+use std::path::{Path, PathBuf};
+#[cfg(any(unix, windows))]
+use std::process::{Command, Stdio};
+
+#[cfg(any(unix, windows))]
+fn shell_bin() -> PathBuf {
+    if let Some(path) = option_env!("CARGO_BIN_EXE_rubash") {
+        return PathBuf::from(path);
+    }
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(profile)
+        .join(if cfg!(windows) {
+            "rubash.exe"
+        } else {
+            "rubash"
+        })
+}
+
+#[cfg(any(unix, windows))]
+struct Output {
+    status: i32,
+    stdout: String,
+    stderr: String,
+}
+
+#[cfg(any(unix, windows))]
+fn run_in_dir(dir: &Path, script: &str) -> Output {
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let output = Command::new(shell_bin())
+        .args(["-c", script])
+        .current_dir(dir)
+        .env("PATH", path_env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run rubash");
+    Output {
+        status: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).replace('\r', ""),
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn scratch(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("rubash-opts-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    dir
+}
+
+// ---------------------------------------------------------------- #1941
+
+#[cfg(unix)]
+#[test]
+fn issue1941_cp_preserve_invalid_attribute_diagnoses_and_creates_nothing() {
+    let dir = scratch("1941-bogus");
+    let out = run_in_dir(
+        &dir,
+        "echo hi > a; cp --preserve=bogus a b; echo rc=$?; test -e b && echo B-EXISTS || echo B-ABSENT",
+    );
+    assert_eq!(out.stdout, "rc=1\nB-ABSENT\n");
+    assert_eq!(
+        out.stderr,
+        "cp: invalid argument 'bogus' for '--preserve'\n\
+         Valid arguments are:\n\
+         \x20 - 'mode'\n\
+         \x20 - 'timestamps'\n\
+         \x20 - 'ownership'\n\
+         \x20 - 'links'\n\
+         \x20 - 'context'\n\
+         \x20 - 'xattr'\n\
+         \x20 - 'all'\n\
+         Try 'cp --help' for more information.\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn issue1941_cp_preserve_empty_element_is_ambiguous() {
+    let dir = scratch("1941-empty");
+    let out = run_in_dir(&dir, "echo hi > a; cp --preserve= a b; echo rc=$?");
+    assert_eq!(out.stdout, "rc=1\n");
+    assert!(out
+        .stderr
+        .starts_with("cp: ambiguous argument '' for '--preserve'\nValid arguments are:\n"));
+}
+
+#[cfg(unix)]
+#[test]
+fn issue1941_cp_no_preserve_invalid_attribute_names_the_option() {
+    let dir = scratch("1941-nopreserve");
+    let out = run_in_dir(&dir, "echo hi > a; cp --no-preserve=bogus a b; echo rc=$?");
+    assert_eq!(out.stdout, "rc=1\n");
+    assert!(out
+        .stderr
+        .starts_with("cp: invalid argument 'bogus' for '--no-preserve'\n"));
+}
+
+#[cfg(unix)]
+#[test]
+fn issue1941_cp_preserve_links_keeps_hard_links_linked() {
+    let dir = scratch("1941-links");
+    let out = run_in_dir(
+        &dir,
+        "mkdir -p src/sub; echo data > src/f1; ln src/f1 src/f2; ln src/f1 src/sub/f3; \
+         echo solo > src/sub/solo; cp -r --preserve=links src dst; \
+         a=$(stat -c %i dst/f1); b=$(stat -c %i dst/f2); c=$(stat -c %i dst/sub/f3); \
+         s=$(stat -c %i dst/sub/solo); \
+         if [ \"$a\" = \"$b\" ] && [ \"$a\" = \"$c\" ] && [ \"$a\" != \"$s\" ]; then echo LINKS-OK; else echo LINKS-BAD; fi",
+    );
+    assert_eq!(out.stdout, "LINKS-OK\n");
+    assert_eq!(out.stderr, "");
+}
+
+#[cfg(unix)]
+#[test]
+fn issue1941_cp_preserve_links_across_plain_operands() {
+    let dir = scratch("1941-links-plain");
+    let out = run_in_dir(
+        &dir,
+        "mkdir s2 dd; echo x > s2/g1; ln s2/g1 s2/g2; cp --preserve=links s2/g1 s2/g2 dd/; \
+         a=$(stat -c %i dd/g1); b=$(stat -c %i dd/g2); \
+         if [ \"$a\" = \"$b\" ]; then echo LINKS-OK; else echo LINKS-BAD; fi",
+    );
+    assert_eq!(out.stdout, "LINKS-OK\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn issue1941_cp_preserve_abbreviated_values_and_mode_apply() {
+    let dir = scratch("1941-abbrev");
+    let out = run_in_dir(
+        &dir,
+        "echo hi > a; chmod 640 a; cp --preserve=mod,timestamps a b; echo rc=$?; stat -c %a b",
+    );
+    assert_eq!(out.stdout, "rc=0\n640\n");
+}
+
+// ---------------------------------------------------------------- #1942
+
+#[cfg(unix)]
+#[test]
+fn issue1942_cp_unknown_long_option_reports_whole_word() {
+    let dir = scratch("1942-unknown");
+    let out = run_in_dir(&dir, "echo hi > a; cp --bogus a b; echo rc=$?");
+    assert_eq!(out.stdout, "rc=1\n");
+    assert_eq!(
+        out.stderr,
+        "cp: unrecognized option '--bogus'\nTry 'cp --help' for more information.\n"
+    );
+    let out = run_in_dir(&dir, "cp --bogus=1 a b; echo rc=$?");
+    assert_eq!(out.stdout, "rc=1\n");
+    assert_eq!(
+        out.stderr,
+        "cp: unrecognized option '--bogus=1'\nTry 'cp --help' for more information.\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn issue1942_cp_unambiguous_abbreviations_are_accepted() {
+    let dir = scratch("1942-abbrev");
+    let out = run_in_dir(
+        &dir,
+        "echo hi > a; mkdir d1; cp --rec a d1; echo rc=$?; test -f d1/a && echo COPIED",
+    );
+    assert_eq!(out.stdout, "rc=0\nCOPIED\n");
+    assert_eq!(out.stderr, "");
+}
+
+#[cfg(unix)]
+#[test]
+fn issue1942_cp_ambiguous_prefix_lists_candidates_in_table_order() {
+    let dir = scratch("1942-ambiguous");
+    let out = run_in_dir(&dir, "echo hi > a; cp --re a b; echo rc=$?");
+    assert_eq!(out.stdout, "rc=1\n");
+    assert_eq!(
+        out.stderr,
+        "cp: option '--re' is ambiguous; possibilities: '--recursive' '--remove-destination' '--reflink'\n\
+         Try 'cp --help' for more information.\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn issue1942_cp_unknown_short_option_carries_try_line() {
+    let dir = scratch("1942-short");
+    let out = run_in_dir(&dir, "echo hi > a; cp -Q a b; echo rc=$?");
+    assert_eq!(out.stdout, "rc=1\n");
+    assert_eq!(
+        out.stderr,
+        "cp: invalid option -- 'Q'\nTry 'cp --help' for more information.\n"
+    );
+}
+

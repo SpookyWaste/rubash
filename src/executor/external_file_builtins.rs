@@ -870,20 +870,22 @@ impl Executor {
         // -u/--update copies only when the source is newer or the destination
         // is absent, --remove-destination unlinks the destination first, and
         // -t/--target-directory routes every operand into one directory.
-        // -p/--preserve keeps the source's mode and timestamps on the
+        // -p/--preserve keeps the source's attributes on the
         // destination (niubash#533: the flags used to parse as no-ops, so
         // the destination always took the copy time); -a/--archive is
-        // -dR --preserve=all, so it preserves too. Ownership from the
-        // preserve list is parsed but not actionable (an unprivileged GNU
-        // cp skips it silently as well).
+        // -dR --preserve=all, so it preserves too. The preserve list is
+        // validated through argmatch and every attribute is actionable
+        // (rubash#1941): mode/timestamps are stamped, links keeps hard
+        // links linked, xattr/context copy through the unix attribute
+        // store; ownership alone parses and is skipped, matching what
+        // an unprivileged GNU cp can actually honor.
         // Formerly "tolerated but unimplemented" shapes (-f, -l, -s,
         // -d/-P, --parents, --backup, -S/--suffix) are no longer
         // tolerated: cp_declines turns them away above, since the
         // emulation does not implement them; the no-op arms in the
         // parse below remain only as a defensive fallback.
         let mut recursive = false;
-        let mut preserve_mode = false;
-        let mut preserve_times = false;
+        let mut preserve = CpPreserve::default();
         let mut no_clobber = false;
         let mut interactive = false;
         let mut verbose = false;
@@ -920,58 +922,148 @@ impl Executor {
                 continue;
             }
             if let Some(rest) = expanded.strip_prefix("--") {
-                let (name, value) = match rest.split_once('=') {
-                    Some((name, value)) => (name, Some(value.to_string())),
+                let (typed, attached) = match rest.split_once('=') {
+                    Some((name, value)) => (name, Some(value)),
                     None => (rest, None),
                 };
-                match name {
-                    "recursive" => recursive = true,
-                    "archive" => {
-                        recursive = true;
-                        preserve_mode = true;
-                        preserve_times = true;
-                    }
-                    "no-clobber" => no_clobber = true,
-                    "interactive" => interactive = true,
-                    "verbose" => verbose = true,
-                    "preserve" => cp_apply_preserve_list(
-                        value.as_deref(),
-                        &mut preserve_mode,
-                        &mut preserve_times,
-                        true,
-                    ),
-                    "no-preserve" => cp_apply_preserve_list(
-                        value.as_deref(),
-                        &mut preserve_mode,
-                        &mut preserve_times,
-                        false,
-                    ),
-                    "update" => update_only = true,
-                    "remove-destination" => remove_dest = true,
-                    "force" | "link" | "symbolic-link" | "parents" | "backup"
-                    | "no-dereference" | "suffix" | "context" => {}
-                    "target-directory" | "target-dir" => {
-                        // The -t/--target-directory value is argv too: take
-                        // it as-is (issue #555).
-                        target_dir = value.or_else(|| words.next().map(|next| next.clone()));
-                    }
-                    "help" => {
-                        let _ = writeln!(stderr, "{}", cp_usage_text());
-                        self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
-                        self.exit_code = 0;
-                        return Ok(true);
-                    }
-                    other => {
-                        let _ = writeln!(stderr, "cp: unknown option '--{}'", other);
+                let entry = match resolve_long_option(typed, CP_LONG_OPTIONS) {
+                    LongResolution::Matched(entry) => entry,
+                    // No cp table entry is no_abbrev.
+                    LongResolution::Abbreviated(entry) => entry,
+                    LongResolution::Unknown => {
+                        diag_unrecognized_option(&mut stderr, "cp", expanded);
                         self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
                         self.exit_code = 1;
                         return Ok(true);
                     }
+                    LongResolution::Ambiguous(candidates) => {
+                        diag_ambiguous_option(&mut stderr, "cp", expanded, &candidates);
+                        self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+                        self.exit_code = 1;
+                        return Ok(true);
+                    }
+                };
+                // rubash#1946: a no-argument option given `=value`
+                // is a getopt error, reported under the canonical
+                // name even when an abbreviation was typed.
+                if entry.arg == LongArg::NoArg && attached.is_some() {
+                    diag_option_no_argument_allowed(&mut stderr, "cp", entry.name);
+                    self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+                    self.exit_code = 1;
+                    return Ok(true);
+                }
+                match entry.name {
+                    "recursive" => recursive = true,
+                    "archive" => {
+                        // -a is -dR --preserve=all (the -d leg
+                        // declines; the preserve leg is all five).
+                        recursive = true;
+                        preserve.set_all(true);
+                    }
+                    "no-clobber" => no_clobber = true,
+                    "interactive" => interactive = true,
+                    "verbose" => verbose = true,
+                    // The emulation always follows links, so these
+                    // two are honest no-ops.
+                    "dereference" | "logical" => {}
+                    "preserve" | "no-preserve" => {
+                        // --preserve's list is optional and never
+                        // consumes the next word; --no-preserve's
+                        // list is required (attached or next word).
+                        let list = if entry.arg == LongArg::Required {
+                            match attached.or_else(|| words.next().map(|next| next.as_str())) {
+                                Some(value) => Some(value),
+                                None => {
+                                    diag_option_requires_argument(&mut stderr, "cp", entry.name);
+                                    self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+                                    self.exit_code = 1;
+                                    return Ok(true);
+                                }
+                            }
+                        } else {
+                            attached
+                        };
+                        // rubash#1941: the list is validated through
+                        // argmatch — an unknown or ambiguous element
+                        // is the measured diagnostic, never a silent
+                        // drop.
+                        if let Err(bad) =
+                            cp_apply_preserve_list(list, &mut preserve, entry.name == "preserve")
+                        {
+                            diag_invalid_value(
+                                &mut stderr,
+                                "cp",
+                                entry.name,
+                                &bad.text,
+                                bad.ambiguous,
+                                CP_PRESERVE_VALID_LINES,
+                            );
+                            self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+                            self.exit_code = 1;
+                            return Ok(true);
+                        }
+                    }
+                    "update" => match attached {
+                        None => update_only = true,
+                        Some(text) => match argmatch(text, CP_UPDATE_VALUES) {
+                            ArgMatch::Matched("older", _) => update_only = true,
+                            // all/none are decline-disposition
+                            // (cp_declines routed them); defensive.
+                            ArgMatch::Matched(_, _) => return Ok(false),
+                            ArgMatch::Invalid => {
+                                diag_invalid_value(
+                                    &mut stderr,
+                                    "cp",
+                                    "update",
+                                    text,
+                                    false,
+                                    CP_UPDATE_VALID_LINES,
+                                );
+                                self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+                                self.exit_code = 1;
+                                return Ok(true);
+                            }
+                            ArgMatch::Ambiguous => {
+                                diag_invalid_value(
+                                    &mut stderr,
+                                    "cp",
+                                    "update",
+                                    text,
+                                    true,
+                                    CP_UPDATE_VALID_LINES,
+                                );
+                                self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+                                self.exit_code = 1;
+                                return Ok(true);
+                            }
+                        },
+                    },
+                    "remove-destination" => remove_dest = true,
+                    "target-directory" => {
+                        // The -t/--target-directory value is argv too: take
+                        // it as-is (issue #555).
+                        match attached.or_else(|| words.next().map(|next| next.as_str())) {
+                            Some(value) => target_dir = Some(value.to_string()),
+                            None => {
+                                diag_option_requires_argument(&mut stderr, "cp", entry.name);
+                                self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+                                self.exit_code = 1;
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    // Every remaining table entry is
+                    // decline-disposition (cp_long_option_declines):
+                    // cp_declines already routed the invocation, and
+                    // this fallback keeps the handler from answering
+                    // a shape it does not implement.
+                    _ => return Ok(false),
                 }
                 continue;
             }
-            // Short option cluster such as -upv; -t and -S take the next
-            // word as their value.
+            // Short option cluster such as -upv; -t and -S take a
+            // value: the rest of the cluster when attached, else the
+            // next word.
             let chars: Vec<char> = expanded[1..].chars().collect();
             let mut index = 0;
             while index < chars.len() {
@@ -979,29 +1071,49 @@ impl Executor {
                     'r' | 'R' => recursive = true,
                     'a' => {
                         recursive = true;
-                        preserve_mode = true;
-                        preserve_times = true;
+                        preserve.set_all(true);
                     }
                     'n' => no_clobber = true,
                     'i' => interactive = true,
                     'v' => verbose = true,
                     'p' => {
-                        preserve_mode = true;
-                        preserve_times = true;
+                        preserve.mode = true;
+                        preserve.times = true;
                     }
                     'u' => update_only = true,
-                    'f' | 'l' | 's' | 'd' | 'P' | 'Z' => {}
+                    // The emulation always follows links (-L is its
+                    // native behavior, an honest no-op).
+                    'L' => {}
+                    // Decline-disposition letters (cp_declines
+                    // routed the invocation); defensive fallback.
+                    'f' | 'l' | 's' | 'd' | 'P' | 'Z' | 'T' => return Ok(false),
                     't' => {
                         // The -t value is argv too: take it as-is (issue #555).
-                        target_dir = words.next().map(|next| next.clone());
+                        if index + 1 < chars.len() {
+                            target_dir = Some(chars[index + 1..].iter().collect());
+                        } else {
+                            match words.next() {
+                                Some(next) => target_dir = Some(next.clone()),
+                                None => {
+                                    diag_short_option_requires_argument(&mut stderr, "cp", 't');
+                                    self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+                                    self.exit_code = 1;
+                                    return Ok(true);
+                                }
+                            }
+                        }
                         break;
                     }
                     'S' => {
-                        words.next();
+                        // Decline-disposition; skip its value
+                        // defensively (rest of cluster or next word).
+                        if index + 1 == chars.len() {
+                            words.next();
+                        }
                         break;
                     }
                     other => {
-                        let _ = writeln!(stderr, "cp: invalid option -- '{}'", other);
+                        diag_invalid_short_option(&mut stderr, "cp", other);
                         self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
                         self.exit_code = 1;
                         return Ok(true);
@@ -1089,6 +1201,10 @@ impl Executor {
             return Ok(true);
         }
 
+        // rubash#1941: --preserve=links bookkeeping for this whole
+        // invocation — the first destination each source inode was
+        // copied to, so a repeat lands as a hard link to it.
+        let mut link_map: CpLinkMap = std::collections::HashMap::new();
         let mut status = 0;
         for source_word in &effective[..effective.len() - 1] {
             // /dev/null as a source reads as an empty stream, so the copy
@@ -1313,21 +1429,24 @@ impl Executor {
                 }
 
                 let result = if source.is_dir() {
-                    cp_copy_tree(&source, &target, 0, preserve_mode, preserve_times)
+                    cp_copy_tree(&source, &target, 0, preserve, &mut link_map)
                 } else {
-                    fs::copy(&source, &target).map(|_| ())
+                    cp_copy_file(&source, &target, preserve, &mut link_map)
                 };
                 match result {
                     Ok(_) => {
-                        if preserve_mode || preserve_times {
+                        if preserve.mode || preserve.times {
                             // Tree copies apply preservation per node
                             // inside cp_copy_tree; a plain file copy is
                             // stamped here (niubash#533).
                             if !source.is_dir() {
-                                cp_apply_preserved(&source, &target, preserve_mode, preserve_times);
+                                cp_apply_preserved(&source, &target, preserve.mode, preserve.times);
                             }
                         } else if !source.is_dir() {
                             cp_set_modified_now(&target);
+                        }
+                        if !source.is_dir() {
+                            cp_apply_preserved_attributes(&source, &target, preserve);
                         }
                         if verbose {
                             let _ = writeln!(
@@ -2463,19 +2582,37 @@ fn cp_declines(words: &[String]) -> bool {
             continue;
         }
         if let Some(rest) = arg.strip_prefix("--") {
-            let (name, value) = match rest.split_once('=') {
+            let (typed, value) = match rest.split_once('=') {
                 Some((name, value)) => (name, Some(value)),
                 None => (rest, None),
             };
-            match name {
-                "link" | "symbolic-link" | "parents" | "backup" | "context" | "force" | "help"
-                | "version" | "no-dereference" | "suffix" => return true,
+            let entry = match resolve_long_option(typed, CP_LONG_OPTIONS) {
+                LongResolution::Matched(entry) => entry,
+                // Unknown and ambiguous words are the handler's to
+                // diagnose (GNU diagnoses them too); a decline is
+                // only for shapes GNU accepts but the emulation does
+                // not implement.
+                _ => continue,
+            };
+            if cp_long_option_declines(entry.name) {
+                return true;
+            }
+            match entry.name {
                 "update" => {
-                    if !matches!(value, None | Some("older")) {
-                        return true;
+                    // Only the implemented `older` semantics stay
+                    // (a bare --update is `older` on the oracle);
+                    // all/none decline, and an unresolvable value
+                    // declines so the real binary prints the argmatch
+                    // diagnostic.
+                    match value {
+                        None => {}
+                        Some(text) => match argmatch(text, CP_UPDATE_VALUES) {
+                            ArgMatch::Matched("older", _) => {}
+                            _ => return true,
+                        },
                     }
                 }
-                "target-directory" | "target-dir" => {
+                "target-directory" => {
                     if value.is_none() {
                         index += 1;
                     }
@@ -2484,31 +2621,28 @@ fn cp_declines(words: &[String]) -> bool {
             }
             continue;
         }
-        for ch in arg[1..].chars() {
-            match ch {
-                'l' | 's' | 'd' | 'P' | 'Z' | 'f' | 'S' => return true,
+        let chars: Vec<char> = arg[1..].chars().collect();
+        let mut position = 0;
+        while position < chars.len() {
+            match chars[position] {
+                'l' | 's' | 'd' | 'P' | 'Z' | 'f' | 'S' | 'T' => return true,
                 't' => {
-                    // The handler takes the next word as -t's value.
-                    index += 1;
+                    // -t takes the rest of the cluster as its value,
+                    // or the next word when it ends the cluster.
+                    if position + 1 == chars.len() {
+                        index += 1;
+                    }
                     break;
                 }
                 _ => {}
             }
+            position += 1;
         }
     }
     false
 }
 
 /// cp's help text, scoped to the forms this implementation honours.
-fn cp_usage_text() -> &'static str {
-    "Usage: cp [OPTION]... SOURCE DEST\n\n\
-     Copy SOURCE to DEST, or multiple SOURCES to DIRECTORY.\n\n\
-     Supported: -a -d -f -i -l -n -P -p -R -r -s -u -v --archive --backup\
-       --force --help --interactive --link --no-clobber --no-dereference\
-       --parents --preserve[=ATTR_LIST] --remove-destination --recursive\
-       --suffix=SUFFIX --symbolic-link --target-directory=DIR\
-       --target-dir=DIR --update\n"
-}
 
 /// Whether an rm operand's target IS the root directory, for the
 /// preserve-root failsafe (rubash#1847). A bare symlink operand
@@ -2676,6 +2810,63 @@ fn cp_source_not_newer(source: &std::path::Path, target: &std::path::Path) -> bo
     }
 }
 
+/// Per-invocation --preserve=links bookkeeping: source inode
+/// identity → the first destination it was copied to.
+type CpLinkMap = std::collections::HashMap<(u64, u64), std::path::PathBuf>;
+
+/// The identity two names of one file share: (device, inode) on
+/// unix, (volume serial, file index) on Windows. None where the
+/// platform exposes neither (links preservation then degrades to
+/// plain copies).
+#[cfg(unix)]
+fn cp_inode_key(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn cp_inode_key(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::windows::fs::MetadataExt;
+    Some((
+        u64::from(metadata.volume_serial_number()?),
+        metadata.file_index()?,
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn cp_inode_key(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+/// Copy one regular file, honoring --preserve=links: a source inode
+/// already copied in this invocation links the new destination to
+/// the first copy instead of duplicating the bytes (the two
+/// destinations then share an inode, mode and times included —
+/// exactly GNU's result).
+fn cp_copy_file(
+    source: &std::path::Path,
+    target: &std::path::Path,
+    preserve: CpPreserve,
+    link_map: &mut CpLinkMap,
+) -> io::Result<()> {
+    if preserve.links {
+        if let Some(key) = fs::metadata(source)
+            .ok()
+            .and_then(|metadata| cp_inode_key(&metadata))
+        {
+            if let Some(first) = link_map.get(&key) {
+                return fs::hard_link(first, target);
+            }
+            let copied = fs::copy(source, target).map(|_| ());
+            if copied.is_ok() {
+                link_map.insert(key, target.to_path_buf());
+            }
+            return copied;
+        }
+    }
+    fs::copy(source, target).map(|_| ())
+}
+
 /// cp -r: directories are created and walked in sorted entry order so the
 /// result is deterministic. Symlinks are followed, which is cp's default
 /// (without -d); the depth cap turns a link cycle into an error instead of
@@ -2684,8 +2875,8 @@ fn cp_copy_tree(
     source: &std::path::Path,
     target: &std::path::Path,
     depth: usize,
-    preserve_mode: bool,
-    preserve_times: bool,
+    preserve: CpPreserve,
+    link_map: &mut CpLinkMap,
 ) -> io::Result<()> {
     if depth > 40 {
         return Err(io::Error::new(
@@ -2699,8 +2890,8 @@ fn cp_copy_tree(
             &fs::canonicalize(source)?,
             target,
             depth + 1,
-            preserve_mode,
-            preserve_times,
+            preserve,
+            link_map,
         );
     }
     if metadata.is_dir() {
@@ -2712,44 +2903,165 @@ fn cp_copy_tree(
                 entry.path().as_path(),
                 &target.join(entry.file_name()),
                 depth + 1,
-                preserve_mode,
-                preserve_times,
+                preserve,
+                link_map,
             )?;
         }
         // GNU sets a copied directory's preserved attributes only after
         // its contents land, so child writes cannot clobber them.
-        if preserve_mode || preserve_times {
-            cp_apply_preserved(source, target, preserve_mode, preserve_times);
+        if preserve.mode || preserve.times {
+            cp_apply_preserved(source, target, preserve.mode, preserve.times);
         }
+        cp_apply_preserved_attributes(source, target, preserve);
         return Ok(());
     }
-    fs::copy(source, target)?;
-    if preserve_mode || preserve_times {
-        cp_apply_preserved(source, target, preserve_mode, preserve_times);
+    cp_copy_file(source, target, preserve, link_map)?;
+    if preserve.mode || preserve.times {
+        cp_apply_preserved(source, target, preserve.mode, preserve.times);
     }
+    cp_apply_preserved_attributes(source, target, preserve);
     Ok(())
 }
 
 /// One `--preserve`/`--no-preserve` attribute list (coreutils cp.c:
-/// the bare option means the default list mode,ownership,timestamps;
-/// `all` names every attribute). Only mode and timestamps are actionable
-/// in this emulation; ownership/links/context/xattr parse and are
-/// skipped, matching what an unprivileged GNU cp can actually honor.
-fn cp_apply_preserve_list(list: Option<&str>, mode: &mut bool, times: &mut bool, value: bool) {
+/// the bare --preserve means the default list
+/// mode,ownership,timestamps; `all` names every attribute). Each
+/// element resolves through argmatch — an element naming no
+/// attribute, or an ambiguous prefix (the empty element above all),
+/// is an error the caller reports with the measured diagnostic
+/// (rubash#1941); nothing is silently dropped. Elements are NOT
+/// trimmed (GNU's argmatch sees the space: `--preserve='mode,
+/// timestamps'` fails on ' timestamps').
+fn cp_apply_preserve_list(
+    list: Option<&str>,
+    preserve: &mut CpPreserve,
+    value: bool,
+) -> Result<(), CpBadAttribute> {
     let Some(list) = list else {
-        *mode = value;
-        *times = value;
-        return;
+        preserve.mode = value;
+        preserve.times = value;
+        return Ok(());
     };
     for attr in list.split(',') {
-        match attr.trim() {
-            "mode" => *mode = value,
-            "timestamps" => *times = value,
-            "all" => {
-                *mode = value;
-                *times = value;
+        match argmatch(attr, CP_PRESERVE_VALUES) {
+            ArgMatch::Matched(name, _) => match name {
+                "mode" => preserve.mode = value,
+                "timestamps" => preserve.times = value,
+                "links" => preserve.links = value,
+                "context" => preserve.context = value,
+                "xattr" => preserve.xattr = value,
+                // Ownership parses; an unprivileged GNU cp cannot
+                // honor it either and skips it silently.
+                "ownership" => {}
+                "all" => preserve.set_all(value),
+                _ => unreachable!("argmatch only returns table names"),
+            },
+            ArgMatch::Invalid => {
+                return Err(CpBadAttribute {
+                    text: attr.to_string(),
+                    ambiguous: false,
+                });
             }
-            _ => {}
+            ArgMatch::Ambiguous => {
+                return Err(CpBadAttribute {
+                    text: attr.to_string(),
+                    ambiguous: true,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The xattr/context half of --preserve (rubash#1941): on unix the
+/// attributes copy through the platform xattr store; Windows has no
+/// xattr namespace and no SELinux context, so the flags are accepted
+/// no-ops there (there is no GNU cp for Windows to diverge from).
+fn cp_apply_preserved_attributes(
+    source: &std::path::Path,
+    target: &std::path::Path,
+    preserve: CpPreserve,
+) {
+    #[cfg(unix)]
+    {
+        if preserve.xattr {
+            cp_copy_xattrs(source, target, false);
+        }
+        if preserve.context {
+            cp_copy_xattrs(source, target, true);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (source, target, preserve);
+    }
+}
+
+/// Best-effort xattr copy (the same stance cp_apply_preserved takes
+/// for mode/times: preservation failures do not fail the copy). With
+/// CONTEXT_ONLY, only the SELinux context attribute moves — that is
+/// what --preserve=context amounts to (lgetfilecon/lsetfilecon);
+/// otherwise every listed attribute moves, security.selinux
+/// included, as gnulib's xattr_copy does.
+#[cfg(unix)]
+fn cp_copy_xattrs(source: &std::path::Path, target: &std::path::Path, context_only: bool) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(source_c) = CString::new(source.as_os_str().as_bytes()) else {
+        return;
+    };
+    let Ok(target_c) = CString::new(target.as_os_str().as_bytes()) else {
+        return;
+    };
+    let size = unsafe { libc::listxattr(source_c.as_ptr(), std::ptr::null_mut(), 0) };
+    if size <= 0 {
+        return;
+    }
+    let mut names = vec![0u8; size as usize];
+    let size = unsafe {
+        libc::listxattr(
+            source_c.as_ptr(),
+            names.as_mut_ptr() as *mut libc::c_char,
+            names.len(),
+        )
+    };
+    if size <= 0 {
+        return;
+    }
+    names.truncate(size as usize);
+    for name in names.split(|byte| *byte == 0) {
+        if name.is_empty() || (context_only && name != b"security.selinux") {
+            continue;
+        }
+        let Ok(name_c) = CString::new(name) else {
+            continue;
+        };
+        let value_size =
+            unsafe { libc::getxattr(source_c.as_ptr(), name_c.as_ptr(), std::ptr::null_mut(), 0) };
+        if value_size < 0 {
+            continue;
+        }
+        let mut value = vec![0u8; value_size as usize];
+        let got = unsafe {
+            libc::getxattr(
+                source_c.as_ptr(),
+                name_c.as_ptr(),
+                value.as_mut_ptr() as *mut libc::c_void,
+                value.len(),
+            )
+        };
+        if got < 0 {
+            continue;
+        }
+        value.truncate(got as usize);
+        unsafe {
+            libc::setxattr(
+                target_c.as_ptr(),
+                name_c.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                0,
+            );
         }
     }
 }
