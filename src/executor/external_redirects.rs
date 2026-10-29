@@ -613,11 +613,11 @@ impl Executor {
             // The append open error must carry the target word like every
             // other redirect diagnostic (redir.c:149-176 redirection_error,
             // issue #518): a bare OS error renders message-only and drops
-            // `$FIX/b` from `$FIX/b: No such file or directory`.
-            open_redirect_append(
-                &self.session_path(shell_path_to_windows(target, &self.shell_state.env_vars)),
-            )
-            .map_err(|e| crate::posix_errors::path_error(target, e))?
+            // `$FIX/b` from `$FIX/b: No such file or directory`. The open
+            // classifies through the registry (rubash#1964) — a net
+            // target connects instead of raw-opening its mapped name.
+            self.open_append_target(target)
+                .map_err(|e| crate::posix_errors::path_error(target, e))?
         } else {
             self.create_redirect_output(target, redirect.clobber)?
         };

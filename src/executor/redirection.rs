@@ -1774,13 +1774,14 @@ impl Executor {
                         // GNU redir.c redirection_error (redir.c:149-176) carries the
                         // failed open's target word (`$FIX/b: No such file or
                         // directory`, issue #518); a bare OS error renders
-                        // message-only and drops the word.
-                        open_redirect_append(&self.session_path(shell_path_to_windows(
-                            &target,
-                            &self.shell_state.env_vars,
-                        )))
-                        .map(|_| ())
-                        .map_err(|e| crate::posix_errors::path_error(&target, e))
+                        // message-only and drops the word. The open itself
+                        // classifies through the registry (rubash#1964):
+                        // this validation is an append open, so it must
+                        // succeed and fail for exactly the shapes the
+                        // real append does.
+                        self.open_append_target(&target)
+                            .map(|_| ())
+                            .map_err(|e| crate::posix_errors::path_error(&target, e))
                     }
                     None => self
                         .create_redirect_output(&target, redirect.clobber)
@@ -2019,9 +2020,12 @@ impl Executor {
                 }
             }
             OutputTarget::Path(path) => {
-                let mut file = open_redirect_append(
-                    &self.session_path(shell_path_to_windows(path, &self.shell_state.env_vars)),
-                )?;
+                // The flush open classifies through the registry like
+                // every other append-shaped open (rubash#1964) — for a
+                // plain path it is the same mapped append open as
+                // before; a net target connects, a synthetic /proc
+                // entry lands in its sink.
+                let mut file = self.open_append_target(path)?;
                 // GNU builtins/common.c:320-334 sh_chkwrite: a builtin's
                 // failed flush is reported by the BUILTIN as
                 // `<name>: write error: <strerror>` (builtin_error via
@@ -2270,10 +2274,10 @@ impl OutputFdState {
                 // (this append-open is where buffered builtin output
                 // actually lands; the setup open in
                 // open_command_output_target only creates/truncates).
-                let mut file = open_redirect_append(
-                    &executor
-                        .session_path(shell_path_to_windows(&path, &executor.shell_state.env_vars)),
-                )?;
+                // The open classifies through the registry
+                // (rubash#1964), whose filesystem arm performs exactly
+                // that session-anchored mapped append.
+                let mut file = executor.open_append_target(&path)?;
                 file.write_all(output)?;
                 Ok(())
             }

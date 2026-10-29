@@ -290,18 +290,10 @@ impl Executor {
                 // (`$FIX/b: No such file or directory`) — the append open's
                 // error needs the same path_error shaping as the truncating
                 // open, or the renderer's message-only text drops the word
-                // (issue #518 background/append repro).
-                self.open_output_fd_append(&target).or_else(|_| {
-                    if is_null_device(&target) {
-                        self.create_redirect_output(&target, true)
-                    } else {
-                        open_redirect_append(&self.session_path(shell_path_to_windows(
-                            &target,
-                            &self.shell_state.env_vars,
-                        )))
-                        .map_err(|e| crate::posix_errors::path_error(&target, e))
-                    }
-                })?;
+                // (issue #518 background/append repro). The open itself
+                // classifies through the registry (rubash#1964).
+                self.open_append_target(&target)
+                    .map_err(|e| crate::posix_errors::path_error(&target, e))?;
             }
         }
 
@@ -332,10 +324,10 @@ impl Executor {
             }
             if redirect.fd_var.is_some() {
             } else if !is_closed_redirect_target(&target) && redirect_target_fd(&target).is_none() {
-                open_redirect_append(
-                    &self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars)),
-                )
-                .map_err(|e| crate::posix_errors::path_error(&target, e))?;
+                // Classified append open (rubash#1964), same
+                // path_error shaping as the fd-1 arm above.
+                self.open_append_target(&target)
+                    .map_err(|e| crate::posix_errors::path_error(&target, e))?;
             }
         }
 
@@ -383,17 +375,12 @@ impl Executor {
                         && !target.starts_with("<(")
                         && !target.starts_with(">(")
                     {
-                        self.open_output_fd_append(&target).or_else(|_| {
-                            if is_null_device(&target) {
-                                self.create_redirect_output(&target, true)
-                            } else {
-                                open_redirect_append(&shell_path_to_windows(
-                                    &target,
-                                    &self.shell_state.env_vars,
-                                ))
-                                .map_err(|e| crate::posix_errors::path_error(&target, e))
-                            }
-                        })?;
+                        // Classified append open (rubash#1964); the
+                        // session_path anchoring the fd-1 arm always
+                        // had applies here too — the previous raw
+                        // fallback opened against the process cwd.
+                        self.open_append_target(&target)
+                            .map_err(|e| crate::posix_errors::path_error(&target, e))?;
                     }
                 }
                 crate::parser::RedirectKind::Input => {

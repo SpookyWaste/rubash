@@ -910,6 +910,96 @@ impl Executor {
         OpenOptions::new().create(true).append(true).open(path)
     }
 
+    /// The one append opener every face asks (rubash#1964). GNU
+    /// redir.c r_appending_to performs ONE open of the word
+    /// (redir.c:702 redir_open, O_WRONLY|O_CREAT|O_APPEND) — for a
+    /// /dev/tcp word that open IS the connection, for /dev/fd/N it
+    /// resolves through the descriptor, for a synthetic /proc entry
+    /// it is the entry's write-class open. The append faces used to
+    /// raw-open the mapped literal path instead, so a net target was
+    /// unreachable through them (the mapped name is not a file) and
+    /// an append probe could fail shapes the real open serves — up
+    /// to preempting an external command whose own redirect handling
+    /// would have connected. Classify first; only plain filesystem
+    /// spellings reach the mapped append open. Errors are raw:
+    /// callers apply posix_errors::path_error.
+    pub(in crate::executor) fn open_append_target(&self, target: &str) -> io::Result<File> {
+        use crate::special_paths::SpecialPathClass;
+        match crate::special_paths::classify_special_path(target) {
+            SpecialPathClass::NetRedirect => self.open_net_redirect_raw(target),
+            SpecialPathClass::NullDevice => OpenOptions::new()
+                .write(true)
+                .append(true)
+                .open(shell_path_to_windows(
+                    "/dev/null",
+                    &self.shell_state.env_vars,
+                )),
+            SpecialPathClass::FdAlias(fd) => {
+                if !super::redirection::dup_source_fd_open(
+                    &self.fd_table,
+                    fd,
+                    &std::collections::HashMap::new(),
+                ) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "No such file or directory",
+                    ));
+                }
+                // The descriptor is open: the append open resolves
+                // through its endpoint. Endpoint shapes that cannot
+                // take an append dup (the process stdio family) fall
+                // back to the mapped device open, which is the shape
+                // those spellings have always taken.
+                match self.open_output_fd_append(target) {
+                    Ok(file) => Ok(file),
+                    Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                        crate::executor::execution_misc::open_redirect_append(
+                            &self.session_path(shell_path_to_windows(
+                                target,
+                                &self.shell_state.env_vars,
+                            )),
+                        )
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            SpecialPathClass::SyntheticProc => {
+                match crate::special_paths::synthetic_proc_write_allowed(target) {
+                    Some(false) => Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Permission denied",
+                    )),
+                    Some(true) => Self::synthetic_proc_write_sink(true),
+                    None => crate::executor::execution_misc::open_redirect_append(
+                        &self.session_path(shell_path_to_windows(
+                            target,
+                            &self.shell_state.env_vars,
+                        )),
+                    ),
+                }
+            }
+            SpecialPathClass::SyntheticLink => {
+                match crate::special_paths::synthetic_link_target(
+                    target,
+                    Some(&crate::proc_vfs::self_cwd_forms(self.session_cwd())),
+                ) {
+                    Some(link) => crate::executor::execution_misc::open_redirect_append(
+                        &std::path::PathBuf::from(&link.native),
+                    ),
+                    None => Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "No such file or directory",
+                    )),
+                }
+            }
+            SpecialPathClass::Filesystem => {
+                crate::executor::execution_misc::open_redirect_append(&self.session_path(
+                    shell_path_to_windows(target, &self.shell_state.env_vars),
+                ))
+            }
+        }
+    }
+
     pub(in crate::executor) fn write_output_fd_redirect(
         &mut self,
         target: &str,
@@ -2407,7 +2497,12 @@ pub(in crate::executor) fn probe_output_redirect(
     executor.create_redirect_output(target, clobber).map(|_| ())
 }
 
-/// Append-arm twin of [`probe_output_redirect`].
+/// Append-arm twin of [`probe_output_redirect`]. The open itself
+/// classifies through the registry (Executor::open_append_target,
+/// rubash#1964): the probe IS an append open, so it must succeed and
+/// fail for exactly the shapes the bind's open does — a net target
+/// connects, a synthetic /proc entry answers by write class, a
+/// closed fd alias fails ENOENT.
 pub(in crate::executor) fn probe_output_redirect_append(
     executor: &Executor,
     target: &str,
@@ -2425,11 +2520,10 @@ pub(in crate::executor) fn probe_output_redirect_append(
             return Ok(());
         }
     }
-    crate::executor::execution_misc::open_redirect_append(&executor.session_path(
-        shell_path_to_windows(target, &executor.shell_state.env_vars),
-    ))
-    .map(|_| ())
-    .map_err(|e| crate::posix_errors::path_error(target, e))
+    executor
+        .open_append_target(target)
+        .map(|_| ())
+        .map_err(|e| crate::posix_errors::path_error(target, e))
 }
 
 /// Feed a spawned child's stdin pipe with the shell's virtual-stdin
