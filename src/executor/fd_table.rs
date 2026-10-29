@@ -1280,6 +1280,13 @@ impl FdTable {
                     FdReadEndpoint::CoprocStdout { pid, .. } => {
                         MaterializedRead::CoprocStdout(*pid)
                     }
+                    FdReadEndpoint::Directory => {
+                        // rubash#1937: the snapshot has no directory
+                        // shape; the rebound fd reads as empty
+                        // instead of failing EISDIR (cross-boundary
+                        // residual — the in-shell faces are exact).
+                        MaterializedRead::Bytes(Vec::new())
+                    }
                 });
                 let write = entry.write.as_ref().map(|endpoint| match endpoint {
                     FdWriteEndpoint::Stdout => MaterializedWrite::Stdout,

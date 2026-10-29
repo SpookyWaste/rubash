@@ -468,6 +468,12 @@ impl Executor {
                 FdReadEndpoint::CoprocStdout { fd: file, .. } => {
                     drain_handle_to_temp(file.handle, m)
                 }
+                // rubash#1937: a directory endpoint cannot be
+                // materialized into an openable operand — decline
+                // and let the caller keep the /dev/fd/N spelling
+                // (on Unix the child opens the real directory and
+                // its reads fail EISDIR natively).
+                FdReadEndpoint::Directory => None,
             };
         }
         match entry.write.as_ref()? {
@@ -781,9 +787,11 @@ impl Executor {
                     None => Some(Vec::new()),
                 }
             }
-            FdWriteEndpoint::CoprocStdin { .. } | FdWriteEndpoint::ProcessSubstitution { .. } => {
-                None
-            }
+            FdWriteEndpoint::CoprocStdin { .. }
+            | FdWriteEndpoint::ProcessSubstitution { .. }
+            // rubash#1898: a /dev/full write endpoint holds no
+            // readable bytes.
+            | FdWriteEndpoint::FullDevice => None,
         }
     }
 

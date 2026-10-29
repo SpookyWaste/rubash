@@ -3121,6 +3121,10 @@ impl Executor {
                 }
             }
             Some(FdReadEndpoint::InheritedProcessStdin) => Ok(Stdio::inherit()),
+            // rubash#1937: a directory endpoint has no handle to
+            // hand the image; the null device is the closest
+            // spawnable state (cross-boundary residual).
+            Some(FdReadEndpoint::Directory) => Ok(Stdio::null()),
             // fd 0 closed (`exec 0<&-`): the closest spawnable state to
             // GNU's inherited-but-unreadable descriptor.
             None if self.fd_table.has_entry(0) => Ok(Stdio::null()),
@@ -3963,6 +3967,18 @@ impl Executor {
                 self.shell_state
                     .env_vars
                     .insert(fd_output_process_substitution_key(target_fd), command);
+            }
+            Some(FdWriteEndpoint::FullDevice) => {
+                // rubash#1898: the ledger records the device
+                // spelling itself, so a respawned child re-derives
+                // the class from the registry.
+                self.shell_state.env_vars.remove(&fd_closed_key(target_fd));
+                self.shell_state
+                    .env_vars
+                    .insert(fd_output_key(target_fd), "/dev/full".to_string());
+                self.shell_state
+                    .env_vars
+                    .remove(&fd_output_process_substitution_key(target_fd));
             }
             None => {
                 self.shell_state.env_vars.remove(&fd_output_key(target_fd));
@@ -5051,6 +5067,17 @@ impl Executor {
                     fd_stdin_key(target_fd),
                     format!("{FD_COPROC_STDIN_TARGET_PREFIX}{pid}"),
                 );
+                self.shell_state
+                    .env_vars
+                    .remove(&fd_stdin_offset_key(target_fd));
+                self.shell_state
+                    .env_vars
+                    .remove(&fd_dynamic_input_key(target_fd));
+            }
+            Some(FdReadEndpoint::Directory) => {
+                // rubash#1937: the directory endpoint cannot cross
+                // a respawn — clear the ledger like an unbound fd.
+                self.shell_state.env_vars.remove(&fd_stdin_key(target_fd));
                 self.shell_state
                     .env_vars
                     .remove(&fd_stdin_offset_key(target_fd));

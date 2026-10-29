@@ -1278,6 +1278,10 @@ impl Executor {
             FdWriteEndpoint::CoprocStdin { .. } | FdWriteEndpoint::ProcessSubstitution { .. } => {
                 write_stderr_bytes(output)
             }
+            // rubash#1898: fd 2 bound to /dev/full — the diagnostic
+            // write fails ENOSPC and is lost, exactly GNU's outcome
+            // for a failing builtin_error write.
+            FdWriteEndpoint::FullDevice => Ok(()),
             FdWriteEndpoint::File(file_fd) => crate::fd::write_all(file_fd.handle, output),
         };
         let _ = result;
