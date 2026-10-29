@@ -1006,9 +1006,13 @@ impl Executor {
                         bytes.retain(|byte| *byte != 0);
                         output.push_str(&bytes_to_shell_text(&bytes));
                     }
-                    Err(_) => {
+                    Err(error) => {
                         status = 1;
-                        eprintln!("cat: '{}': No such file or directory", path);
+                        // rubash#1949: report the read's real strerror,
+                        // unquoted — GNU cat names the actual errno
+                        // (`Is a directory`, `Not a directory`, ELOOP),
+                        // never a blanket ENOENT.
+                        eprintln!("cat: {}: {}", path, crate::posix_errors::message(&error));
                     }
                 }
             }
