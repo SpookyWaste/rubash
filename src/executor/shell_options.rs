@@ -820,6 +820,41 @@ impl Executor {
             }
             return Self::synthetic_proc_write_sink(false);
         }
+        // rubash#1963: an fd-alias spelling is an open of fd N's
+        // open file description (redir.c redir_open over the /dev/fd
+        // layer), never a filesystem create at the mapped literal
+        // path — the literal create made a phantom enclave file for
+        // a spelling GNU fails ENOENT when the fd is closed. Closed
+        // alias: ENOENT, pre-shaped like the synthetic arm above
+        // (this function's callers render the io message verbatim).
+        // Open alias: resolve through the endpoint like the append
+        // face (open_append_target's FdAlias arm); endpoint shapes
+        // that cannot take a handle dup fall back to the null sink —
+        // the routing walk owns exact delivery for fds 1/2 through
+        // its dup shortcut, and this function's contract is the
+        // open itself.
+        if let Some(fd) = crate::special_paths::fd_alias_target(target) {
+            if !super::redirection::dup_source_fd_open(
+                &self.fd_table,
+                fd,
+                &std::collections::HashMap::new(),
+            ) {
+                return Err(crate::posix_errors::path_error(
+                    target,
+                    io::Error::new(io::ErrorKind::NotFound, "No such file or directory"),
+                ));
+            }
+            return match self.open_output_fd_append(target) {
+                Ok(file) => Ok(file),
+                Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                    OpenOptions::new().write(true).open(shell_path_to_windows(
+                        "/dev/null",
+                        &self.shell_state.env_vars,
+                    ))
+                }
+                Err(error) => Err(error),
+            };
+        }
         let target = self.redirect_output_path_target(target);
         let path = self.session_path(shell_path_to_windows(&target, &self.shell_state.env_vars));
         if !clobber

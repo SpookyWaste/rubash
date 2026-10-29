@@ -220,10 +220,9 @@ impl Executor {
             }
             if redirect.fd_var.is_some() {
             } else if is_closed_redirect_target(&target) {
-            } else if let Some((source_fd, _)) = redirect_target_fd_and_move(&target) {
-                // `<&N`, the move form `<&N-` (make_cmd.c:704-718) and the
-                // fd-alias paths (/dev/stdin, /dev/fd/0, /proc/self/fd/0):
-                // the builtin keeps reading its current stdin channel — the
+            } else if let Some(source_fd) = dup_spelling_source_fd(&target) {
+                // `<&N`, the move form `<&N-` (make_cmd.c:704-718): the
+                // builtin keeps reading its current stdin channel — the
                 // dup is a no-op for the virtual input model, and the
                 // reject_invalid_redirects gate already validated fd N is
                 // open (redir.c:1115 dup2 EBADF). GNU r_duplicating_input
@@ -231,7 +230,11 @@ impl Executor {
                 // when fd N is closed, so a closed or untracked source must
                 // fail the builtin with `N: Bad file descriptor' instead of
                 // silently succeeding (modernish BUG_SCLOSEDFD probe
-                // `command : <&8' — rubash#258).
+                // `command : <&8' — rubash#258). An fd-alias PATH spelling
+                // (/dev/fd/N, /dev/stdin, /proc/self/fd/N) is NOT a dup
+                // spelling: GNU opens it (redir_open), so it falls through
+                // to the classified probes below, whose closed-alias answer
+                // is the open's ENOENT (rubash#1963).
                 self.validate_builtin_dup_source(source_fd)?;
             } else if redirect.append {
                 // `<> word` on fd 0: the classified probe performs the
@@ -257,11 +260,15 @@ impl Executor {
             }
             if redirect.fd_var.is_some() {
             } else if is_closed_redirect_target(&target) {
-            } else if let Some((source_fd, _)) = redirect_target_fd_and_move(&target) {
+            } else if let Some(source_fd) = dup_spelling_source_fd(&target) {
                 // `>&N` / `>&N-` dup (and move) forms: validated by the
                 // reject_invalid_redirects gate; nothing to open here. GNU
                 // redir.c:1152-1160 dup2 EBADF — closed source fails with
-                // `N: Bad file descriptor' (rubash#258 SCLOSEDFD).
+                // `N: Bad file descriptor' (rubash#258 SCLOSEDFD). An
+                // fd-alias PATH spelling is an open, not a dup: it falls
+                // through to create_redirect_output, whose registry arm
+                // answers a closed alias with the open's ENOENT
+                // (rubash#1963).
                 self.validate_builtin_dup_source(source_fd)?;
             } else if redirect.fd.unwrap_or(1) == 1 && target.starts_with('&') {
                 // GNU redir.c:832-838: >&WORD with a non-numeric WORD and
@@ -363,7 +370,7 @@ impl Executor {
                 | crate::parser::RedirectKind::CombinedOutput
                 | crate::parser::RedirectKind::CombinedAppend => {
                     if is_closed_redirect_target(&target) {
-                    } else if let Some((source_fd, _)) = redirect_target_fd_and_move(&target) {
+                    } else if let Some(source_fd) = dup_spelling_source_fd(&target) {
                         self.validate_builtin_dup_source(source_fd)?;
                     } else if !target.starts_with("<(") && !target.starts_with(">(") {
                         self.create_redirect_output(&target, redirect.clobber)?;
@@ -385,7 +392,7 @@ impl Executor {
                 }
                 crate::parser::RedirectKind::Input => {
                     if is_closed_redirect_target(&target) {
-                    } else if let Some((source_fd, _)) = redirect_target_fd_and_move(&target) {
+                    } else if let Some(source_fd) = dup_spelling_source_fd(&target) {
                         self.validate_builtin_dup_source(source_fd)?;
                     } else if !target.starts_with("<(") && !target.starts_with(">(") {
                         self.probe_input_redirect(&target)?;
