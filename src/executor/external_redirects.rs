@@ -652,12 +652,11 @@ impl Executor {
             let stdout_target = self.expand_redirect_target(stdout_redirect);
             let stderr_target = self.expand_redirect_target(stderr_redirect);
             if stdout_target == stderr_target {
-                let path = shell_path_to_windows(&stdout_target, &self.shell_state.env_vars);
-                let path = self.session_path(path);
-                let mut file = OpenOptions::new().create(true).write(true).open(&path)?;
-                if !is_dos_device_path(&path) {
-                    file.seek(SeekFrom::End(0))?;
-                }
+                // One classified append open shared by both streams
+                // (rubash#1964), mirroring the truncating pair above.
+                let file = self
+                    .open_append_target(&stdout_target)
+                    .map_err(|e| crate::posix_errors::path_error(&stdout_target, e))?;
                 process.stderr(Stdio::from(file.try_clone()?));
                 process.stdout(Stdio::from(file));
                 return Ok(true);
@@ -712,12 +711,16 @@ impl Executor {
                 } else if self.has_output_fd_target(&target) {
                     process.stdout(Stdio::from(self.open_output_fd_append(&target)?));
                 } else if redirect_target_fd(&target).is_none() {
-                    let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
-                    let path = self.session_path(path);
-                    let mut file = OpenOptions::new().create(true).write(true).open(&path)?;
-                    if !is_dos_device_path(&path) {
-                        file.seek(SeekFrom::End(0))?;
-                    }
+                    // The append open classifies through the registry
+                    // (rubash#1964): a net target connects, synthetic
+                    // classes answer by their write class, and only
+                    // plain files reach the session-anchored mapped
+                    // append open. The raw mapped open this replaces
+                    // failed /dev/tcp targets with a bare ENOENT that
+                    // dropped the target word.
+                    let file = self
+                        .open_append_target(&target)
+                        .map_err(|e| crate::posix_errors::path_error(&target, e))?;
                     process.stdout(Stdio::from(file));
                 }
                 redirected = true;
@@ -835,12 +838,11 @@ impl Executor {
                 } else if self.has_output_fd_target(&target) {
                     process.stderr(Stdio::from(self.open_output_fd_append(&target)?));
                 } else if redirect_target_fd(&target).is_none() {
-                    let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
-                    let path = self.session_path(path);
-                    let mut file = OpenOptions::new().create(true).write(true).open(&path)?;
-                    if !is_dos_device_path(&path) {
-                        file.seek(SeekFrom::End(0))?;
-                    }
+                    // Classified append open (rubash#1964), the fd-2
+                    // twin of the stdout arm above.
+                    let file = self
+                        .open_append_target(&target)
+                        .map_err(|e| crate::posix_errors::path_error(&target, e))?;
                     process.stderr(Stdio::from(file));
                 }
                 redirected = true;
