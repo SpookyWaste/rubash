@@ -5100,3 +5100,159 @@ mod issue_1976 {
         assert_eq!(stdout, "rc=142\nline=[]\n", "stderr:\n{stderr}");
     }
 }
+
+mod issue_1646 {
+    use super::*;
+
+    fn run(dir: &Path, script: &str) -> (String, String, Option<i32>) {
+        let path = dir.join("case.sh");
+        std::fs::write(&path, script).expect("write probe script");
+        let out = run_rubash_in(
+            dir,
+            &[path.to_str().expect("utf8 scratch path")],
+            Duration::from_secs(30),
+        );
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    /// rubash#1646 (varredir_close arm): GNU closes a `{var}` descriptor
+    /// when the owning command COMPLETES (redir.c undo_redirections), so
+    /// the command's own `>&$f` write lands and the `>(...)` consumer
+    /// drains it; only a LATER write sees the closed fd. Closing at
+    /// application time (the old behavior) rejected the first write with
+    /// EBADF and the consumer's stream was lost entirely. GNU bash
+    /// 5.3.20 oracle output for this probe: first-rc=0, the second write
+    /// reports Bad file descriptor, file:[one].
+    #[test]
+    fn issue1646_varredir_close_procsub_write_survives_own_command() {
+        let dir = case_scratch("1646-varredir-procsub");
+        let (stdout, stderr, code) = run(
+            &dir,
+            "shopt -s varredir_close\n\
+             echo one {f}> >(cat > out.txt) >&$f\n\
+             echo \"first-rc=$?\"\n\
+             echo two >&$f 2>/dev/null || echo second-failed\n\
+             sleep 0.5\n\
+             echo \"file:[$(cat out.txt)]\"\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "first-rc=0\nsecond-failed\nfile:[one]\n",
+            "stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("Bad file descriptor"),
+            "the post-completion write must report EBADF: {stderr}"
+        );
+    }
+
+    /// rubash#1646 (varredir_close arm, plain-file form of the same
+    /// invariant): a `{f}>file` descriptor closed at application time
+    /// rejected the owning command's write too — first-rc was 1 and the
+    /// file stayed empty. GNU: first-rc=0, second write EBADF, file
+    /// holds exactly the first line.
+    #[test]
+    fn issue1646_varredir_close_plain_file_write_survives_own_command() {
+        let dir = case_scratch("1646-varredir-file");
+        let (stdout, stderr, code) = run(
+            &dir,
+            "shopt -s varredir_close\n\
+             echo one {f}>plain.txt >&$f\n\
+             echo \"first-rc=$?\"\n\
+             echo two >&$f 2>/dev/null || echo second-failed\n\
+             echo \"file:[$(cat plain.txt)]\"\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "first-rc=0\nsecond-failed\nfile:[one]\n",
+            "stderr:\n{stderr}"
+        );
+    }
+
+    /// rubash#1646 (headline form): a persistent `exec {f}> >(...)`
+    /// stream that is never explicitly closed must still reach the
+    /// consumer when the shell exits — GNU's consumer drains at EOF
+    /// (subst.c:6362 process_substitute pipe semantics); the shell-exit
+    /// sweep is rubash's drain point. Byte-exact content check after
+    /// the process has exited.
+    #[test]
+    fn issue1646_persistent_procsub_drains_at_exit() {
+        let dir = case_scratch("1646-exit-drain");
+        let (_stdout, stderr, code) = run(
+            &dir,
+            "exec {f}> >(cat > out.txt)\nprintf 'a\\nb\\nc\\n' >&$f\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        let drained = std::fs::read(dir.join("out.txt")).expect("consumer output exists");
+        assert_eq!(drained, b"a\nb\nc\n", "stderr:\n{stderr}");
+    }
+
+    /// rubash#1646 (default mode): with varredir_close off (the GNU
+    /// default) the descriptor persists across commands, both writes
+    /// land, and the accumulated stream drains whole at shell exit.
+    #[test]
+    fn issue1646_dynamic_fd_procsub_accumulates_and_drains_at_exit() {
+        let dir = case_scratch("1646-default-drain");
+        let (stdout, stderr, code) = run(
+            &dir,
+            "echo one {f}> >(cat > out.txt) >&$f\necho \"first-rc=$?\"\necho two >&$f\necho \"second-rc=$?\"\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "first-rc=0\nsecond-rc=0\n", "stderr:\n{stderr}");
+        let drained = std::fs::read(dir.join("out.txt")).expect("consumer output exists");
+        assert_eq!(drained, b"one\ntwo\n", "stderr:\n{stderr}");
+    }
+}
+
+mod issue_1951 {
+    use super::*;
+
+    fn run(dir: &Path, script: &str) -> (String, String, Option<i32>) {
+        let path = dir.join("case.sh");
+        std::fs::write(&path, script).expect("write probe script");
+        let out = run_rubash_in(
+            dir,
+            &[path.to_str().expect("utf8 scratch path")],
+            Duration::from_secs(60),
+        );
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    /// rubash#1951: the streamed input-procsub endpoint serves a
+    /// line-wise `while read` loop completely and in order — the count
+    /// over 20k produced lines is exact (the materialized endpoint this
+    /// replaces lost its constant-factor footing entirely: ~0.29ms per
+    /// line at the audit tip). GNU bash 5.3.20 prints the same count.
+    #[test]
+    fn issue1951_procsub_endpoint_while_read_count_exact() {
+        let dir = case_scratch("1951-stream-count");
+        let (stdout, stderr, code) = run(
+            &dir,
+            "n=0\nwhile read -r l; do n=$((n+1)); done < <(seq 1 20000)\necho \"read=$n\"\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "read=20000\n", "stderr:\n{stderr}");
+    }
+
+    /// rubash#1951 (content face): lines arrive whole and in order —
+    /// the first, middle and last records read off the endpoint match
+    /// the producer's sequence exactly.
+    #[test]
+    fn issue1951_procsub_endpoint_records_whole_and_ordered() {
+        let dir = case_scratch("1951-stream-order");
+        let (stdout, stderr, code) = run(
+            &dir,
+            "n=0\nfirst= mid= last=\nwhile read -r l; do n=$((n+1)); case $n in 1) first=$l;; 1000) mid=$l;; esac; last=$l; done < <(seq 1 2000)\necho \"$first/$mid/$last/$n\"\n",
+        );
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert_eq!(stdout, "1/1000/2000/2000\n", "stderr:\n{stderr}");
+    }
+}
