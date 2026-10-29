@@ -149,6 +149,28 @@ impl Executor {
         }
     }
 
+    /// `exec N<directory` reached through a synthetic link
+    /// (rubash#1937): GNU's O_RDONLY open of a directory succeeds —
+    /// only the READ fails (EISDIR). Windows cannot open a directory
+    /// handle at all, so the bind installs the Directory endpoint and
+    /// the read side fabricates the failure (see
+    /// FdReadEndpoint::Directory). Bookkeeping mirrors
+    /// set_fd_input_file.
+    pub(in crate::executor) fn set_fd_input_directory(&mut self, fd: u32, dynamic: bool) {
+        self.fd_table
+            .open_input(fd, FdReadEndpoint::Directory, dynamic);
+        self.shell_state.env_vars.remove(&fd_closed_key(fd));
+        self.shell_state.env_vars.remove(&fd_stdin_key(fd));
+        self.shell_state.env_vars.remove(&fd_stdin_offset_key(fd));
+        if dynamic {
+            self.shell_state
+                .env_vars
+                .insert(fd_dynamic_input_key(fd), "1".to_string());
+        } else {
+            self.shell_state.env_vars.remove(&fd_dynamic_input_key(fd));
+        }
+    }
+
     /// `[N]<>file` — one O_RDWR handle feeding both directions of the slot
     /// (GNU redir.c r_input_output opens a single descriptor).
     pub(in crate::executor) fn set_fd_readwrite_file(
@@ -3577,9 +3599,23 @@ impl Executor {
                         // to the resolved native target (the session
                         // cwd answers for self/cwd), exactly as the
                         // open ladder binds it.
-                        let file = FileFd::open_read(std::path::PathBuf::from(&link.native))
-                            .map_err(|e| crate::posix_errors::path_error(&target, e))?;
-                        self.set_fd_input_file(fd, file, fd != 0);
+                        // rubash#1937: a DIRECTORY target (self/cwd)
+                        // has no openable handle on Windows, but
+                        // GNU's bind succeeds — only reads fail
+                        // (EISDIR). Bind the directory endpoint
+                        // instead of failing the whole redirect at
+                        // open. (Off Windows proc_unary_facts is a
+                        // stub and the real open below serves.)
+                        if crate::proc_vfs::proc_unary_facts(&target)
+                            .is_some_and(|facts| facts.is_link && facts.link_target_is_dir)
+                        {
+                            self.set_fd_input_directory(fd, fd != 0);
+                        } else {
+                            let file =
+                                FileFd::open_read(std::path::PathBuf::from(&link.native))
+                                    .map_err(|e| crate::posix_errors::path_error(&target, e))?;
+                            self.set_fd_input_file(fd, file, fd != 0);
+                        }
                     } else {
                         // G-02 session-cwd anchor (rubash#1887): see
                         // set_fd_readwrite_file — without it `exec

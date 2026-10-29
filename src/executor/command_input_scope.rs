@@ -527,9 +527,18 @@ impl Executor {
             ) {
                 // SyntheticLink (rubash#1900): open the resolved
                 // native target (session cwd answers for self/cwd).
-                let file = FileFd::open_read(std::path::PathBuf::from(&link.native))
-                    .map_err(|error| crate::posix_errors::path_error(&target, error))?;
-                self.set_fd_input_file(fd, file, true);
+                // rubash#1937: a directory target binds the directory
+                // endpoint (GNU's bind succeeds; reads fail EISDIR) —
+                // see the exec-fd face in trap_exec.rs.
+                if crate::proc_vfs::proc_unary_facts(&target)
+                    .is_some_and(|facts| facts.is_link && facts.link_target_is_dir)
+                {
+                    self.set_fd_input_directory(fd, true);
+                } else {
+                    let file = FileFd::open_read(std::path::PathBuf::from(&link.native))
+                        .map_err(|error| crate::posix_errors::path_error(&target, error))?;
+                    self.set_fd_input_file(fd, file, true);
+                }
             } else {
                 // niubash#177: same operand resolution as
                 // open_input_redirect — a virtual-root input operand may

@@ -114,6 +114,16 @@ pub(crate) enum FdReadEndpoint {
     InheritedProcessStdin,
     ProcessSubstitution(Rc<RefCell<TextInput>>),
     CoprocStdout { pid: u32, fd: Rc<FileFd> },
+    /// A descriptor bound to a DIRECTORY (rubash#1937): GNU's open of
+    /// a directory succeeds (O_RDONLY) and every read fails EISDIR —
+    /// the read builtin reports `read error: Is a directory`
+    /// (read.def:911). The variant exists for the Windows synthetic
+    /// -link bind of /proc/self/cwd, where no directory handle can be
+    /// opened at all: the bind succeeds with this endpoint and reads
+    /// fabricate the EISDIR failure, so the in-shell readers report
+    /// exactly GNU's shape. Off Windows a real directory FileFd
+    /// serves the same descriptor.
+    Directory,
 }
 
 #[derive(Debug, Clone)]
@@ -665,6 +675,13 @@ impl FdTable {
     ) -> Option<Vec<u8>> {
         self.read_error = None;
         let endpoint = self.entries.get(&fd)?.read.clone()?;
+        // rubash#1937: a directory descriptor fails every read with
+        // EISDIR (read.def:911) — record the strerror the read
+        // builtin's error channel renders, and serve no record.
+        if matches!(endpoint, FdReadEndpoint::Directory) {
+            self.read_error = Some("Is a directory".to_string());
+            return None;
+        }
         let file = match &endpoint {
             FdReadEndpoint::File(file) | FdReadEndpoint::CoprocStdout { fd: file, .. } => {
                 Some(file.clone())

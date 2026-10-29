@@ -747,6 +747,20 @@ impl Executor {
             // GNU read receives raw bytes from redir.c-opened inputs. Keep
             // invalid UTF-8 inside the RAW_BYTE_MARKER carrier instead of
             // dropping the whole record at this boundary.
+            // rubash#1937: a synthetic-link target resolving to a
+            // directory (/proc/self/cwd) — GNU's read fails EISDIR on
+            // the descriptor itself (read.def:911). Record the read
+            // error so the builtin renders
+            // `read: 0: read error: Is a directory` instead of serving
+            // the mapped literal path's unrelated failure. The facts
+            // are a stub off Windows, where the real directory read
+            // below produces the same failure natively.
+            if crate::proc_vfs::proc_unary_facts(&expanded_target)
+                .is_some_and(|facts| facts.is_link && facts.link_target_is_dir)
+            {
+                self.fd_table.read_error = Some("Is a directory".to_string());
+                return None;
+            }
             // Q11 /proc P1: synthetic files are served before the filesystem
             // (docs/proc-vfs-plan.md hook B).
             let input = if let Some(bytes) =
