@@ -915,7 +915,11 @@ impl Executor {
                 && !is_null_device(&target)
                 && dev_stdio_redirect_fd(&target).is_none()
                 && !crate::special_paths::is_net_redirect_target(&target)
-                && !target.starts_with("<(")
+                // rubash#1931: only a parser-recorded (unquoted) span
+                // target is exempt from the open probe — a quoted
+                // "<(...)" target is a literal filename whose failed
+                // open must report here like any other.
+                && !super::external_setup::redirect_target_span_is_recorded(redirect)
                 // Registry classes (rubash#1917/#1900): a synthetic
                 // /proc spelling's mapped path is not the file — the
                 // class's own open face owns its outcome, so this
@@ -950,7 +954,9 @@ impl Executor {
                 && !is_null_device(&target)
                 && dev_stdio_redirect_fd(&target).is_none()
                 && !crate::special_paths::is_net_redirect_target(&target)
-                && !target.starts_with("<(")
+                // rubash#1931: recorded-span exemption only, as in the
+                // ReadWrite probe above.
+                && !super::external_setup::redirect_target_span_is_recorded(redirect)
                 && redirect_target_fd(&target).is_none()
                 // Registry classes (rubash#1917/#1900): synthetic /proc
                 // content and links are validated by the open ladder
