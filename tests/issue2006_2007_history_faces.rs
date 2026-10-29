@@ -180,3 +180,48 @@ fn provider_path_fc_list_excludes_itself() {
     assert_eq!(out, "1\t echo alpha\n2\t echo beta\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
+#[test]
+fn session_path_history_numbering_survives_histsize_trim() {
+    let stdout = run_interactive(
+        "HISTSIZE=3\necho h1\necho h2\necho h3\necho h4\nhistory\n",
+        "sess-hist",
+    );
+    assert_eq!(
+        stdout,
+        "h1\nh2\nh3\nh4\n    4  echo h3\n    5  echo h4\n    6  history\n"
+    );
+}
+
+#[test]
+fn session_path_history_plain_numbering() {
+    let stdout = run_interactive("echo one\necho two\nhistory\n", "sess-plain");
+    assert_eq!(
+        stdout,
+        "one\ntwo\n    1  echo one\n    2  echo two\n    3  history\n"
+    );
+}
+
+/// #2007: the host store stifled to HISTSIZE=3; the surviving entries
+/// are global numbers 4,5,6. GNU `history` prints 4,5,6.
+///
+/// Ignored: the HistoryProvider contract returns bare entry strings
+/// with no history_base channel, so the provider-path display in
+/// builtins/history.rs can only number from 1. The session path above
+/// passes; this pin waits on the contract adjudication in rubash#2007.
+#[test]
+#[ignore = "provider contract gap: no history_base channel (rubash#2007)"]
+fn provider_path_history_numbering_survives_stifle() {
+    let dir = tempdir("prov-hist");
+    let d = dir.to_string_lossy().replace('\\', "/");
+    let mut executor = executor_with(vec![
+        "echo h3".to_string(),
+        "echo h4".to_string(),
+        "history".to_string(),
+    ]);
+    let script = format!("cd {d}\nhistory > out.txt 2> err.txt\n");
+    let code = rubash::script_driver::run_source(&mut executor, &script, true);
+    assert_eq!(code, 0);
+    let out = std::fs::read_to_string(dir.join("out.txt")).expect("history output");
+    assert_eq!(out, "    4  echo h3\n    5  echo h4\n    6  history\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
