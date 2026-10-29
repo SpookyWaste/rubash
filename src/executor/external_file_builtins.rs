@@ -2488,37 +2488,110 @@ impl Executor {
         }
         #[cfg(windows)]
         {
-            // -m MODE consumes a value; other options are accepted and
-            // ignored. argv as-is — no second expand_word pass (issue
+            // -m/--mode consumes a value; -Z/--context is accepted
+            // and ignored (no SELinux context exists on Windows).
+            // argv as-is — no second expand_word pass (issue
             // #555, see external_mkdir). Diagnostics are the emulated
             // command's own stderr and go through the command's
             // redirections (rubash#1372/#1725), never straight to the
             // terminal via the shell's default stderr.
-            let mut mode_value_pending = false;
+            //
+            // rubash#1945: the usage-error shapes are GNU's, not the
+            // per-operand refusal — a missing -m value and a missing
+            // operand are getopt/operand diagnostics with the Try
+            // line, and an invocation with no operand at all must
+            // not exit 0 in silence.
+            let mut mode_pending: Option<bool> = None; // Some(true): --mode form
             let mut no_more_flags = false;
             let mut failed = false;
+            let mut operands = 0usize;
             let mut stderr: Vec<u8> = Vec::new();
-            for word in &cmd.words[1..] {
+            'words: for word in &cmd.words[1..] {
                 let expanded = word.as_str();
-                if mode_value_pending {
-                    mode_value_pending = false;
+                if mode_pending.is_some() {
+                    mode_pending = None;
                     continue;
                 }
                 if !no_more_flags && expanded == "--" {
                     no_more_flags = true;
                     continue;
                 }
-                if !no_more_flags && expanded.starts_with('-') && expanded != "-" {
-                    if expanded == "-m" {
-                        mode_value_pending = true;
+                if !no_more_flags && expanded.starts_with("--") {
+                    let (typed, attached) = match expanded[2..].split_once('=') {
+                        Some((name, value)) => (name, Some(value)),
+                        None => (&expanded[2..], None),
+                    };
+                    match resolve_long_option(typed, MKFIFO_LONG_OPTIONS) {
+                        LongResolution::Matched(entry) => {
+                            if entry.arg == LongArg::NoArg && attached.is_some() {
+                                diag_option_no_argument_allowed(&mut stderr, "mkfifo", entry.name);
+                                failed = true;
+                                break 'words;
+                            }
+                            if entry.name == "mode" && attached.is_none() {
+                                mode_pending = Some(true);
+                            }
+                        }
+                        LongResolution::Unknown => {
+                            diag_unrecognized_option(&mut stderr, "mkfifo", expanded);
+                            failed = true;
+                            break 'words;
+                        }
+                        LongResolution::Ambiguous(candidates) => {
+                            diag_ambiguous_option(&mut stderr, "mkfifo", expanded, &candidates);
+                            failed = true;
+                            break 'words;
+                        }
+                        // No mkfifo table entry is no_abbrev.
+                        LongResolution::Abbreviated(_) => {}
                     }
                     continue;
                 }
+                if !no_more_flags && expanded.starts_with('-') && expanded != "-" {
+                    let cluster: Vec<char> = expanded[1..].chars().collect();
+                    let mut position = 0;
+                    while position < cluster.len() {
+                        match cluster[position] {
+                            // -m takes the rest of the cluster as
+                            // its value, or the next word when it
+                            // ends the cluster.
+                            'm' => {
+                                if position + 1 == cluster.len() {
+                                    mode_pending = Some(false);
+                                }
+                                break;
+                            }
+                            'Z' => {}
+                            bad => {
+                                diag_invalid_short_option(&mut stderr, "mkfifo", bad);
+                                failed = true;
+                                break 'words;
+                            }
+                        }
+                        position += 1;
+                    }
+                    continue;
+                }
+                operands += 1;
                 writeln!(
                     stderr,
                     "mkfifo: cannot create fifo '{expanded}': Operation not supported"
                 )?;
                 failed = true;
+            }
+            if !failed {
+                if let Some(long_form) = mode_pending {
+                    if long_form {
+                        diag_option_requires_argument(&mut stderr, "mkfifo", "mode");
+                    } else {
+                        diag_short_option_requires_argument(&mut stderr, "mkfifo", 'm');
+                    }
+                    failed = true;
+                } else if operands == 0 {
+                    let _ = writeln!(stderr, "mkfifo: missing operand");
+                    diag_try_line(&mut stderr, "mkfifo");
+                    failed = true;
+                }
             }
             self.write_buffered_builtin_output(cmd, &[], &stderr)?;
             self.exit_code = if failed { 1 } else { 0 };
@@ -2526,6 +2599,238 @@ impl Executor {
         }
     }
 }
+
+/// gnulib getopt_long resolution shared by the emulated coreutils
+/// applets in this file (cp/touch/rm/mkfifo): a typed long option
+/// resolves by exact match or by unambiguous prefix against the
+/// command's table, and option VALUES resolve the same way through
+/// argmatch. The diagnostic forms are the coreutils 9.4 shapes
+/// measured against the local oracle (rubash#1941/#1942/#1946/#1947):
+/// an unknown option is reported with the whole typed word (an
+/// attached `=value` included), an ambiguous prefix lists every
+/// candidate in table order (again with the whole typed word), a
+/// no-argument option given `=value` and a value-list failure are
+/// reported under the canonical name, and every form carries the
+/// `Try '<cmd> --help'` line except rm's preserve-root pair, which
+/// coreutils prints bare.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LongArg {
+    /// No argument; an attached `=value` is an error.
+    NoArg,
+    /// An argument is required: attached, or the next word.
+    Required,
+    /// An argument may be attached with `=` but the next word is
+    /// never consumed.
+    Optional,
+}
+
+#[derive(Clone, Copy)]
+struct LongOption {
+    name: &'static str,
+    arg: LongArg,
+    /// rm's --no-preserve-root: coreutils accepts the option only
+    /// spelled in full (`rm: you may not abbreviate the
+    /// --no-preserve-root option`, no Try line).
+    no_abbrev: bool,
+}
+
+const fn long_option(name: &'static str, arg: LongArg) -> LongOption {
+    LongOption {
+        name,
+        arg,
+        no_abbrev: false,
+    }
+}
+
+const fn long_option_no_abbrev(name: &'static str, arg: LongArg) -> LongOption {
+    LongOption {
+        name,
+        arg,
+        no_abbrev: true,
+    }
+}
+
+enum LongResolution<'a> {
+    Matched(&'a LongOption),
+    Unknown,
+    Ambiguous(Vec<&'a str>),
+    /// The typed text abbreviates a no_abbrev option.
+    Abbreviated(&'a LongOption),
+}
+
+/// Resolve the name part of one `--name[=value]` word against TABLE
+/// the way gnulib getopt_long does: an exact match wins outright;
+/// otherwise the typed text must be a prefix of exactly one entry.
+fn resolve_long_option<'a>(typed: &str, table: &'a [LongOption]) -> LongResolution<'a> {
+    if typed.is_empty() {
+        return LongResolution::Unknown;
+    }
+    if let Some(entry) = table.iter().find(|entry| entry.name == typed) {
+        return LongResolution::Matched(entry);
+    }
+    let matches: Vec<&LongOption> = table
+        .iter()
+        .filter(|entry| entry.name.starts_with(typed))
+        .collect();
+    match matches.as_slice() {
+        [] => LongResolution::Unknown,
+        [only] => {
+            if only.no_abbrev {
+                LongResolution::Abbreviated(only)
+            } else {
+                LongResolution::Matched(only)
+            }
+        }
+        many => LongResolution::Ambiguous(many.iter().map(|entry| entry.name).collect()),
+    }
+}
+
+/// coreutils argmatch for an option VALUE (cp --preserve lists,
+/// touch --time, cp --update): the value resolves by exact match or
+/// unambiguous prefix; entries sharing a group collapse into one
+/// value (touch's --time synonyms atime/access/use are one value, so
+/// `ac` is unambiguous). The empty value matches every entry and is
+/// therefore ambiguous whenever the list names two values — the
+/// "ambiguous argument ''" wording, never "invalid".
+enum ArgMatch<'a> {
+    Matched(&'a str, u8),
+    Invalid,
+    Ambiguous,
+}
+
+fn argmatch<'a>(value: &str, valid: &[(&'a str, u8)]) -> ArgMatch<'a> {
+    if let Some((name, group)) = valid.iter().find(|(name, _)| *name == value) {
+        return ArgMatch::Matched(name, *group);
+    }
+    let mut matched: Option<(&str, u8)> = None;
+    for (name, group) in valid {
+        if !name.starts_with(value) {
+            continue;
+        }
+        match matched {
+            None => matched = Some((name, *group)),
+            Some((_, seen_group)) if seen_group == *group => {}
+            Some(_) => return ArgMatch::Ambiguous,
+        }
+    }
+    match matched {
+        Some((name, group)) => ArgMatch::Matched(name, group),
+        None => ArgMatch::Invalid,
+    }
+}
+
+fn diag_try_line(stderr: &mut Vec<u8>, prog: &str) {
+    let _ = writeln!(stderr, "Try '{prog} --help' for more information.");
+}
+
+/// `<prog>: unrecognized option '--<whole typed word>'` + Try line.
+/// The whole word is reported, an attached `=value` included
+/// (glibc getopt_long; measured for cp/rm/touch alike).
+fn diag_unrecognized_option(stderr: &mut Vec<u8>, prog: &str, whole_word: &str) {
+    let _ = writeln!(stderr, "{prog}: unrecognized option '{whole_word}'");
+    diag_try_line(stderr, prog);
+}
+
+/// `<prog>: option '--<whole typed word>' is ambiguous; possibilities:
+/// '--a' '--b'` + Try line, candidates in table order.
+fn diag_ambiguous_option(stderr: &mut Vec<u8>, prog: &str, whole_word: &str, candidates: &[&str]) {
+    let listed: Vec<String> = candidates
+        .iter()
+        .map(|name| format!("'--{name}'"))
+        .collect();
+    let _ = writeln!(
+        stderr,
+        "{prog}: option '{whole_word}' is ambiguous; possibilities: {}",
+        listed.join(" ")
+    );
+    diag_try_line(stderr, prog);
+}
+
+/// `<prog>: option '--<canonical>' doesn't allow an argument` + Try
+/// line (rubash#1946: the canonical name is reported even when the
+/// user typed an abbreviation).
+fn diag_option_no_argument_allowed(stderr: &mut Vec<u8>, prog: &str, canonical: &str) {
+    let _ = writeln!(
+        stderr,
+        "{prog}: option '--{canonical}' doesn't allow an argument"
+    );
+    diag_try_line(stderr, prog);
+}
+
+/// `<prog>: option '--<canonical>' requires an argument` + Try line.
+fn diag_option_requires_argument(stderr: &mut Vec<u8>, prog: &str, canonical: &str) {
+    let _ = writeln!(
+        stderr,
+        "{prog}: option '--{canonical}' requires an argument"
+    );
+    diag_try_line(stderr, prog);
+}
+
+/// `<prog>: option requires an argument -- '<ch>'` + Try line (the
+/// short-option missing-value form).
+fn diag_short_option_requires_argument(stderr: &mut Vec<u8>, prog: &str, flag: char) {
+    let _ = writeln!(stderr, "{prog}: option requires an argument -- '{flag}'");
+    diag_try_line(stderr, prog);
+}
+
+/// `<prog>: invalid option -- '<ch>'` + Try line.
+fn diag_invalid_short_option(stderr: &mut Vec<u8>, prog: &str, flag: char) {
+    let _ = writeln!(stderr, "{prog}: invalid option -- '{flag}'");
+    diag_try_line(stderr, prog);
+}
+
+/// `<prog>: invalid argument '<value>' for '--<canonical>'` (or the
+/// "ambiguous argument" wording) + the `Valid arguments are:` block
+/// (one `  - '<line>'` per line) + Try line — the argmatch failure
+/// form shared by cp --preserve/--update and touch --time.
+fn diag_invalid_value(
+    stderr: &mut Vec<u8>,
+    prog: &str,
+    canonical: &str,
+    value: &str,
+    ambiguous: bool,
+    valid_lines: &[&str],
+) {
+    if ambiguous {
+        let _ = writeln!(
+            stderr,
+            "{prog}: ambiguous argument '{value}' for '--{canonical}'"
+        );
+    } else {
+        let _ = writeln!(
+            stderr,
+            "{prog}: invalid argument '{value}' for '--{canonical}'"
+        );
+    }
+    let _ = writeln!(stderr, "Valid arguments are:");
+    for line in valid_lines {
+        let _ = writeln!(stderr, "  - '{line}'");
+    }
+    diag_try_line(stderr, prog);
+}
+
+/// mkfifo's long-option table (coreutils mkfifo.c).
+const MKFIFO_LONG_OPTIONS: &[LongOption] = &[
+    long_option("context", LongArg::Optional),
+    long_option("help", LongArg::NoArg),
+    long_option("mode", LongArg::Required),
+    long_option("version", LongArg::NoArg),
+];
+
+/// rm's long-option table (coreutils rm.c). --no-preserve-root is
+/// no_abbrev: coreutils accepts it only spelled in full.
+const RM_LONG_OPTIONS: &[LongOption] = &[
+    long_option("dir", LongArg::NoArg),
+    long_option("force", LongArg::NoArg),
+    long_option("help", LongArg::NoArg),
+    long_option("interactive", LongArg::Optional),
+    long_option("one-file-system", LongArg::NoArg),
+    long_option_no_abbrev("no-preserve-root", LongArg::NoArg),
+    long_option("preserve-root", LongArg::Optional),
+    long_option("recursive", LongArg::NoArg),
+    long_option("verbose", LongArg::NoArg),
+    long_option("version", LongArg::NoArg),
+];
 
 /// rubash#1636: whether an rm invocation carries an option shape
 /// the emulation accepts but does not implement — the interactive

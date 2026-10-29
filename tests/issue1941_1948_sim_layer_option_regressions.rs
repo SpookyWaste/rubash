@@ -381,3 +381,23 @@ fn issue1946_no_argument_long_options_reject_attached_values() {
     );
 }
 
+// ---------------------------------------------------------------- #1945
+
+#[cfg(windows)]
+#[test]
+fn issue1945_mkfifo_missing_operand_and_value_diagnose() {
+    let dir = scratch("1945-mkfifo");
+    let out = run_in_dir(&dir, "mkfifo; echo rc=$?");
+    assert_eq!(out.stdout, "rc=1\n");
+    assert_eq!(
+        out.stderr,
+        "mkfifo: missing operand\nTry 'mkfifo --help' for more information.\n"
+    );
+    let out = run_in_dir(&dir, "mkfifo -m; echo rc=$?");
+    assert_eq!(out.stdout, "rc=1\n");
+    assert_eq!(
+        out.stderr,
+        "mkfifo: option requires an argument -- 'm'\nTry 'mkfifo --help' for more information.\n"
+    );
+}
+
