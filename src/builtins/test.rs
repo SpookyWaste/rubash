@@ -668,6 +668,14 @@ fn proc_unary_test(op: &str, operand: &str) -> Option<bool> {
         "-f" => facts.is_file || (facts.is_link && !facts.link_target_is_dir),
         "-h" | "-L" => facts.is_link,
         "-r" => true,
+        // rubash#1936: -w/-x are mode questions the facts now carry
+        // (procfs modes are definitional — see ProcUnaryFacts); they
+        // previously fell through to the filesystem, which has no
+        // such names on Windows and answered false for every entry,
+        // including the writable per-pid files and the executable
+        // exe link.
+        "-w" => facts.writable,
+        "-x" => facts.executable,
         "-s" => facts.is_file || (facts.is_link && !facts.link_target_is_dir),
         _ => return None,
     })
