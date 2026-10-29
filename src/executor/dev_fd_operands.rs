@@ -181,22 +181,13 @@ fn split_dev_operand(arg: &str) -> Option<(&str, &str)> {
 /// (`special_paths::fd_alias_target`): this face used to re-parse the
 /// tail with `str::parse`, which also accepted `/dev/fd/+3` — a spelling
 /// GNU rejects on every face (the open fails ENOENT) — so the two
-/// answers drifted apart (redundancy audit R3/D1). One layer stays
-/// local: GNU also resolves the shell's own numeric-pid spelling
-/// (`/proc/$$/fd/3`) through procfs, and an operand has no other server
-/// for it on Windows, so that spelling is rewritten to the `self`
-/// spelling and the registry judges the fd part. Foreign pids stay
-/// plain filesystem paths.
+/// answers drifted apart (redundancy audit R3/D1). The registry also
+/// owns the own-pid spelling (rubash#1974: `/proc/<pid>/fd/N` with the
+/// shell's own pid is the same alias, exactly as procfs serves it);
+/// this face previously carried the only private copy of that rewrite.
+/// Foreign pids stay plain filesystem paths.
 pub(in crate::executor) fn dev_operand_fd(value: &str) -> Option<u32> {
-    if let Some(fd) = crate::special_paths::fd_alias_target(value) {
-        return Some(fd);
-    }
-    let rest = value.strip_prefix("/proc/")?;
-    let (pid, tail) = rest.split_once('/')?;
-    if pid.parse::<u32>().ok()? != std::process::id() {
-        return None;
-    }
-    crate::special_paths::fd_alias_target(&format!("/proc/self/{tail}"))
+    crate::special_paths::fd_alias_target(value)
 }
 
 /// The resolved content of a `/dev/fd/N`-family operand together with the

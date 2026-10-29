@@ -47,8 +47,9 @@ pub(crate) enum SpecialPathClass {
     /// sink/source-of-EOF device; opens route to the mapped device.
     NullDevice,
     /// `/dev/stdin`, `/dev/stdout`, `/dev/stderr`, `/dev/fd/N`,
-    /// `/proc/self/fd/N` — an alias for a dup of the named fd in the
-    /// shell's fd table, never a filesystem open.
+    /// `/proc/self/fd/N`, `/proc/<own-pid>/fd/N` — an alias for a dup
+    /// of the named fd in the shell's fd table, never a filesystem
+    /// open.
     FdAlias(u32),
     /// A synthetic /proc file whose bytes the engine generates
     /// (Windows-only simulation; the class is empty off Windows).
@@ -133,8 +134,30 @@ pub(crate) fn fd_alias_target(target: &str) -> Option<u32> {
     }
     let fd = target
         .strip_prefix("/dev/fd/")
-        .or_else(|| target.strip_prefix("/proc/self/fd/"))?;
+        .or_else(|| target.strip_prefix("/proc/self/fd/"))
+        .or_else(|| own_pid_fd_tail(target))?;
     canonical_fd_number(fd)
+}
+
+/// The numeric-pid spelling of the shell's OWN fd directory
+/// (rubash#1974): `/proc/<pid>/fd/N` with pid == this process. GNU
+/// resolves it through procfs exactly like `/proc/self/fd/N` — the
+/// kernel serves the directory under both names — so the registry
+/// judges it here, once, instead of leaving each consumer to grow a
+/// private pid rewrite (the operand face in dev_fd_operands carried
+/// the only copy, and the redirect/test faces classified the spelling
+/// as a plain filesystem path). Foreign pids stay Filesystem: dup'ing
+/// another process's descriptors is a different mechanism than an
+/// alias of the shell's own table. The pid field is canonical decimal
+/// for the same reason the fd field is (procfs serves only canonical
+/// pid directory names).
+fn own_pid_fd_tail(target: &str) -> Option<&str> {
+    let rest = target.strip_prefix("/proc/")?;
+    let (pid, tail) = rest.split_once("/fd/")?;
+    if canonical_fd_number(pid)? != std::process::id() {
+        return None;
+    }
+    Some(tail)
 }
 
 /// The registry's numeric field is canonical decimal — exactly the
@@ -231,7 +254,11 @@ mod tests {
         }
         let fd = target
             .strip_prefix("/dev/fd/")
-            .or_else(|| target.strip_prefix("/proc/self/fd/"))?;
+            .or_else(|| target.strip_prefix("/proc/self/fd/"))
+            // Issue rubash#1974: the registry also judges the shell's
+            // own numeric-pid spelling; the mirror carries the same
+            // arm so the battery keeps tripping on drift.
+            .or_else(|| own_pid_fd_tail(target))?;
         // Issue rubash#1973: the pre-registry body also accepted
         // leading-zero spellings, which GNU rejects everywhere; the
         // mirror carries the corrected canonical judgment so the
@@ -434,6 +461,45 @@ mod tests {
                 "canonical spelling must stay an fd alias: {spelling:?}"
             );
         }
+    }
+
+    /// Issue rubash#1974 regression pin: the shell's own numeric-pid
+    /// spelling `/proc/<pid>/fd/N` is an fd alias exactly like
+    /// `/proc/self/fd/N` (GNU resolves both through procfs to the same
+    /// descriptor), while a foreign pid's fd directory is NOT an alias
+    /// of the shell's table and a non-canonical pid spelling names no
+    /// procfs directory at all.
+    #[test]
+    fn issue1974_own_pid_fd_spellings_are_aliases() {
+        let pid = std::process::id();
+        for (spelling, fd) in [
+            (format!("/proc/{pid}/fd/0"), 0),
+            (format!("/proc/{pid}/fd/3"), 3),
+            (format!("/proc/{pid}/fd/63"), 63),
+        ] {
+            assert_eq!(
+                fd_alias_target(&spelling),
+                Some(fd),
+                "own-pid spelling must be an fd alias: {spelling:?}"
+            );
+            assert_eq!(
+                classify_special_path(&spelling),
+                SpecialPathClass::FdAlias(fd),
+                "own-pid spelling must classify as fd alias: {spelling:?}"
+            );
+        }
+        // Foreign pid (pid 1 can never be this test process in the
+        // harness, and dup'ing a foreign process's fds is not the
+        // alias mechanism).
+        assert_eq!(fd_alias_target("/proc/1/fd/0"), None);
+        assert_eq!(
+            classify_special_path("/proc/1/fd/0"),
+            SpecialPathClass::Filesystem
+        );
+        // Non-canonical pid and fd fields stay filesystem spellings.
+        assert_eq!(fd_alias_target(&format!("/proc/{pid}/fd/03")), None);
+        assert_eq!(fd_alias_target(&format!("/proc/0{pid}/fd/3")), None);
+        assert_eq!(fd_alias_target("/proc/self/fd/3"), Some(3));
     }
 
     /// rubash#1900: resolution answers exactly for the link class —
