@@ -207,7 +207,7 @@ impl Executor {
             || crate::special_paths::is_full_device(target)
         {
             let full = crate::special_paths::is_full_device(target);
-            let read_file = Self::zero_device_file()?;
+            let read_file = Self::zero_device_file(&target)?;
             let read_fd = FileFd::from_file(read_file, target.into());
             self.set_fd_input_file(fd, read_fd, dynamic);
             if full {
@@ -3641,7 +3641,7 @@ impl Executor {
                         // an unbounded zero stream — bind the
                         // pump-fed source handle (a real handle, so
                         // the descriptor behaves like the device).
-                        let file = Self::zero_device_file()
+                        let file = Self::zero_device_file(&target)
                             .map_err(|e| crate::posix_errors::path_error(&target, e))?;
                         let file_fd = FileFd::from_file(file, target.clone().into());
                         self.set_fd_input_file(fd, file_fd, fd != 0);

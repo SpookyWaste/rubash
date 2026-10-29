@@ -34,16 +34,18 @@ fn run(script: &str) -> (String, String, i32) {
 
 #[test]
 fn issue1898_zero_reads_are_bounded_zero_bytes() {
+    // `od -An -tu1` pads each field to its display width, so the
+    // byte list is compared whitespace-normalized.
+    let zeros = |script: &str| {
+        let (stdout, stderr, code) = run(script);
+        assert_eq!(code, 0, "stderr: {stderr}");
+        stdout.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
     // External consumer through the input ladder: the pump-fed
     // source must deliver exactly the requested zeros.
-    let (stdout, stderr, code) = run("head -c 4 < /dev/zero | od -An -tu1");
-    assert_eq!(code, 0, "stderr: {stderr}");
-    assert_eq!(stdout.trim(), "0 0 0 0", "stdout: {stdout}");
-
+    assert_eq!(zeros("head -c 4 < /dev/zero | od -An -tu1"), "0 0 0 0");
     // /dev/full reads as zeros too (its write side is the full one).
-    let (stdout, stderr, code) = run("head -c 3 < /dev/full | od -An -tu1");
-    assert_eq!(code, 0, "stderr: {stderr}");
-    assert_eq!(stdout.trim(), "0 0 0", "stdout: {stdout}");
+    assert_eq!(zeros("head -c 3 < /dev/full | od -An -tu1"), "0 0 0");
 }
 
 #[test]

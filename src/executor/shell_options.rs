@@ -124,7 +124,7 @@ impl Executor {
             // and discards writes; <> on /dev/full reads zeros (the
             // probe's File is dropped by every caller; the sink
             // stand-in carries the write side of the bind contract).
-            SpecialPathClass::ZeroDevice => return Self::zero_device_file(),
+            SpecialPathClass::ZeroDevice => return Self::zero_device_file(&target),
             SpecialPathClass::FullDevice => return Self::synthetic_proc_write_sink(false),
             SpecialPathClass::FdAlias(fd) => {
                 if super::redirection::dup_source_fd_open(
@@ -300,7 +300,7 @@ impl Executor {
         if crate::special_paths::is_zero_device(target)
             || crate::special_paths::is_full_device(target)
         {
-            return Some(Self::zero_device_file());
+            return Some(Self::zero_device_file(&target));
         }
         // GNU redir.c resolves /dev/std*, /dev/fd/N, /proc/self/fd/N through
         // the OS fd-alias layer — a dup of fd N, not a filesystem path.
@@ -412,31 +412,31 @@ impl Executor {
     }
 
     /// rubash#1898: a readable File that yields an unbounded stream
-    /// of NUL bytes — the /dev/zero (and /dev/full) read face. A pump
-    /// thread feeds a pipe, following the process-substitution
-    /// streaming precedent: consumers get a real handle (external
-    /// children can inherit it), reads never see EOF, and the pump
-    /// exits on EPIPE once the last reader closes. Where the OS has
-    /// the real device (Unix) the faces open it directly and this
-    /// construction is only the shared fallback shape.
-    pub(in crate::executor) fn zero_device_file() -> io::Result<File> {
-        use std::io::Write as _;
-        let (reader, mut writer) = std::io::pipe()?;
-        std::thread::spawn(move || {
-            const ZEROS: [u8; 8192] = [0u8; 8192];
-            while writer.write_all(&ZEROS).is_ok() {}
-        });
+    /// of NUL bytes — the /dev/zero (and /dev/full) read face. Unix
+    /// hosts have the real devices: opening the target IS GNU's
+    /// semantics, an unbounded kernel-owned zero source. Windows has
+    /// no zero device, so a pump thread feeds a pipe, following the
+    /// process-substitution streaming precedent: consumers get a
+    /// real handle (external children can inherit it), reads never
+    /// see EOF, and the pump exits on a broken pipe once the last
+    /// reader closes.
+    pub(in crate::executor) fn zero_device_file(target: &str) -> io::Result<File> {
+        #[cfg(unix)]
+        {
+            File::open(target)
+        }
         #[cfg(windows)]
         {
+            let _ = target;
+            use std::io::Write as _;
+            let (reader, mut writer) = std::io::pipe()?;
+            std::thread::spawn(move || {
+                const ZEROS: [u8; 8192] = [0u8; 8192];
+                while writer.write_all(&ZEROS).is_ok() {}
+            });
             use std::os::windows::io::{FromRawHandle as _, IntoRawHandle as _};
             let handle = reader.into_raw_handle();
             Ok(unsafe { File::from_raw_handle(handle) })
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::{FromRawFd as _, IntoRawFd as _};
-            let fd = reader.into_raw_fd();
-            Ok(unsafe { File::from_raw_fd(fd) })
         }
     }
 

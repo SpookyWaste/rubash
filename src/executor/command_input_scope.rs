@@ -520,7 +520,7 @@ impl Executor {
             {
                 // rubash#1898: the zero/full devices read as an
                 // unbounded zero stream — bind the pump-fed source.
-                let file = Self::zero_device_file()
+                let file = Self::zero_device_file(&target)
                     .map_err(|error| crate::posix_errors::path_error(&target, error))?;
                 let file_fd = FileFd::from_file(file, target.clone().into());
                 self.set_fd_input_file(fd, file_fd, true);
