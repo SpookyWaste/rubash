@@ -448,17 +448,20 @@ impl Executor {
         let mut create_missing = true;
         let mut stamp_accessed = true;
         let mut stamp_modified = true;
-        // (atime, mtime) requested by -t/-d/-r; None = current time.
-        let mut stamp: Option<(SystemTime, SystemTime)> = None;
-        // A -d/-t value this emulation cannot evaluate exactly.
-        let mut unevaluated_date: Option<String> = None;
+        // The stamp is resolved after the option loop from the LAST
+        // -t/-d/-r, in GNU's evaluation order (rubash#1948): -t
+        // converts eagerly (a bad stamp errors on sight, even when a
+        // later option would supersede it), while -d and -r are only
+        // recorded — a superseded -r is never stat'ed and a
+        // superseded -d never parsed, so `touch -r missing -r good
+        // out` succeeds. Of the survivors, the reference file is
+        // evaluated before the date grammar (rubash#1846) and the
+        // date wins the value; -t combined with either is the
+        // separate "more than one source" error.
+        let mut stamp_t: Option<(SystemTime, SystemTime)> = None;
+        let mut date_text: Option<String> = None;
+        let mut ref_file: Option<String> = None;
         let mut info_request = false;
-        // The first -r failure's diagnostic text, held back instead of
-        // printed on sight (rubash#1846): coreutils touch evaluates
-        // the reference file before the date grammar, so when both
-        // fail the reference line is the only one GNU prints, and a
-        // delegated invocation lets the real binary report its own.
-        let mut ref_error: Option<String> = None;
         let mut operands: Vec<String> = Vec::new();
         // coreutils diagnostics are the emulated command's own stderr
         // (rubash#1846): buffered and routed through the command's
@@ -484,51 +487,94 @@ impl Executor {
                 continue;
             }
             if let Some(long) = expanded.strip_prefix("--") {
-                let (name, attached) = match long.split_once('=') {
-                    Some((name, value)) => (name, Some(value.to_string())),
+                let (typed, attached) = match long.split_once('=') {
+                    Some((name, value)) => (name, Some(value)),
                     None => (long, None),
                 };
-                match name {
-                    "date" | "reference" => {
-                        let value = attached.or_else(|| {
-                            let value = cmd.words.get(index).cloned();
-                            index += 1;
-                            value
-                        });
-                        match value {
-                            Some(value) => self.touch_apply_stamp_option(
-                                if name == "date" { 'd' } else { 'r' },
-                                &value,
-                                &mut stamp,
-                                &mut unevaluated_date,
-                                &mut ref_error,
-                            ),
-                            None => failed = true,
-                        }
-                    }
-                    "time" => {
-                        let value = attached.or_else(|| {
-                            let value = cmd.words.get(index).cloned();
-                            index += 1;
-                            value
-                        });
-                        match value.as_deref() {
-                            Some("atime" | "access" | "use") => stamp_modified = false,
-                            Some("mtime" | "modify") => stamp_accessed = false,
-                            _ => failed = true,
-                        }
-                    }
-                    "no-create" => create_missing = false,
-                    "version" | "help" => info_request = true,
-                    _ => {
-                        // glibc getopt_long reports the whole word,
-                        // an attached `=value` included.
-                        writeln!(stderr, "touch: unrecognized option '--{}'", long)?;
-                        writeln!(stderr, "Try 'touch --help' for more information.")?;
+                let entry = match resolve_long_option(typed, TOUCH_LONG_OPTIONS) {
+                    LongResolution::Matched(entry) => entry,
+                    // No touch table entry is no_abbrev.
+                    LongResolution::Abbreviated(entry) => entry,
+                    LongResolution::Unknown => {
+                        diag_unrecognized_option(&mut stderr, "touch", expanded);
                         self.write_buffered_builtin_output(cmd, &[], &stderr)?;
                         self.exit_code = 1;
                         return Ok(true);
                     }
+                    LongResolution::Ambiguous(candidates) => {
+                        diag_ambiguous_option(&mut stderr, "touch", expanded, &candidates);
+                        self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                        self.exit_code = 1;
+                        return Ok(true);
+                    }
+                };
+                // rubash#1946: a no-argument option given `=value`.
+                if entry.arg == LongArg::NoArg && attached.is_some() {
+                    diag_option_no_argument_allowed(&mut stderr, "touch", entry.name);
+                    self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                    self.exit_code = 1;
+                    return Ok(true);
+                }
+                match entry.name {
+                    "date" | "reference" | "time" => {
+                        let value = match attached {
+                            Some(value) => Some(value.to_string()),
+                            None => {
+                                let value = cmd.words.get(index).cloned();
+                                index += 1;
+                                value
+                            }
+                        };
+                        // rubash#1947: a missing value is a getopt
+                        // error with its own diagnostic, never a
+                        // silent failure bit with empty stderr.
+                        let Some(value) = value else {
+                            diag_option_requires_argument(&mut stderr, "touch", entry.name);
+                            self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                            self.exit_code = 1;
+                            return Ok(true);
+                        };
+                        match entry.name {
+                            "date" => date_text = Some(value),
+                            "reference" => ref_file = Some(value),
+                            _ => match argmatch(&value, TOUCH_TIME_VALUES) {
+                                ArgMatch::Matched(_, 0) => stamp_modified = false,
+                                ArgMatch::Matched(_, _) => stamp_accessed = false,
+                                ArgMatch::Invalid => {
+                                    diag_invalid_value(
+                                        &mut stderr,
+                                        "touch",
+                                        "time",
+                                        &value,
+                                        false,
+                                        TOUCH_TIME_VALID_LINES,
+                                    );
+                                    self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                                    self.exit_code = 1;
+                                    return Ok(true);
+                                }
+                                ArgMatch::Ambiguous => {
+                                    diag_invalid_value(
+                                        &mut stderr,
+                                        "touch",
+                                        "time",
+                                        &value,
+                                        true,
+                                        TOUCH_TIME_VALID_LINES,
+                                    );
+                                    self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                                    self.exit_code = 1;
+                                    return Ok(true);
+                                }
+                            },
+                        }
+                    }
+                    "no-create" => create_missing = false,
+                    // Decline-disposition (touch_declines routed the
+                    // invocation); defensive fallback.
+                    "no-dereference" => return Ok(false),
+                    "version" | "help" => info_request = true,
+                    _ => unreachable!("the resolver only returns table names"),
                 }
                 continue;
             }
@@ -539,6 +585,9 @@ impl Executor {
                 position += flag.len_utf8();
                 match flag {
                     'c' => create_missing = false,
+                    // rubash#1944: -f is GNU's legacy no-op flag,
+                    // silently accepted since the 1990s.
+                    'f' => {}
                     'a' => stamp_modified = false,
                     'm' => stamp_accessed = false,
                     'h' => {}
@@ -553,26 +602,88 @@ impl Executor {
                             index += 1;
                             value
                         };
-                        match value {
-                            Some(value) => self.touch_apply_stamp_option(
-                                flag,
-                                &value,
-                                &mut stamp,
-                                &mut unevaluated_date,
-                                &mut ref_error,
-                            ),
-                            None => failed = true,
+                        // rubash#1947: a missing value is a getopt
+                        // error with its own diagnostic.
+                        let Some(value) = value else {
+                            diag_short_option_requires_argument(&mut stderr, "touch", flag);
+                            self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                            self.exit_code = 1;
+                            return Ok(true);
+                        };
+                        match flag {
+                            // -t converts eagerly (coreutils
+                            // posixtime): a bad stamp errors on
+                            // sight, even when a later -t would
+                            // supersede it (rubash#1948).
+                            't' => match parse_touch_stamp_time(&value) {
+                                Some(time) => stamp_t = Some((time, time)),
+                                None => {
+                                    let _ =
+                                        writeln!(stderr, "touch: invalid date format '{}'", value);
+                                    self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                                    self.exit_code = 1;
+                                    return Ok(true);
+                                }
+                            },
+                            'd' => date_text = Some(value),
+                            _ => ref_file = Some(value),
                         }
                         break;
                     }
                     bad => {
-                        writeln!(stderr, "touch: invalid option -- '{}'", bad)?;
-                        writeln!(stderr, "Try 'touch --help' for more information.")?;
+                        diag_invalid_short_option(&mut stderr, "touch", bad);
                         self.write_buffered_builtin_output(cmd, &[], &stderr)?;
                         self.exit_code = 1;
                         return Ok(true);
                     }
                 }
+            }
+        }
+        // -t is the POSIX time source: combined with a surviving -d
+        // or -r it is its own error (measured against coreutils 9.4;
+        // the verdict precedes the -r stat and the -d evaluation).
+        if stamp_t.is_some() && (date_text.is_some() || ref_file.is_some()) {
+            let _ = writeln!(
+                stderr,
+                "touch: cannot specify times from more than one source"
+            );
+            diag_try_line(&mut stderr, "touch");
+            self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+            self.exit_code = 1;
+            return Ok(true);
+        }
+        // Deferred evaluation of the surviving -r/-d (rubash#1948),
+        // in GNU's order: the reference file first, then the date
+        // grammar; the date wins the value.
+        let mut ref_stamp: Option<(SystemTime, SystemTime)> = None;
+        let mut ref_error: Option<String> = None;
+        if let Some(reference) = &ref_file {
+            let target =
+                self.session_path(shell_path_to_windows(reference, &self.shell_state.env_vars));
+            match std::fs::metadata(&target) {
+                Ok(metadata) => {
+                    ref_stamp = Some((
+                        metadata.accessed().unwrap_or(SystemTime::UNIX_EPOCH),
+                        metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                    ));
+                }
+                Err(error) => {
+                    ref_error = Some(format!(
+                        "touch: failed to get attributes of '{}': {}",
+                        reference,
+                        crate::posix_errors::message(&error)
+                    ));
+                }
+            }
+        }
+        let mut date_stamp: Option<(SystemTime, SystemTime)> = None;
+        // The surviving -d, when it falls outside the evaluated
+        // grammar (delegation decides its fate below).
+        let mut unevaluated_date: Option<String> = None;
+        if let Some(text) = &date_text {
+            match parse_touch_date_string(text) {
+                Some(time) => date_stamp = Some((time, time)),
+                None => unevaluated_date = Some(text.clone()),
             }
         }
         // Delegation: --version/--help and dates outside the evaluated
@@ -596,6 +707,7 @@ impl Executor {
             self.exit_code = 1;
             return Ok(true);
         }
+        let stamp = date_stamp.or(ref_stamp).or(stamp_t);
         let (stamp_atime, stamp_mtime) = stamp.unwrap_or_else(|| {
             let now = SystemTime::now();
             (now, now)
@@ -642,48 +754,6 @@ impl Executor {
         self.write_buffered_builtin_output(cmd, &[], &stderr)?;
         self.exit_code = if failed { 1 } else { 0 };
         Ok(true)
-    }
-
-    /// One -t/-d/-r option for the emulated touch (rubash#1069): resolve
-    /// it to a concrete (atime, mtime) stamp, record an unevaluated date
-    /// for the delegation/error decision, or flag a missing reference.
-    fn touch_apply_stamp_option(
-        &self,
-        flag: char,
-        value: &str,
-        stamp: &mut Option<(SystemTime, SystemTime)>,
-        unevaluated_date: &mut Option<String>,
-        ref_error: &mut Option<String>,
-    ) {
-        match flag {
-            'r' => {
-                let target =
-                    self.session_path(shell_path_to_windows(value, &self.shell_state.env_vars));
-                match std::fs::metadata(&target) {
-                    Ok(metadata) => {
-                        let atime = metadata.accessed().unwrap_or(SystemTime::UNIX_EPOCH);
-                        let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                        *stamp = Some((atime, mtime));
-                    }
-                    Err(error) => {
-                        *ref_error = Some(format!(
-                            "touch: failed to get attributes of '{}': {}",
-                            value,
-                            crate::posix_errors::message(&error)
-                        ));
-                    }
-                }
-            }
-            't' => match parse_touch_stamp_time(value) {
-                Some(time) => *stamp = Some((time, time)),
-                None => *unevaluated_date = Some(value.to_string()),
-            },
-            'd' => match parse_touch_date_string(value) {
-                Some(time) => *stamp = Some((time, time)),
-                None => *unevaluated_date = Some(value.to_string()),
-            },
-            _ => {}
-        }
     }
 }
 
@@ -2497,6 +2567,33 @@ fn mkdir_declines(words: &[String]) -> bool {
     false
 }
 
+/// touch's long-option table (coreutils touch.c). --file is NOT in
+/// it: coreutils 9.4 answers `unrecognized option '--file'`.
+const TOUCH_LONG_OPTIONS: &[LongOption] = &[
+    long_option("date", LongArg::Required),
+    long_option("help", LongArg::NoArg),
+    long_option("no-create", LongArg::NoArg),
+    long_option("no-dereference", LongArg::NoArg),
+    long_option("reference", LongArg::Required),
+    long_option("time", LongArg::Required),
+    long_option("version", LongArg::NoArg),
+];
+
+/// touch --time values with their argmatch groups: the three atime
+/// synonyms are one value, the two mtime synonyms another, so a
+/// prefix naming only synonyms of one value is unambiguous.
+const TOUCH_TIME_VALUES: &[(&str, u8)] = &[
+    ("atime", 0),
+    ("access", 0),
+    ("use", 0),
+    ("mtime", 1),
+    ("modify", 1),
+];
+
+/// The --time `Valid arguments are:` lines, in the shape
+/// diag_invalid_value prints them (`  - '<line>'` per line).
+const TOUCH_TIME_VALID_LINES: &[&str] = &["atime', 'access', 'use", "mtime', 'modify"];
+
 /// rubash#1636: whether a touch invocation declines — it carries
 /// -h/--no-dereference (parsed as a no-op; the stamp would land on
 /// the symlink target instead of the link), or it has no operands at
@@ -2520,18 +2617,20 @@ fn touch_declines(words: &[String]) -> bool {
             continue;
         }
         if let Some(long) = arg.strip_prefix("--") {
-            let (name, attached) = match long.split_once('=') {
+            let (typed, attached) = match long.split_once('=') {
                 Some((name, value)) => (name, Some(value)),
                 None => (long, None),
             };
-            match name {
-                "no-dereference" => return true,
-                "date" | "reference" | "time" => {
-                    if attached.is_none() {
-                        index += 1;
+            if let LongResolution::Matched(entry) = resolve_long_option(typed, TOUCH_LONG_OPTIONS) {
+                match entry.name {
+                    "no-dereference" => return true,
+                    "date" | "reference" | "time" => {
+                        if attached.is_none() {
+                            index += 1;
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
             continue;
         }
@@ -2554,6 +2653,138 @@ fn touch_declines(words: &[String]) -> bool {
         }
     }
     operands == 0
+}
+
+/// cp's long-option table in coreutils cp.c declaration order —
+/// the order is observable: an ambiguous prefix lists its candidates
+/// in table order (measured: `--re` → '--recursive'
+/// '--remove-destination' '--reflink'; `--c` → '--copy-contents'
+/// '--context').
+const CP_LONG_OPTIONS: &[LongOption] = &[
+    long_option("archive", LongArg::NoArg),
+    long_option("attributes-only", LongArg::NoArg),
+    long_option("backup", LongArg::Optional),
+    long_option("copy-contents", LongArg::NoArg),
+    long_option("context", LongArg::Optional),
+    long_option("dereference", LongArg::NoArg),
+    long_option("force", LongArg::NoArg),
+    long_option("help", LongArg::NoArg),
+    long_option("interactive", LongArg::NoArg),
+    long_option("link", LongArg::NoArg),
+    long_option("logical", LongArg::NoArg),
+    long_option("no-clobber", LongArg::NoArg),
+    long_option("no-dereference", LongArg::NoArg),
+    long_option("no-preserve", LongArg::Required),
+    long_option("no-target-directory", LongArg::NoArg),
+    long_option("one-file-system", LongArg::NoArg),
+    long_option("parents", LongArg::NoArg),
+    long_option("physical", LongArg::NoArg),
+    long_option("preserve", LongArg::Optional),
+    long_option("recursive", LongArg::NoArg),
+    long_option("remove-destination", LongArg::NoArg),
+    long_option("reflink", LongArg::Optional),
+    long_option("sparse", LongArg::Required),
+    long_option("strip-trailing-slashes", LongArg::NoArg),
+    long_option("suffix", LongArg::Required),
+    long_option("symbolic-link", LongArg::NoArg),
+    long_option("target-directory", LongArg::Required),
+    long_option("update", LongArg::Optional),
+    long_option("verbose", LongArg::NoArg),
+    long_option("version", LongArg::NoArg),
+];
+
+/// The cp long options whose semantics this emulation does not
+/// implement: resolving to one declines the invocation to the real
+/// binary (the cp_declines narrowing, rubash#1636). --dereference
+/// and --logical are NOT here: the emulation always follows links,
+/// so both are honest no-ops.
+fn cp_long_option_declines(name: &str) -> bool {
+    matches!(
+        name,
+        "attributes-only"
+            | "backup"
+            | "copy-contents"
+            | "context"
+            | "force"
+            | "help"
+            | "link"
+            | "no-dereference"
+            | "no-target-directory"
+            | "one-file-system"
+            | "parents"
+            | "physical"
+            | "reflink"
+            | "sparse"
+            | "strip-trailing-slashes"
+            | "suffix"
+            | "symbolic-link"
+            | "version"
+    )
+}
+
+/// The --preserve/--no-preserve attribute names (coreutils cp.c
+/// argmatch table), in the order the `Valid arguments are:` block
+/// prints them.
+const CP_PRESERVE_VALUES: &[(&str, u8)] = &[
+    ("mode", 0),
+    ("timestamps", 1),
+    ("ownership", 2),
+    ("links", 3),
+    ("context", 4),
+    ("xattr", 5),
+    ("all", 6),
+];
+
+const CP_PRESERVE_VALID_LINES: &[&str] = &[
+    "mode",
+    "timestamps",
+    "ownership",
+    "links",
+    "context",
+    "xattr",
+    "all",
+];
+
+/// The --update values (coreutils cp.c argmatch table).
+const CP_UPDATE_VALUES: &[(&str, u8)] = &[("all", 0), ("none", 1), ("older", 2)];
+
+const CP_UPDATE_VALID_LINES: &[&str] = &["all", "none", "older"];
+
+/// The attributes a cp invocation preserves (rubash#1941): mode and
+/// timestamps are stamped by cp_apply_preserved; links reroutes a
+/// repeated source inode to a hard link (cp_link_destination); xattr
+/// and context copy through the platform attribute store on unix.
+/// Ownership parses and is skipped, matching what an unprivileged
+/// GNU cp can actually honor.
+#[derive(Clone, Copy, Default)]
+struct CpPreserve {
+    mode: bool,
+    times: bool,
+    links: bool,
+    xattr: bool,
+    context: bool,
+}
+
+impl CpPreserve {
+    fn any(&self) -> bool {
+        self.mode || self.times || self.links || self.xattr || self.context
+    }
+
+    fn set_all(&mut self, value: bool) {
+        self.mode = value;
+        self.times = value;
+        self.links = value;
+        self.xattr = value;
+        self.context = value;
+    }
+}
+
+/// One bad --preserve/--no-preserve element: the offending text and
+/// whether argmatch found it ambiguous (an empty element, or a
+/// prefix of two attributes) rather than invalid.
+struct CpBadAttribute {
+    text: String,
+    ambiguous: bool,
 }
 
 /// rubash#1636: whether a cp invocation uses an option shape the

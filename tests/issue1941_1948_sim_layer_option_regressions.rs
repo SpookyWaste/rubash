@@ -217,3 +217,122 @@ fn issue1942_cp_unknown_short_option_carries_try_line() {
     );
 }
 
+// ---------------------------------------------------------------- #1944
+
+#[cfg(unix)]
+#[test]
+fn issue1944_touch_f_is_a_silent_noop_flag() {
+    let dir = scratch("1944-f");
+    let out = run_in_dir(
+        &dir,
+        "touch -f nf; echo rc=$?; test -e nf && echo CREATED; \
+         touch -cf nf2; echo rc=$?; test -e nf2 && echo BAD-CREATED || echo NOT-CREATED",
+    );
+    assert_eq!(out.stdout, "rc=0\nCREATED\nrc=0\nNOT-CREATED\n");
+    assert_eq!(out.stderr, "");
+}
+
+// ---------------------------------------------------------------- #1947
+
+#[cfg(unix)]
+#[test]
+fn issue1947_touch_missing_option_values_diagnose() {
+    let dir = scratch("1947-missing");
+    let out = run_in_dir(&dir, "touch f -r; echo rc=$?");
+    assert_eq!(out.stdout, "rc=1\n");
+    assert_eq!(
+        out.stderr,
+        "touch: option requires an argument -- 'r'\nTry 'touch --help' for more information.\n"
+    );
+
+    let out = run_in_dir(&dir, "touch f --date; echo rc=$?");
+    assert_eq!(out.stdout, "rc=1\n");
+    assert_eq!(
+        out.stderr,
+        "touch: option '--date' requires an argument\nTry 'touch --help' for more information.\n"
+    );
+
+    let out = run_in_dir(&dir, "touch f -t; echo rc=$?");
+    assert_eq!(out.stdout, "rc=1\n");
+    assert_eq!(
+        out.stderr,
+        "touch: option requires an argument -- 't'\nTry 'touch --help' for more information.\n"
+    );
+
+    let out = run_in_dir(&dir, "touch f --time; echo rc=$?");
+    assert_eq!(out.stdout, "rc=1\n");
+    assert_eq!(
+        out.stderr,
+        "touch: option '--time' requires an argument\nTry 'touch --help' for more information.\n"
+    );
+}
+
+// ---------------------------------------------------------------- #1948
+
+#[cfg(unix)]
+#[test]
+fn issue1948_touch_last_reference_wins_and_superseded_never_stats() {
+    let dir = scratch("1948-ref");
+    let out = run_in_dir(
+        &dir,
+        "touch -d '2001-01-01' good; touch -d '2002-02-02' good2; \
+         touch -r missing -r good out1; echo rc=$?; \
+         test \"$(stat -c %Y out1)\" = \"$(stat -c %Y good)\" && echo OUT1-GOOD; \
+         touch -r good -r good2 out9; \
+         test \"$(stat -c %Y out9)\" = \"$(stat -c %Y good2)\" && echo OUT9-GOOD2",
+    );
+    assert_eq!(out.stdout, "rc=0\nOUT1-GOOD\nOUT9-GOOD2\n");
+    assert_eq!(out.stderr, "");
+}
+
+#[cfg(unix)]
+#[test]
+fn issue1948_touch_winning_bad_reference_still_fails() {
+    let dir = scratch("1948-ref-bad");
+    let out = run_in_dir(
+        &dir,
+        "touch -d '2001-01-01' good; touch -r good -r missing out2; echo rc=$?; \
+         test -e out2 && echo BAD-CREATED || echo NOT-CREATED",
+    );
+    assert_eq!(out.stdout, "rc=1\nNOT-CREATED\n");
+    assert!(out
+        .stderr
+        .contains("touch: failed to get attributes of 'missing'"));
+}
+
+#[cfg(unix)]
+#[test]
+fn issue1948_touch_superseded_bad_date_is_never_parsed() {
+    let dir = scratch("1948-date");
+    let out = run_in_dir(
+        &dir,
+        "touch -d 'garbage!!' -d '2001-01-01' out3; echo rc=$?; \
+         test \"$(stat -c %Y out3)\" = \"$(stat -c %Y out3)\" && echo OUT3-OK; \
+         touch -d '2001-01-01' -d 'garbage!!' out4; echo rc=$?",
+    );
+    // out4's surviving -d is outside the emulation's grammar, so the
+    // invocation delegates to the real GNU touch on PATH, which
+    // reports the same invalid-date line the emulation would.
+    assert_eq!(out.stdout, "rc=0\nOUT3-OK\nrc=1\n");
+    assert!(out.stderr.contains("invalid date format 'garbage!!'"));
+}
+
+#[cfg(unix)]
+#[test]
+fn issue1948_touch_date_beats_reference_and_t_conflicts() {
+    let dir = scratch("1948-mix");
+    let out = run_in_dir(
+        &dir,
+        "touch -d '2001-01-01' good; touch -d '2002-02-02' y2002; \
+         touch -r good -d '2002-02-02' out1; \
+         test \"$(stat -c %Y out1)\" = \"$(stat -c %Y y2002)\" && echo DATE-WINS; \
+         touch -r missing -t 200101010000 out8; echo rc=$?; \
+         touch -t badstamp -t 200101010000 outA; echo rc=$?; \
+         test -e outA && echo BAD-CREATED || echo A-ABSENT",
+    );
+    assert_eq!(out.stdout, "DATE-WINS\nrc=1\nrc=1\nA-ABSENT\n");
+    assert!(out
+        .stderr
+        .contains("touch: cannot specify times from more than one source"));
+    assert!(out.stderr.contains("touch: invalid date format 'badstamp'"));
+}
