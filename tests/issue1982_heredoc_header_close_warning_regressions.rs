@@ -134,6 +134,6 @@ fn issue1982_paren_on_delimiter_line_warns_delimited_only() {
     assert_eq!(out, "V=[hello body]\n");
     assert_eq!(
         err,
-        "SH: line 1: warning: Here document at line 1 delimited by EOF\n"
+        "SH: line 3: warning: here-document at line 1 delimited by end-of-file (wanted `EOF')\n"
     );
 }

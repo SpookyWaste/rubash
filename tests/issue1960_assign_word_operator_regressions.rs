@@ -123,11 +123,10 @@ fn issue1960_operator_inside_dash_word_does_not_claim() {
     // GNU agreement guard: `${a:-x=y:=z}` is the `:-` form — the
     // inner operators are word text; nothing is assigned and `a`
     // stays unset.
-    let (out, err, rc) = s.run("unset a\necho \"r=[${a:-x=y:=z}]\"\ndeclare -p a 2>&1 | head -1\n");
-    assert_eq!(rc, 0, "stderr: {err}");
-    assert_eq!(out, "r=[x=y:=z]\n");
-    assert!(
-        err.contains("a: unbound variable") || err.contains("declare: a: not found"),
-        "unexpected stderr: {err}"
+    let (out, err, rc) = s.run(
+        "unset a\necho \"r=[${a:-x=y:=z}]\"\nif [[ -v a ]]; then echo bound; else echo unbound; fi\n",
     );
+    assert_eq!(rc, 0, "stderr: {err}");
+    assert_eq!(out, "r=[x=y:=z]\nunbound\n");
+    assert_eq!(err, "");
 }
