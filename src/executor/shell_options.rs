@@ -549,10 +549,32 @@ impl Executor {
             Some(FdReadEndpoint::InheritedProcessStdin) => {
                 super::inherited_stdin::duplicate_process_stdin()
             }
-            _ => Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("{target}: Bad file descriptor"),
-            )),
+            _ => {
+                // rubash#1963: no read endpoint, but the descriptor
+                // may be open write-only (`exec 63>f; : < /dev/fd/63`).
+                // GNU's /dev/fd open is a fresh open of the
+                // descriptor's TARGET, judged against the target
+                // file's mode, not the descriptor's: a file binding
+                // reopens its path (its stored path is the native
+                // form it was opened from), and any other open
+                // descriptor's read-open succeeds against the null
+                // device (reads see EOF — the stdio write ends'
+                // content contract is the dev-operand face's
+                // documented decline). Only a descriptor with no
+                // endpoint at all keeps the EBADF answer.
+                match self.fd_table.write_endpoint(fd) {
+                    Some(FdWriteEndpoint::File(file)) => File::open(&file.path)
+                        .map_err(|e| crate::posix_errors::path_error(target, e)),
+                    Some(_) => File::open(shell_path_to_windows(
+                        "/dev/null",
+                        &self.shell_state.env_vars,
+                    )),
+                    None => Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("{target}: Bad file descriptor"),
+                    )),
+                }
+            }
         }
     }
 

@@ -737,6 +737,39 @@ impl Executor {
                     )
                     .map(|_| Some(RedirectRejection::Command));
             }
+            // rubash#1963: an fd-alias target under any file-open
+            // kind whose fd is closed — GNU's redir_open over the
+            // /dev/fd layer fails ENOENT, reported once through
+            // redirection_error (redir.c:149-176). The judgment is a
+            // pure fd-table lookup against the ordered effects
+            // recorded so far in this list, so the gate delivers it
+            // here, before any serving face can report it a second
+            // time (the no-output mirror paired with the routing
+            // walk) or not at all (a builtin that never reads stdin
+            // silently ignored its failed input open). Open aliases
+            // pass: their serving faces own the dup semantics.
+            if matches!(
+                redirect.kind,
+                crate::parser::RedirectKind::Output
+                    | crate::parser::RedirectKind::ClobberOutput
+                    | crate::parser::RedirectKind::CombinedOutput
+                    | crate::parser::RedirectKind::Append
+                    | crate::parser::RedirectKind::CombinedAppend
+                    | crate::parser::RedirectKind::Input
+                    | crate::parser::RedirectKind::ReadWrite
+            ) {
+                if let Some(fd) = crate::special_paths::fd_alias_target(&target) {
+                    if !dup_source_fd_open(&self.fd_table, fd, &opened) {
+                        return self
+                            .reject_redirect_at(
+                                cmd,
+                                index,
+                                &format!("{target}: No such file or directory"),
+                            )
+                            .map(|_| Some(RedirectRejection::Command));
+                    }
+                }
+            }
             // `<> word` opens O_RDWR|O_CREAT (make_cmd.c:682) — creating
             // the missing file is part of the redirection, not a consumer
             // side effect (rubash#264). Other open failures (bad

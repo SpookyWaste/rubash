@@ -108,6 +108,23 @@ fn issue1963_closed_alias_proc_spelling_parity() {
 }
 
 #[test]
+fn issue1963_closed_alias_exec_bind_fails_single_enoent() {
+    // `exec 3> /dev/fd/63` performs the same open at bind time:
+    // one ENOENT line, the exec reports status 1, and the script
+    // continues (measured on the oracle).
+    let (stdout, stderr, code) = run("exec 3> /dev/fd/63; echo rc=$?");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "rc=1", "stdout: {stdout}");
+    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 1, "stderr: {stderr}");
+    assert!(
+        lines[0].ends_with("/dev/fd/63: No such file or directory"),
+        "line: {}",
+        lines[0]
+    );
+}
+
+#[test]
 fn issue1963_open_alias_shapes_all_succeed() {
     let script = "exec 63>/dev/null; \
                   : > /dev/fd/63; echo a=$?; \
