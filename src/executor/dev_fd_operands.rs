@@ -499,6 +499,12 @@ impl Executor {
             FdWriteEndpoint::ProcessSubstitution { path, .. } => {
                 Some(path.to_string_lossy().into_owned())
             }
+            // rubash#1898: an operand naming a /dev/full binding —
+            // the child gets a throwaway temp whose contents are
+            // never flushed anywhere (absorbed, like the device's
+            // contract minus the ENOSPC the child would see from
+            // the real device; the in-shell faces carry that shape).
+            FdWriteEndpoint::FullDevice => dev_operand_temp(&[], m),
         }
     }
 

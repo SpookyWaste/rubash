@@ -113,7 +113,10 @@ pub(crate) enum FdReadEndpoint {
     File(Rc<FileFd>),
     InheritedProcessStdin,
     ProcessSubstitution(Rc<RefCell<TextInput>>),
-    CoprocStdout { pid: u32, fd: Rc<FileFd> },
+    CoprocStdout {
+        pid: u32,
+        fd: Rc<FileFd>,
+    },
     /// A descriptor bound to a DIRECTORY (rubash#1937): GNU's open of
     /// a directory succeeds (O_RDONLY) and every read fails EISDIR —
     /// the read builtin reports `read error: Is a directory`
@@ -145,6 +148,14 @@ pub(crate) enum FdWriteEndpoint {
         /// Bookkeeping only — excluded from endpoint identity below.
         procsub_pid: Option<u32>,
     },
+    /// rubash#1898: an fd bound to /dev/full. The bind succeeds;
+    /// every write fails ENOSPC, which the write faces render through
+    /// sh_chkwrite (`<name>: write error: No space left on device`,
+    /// builtins/common.c:320-334). No Windows handle has that failure
+    /// profile, so the endpoint is carried symbolically and the
+    /// faces produce the failure — the registry's answer travels
+    /// with the descriptor instead of being re-derived per face.
+    FullDevice,
 }
 
 #[derive(Debug, Clone)]
@@ -1283,6 +1294,21 @@ impl FdTable {
                             command: command.clone(),
                         }
                     }
+                    FdWriteEndpoint::FullDevice => {
+                        // rubash#1898: materializing a /dev/full
+                        // binding for a child stage hands it an
+                        // absorbed sink file — the ENOSPC failure
+                        // profile cannot cross this boundary (the
+                        // in-shell write faces carry it exactly);
+                        // GNU hands the child the real device.
+                        let path = std::env::temp_dir().join(format!(
+                            "rubash-full-sink-{}-{}",
+                            std::process::id(),
+                            fd
+                        ));
+                        let _ = std::fs::File::create(&path);
+                        MaterializedWrite::File(path)
+                    }
                 });
                 (*fd, MaterializedFd { read, write })
             })
@@ -1320,6 +1346,8 @@ impl PartialEq for FdWriteEndpoint {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Stdout, Self::Stdout) | (Self::Stderr, Self::Stderr) => true,
+            // rubash#1898: /dev/full endpoints are interchangeable.
+            (Self::FullDevice, Self::FullDevice) => true,
             (Self::File(a), Self::File(b)) => Rc::ptr_eq(a, b),
             (Self::CoprocStdin { pid: a, .. }, Self::CoprocStdin { pid: b, .. }) => a == b,
             (

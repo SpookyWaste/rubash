@@ -515,6 +515,15 @@ impl Executor {
             if redirect.kind == crate::parser::RedirectKind::ReadWrite {
                 self.set_fd_readwrite_file(fd, &target, true)
                     .map_err(|e| crate::posix_errors::path_error(&target, e))?;
+            } else if crate::special_paths::is_zero_device(&target)
+                || crate::special_paths::is_full_device(&target)
+            {
+                // rubash#1898: the zero/full devices read as an
+                // unbounded zero stream — bind the pump-fed source.
+                let file = Self::zero_device_file()
+                    .map_err(|error| crate::posix_errors::path_error(&target, error))?;
+                let file_fd = FileFd::from_file(file, target.clone().into());
+                self.set_fd_input_file(fd, file_fd, true);
             } else if let Some(bytes) = crate::special_paths::synthetic_proc_content(&target) {
                 // Registry first (rubash#1917, same ladder-skip family
                 // as the exec-fd face): synthetic /proc content has no

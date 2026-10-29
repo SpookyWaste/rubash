@@ -198,6 +198,36 @@ impl Executor {
                 .insert(fd_output_key(fd), target.to_string());
             return Ok(());
         }
+        // rubash#1898: the zero/full devices bind directly — reads
+        // come from the pump-fed zero source; /dev/zero writes go to
+        // the null sink; /dev/full writes bind the FullDevice
+        // endpoint, whose faces fail ENOSPC through sh_chkwrite
+        // exactly like the direct redirect faces.
+        if crate::special_paths::is_zero_device(target)
+            || crate::special_paths::is_full_device(target)
+        {
+            let full = crate::special_paths::is_full_device(target);
+            let read_file = Self::zero_device_file()?;
+            let read_fd = FileFd::from_file(read_file, target.into());
+            self.set_fd_input_file(fd, read_fd, dynamic);
+            if full {
+                self.fd_table
+                    .open_output(fd, FdWriteEndpoint::FullDevice, dynamic);
+            } else {
+                let write_file = self.create_redirect_output("/dev/null", true)?;
+                let write_fd = FileFd::from_file(write_file, target.into());
+                self.fd_table
+                    .open_output(fd, FdWriteEndpoint::File(write_fd), dynamic);
+            }
+            self.shell_state.env_vars.remove(&fd_closed_key(fd));
+            self.shell_state
+                .env_vars
+                .remove(&fd_output_process_substitution_key(fd));
+            self.shell_state
+                .env_vars
+                .insert(fd_output_key(fd), target.to_string());
+            return Ok(());
+        }
         // rubash#1935: synthetic /proc content — the entry's write
         // class decides the open, the same answer the probe ladder
         // gives: the 0444 class fails the open EACCES (redir.c
@@ -313,6 +343,28 @@ impl Executor {
             let file_fd = FileFd::from_file(file, target.clone().into());
             self.fd_table
                 .open_output(fd, FdWriteEndpoint::File(file_fd), dynamic);
+            self.shell_state.env_vars.remove(&fd_closed_key(fd));
+            self.shell_state
+                .env_vars
+                .remove(&fd_output_process_substitution_key(fd));
+            self.shell_state.env_vars.insert(fd_output_key(fd), target);
+            return Ok(());
+        }
+        // rubash#1898: device write binds — /dev/zero discards
+        // through the null sink; /dev/full binds the FullDevice
+        // endpoint (its writes fail ENOSPC through sh_chkwrite).
+        if crate::special_paths::is_zero_device(&target)
+            || crate::special_paths::is_full_device(&target)
+        {
+            if crate::special_paths::is_full_device(&target) {
+                self.fd_table
+                    .open_output(fd, FdWriteEndpoint::FullDevice, dynamic);
+            } else {
+                let file = self.create_redirect_output("/dev/null", true)?;
+                let file_fd = FileFd::from_file(file, target.clone().into());
+                self.fd_table
+                    .open_output(fd, FdWriteEndpoint::File(file_fd), dynamic);
+            }
             self.shell_state.env_vars.remove(&fd_closed_key(fd));
             self.shell_state
                 .env_vars
@@ -3578,6 +3630,17 @@ impl Executor {
                         let file = self.open_net_redirect(&target)?;
                         let file_fd = FileFd::from_file(file, target.clone().into());
                         self.set_fd_input_file(fd, file_fd, fd != 0);
+                    } else if crate::special_paths::is_zero_device(&target)
+                        || crate::special_paths::is_full_device(&target)
+                    {
+                        // rubash#1898: the zero/full devices read as
+                        // an unbounded zero stream — bind the
+                        // pump-fed source handle (a real handle, so
+                        // the descriptor behaves like the device).
+                        let file = Self::zero_device_file()
+                            .map_err(|e| crate::posix_errors::path_error(&target, e))?;
+                        let file_fd = FileFd::from_file(file, target.clone().into());
+                        self.set_fd_input_file(fd, file_fd, fd != 0);
                     } else if let Some(bytes) =
                         crate::special_paths::synthetic_proc_content(&target)
                     {
@@ -3611,9 +3674,8 @@ impl Executor {
                         {
                             self.set_fd_input_directory(fd, fd != 0);
                         } else {
-                            let file =
-                                FileFd::open_read(std::path::PathBuf::from(&link.native))
-                                    .map_err(|e| crate::posix_errors::path_error(&target, e))?;
+                            let file = FileFd::open_read(std::path::PathBuf::from(&link.native))
+                                .map_err(|e| crate::posix_errors::path_error(&target, e))?;
                             self.set_fd_input_file(fd, file, fd != 0);
                         }
                     } else {

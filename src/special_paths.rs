@@ -15,7 +15,8 @@
 //!   filesystem), keeping only their own semantic pre-steps (noclobber,
 //!   session-cwd anchoring, consume/probe discipline);
 //! - the per-class query functions ([`is_net_redirect_target`],
-//!   [`is_shell_null_device`], [`fd_alias_target`],
+//!   [`is_shell_null_device`], [`is_zero_device`], [`is_full_device`],
+//!   [`fd_alias_target`],
 //!   [`synthetic_proc_content`], [`is_synthetic_link_path`]) are the
 //!   same judgments in the shapes existing consumers already ask; they
 //!   are defined here once, from the same bodies, so a query answer
@@ -46,6 +47,17 @@ pub(crate) enum SpecialPathClass {
     /// `/dev/null` (plus the DOS spelling `NUL` on Windows) — the
     /// sink/source-of-EOF device; opens route to the mapped device.
     NullDevice,
+    /// `/dev/zero` — the zero device (rubash#1898): reads yield an
+    /// unbounded stream of NUL bytes, writes are discarded. A real
+    /// device on Unix; in the Windows simulation the service faces
+    /// build it (a pump-fed pipe for reads, the null sink for
+    /// writes), so the class is judged on every platform and only
+    /// its construction is platform work.
+    ZeroDevice,
+    /// `/dev/full` — the full device (rubash#1898): reads yield
+    /// zeros like /dev/zero, and every write fails ENOSPC
+    /// (`write error: No space left on device`, sh_chkwrite).
+    FullDevice,
     /// `/dev/stdin`, `/dev/stdout`, `/dev/stderr`, `/dev/fd/N`,
     /// `/proc/self/fd/N`, `/proc/<own-pid>/fd/N` — an alias for a dup
     /// of the named fd in the shell's fd table, never a filesystem
@@ -85,6 +97,10 @@ pub(crate) fn classify_special_path(target: &str) -> SpecialPathClass {
         SpecialPathClass::NetRedirect
     } else if is_shell_null_device(target) {
         SpecialPathClass::NullDevice
+    } else if is_zero_device(target) {
+        SpecialPathClass::ZeroDevice
+    } else if is_full_device(target) {
+        SpecialPathClass::FullDevice
     } else if let Some(fd) = fd_alias_target(target) {
         SpecialPathClass::FdAlias(fd)
     } else if is_synthetic_link_path(target) {
@@ -116,6 +132,21 @@ pub(crate) fn is_net_redirect_target(target: &str) -> bool {
 pub(crate) fn is_shell_null_device(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
     normalized == "/dev/null" || (cfg!(windows) && normalized.eq_ignore_ascii_case("NUL"))
+}
+
+/// Whether `path` spells the zero device (rubash#1898): the POSIX
+/// spelling with backslashes normalized, exactly the judgment shape
+/// the null device uses. GNU serves /dev/zero from the kernel device;
+/// the registry judges the spelling on every platform so no face
+/// re-derives it.
+pub(crate) fn is_zero_device(path: &str) -> bool {
+    path.replace('\\', "/") == "/dev/zero"
+}
+
+/// Whether `path` spells the full device (rubash#1898): reads yield
+/// zeros, writes fail ENOSPC. Same judgment shape as the zero device.
+pub(crate) fn is_full_device(path: &str) -> bool {
+    path.replace('\\', "/") == "/dev/full"
 }
 
 /// GNU redir.c opens `/dev/stdin`/`/dev/stdout`/`/dev/stderr`,
@@ -370,10 +401,14 @@ mod tests {
             // The one overlap family: the fd-alias reading wins over
             // the /proc reading on every platform.
             ("/proc/self/fd/0", FdAlias(0)),
-            // Ordinary paths and not-yet-implemented device spellings
-            // (/dev/zero is audit D5, a later slice) stay Filesystem.
+            // Character devices (rubash#1898): /dev/zero and
+            // /dev/full are registry classes on every platform —
+            // the service faces build them where the OS has none.
+            ("/dev/zero", ZeroDevice),
+            ("/dev/full", FullDevice),
+            ("\\dev\\zero", ZeroDevice),
+            // Ordinary paths stay Filesystem.
             ("/dev/tty", Filesystem),
-            ("/dev/zero", Filesystem),
             ("etc/hosts", Filesystem),
             ("/tmp/x", Filesystem),
             ("", Filesystem),
@@ -402,6 +437,16 @@ mod tests {
                 is_shell_null_device(target),
                 class == NullDevice,
                 "null query vs classify for {target:?}"
+            );
+            assert_eq!(
+                is_zero_device(target),
+                class == ZeroDevice,
+                "zero query vs classify for {target:?}"
+            );
+            assert_eq!(
+                is_full_device(target),
+                class == FullDevice,
+                "full query vs classify for {target:?}"
             );
             assert_eq!(
                 fd_alias_target(target),

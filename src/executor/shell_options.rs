@@ -120,6 +120,12 @@ impl Executor {
         use crate::special_paths::SpecialPathClass;
         match crate::special_paths::classify_special_path(target) {
             SpecialPathClass::NetRedirect => return self.open_net_redirect_raw(target),
+            // rubash#1898: the devices — <> on /dev/zero reads zeros
+            // and discards writes; <> on /dev/full reads zeros (the
+            // probe's File is dropped by every caller; the sink
+            // stand-in carries the write side of the bind contract).
+            SpecialPathClass::ZeroDevice => return Self::zero_device_file(),
+            SpecialPathClass::FullDevice => return Self::synthetic_proc_write_sink(false),
             SpecialPathClass::FdAlias(fd) => {
                 if super::redirection::dup_source_fd_open(
                     &self.fd_table,
@@ -154,10 +160,7 @@ impl Executor {
                     Some(&crate::proc_vfs::self_cwd_forms(self.session_cwd())),
                 ) {
                     Some(link) => {
-                        return OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .open(&link.native);
+                        return OpenOptions::new().read(true).write(true).open(&link.native);
                     }
                     None => {
                         return Err(io::Error::new(
@@ -289,6 +292,16 @@ impl Executor {
                 &self.shell_state.env_vars,
             )));
         }
+        // rubash#1898: /dev/zero reads yield an unbounded stream of
+        // NUL bytes, and /dev/full reads yield the same zeros — both
+        // serve from the pump-fed zero source (a real handle, so
+        // external children can inherit it). On Unix the construction
+        // is equivalent to opening the real device.
+        if crate::special_paths::is_zero_device(target)
+            || crate::special_paths::is_full_device(target)
+        {
+            return Some(Self::zero_device_file());
+        }
         // GNU redir.c resolves /dev/std*, /dev/fd/N, /proc/self/fd/N through
         // the OS fd-alias layer — a dup of fd N, not a filesystem path.
         // Windows has no /dev, so resolve against the virtual fd table
@@ -373,10 +386,8 @@ impl Executor {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SINK_SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SINK_SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "rubash-proc-sink-{}-{seq}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("rubash-proc-sink-{}-{seq}", std::process::id()));
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         if append {
@@ -398,6 +409,35 @@ impl Executor {
             let _ = std::fs::remove_file(&path);
         }
         Ok(file)
+    }
+
+    /// rubash#1898: a readable File that yields an unbounded stream
+    /// of NUL bytes — the /dev/zero (and /dev/full) read face. A pump
+    /// thread feeds a pipe, following the process-substitution
+    /// streaming precedent: consumers get a real handle (external
+    /// children can inherit it), reads never see EOF, and the pump
+    /// exits on EPIPE once the last reader closes. Where the OS has
+    /// the real device (Unix) the faces open it directly and this
+    /// construction is only the shared fallback shape.
+    pub(in crate::executor) fn zero_device_file() -> io::Result<File> {
+        use std::io::Write as _;
+        let (reader, mut writer) = std::io::pipe()?;
+        std::thread::spawn(move || {
+            const ZEROS: [u8; 8192] = [0u8; 8192];
+            while writer.write_all(&ZEROS).is_ok() {}
+        });
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::{FromRawHandle as _, IntoRawHandle as _};
+            let handle = reader.into_raw_handle();
+            Ok(unsafe { File::from_raw_handle(handle) })
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::{FromRawFd as _, IntoRawFd as _};
+            let fd = reader.into_raw_fd();
+            Ok(unsafe { File::from_raw_fd(fd) })
+        }
     }
 
     fn open_input_redirect_impl(&self, target: &str, consume: bool) -> io::Result<File> {
@@ -479,7 +519,9 @@ impl Executor {
             Some(FdReadEndpoint::CoprocStdout { fd: file_fd, .. }) => {
                 crate::fd::duplicate_handle(file_fd.handle)
                     .map(crate::fd::handle_to_file)
-                    .map_err(|e| crate::posix_errors::path_error(&file_fd.path.to_string_lossy(), e))
+                    .map_err(|e| {
+                        crate::posix_errors::path_error(&file_fd.path.to_string_lossy(), e)
+                    })
             }
             Some(FdReadEndpoint::Text(_)) | Some(FdReadEndpoint::ProcessSubstitution(_)) => {
                 let bytes = self
@@ -744,6 +786,24 @@ impl Executor {
                 &self.shell_state.env_vars,
             ));
         }
+        // rubash#1898: /dev/zero discards writes exactly like the
+        // null device; opens route to the same sink.
+        if crate::special_paths::is_zero_device(target) {
+            return OpenOptions::new().write(true).open(shell_path_to_windows(
+                "/dev/null",
+                &self.shell_state.env_vars,
+            ));
+        }
+        // rubash#1898: /dev/full ACCEPTS the open — GNU fails only
+        // the write (ENOSPC). The direct builtin faces route their
+        // flush through OutputTarget::FullDevice, which owns the
+        // write-error shape; the File returned here is the stand-in
+        // for the probe/bind/external contracts that need the open
+        // itself to succeed (their writes are absorbed — the
+        // documented residual of those faces).
+        if crate::special_paths::is_full_device(target) {
+            return Self::synthetic_proc_write_sink(false);
+        }
         // rubash#1935: synthetic /proc content has no filesystem file
         // behind the mapped path — without this step `> /proc/...`
         // either failed ENOENT or created a phantom enclave file at
@@ -896,6 +956,14 @@ impl Executor {
                     "coprocess file descriptor",
                 ));
             }
+            FdWriteEndpoint::FullDevice => {
+                // rubash#1898: an append-dup of a /dev/full binding —
+                // GNU's open succeeds and its writes fail ENOSPC; no
+                // handle reproduces that, so the append lands on the
+                // absorbed sink (a deep edge; the bound write faces
+                // themselves carry the exact ENOSPC shape).
+                return Self::synthetic_proc_write_sink(true);
+            }
             FdWriteEndpoint::File(_) => unreachable!("handled above"),
         };
         if is_null_device(&path.to_string_lossy()) {
@@ -927,13 +995,29 @@ impl Executor {
         use crate::special_paths::SpecialPathClass;
         match crate::special_paths::classify_special_path(target) {
             SpecialPathClass::NetRedirect => self.open_net_redirect_raw(target),
-            SpecialPathClass::NullDevice => OpenOptions::new()
-                .write(true)
-                .append(true)
-                .open(shell_path_to_windows(
-                    "/dev/null",
-                    &self.shell_state.env_vars,
-                )),
+            SpecialPathClass::NullDevice => {
+                OpenOptions::new()
+                    .write(true)
+                    .append(true)
+                    .open(shell_path_to_windows(
+                        "/dev/null",
+                        &self.shell_state.env_vars,
+                    ))
+            }
+            // rubash#1898: /dev/zero appends discard like the null
+            // device; /dev/full appends take the sink stand-in (the
+            // open succeeds — GNU fails only the write; the direct
+            // builtin faces own that shape via OutputTarget).
+            SpecialPathClass::ZeroDevice => {
+                OpenOptions::new()
+                    .write(true)
+                    .append(true)
+                    .open(shell_path_to_windows(
+                        "/dev/null",
+                        &self.shell_state.env_vars,
+                    ))
+            }
+            SpecialPathClass::FullDevice => Self::synthetic_proc_write_sink(true),
             SpecialPathClass::FdAlias(fd) => {
                 if !super::redirection::dup_source_fd_open(
                     &self.fd_table,
@@ -953,12 +1037,9 @@ impl Executor {
                 match self.open_output_fd_append(target) {
                     Ok(file) => Ok(file),
                     Err(error) if error.kind() == io::ErrorKind::Unsupported => {
-                        crate::executor::execution_misc::open_redirect_append(
-                            &self.session_path(shell_path_to_windows(
-                                target,
-                                &self.shell_state.env_vars,
-                            )),
-                        )
+                        crate::executor::execution_misc::open_redirect_append(&self.session_path(
+                            shell_path_to_windows(target, &self.shell_state.env_vars),
+                        ))
                     }
                     Err(error) => Err(error),
                 }
@@ -970,12 +1051,11 @@ impl Executor {
                         "Permission denied",
                     )),
                     Some(true) => Self::synthetic_proc_write_sink(true),
-                    None => crate::executor::execution_misc::open_redirect_append(
-                        &self.session_path(shell_path_to_windows(
-                            target,
-                            &self.shell_state.env_vars,
-                        )),
-                    ),
+                    None => {
+                        crate::executor::execution_misc::open_redirect_append(&self.session_path(
+                            shell_path_to_windows(target, &self.shell_state.env_vars),
+                        ))
+                    }
                 }
             }
             SpecialPathClass::SyntheticLink => {
@@ -992,11 +1072,9 @@ impl Executor {
                     )),
                 }
             }
-            SpecialPathClass::Filesystem => {
-                crate::executor::execution_misc::open_redirect_append(&self.session_path(
-                    shell_path_to_windows(target, &self.shell_state.env_vars),
-                ))
-            }
+            SpecialPathClass::Filesystem => crate::executor::execution_misc::open_redirect_append(
+                &self.session_path(shell_path_to_windows(target, &self.shell_state.env_vars)),
+            ),
         }
     }
 
@@ -1052,6 +1130,13 @@ impl Executor {
             }
             FdWriteEndpoint::File(file_fd) => {
                 crate::fd::write_all(file_fd.handle, output)?;
+            }
+            FdWriteEndpoint::FullDevice => {
+                // rubash#1898: every write to a /dev/full binding
+                // fails ENOSPC; the payload carries the strerror so
+                // the sh_chkwrite rendering is exact on every
+                // platform (Windows' error table has no ENOSPC).
+                return Err(io::Error::new(io::ErrorKind::Other, "No space left on device").into());
             }
             FdWriteEndpoint::ProcessSubstitution { path, .. } => {
                 let mut file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -1279,6 +1364,13 @@ impl Executor {
             }
             FdWriteEndpoint::File(file_fd) => {
                 crate::fd::write_all(file_fd.handle, output)?;
+            }
+            FdWriteEndpoint::FullDevice => {
+                // rubash#1898: every write to a /dev/full binding
+                // fails ENOSPC; the payload carries the strerror so
+                // the sh_chkwrite rendering is exact on every
+                // platform (Windows' error table has no ENOSPC).
+                return Err(io::Error::new(io::ErrorKind::Other, "No space left on device").into());
             }
             FdWriteEndpoint::ProcessSubstitution { path, .. } => {
                 let mut file = OpenOptions::new().create(true).append(true).open(path)?;

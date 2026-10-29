@@ -262,9 +262,12 @@ impl Executor {
                     ExternalStdioSlot::Handle(crate::fd::handle_to_file(dup))
                 }
                 // Coproc / process-substitution endpoints have dedicated
-                // legacy spawn plumbing.
+                // legacy spawn plumbing. A /dev/full binding
+                // (rubash#1898) declines the same way — the legacy
+                // route reopens the spelling into the absorbed sink.
                 FdWriteEndpoint::CoprocStdin { .. }
-                | FdWriteEndpoint::ProcessSubstitution { .. } => return Ok(None),
+                | FdWriteEndpoint::ProcessSubstitution { .. }
+                | FdWriteEndpoint::FullDevice => return Ok(None),
             };
             if !is_default_slot(&slot) {
                 compound_bound_fds.push(fd);
@@ -324,7 +327,8 @@ impl Executor {
                 }
                 FdWriteEndpoint::File(_) => None,
                 FdWriteEndpoint::CoprocStdin { .. }
-                | FdWriteEndpoint::ProcessSubstitution { .. } => None,
+                | FdWriteEndpoint::ProcessSubstitution { .. }
+                | FdWriteEndpoint::FullDevice => None,
             }
         };
 

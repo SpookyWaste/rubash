@@ -592,7 +592,15 @@ fn virtual_device_test(op: &str, operand: &str) -> Option<bool> {
     if cfg!(unix) && matches!(op, "-O" | "-G") {
         return None;
     }
-    if crate::executor::path::is_shell_null_device(operand) {
+    // rubash#1898: /dev/zero and /dev/full carry the null device's
+    // exact truth table in GNU (measured against the 5.3.20 oracle:
+    // -e -r -w -c true; -x -s -b -f false) — they are the same class
+    // of always-present character device, so one arm serves all
+    // three spellings, judged by the registry.
+    if crate::executor::path::is_shell_null_device(operand)
+        || crate::special_paths::is_zero_device(operand)
+        || crate::special_paths::is_full_device(operand)
+    {
         return Some(match op {
             "-a" | "-e" | "-r" | "-w" | "-c" => true,
             "-x" | "-s" | "-b" | "-p" | "-S" | "-u" | "-g" | "-k" | "-h" | "-L" | "-O" | "-G"
