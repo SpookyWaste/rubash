@@ -787,7 +787,21 @@ impl Executor {
         // Here-strings are command-local input. Persistent virtual fds must
         // bypass `stdin_string_for_command`, whose legacy remaining-text view
         // does not advance the shared fd cursor.
-        if cmd.here_string.is_some() {
+        // rubash#1966: the body may live in EITHER store — the parser
+        // places an unnumbered `<<<` in cmd.here_string but a numbered
+        // `0<<<` (and `0<<`) in heredoc_redirects with fd == Some(0)
+        // (parser/redirections.rs assign_here_string_redirect_raw).
+        // stdin_string_for_command_mut resolves both stores (its
+        // fd-0-winner logic owns the ordering); this funnel's admission
+        // check looked only at the unnumbered field, so a numbered
+        // here-string was invisible to `read` and the builtin fell
+        // through to the process stdin (EOF / a block) instead.
+        let has_fd0_body = cmd.here_string.is_some()
+            || cmd
+                .heredoc_redirects
+                .iter()
+                .any(|redirect| redirect.fd == Some(0));
+        if has_fd0_body {
             if let Some(line) = self.stdin_string_for_command_mut(cmd) {
                 self.read_eof_no_delimiter |= slurped_record_eof_no_delimiter(
                     &line,
