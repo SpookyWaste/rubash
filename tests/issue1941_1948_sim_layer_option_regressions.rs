@@ -401,3 +401,29 @@ fn issue1945_mkfifo_missing_operand_and_value_diagnose() {
     );
 }
 
+// ---------------------------------------------------------------- #1943
+
+#[cfg(unix)]
+#[test]
+fn issue1943_chmod_capital_x_honors_directories() {
+    let dir = scratch("1943-x");
+    let out = run_in_dir(
+        &dir,
+        "mkdir d; chmod 666 d; chmod a+X d; stat -c %a d; \
+         touch f; chmod 644 f; chmod a+X f; stat -c %a f; \
+         mkdir e; chmod 666 e; chmod u+X e; stat -c %a e",
+    );
+    assert_eq!(out.stdout, "777\n644\n766\n");
+    assert_eq!(out.stderr, "");
+}
+
+#[cfg(unix)]
+#[test]
+fn issue1943_chmod_capital_x_reads_the_original_mode() {
+    // GNU mode_adjust judges X against the mode the file had before
+    // this invocation: `u+x` must not arm a later `g+X` clause.
+    let dir = scratch("1943-x-orig");
+    let out = run_in_dir(&dir, "touch f; chmod 644 f; chmod u+x,g+X f; stat -c %a f");
+    assert_eq!(out.stdout, "744\n");
+}
+

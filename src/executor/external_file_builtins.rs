@@ -4065,16 +4065,25 @@ impl Executor {
             // the file's current mode via chmod(2)); windows keeps the
             // emulated store, which is the only mode source there.
             #[cfg(unix)]
-            let base = {
+            let (base, is_dir) = {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::metadata(&host)
-                    .map(|metadata| metadata.permissions().mode())
-                    .unwrap_or(0o644)
+                    .map(|metadata| (metadata.permissions().mode(), metadata.is_dir()))
+                    .unwrap_or((0o644, false))
             };
             #[cfg(not(unix))]
             let base = crate::builtins::test::emulated_file_mode(file, &self.shell_state.env_vars)
                 .unwrap_or_else(|| self.default_emulated_mode(&windows));
-            match apply_chmod_mode(base, mode, current_umask(&self.shell_state.env_vars)) {
+            #[cfg(not(unix))]
+            let is_dir = std::fs::metadata(&host)
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false);
+            match apply_chmod_mode(
+                base,
+                mode,
+                current_umask(&self.shell_state.env_vars),
+                is_dir,
+            ) {
                 Some(new_mode) => {
                     #[cfg(unix)]
                     {
@@ -4299,7 +4308,7 @@ fn chmod_mode_declines(mode: &str) -> bool {
 }
 
 /// Apply one chmod MODE operand (octal or symbolic clauses) to BASE.
-fn apply_chmod_mode(base: u32, mode: &str, umask: u32) -> Option<u32> {
+fn apply_chmod_mode(base: u32, mode: &str, umask: u32, is_dir: bool) -> Option<u32> {
     let trimmed = mode.trim();
     if !trimmed.is_empty() && trimmed.chars().all(|ch| ch.is_ascii_digit()) && trimmed.len() <= 4 {
         return u32::from_str_radix(trimmed, 8)
@@ -4337,8 +4346,13 @@ fn apply_chmod_mode(base: u32, mode: &str, umask: u32) -> Option<u32> {
                 'w' => perms |= 0o222,
                 'x' => perms |= 0o111,
                 'X' => {
-                    // Directory, or some execute bit already set.
-                    if (current & 0o111) != 0 {
+                    // coreutils modechange.c mode_adjust: X grants
+                    // execute only for a directory, or when the
+                    // file's ORIGINAL mode (BASE, before this
+                    // invocation's clauses) already has some execute
+                    // bit — never for modes an earlier clause of the
+                    // same string just created (rubash#1943).
+                    if is_dir || (base & 0o111) != 0 {
                         perms |= 0o111;
                     }
                 }
