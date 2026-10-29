@@ -51,7 +51,7 @@ fn stty_is_answered_by_engine() {
 /// for device`, rc=1).
 #[test]
 fn stty_non_terminal_stdin_reports_gnu_diagnostic() {
-    let (stdout, stderr, rc) = run_stdin(&["-c", "stty raw; echo \"rc=$?\""], b"");
+    let (stdout, stderr, _rc) = run_stdin(&["-c", "stty raw; echo \"rc=$?\""], b"");
     assert_eq!(
         stderr, "stty: 'standard input': Inappropriate ioctl for device\n",
         "stdout: {stdout:?}"
